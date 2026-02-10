@@ -1,864 +1,188 @@
-use crate::modules::ammdata::consts::PRICE_SCALE;
-use crate::modules::ammdata::utils::activity::{
-    ActivityFilter, ActivityPage, ActivitySideFilter, ActivitySortKey, SortDir,
-    read_activity_for_pool, read_activity_for_pool_sorted,
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
+    RpcGetBestMevSwapParams, RpcGetCandlesParams, RpcGetPoolsParams, RpcPingParams,
 };
-use crate::modules::ammdata::utils::candles::{PriceSide, read_candles_v1};
-use crate::modules::ammdata::utils::live_reserves::fetch_all_pools;
 use crate::modules::defs::RpcNsRegistrar;
-use crate::runtime::mdb::Mdb;
-use crate::schemas::SchemaAlkaneId;
+use serde_json::{Value, json};
 use std::sync::Arc;
 
-use serde_json::map::Map;
-use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use super::schemas::{SchemaPoolSnapshot, Timeframe};
-
-// === pathfinder (still needed, but built from LIVE reserves now) ===
-use crate::modules::ammdata::utils::pathfinder::{
-    DEFAULT_FEE_BPS, plan_best_mev_swap, plan_exact_in_default_fee, plan_exact_out_default_fee,
-    plan_implicit_default_fee, plan_swap_exact_tokens_for_tokens,
-    plan_swap_exact_tokens_for_tokens_implicit, plan_swap_tokens_for_exact_tokens,
-};
-
-#[inline]
-fn log_rpc(method: &str, msg: &str) {
-    eprintln!("[RPC::AMMDATA] {method} — {msg}");
-}
-
-fn now_ts() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
-
-/// Parse pool/token id string like "2:68441" (decimal) or "0x2:0x10b59" (hex).
-fn parse_id_from_str(s: &str) -> Option<SchemaAlkaneId> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let parse_u32 = |s: &str| {
-        if let Some(x) = s.strip_prefix("0x") {
-            u32::from_str_radix(x, 16).ok()
-        } else {
-            s.parse::<u32>().ok()
-        }
-    };
-    let parse_u64 = |s: &str| {
-        if let Some(x) = s.strip_prefix("0x") {
-            u64::from_str_radix(x, 16).ok()
-        } else {
-            s.parse::<u64>().ok()
-        }
-    };
-    Some(SchemaAlkaneId { block: parse_u32(parts[0])?, tx: parse_u64(parts[1])? })
-}
-
-fn parse_timeframe(s: &str) -> Option<Timeframe> {
-    match s {
-        "10m" | "m10" => Some(Timeframe::M10),
-        "1h" | "h1" => Some(Timeframe::H1),
-        "1d" | "d1" => Some(Timeframe::D1),
-        "1w" | "w1" => Some(Timeframe::W1),
-        "1M" | "m1" => Some(Timeframe::M1),
-        _ => None,
-    }
-}
-
-fn parse_price_side(s: &str) -> Option<PriceSide> {
-    match s.to_ascii_lowercase().as_str() {
-        "base" | "b" => Some(PriceSide::Base),
-        "quote" | "q" => Some(PriceSide::Quote),
-        _ => None,
-    }
-}
-
-fn parse_side_filter(v: Option<&Value>) -> ActivitySideFilter {
-    if let Some(Value::String(s)) = v {
-        return match s.to_ascii_lowercase().as_str() {
-            "buy" | "b" => ActivitySideFilter::Buy,
-            "sell" | "s" => ActivitySideFilter::Sell,
-            "all" | "a" | "" => ActivitySideFilter::All,
-            _ => ActivitySideFilter::All,
-        };
-    }
-    ActivitySideFilter::All
-}
-
-fn parse_activity_type(v: Option<&Value>) -> ActivityFilter {
-    if let Some(Value::String(s)) = v {
-        return match s.to_ascii_lowercase().as_str() {
-            "trades" | "trade" => ActivityFilter::Trades,
-            "events" | "event" => ActivityFilter::Events,
-            "all" | "" => ActivityFilter::All,
-            _ => ActivityFilter::All,
-        };
-    }
-    ActivityFilter::All
-}
-
-#[inline]
-fn scale_u128(x: u128) -> f64 {
-    (x as f64) / (PRICE_SCALE as f64) // 8 decimals
-}
-
-/* ---------- sort parsing helpers (single token only) ---------- */
-
-fn parse_sort_dir(v: Option<&Value>) -> SortDir {
-    if let Some(Value::String(s)) = v {
-        match s.to_ascii_lowercase().as_str() {
-            "asc" | "ascending" => return SortDir::Asc,
-            "desc" | "descending" => return SortDir::Desc,
-            _ => {}
-        }
-    }
-    SortDir::Desc
-}
-
-fn norm_token(s: &str) -> Option<&'static str> {
-    match s.to_ascii_lowercase().as_str() {
-        // timestamp
-        "ts" | "time" | "timestamp" => Some("ts"),
-        // generic amount (mapped to base/quote depending on `side`)
-        "amt" | "amount" => Some("amount"),
-        // side (buy/sell group, then ts)
-        "side" | "s" => Some("side"),
-        // explicit base/quote amounts
-        "absb" | "amount_base" | "base_amount" => Some("absb"),
-        "absq" | "amount_quote" | "quote_amount" => Some("absq"),
-        _ => None,
-    }
-}
-
-/// Map a single `sort` token + requested PriceSide to a concrete index label + key.
-fn map_sort(side: PriceSide, token: Option<&str>) -> (ActivitySortKey, &'static str) {
-    if let Some(tok) = token.and_then(norm_token) {
-        return match tok {
-            "ts" => (ActivitySortKey::Timestamp, "ts"),
-            "amount" => match side {
-                PriceSide::Base => (ActivitySortKey::AmountBaseAbs, "absb"),
-                PriceSide::Quote => (ActivitySortKey::AmountQuoteAbs, "absq"),
-            },
-            "side" => match side {
-                // side ⇒ group by side then ts so paging is stable
-                PriceSide::Base => (ActivitySortKey::SideBaseTs, "sb_ts"),
-                PriceSide::Quote => (ActivitySortKey::SideQuoteTs, "sq_ts"),
-            },
-            "absb" => (ActivitySortKey::AmountBaseAbs, "absb"),
-            "absq" => (ActivitySortKey::AmountQuoteAbs, "absq"),
-            _ => (ActivitySortKey::Timestamp, "ts"),
-        };
-    }
-    (ActivitySortKey::Timestamp, "ts")
-}
-
-/* ---------- tiny helpers for this file ---------- */
-
-fn parse_u128_arg(v: Option<&Value>) -> Option<u128> {
-    match v {
-        Some(Value::String(s)) => s.parse::<u128>().ok(),
-        Some(Value::Number(n)) => n.as_u64().map(|x| x as u128), // accept small numeric for convenience
-        _ => None,
-    }
-}
-
-fn id_str(id: &SchemaAlkaneId) -> String {
-    format!("{}:{}", id.block, id.tx)
-}
-
-/* ================================================================================ */
-
 #[allow(dead_code)]
-pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
-    let mdb_ptr = Arc::new(mdb);
+pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
+    let mdb_ptr = Arc::clone(&provider);
 
     eprintln!("[RPC::AMMDATA] registering RPC handlers…");
 
-    /* -------------------- get_candles -------------------- */
     let reg_candles = reg.clone();
-    let mdb_ptr_candles: Arc<Mdb> = Arc::clone(&mdb_ptr);
-
+    let mdb_ptr_candles: Arc<AmmDataProvider> = Arc::clone(&mdb_ptr);
     tokio::spawn(async move {
         let mdb_for_handler = Arc::clone(&mdb_ptr_candles);
         reg_candles
             .register("get_candles", move |_cx, payload| {
                 let mdb = Arc::clone(&mdb_for_handler);
                 async move {
-                    let tf = payload
-                        .get("timeframe")
-                        .and_then(|v| v.as_str())
-                        .and_then(parse_timeframe)
-                        .unwrap_or(Timeframe::H1);
-
-                    // legacy "size" alias
-                    let legacy_size = payload
-                        .get("size")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as usize);
-                    let limit = payload
-                        .get("limit")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as usize)
-                        .or(legacy_size)
-                        .unwrap_or(120);
-                    let page = payload
-                        .get("page")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as usize)
-                        .unwrap_or(1);
-
-                    let side = payload
-                        .get("side")
-                        .and_then(|v| v.as_str())
-                        .and_then(parse_price_side)
-                        .unwrap_or(PriceSide::Base);
-
-                    let now = payload
-                        .get("now")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or_else(now_ts);
-
-                    let pool =
-                        match payload.get("pool").and_then(|v| v.as_str()).and_then(parse_id_from_str)
-                        {
-                            Some(p) => p,
-                            None => {
-                                log_rpc("get_candles", &format!("invalid pool, payload={payload:?}"));
-                                return json!({
-                                    "ok": false,
-                                    "error": "missing_or_invalid_pool",
-                                    "hint": "pool should be a string like \"2:68441\""
-                                });
-                            }
-                        };
-
-                    log_rpc(
-                        "get_candles",
-                        &format!(
-                            "pool={}, timeframe={}, side={:?}, page={}, limit={}, now={}",
-                            id_str(&pool),
-                            tf.code(),
-                            side,
-                            page,
-                            limit,
-                            now
-                        ),
-                    );
-
-                    let slice = read_candles_v1(&mdb, pool, tf, /*unused*/ limit, now, side);
-                    match slice {
-                        Ok(slice) => {
-                            let total = slice.candles_newest_first.len();
-
-                            let dur = tf.duration_secs();
-                            let newest_ts = slice.newest_ts;
-
-                            let offset = limit.saturating_mul(page.saturating_sub(1));
-                            let end = (offset + limit).min(total);
-                            let page_slice = if offset >= total {
-                                &[][..]
-                            } else {
-                                &slice.candles_newest_first[offset..end]
-                            };
-
-                            let arr: Vec<Value> =
-                                page_slice.iter().enumerate().map(|(i, c)| {
-                                    let global_idx = offset + i;
-                                    let ts = newest_ts.saturating_sub((global_idx as u64) * dur);
-                                    json!({
-                                        "ts":     ts,
-                                        "open":   scale_u128(c.open),
-                                        "high":   scale_u128(c.high),
-                                        "low":    scale_u128(c.low),
-                                        "close":  scale_u128(c.close),
-                                        "volume": scale_u128(c.volume),
-                                    })
-                                }).collect();
-
-                            json!({
-                                "ok": true,
-                                "pool": id_str(&pool),
-                                "timeframe": tf.code(),
-                                "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
-                                "page": page,
-                                "limit": limit,
-                                "total": total,
-                                "has_more": end < total,
-                                "candles": arr
-                            })
-                        }
-                        Err(e) => {
-                            log_rpc("get_candles", &format!("read_failed: {e}"));
-                            json!({ "ok": false, "error": format!("read_failed: {e}") })
-                        }
-                    }
+                    let params = RpcGetCandlesParams {
+                        pool: payload.get("pool").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        timeframe: payload
+                            .get("timeframe")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        size: payload.get("size").and_then(|v| v.as_u64()),
+                        page: payload.get("page").and_then(|v| v.as_u64()),
+                        side: payload.get("side").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        now: payload.get("now").and_then(|v| v.as_u64()),
+                    };
+                    mdb.rpc_get_candles(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
             })
             .await;
     });
 
-    /* -------------------- get_activity -------------------- */
     let reg_activity = reg.clone();
-    let mdb_ptr_activity: Arc<Mdb> = Arc::clone(&mdb_ptr);
-
+    let mdb_ptr_activity: Arc<AmmDataProvider> = Arc::clone(&mdb_ptr);
     tokio::spawn(async move {
         reg_activity
             .register("get_activity", move |_cx, payload| {
                 let mdb_for_handler = Arc::clone(&mdb_ptr_activity);
-
                 async move {
-                    let limit = payload
-                        .get("limit")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as usize)
-                        .unwrap_or(50);
-                    let page = payload
-                        .get("page")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as usize)
-                        .unwrap_or(1);
-
-                    let side = payload
-                        .get("side")
-                        .and_then(|v| v.as_str())
-                        .and_then(parse_price_side)
-                        .unwrap_or(PriceSide::Base);
-
-                    let filter_side = parse_side_filter(payload.get("filter_side"));
-                    let activity_type = parse_activity_type(
-                        payload.get("activity_type").or_else(|| payload.get("type")),
-                    );
-
-                    // parse single sort token + dir
-                    let sort_token: Option<String> =
-                        payload.get("sort").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let dir = parse_sort_dir(payload.get("dir").or_else(|| payload.get("direction")));
-                    let (sort_key, sort_code) = map_sort(side, sort_token.as_deref());
-
-                    let pool =
-                        match payload.get("pool").and_then(|v| v.as_str()).and_then(parse_id_from_str)
-                        {
-                            Some(p) => p,
-                            None => {
-                                log_rpc("get_activity", &format!("invalid pool, payload={payload:?}"));
-                                return json!({
-                                    "ok": false,
-                                    "error": "missing_or_invalid_pool",
-                                    "hint": "pool should be a string like \"2:68441\""
-                                });
-                            }
-                        };
-
-                    log_rpc(
-                        "get_activity",
-                        &format!(
-                            "pool={}, side={:?}, filter_side={:?}, activity_type={:?}, sort={}, dir={:?}, page={}, limit={}",
-                            id_str(&pool),
-                            side,
-                            filter_side,
-                            activity_type,
-                            sort_code,
-                            dir,
-                            page,
-                            limit
-                        ),
-                    );
-
-                    if sort_token.is_some()
-                        || !matches!(filter_side, ActivitySideFilter::All)
-                        || !matches!(activity_type, ActivityFilter::All)
-                    {
-                        match read_activity_for_pool_sorted(
-                            &mdb_for_handler,
-                            pool,
-                            page,
-                            limit,
-                            side,
-                            sort_key,
-                            dir,
-                            filter_side,
-                            activity_type,
-                        ) {
-                            Ok(ActivityPage { activity, total }) => {
-                                json!({
-                                    "ok": true,
-                                    "pool": id_str(&pool),
-                                    "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
-                                    "filter_side": match filter_side {
-                                        ActivitySideFilter::All => "all",
-                                        ActivitySideFilter::Buy => "buy",
-                                        ActivitySideFilter::Sell => "sell"
-                                    },
-                                    "activity_type": match activity_type {
-                                        ActivityFilter::All => "all",
-                                        ActivityFilter::Trades => "trades",
-                                        ActivityFilter::Events => "events",
-                                    },
-                                    "sort": sort_code,
-                                    "dir": match dir { SortDir::Asc => "asc", SortDir::Desc => "desc" },
-                                    "page": page,
-                                    "limit": limit,
-                                    "total": total,
-                                    "has_more": page.saturating_mul(limit) < total,
-                                    "activity": activity
-                                })
-                            }
-                            Err(e) => {
-                                log_rpc("get_activity", &format!("read_failed(sorted): {e}"));
-                                json!({ "ok": false, "error": format!("read_failed: {e}") })
-                            }
-                        }
-                    } else {
-                        match read_activity_for_pool(
-                            &mdb_for_handler,
-                            pool,
-                            page,
-                            limit,
-                            side,
-                            activity_type,
-                        ) {
-                            Ok(ActivityPage { activity, total }) => {
-                                json!({
-                                    "ok": true,
-                                    "pool": id_str(&pool),
-                                    "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
-                                    "filter_side": "all",
-                                    "activity_type": "all",
-                                    "sort": "ts",
-                                    "dir": "desc",
-                                    "page": page,
-                                    "limit": limit,
-                                    "total": total,
-                                    "has_more": page.saturating_mul(limit) < total,
-                                    "activity": activity
-                                })
-                            }
-                            Err(e) => {
-                                log_rpc("get_activity", &format!("read_failed: {e}"));
-                                json!({ "ok": false, "error": format!("read_failed: {e}") })
-                            }
-                        }
-                    }
+                    let params = RpcGetActivityParams {
+                        pool: payload.get("pool").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        page: payload.get("page").and_then(|v| v.as_u64()),
+                        side: payload.get("side").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        filter_side: payload
+                            .get("filter_side")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        activity_type: payload
+                            .get("activity_type")
+                            .or_else(|| payload.get("type"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        sort: payload.get("sort").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        dir: payload
+                            .get("dir")
+                            .or_else(|| payload.get("direction"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                    };
+                    mdb_for_handler
+                        .rpc_get_activity(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
             })
             .await;
     });
 
-    /* -------------------- get_pools (LIVE ONLY, single call) -------------------- */
     let reg_pools = reg.clone();
     let mdb_for_pools = Arc::clone(&mdb_ptr);
-
     tokio::spawn(async move {
         reg_pools
-            .register("get_pools", move |_cx, payload|  {
+            .register("get_pools", move |_cx, payload| {
                 let mdb_for_handler = Arc::clone(&mdb_for_pools);
                 async move {
-                // Single live call that returns ALL pools + reserves
-                let live_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> =
-                    match fetch_all_pools(&mdb_for_handler) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            log_rpc("get_pools", &format!("live reserves fetch failed: {e:?}"));
-                            return json!({
-                                "ok": false,
-                                "error": "live_fetch_failed",
-                                "hint": "could not load live reserves"
-                            });
-                        }
+                    let params = RpcGetPoolsParams {
+                        page: payload.get("page").and_then(|v| v.as_u64()),
+                        limit: payload.get("limit").and_then(|v| v.as_u64()),
                     };
-
-                // Order deterministically by (block, tx) for stable pagination
-                let mut rows: Vec<(SchemaAlkaneId, SchemaPoolSnapshot)> =
-                    live_map.into_iter().collect();
-                rows.sort_by(|(a, _), (b, _)| a.block.cmp(&b.block).then(a.tx.cmp(&b.tx)));
-
-                let total = rows.len();
-
-                // default page size: all (bounded)
-                let limit = payload
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(total.max(1))
-                    .clamp(1, 20_000);
-
-                let page = payload
-                    .get("page")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(1)
-                    .max(1);
-
-                log_rpc("get_pools", &format!("total={}, page={}, limit={}", total, page, limit));
-
-                let offset = limit.saturating_mul(page.saturating_sub(1));
-                let end = (offset + limit).min(total);
-                let window = if offset >= total {
-                    &[][..]
-                } else {
-                    &rows[offset..end]
-                };
-                let has_more = end < total;
-
-                let mut pools_obj: Map<String, Value> = Map::with_capacity(window.len());
-                for (pool, snap) in window.iter() {
-                    pools_obj.insert(
-                        format!("{}:{}", pool.block, pool.tx),
-                        json!({
-                            "base":          format!("{}:{}", snap.base_id.block,  snap.base_id.tx),
-                            "quote":         format!("{}:{}", snap.quote_id.block, snap.quote_id.tx),
-                            "base_reserve":  snap.base_reserve.to_string(),
-                            "quote_reserve": snap.quote_reserve.to_string(),
-                            "source": "live",
-                        }),
-                    );
+                    mdb_for_handler
+                        .rpc_get_pools(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
-
-                json!({
-                    "ok": true,
-                    "page": page,
-                    "limit": limit,
-                    "total": total,
-                    "has_more": has_more,
-                    "pools": Value::Object(pools_obj)
-                })
-            }})
+            })
             .await;
     });
 
-    /* -------------------- find_best_swap_path (uses LIVE reserves) -------------------- */
-    let reg_path = reg.clone();
-    let mdb_for_swap_path: Arc<Mdb> = Arc::clone(&mdb_ptr);
+    let reg_factories = reg.clone();
+    let mdb_for_factories = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_factories
+            .register("get_amm_factories", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_for_factories);
+                async move {
+                    let params = RpcGetAmmFactoriesParams {
+                        page: payload.get("page").and_then(|v| v.as_u64()),
+                        limit: payload.get("limit").and_then(|v| v.as_u64()),
+                    };
+                    mdb_for_handler
+                        .rpc_get_amm_factories(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
 
+    let reg_path = reg.clone();
+    let mdb_for_swap_path: Arc<AmmDataProvider> = Arc::clone(&mdb_ptr);
     tokio::spawn(async move {
         reg_path
-            .register("find_best_swap_path", move |_cx, payload|   {
-                // Load LIVE reserves once
+            .register("find_best_swap_path", move |_cx, payload| {
                 let mdb_for_handler = Arc::clone(&mdb_for_swap_path);
                 async move {
-                let snapshot_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> =
-                    match fetch_all_pools(&mdb_for_handler) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            log_rpc("find_best_swap_path", &format!("live fetch failed: {e:?}"));
-                            return json!({
-                                "ok": false,
-                                "error": "no_liquidity",
-                                "hint": "live reserves unavailable"
-                            });
-                        }
+                    let params = RpcFindBestSwapPathParams {
+                        mode: payload.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        token_in: payload
+                            .get("token_in")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        token_out: payload
+                            .get("token_out")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        fee_bps: payload.get("fee_bps").and_then(|v| v.as_u64()),
+                        max_hops: payload.get("max_hops").and_then(|v| v.as_u64()),
+                        amount_in: payload.get("amount_in").cloned(),
+                        amount_out_min: payload.get("amount_out_min").cloned(),
+                        amount_out: payload.get("amount_out").cloned(),
+                        amount_in_max: payload.get("amount_in_max").cloned(),
+                        available_in: payload.get("available_in").cloned(),
                     };
-
-                if snapshot_map.is_empty() {
-                    log_rpc("find_best_swap_path", "live reserves map is empty");
-                    return json!({
-                        "ok": false,
-                        "error": "no_liquidity",
-                        "hint": "live reserves map is empty"
-                    });
+                    mdb_for_handler
+                        .rpc_find_best_swap_path(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
-
-                // Parse core params
-                let mode = payload
-                    .get("mode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("exact_in")
-                    .to_ascii_lowercase();
-
-                let token_in =
-                    match payload.get("token_in").and_then(|v| v.as_str()).and_then(parse_id_from_str)
-                    {
-                        Some(t) => t,
-                        None => return json!({"ok": false, "error": "missing_or_invalid_token_in"}),
-                    };
-                let token_out =
-                    match payload.get("token_out").and_then(|v| v.as_str()).and_then(parse_id_from_str)
-                    {
-                        Some(t) => t,
-                        None => return json!({"ok": false, "error": "missing_or_invalid_token_out"}),
-                    };
-
-                let fee_bps = payload
-                    .get("fee_bps")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32)
-                    .unwrap_or(DEFAULT_FEE_BPS);
-                let max_hops = payload
-                    .get("max_hops")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(3)
-                    .max(1)
-                    .min(6);
-
-                log_rpc(
-                    "find_best_swap_path",
-                    &format!(
-                        "mode={}, token_in={}, token_out={}, fee_bps={}, max_hops={}",
-                        id_str(&token_in),
-                        id_str(&token_in),
-                        id_str(&token_out),
-                        fee_bps,
-                        max_hops
-                    ),
-                );
-
-                // Run planner by mode
-                let plan = match mode.as_str() {
-                    // amount_in (req), amount_out_min (optional → default 0)
-                    "exact_in" => {
-                        let amount_in = match parse_u128_arg(payload.get("amount_in")) {
-                            Some(v) => v,
-                            None => {
-                                return json!({"ok": false, "error": "missing_or_invalid_amount_in"})
-                            }
-                        };
-                        let min_out = parse_u128_arg(payload.get("amount_out_min")).unwrap_or(0u128);
-
-                        if let Some(bps) = payload.get("fee_bps").and_then(|v| v.as_u64()) {
-                            plan_swap_exact_tokens_for_tokens(
-                                &snapshot_map,
-                                token_in,
-                                token_out,
-                                amount_in,
-                                min_out,
-                                bps as u32,
-                                max_hops,
-                            )
-                        } else {
-                            plan_exact_in_default_fee(
-                                &snapshot_map,
-                                token_in,
-                                token_out,
-                                amount_in,
-                                min_out,
-                                max_hops,
-                            )
-                        }
-                    }
-
-                    // amount_out (req), amount_in_max (optional → u128::MAX)
-                    "exact_out" => {
-                        let amount_out = match parse_u128_arg(payload.get("amount_out")) {
-                            Some(v) => v,
-                            None => {
-                                return json!({"ok": false, "error": "missing_or_invalid_amount_out"})
-                            }
-                        };
-                        let in_max =
-                            parse_u128_arg(payload.get("amount_in_max")).unwrap_or(u128::MAX);
-
-                        if let Some(bps) = payload.get("fee_bps").and_then(|v| v.as_u64()) {
-                            plan_swap_tokens_for_exact_tokens(
-                                &snapshot_map,
-                                token_in,
-                                token_out,
-                                amount_out,
-                                in_max,
-                                bps as u32,
-                                max_hops,
-                            )
-                        } else {
-                            plan_exact_out_default_fee(
-                                &snapshot_map,
-                                token_in,
-                                token_out,
-                                amount_out,
-                                in_max,
-                                max_hops,
-                            )
-                        }
-                    }
-
-                    // available_in (req), amount_out_min (optional → 0)
-                    "implicit" => {
-                        let available_in = match parse_u128_arg(
-                            payload
-                                .get("amount_in")
-                                .or_else(|| payload.get("available_in")),
-                        ) {
-                            Some(v) => v,
-                            None => {
-                                return json!({"ok": false, "error": "missing_or_invalid_amount_in"})
-                            }
-                        };
-                        let min_out = parse_u128_arg(payload.get("amount_out_min")).unwrap_or(0u128);
-
-                        if let Some(bps) = payload.get("fee_bps").and_then(|v| v.as_u64()) {
-                            plan_swap_exact_tokens_for_tokens_implicit(
-                                &snapshot_map,
-                                token_in,
-                                token_out,
-                                available_in,
-                                min_out,
-                                bps as u32,
-                                max_hops,
-                            )
-                        } else {
-                            plan_implicit_default_fee(
-                                &snapshot_map,
-                                token_in,
-                                token_out,
-                                available_in,
-                                min_out,
-                                max_hops,
-                            )
-                        }
-                    }
-
-                    _ => {
-                        return json!({
-                            "ok": false,
-                            "error": "invalid_mode",
-                            "hint": "use exact_in | exact_out | implicit"
-                        })
-                    }
-                };
-
-                match plan {
-                    Some(pq) => {
-                        let hops: Vec<Value> = pq
-                            .hops
-                            .iter()
-                            .map(|h| {
-                                json!({
-                                    "pool":       id_str(&h.pool),
-                                    "token_in":   id_str(&h.token_in),
-                                    "token_out":  id_str(&h.token_out),
-                                    "amount_in":  h.amount_in.to_string(),
-                                    "amount_out": h.amount_out.to_string(),
-                                })
-                            })
-                            .collect();
-
-                        json!({
-                            "ok": true,
-                            "mode": mode,
-                            "token_in":  id_str(&token_in),
-                            "token_out": id_str(&token_out),
-                            "fee_bps": fee_bps,
-                            "max_hops": max_hops,
-                            "amount_in":  pq.amount_in.to_string(),
-                            "amount_out": pq.amount_out.to_string(),
-                            "hops": hops
-                        })
-                    }
-                    None => {
-                        log_rpc("find_best_swap_path", "no_path_found");
-                        json!({"ok": false, "error": "no_path_found"})
-                    }
-                }
-    }})
+            })
             .await;
     });
 
-    /* -------------------- get_best_mev_swap (LIVE reserves, one call) -------------------- */
     let reg_mev = reg.clone();
     let mdb_mev_swap_ptr = Arc::clone(&mdb_ptr);
-
     tokio::spawn(async move {
         reg_mev
             .register("get_best_mev_swap", move |_cx, payload| {
                 let mdb_for_handler = Arc::clone(&mdb_mev_swap_ptr);
-
                 async move {
-                // Load LIVE reserves once
-                let snapshot_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> =
-                    match fetch_all_pools(&mdb_for_handler) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            log_rpc("get_best_mev_swap", &format!("live fetch failed: {e:?}"));
-                            return json!({
-                                "ok": false,
-                                "error": "no_liquidity",
-                                "hint": "live reserves unavailable"
-                            });
-                        }
+                    let params = RpcGetBestMevSwapParams {
+                        token: payload.get("token").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        fee_bps: payload.get("fee_bps").and_then(|v| v.as_u64()),
+                        max_hops: payload.get("max_hops").and_then(|v| v.as_u64()),
                     };
-
-                if snapshot_map.is_empty() {
-                    log_rpc("get_best_mev_swap", "live reserves map is empty");
-                    return json!({
-                        "ok": false,
-                        "error": "no_liquidity",
-                        "hint": "live reserves map is empty"
-                    });
+                    mdb_for_handler
+                        .rpc_get_best_mev_swap(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
-
-                // Parse params
-                let token =
-                    match payload.get("token").and_then(|v| v.as_str()).and_then(parse_id_from_str)
-                    {
-                        Some(t) => t,
-                        None => return json!({"ok": false, "error": "missing_or_invalid_token"}),
-                    };
-                let fee_bps = payload
-                    .get("fee_bps")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32)
-                    .unwrap_or(DEFAULT_FEE_BPS);
-                let max_hops = payload
-                    .get("max_hops")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize)
-                    .unwrap_or(3)
-                    .clamp(2, 6); // cycles require at least 2 hops
-
-                log_rpc(
-                    "get_best_mev_swap",
-                    &format!(
-                        "token={}, fee_bps={}, max_hops={}",
-                        id_str(&token),
-                        fee_bps,
-                        max_hops
-                    ),
-                );
-
-                match plan_best_mev_swap(&snapshot_map, token, fee_bps, max_hops) {
-                    Some(pq) => {
-                        let hops: Vec<Value> = pq
-                            .hops
-                            .iter()
-                            .map(|h| {
-                                json!({
-                                    "pool":       id_str(&h.pool),
-                                    "token_in":   id_str(&h.token_in),
-                                    "token_out":  id_str(&h.token_out),
-                                    "amount_in":  h.amount_in.to_string(),
-                                    "amount_out": h.amount_out.to_string(),
-                                })
-                            })
-                            .collect();
-
-                        json!({
-                            "ok": true,
-                            "token":   id_str(&token),
-                            "fee_bps": fee_bps,
-                            "max_hops": max_hops,
-                            "amount_in":  pq.amount_in.to_string(),
-                            "amount_out": pq.amount_out.to_string(),
-                            "profit": (pq.amount_out as i128 - pq.amount_in as i128).to_string(),
-                            "hops": hops
-                        })
-                    }
-                    None => {
-                        log_rpc("get_best_mev_swap", "no_profitable_cycle");
-                        json!({"ok": false, "error": "no_profitable_cycle"})
-                    }
-                }
-            }})
+            })
             .await;
     });
 
-    /* -------------------- ping -------------------- */
     let reg_ping = reg.clone();
+    let mdb_ping = Arc::clone(&mdb_ptr);
     tokio::spawn(async move {
         reg_ping
-            .register("ping", |_cx, _payload| async move {
-                log_rpc("ping", "ok");
-                Value::String("pong".to_string())
+            .register("ping", move |_cx, _payload| {
+                let mdb = Arc::clone(&mdb_ping);
+                async move {
+                    mdb.rpc_ping(RpcPingParams)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| Value::String("pong".to_string()))
+                }
             })
             .await;
     });

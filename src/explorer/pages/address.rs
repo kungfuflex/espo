@@ -1,6 +1,6 @@
+use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use axum::extract::{Path, Query, State};
 use axum::response::Html;
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use bitcoin::address::AddressType;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
@@ -26,10 +26,8 @@ use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::common::fmt_sats;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::{
-    AlkaneTxSummary, alkane_address_len_key, alkane_address_txid_key, alkane_tx_summary_key,
-};
 use crate::modules::essentials::storage::BalanceEntry;
+use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable};
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_balances_with_spent_batch,
 };
@@ -148,6 +146,7 @@ pub async fn address_page(
 
     let electrum_like = get_electrum_like();
     let address_str = address.to_string();
+    let table = EssentialsTable::new(&state.essentials_mdb);
     let address_stats = electrum_like
         .address_stats(&address)
         .map_err(|e| {
@@ -155,7 +154,8 @@ pub async fn address_page(
         })
         .ok();
 
-    let balances = get_balance_for_address(&state.essentials_mdb, &address_str).unwrap_or_default();
+    let balances =
+        get_balance_for_address(&state.essentials_provider(), &address_str).unwrap_or_default();
     let mut balance_entries: Vec<BalanceEntry> = balances
         .into_iter()
         .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
@@ -205,7 +205,7 @@ pub async fn address_page(
     if traces_only {
         let confirmed_total = state
             .essentials_mdb
-            .get(&alkane_address_len_key(&address_str))
+            .get(&table.alkane_address_len_key(&address_str))
             .ok()
             .flatten()
             .and_then(|b| {
@@ -219,14 +219,13 @@ pub async fn address_page(
             })
             .unwrap_or(0);
         let confirmed_slice_start = confirmed_offset.min(confirmed_total);
-        let confirmed_slice_end =
-            (confirmed_offset + remaining_slots).min(confirmed_total);
+        let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
 
         if confirmed_slice_end > confirmed_slice_start {
             let mut txid_keys: Vec<Vec<u8>> = Vec::new();
             for idx in confirmed_slice_start..confirmed_slice_end {
                 let rev_idx = confirmed_total - 1 - idx;
-                txid_keys.push(alkane_address_txid_key(&address_str, rev_idx as u64));
+                txid_keys.push(table.alkane_address_txid_key(&address_str, rev_idx as u64));
             }
             let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
             let mut txids: Vec<Txid> = Vec::new();
@@ -240,8 +239,8 @@ pub async fn address_page(
                 }
             }
 
-                let summary_keys: Vec<Vec<u8>> =
-                    txids.iter().map(|t| alkane_tx_summary_key(&t.to_byte_array())).collect();
+            let summary_keys: Vec<Vec<u8>> =
+                txids.iter().map(|t| table.alkane_tx_summary_key(&t.to_byte_array())).collect();
             let summary_vals = state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
             let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
 
@@ -285,8 +284,9 @@ pub async fn address_page(
     } else {
         match address_stats.as_ref().map(|s| s.backend) {
             Some(ElectrumLikeBackend::ElectrumRpc) => {
-                history_error =
-                    Some("Esplora backend is required to show all address transactions.".to_string());
+                history_error = Some(
+                    "Esplora backend is required to show all address transactions.".to_string(),
+                );
                 tx_total = pending_total + tx_renders.len();
                 tx_has_next = false;
             }
@@ -303,12 +303,13 @@ pub async fn address_page(
                             .into_iter()
                             .filter(|e| !pending_set.contains(&e.txid))
                             .collect();
-                        let confirmed_total = hist_page.total.unwrap_or(entries.len()).max(entries.len());
+                        let confirmed_total =
+                            hist_page.total.unwrap_or(entries.len()).max(entries.len());
                         let txids: Vec<Txid> =
                             entries.iter().take(remaining_slots).map(|h| h.txid).collect();
                         let summary_keys: Vec<Vec<u8>> = txids
                             .iter()
-                            .map(|t| alkane_tx_summary_key(&t.to_byte_array()))
+                            .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
                             .collect();
                         let summary_vals =
                             state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
@@ -339,7 +340,8 @@ pub async fn address_page(
                                 .map(|s| traces_from_summary(&entry.txid, s))
                                 .filter(|t| !t.is_empty());
                             let confirmations = entry.height.and_then(|h| {
-                                chain_tip.and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
+                                chain_tip
+                                    .and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
                             });
                             tx_renders.push(AddressTxRender {
                                 txid: entry.txid,
@@ -388,11 +390,7 @@ pub async fn address_page(
     if let Some(cur) = current_cursor {
         next_stack_vec.push(cur);
     }
-    let next_stack = if next_stack_vec.is_empty() {
-        None
-    } else {
-        Some(next_stack_vec.join(","))
-    };
+    let next_stack = if next_stack_vec.is_empty() { None } else { Some(next_stack_vec.join(",")) };
     let next_cursor_str = next_cursor.map(|t| t.to_string());
     let base_path = explorer_path(&format!("/address/{}", address_str));
     let first_href = format!("{base_path}?page=1&limit={limit}&traces={traces_param}");
@@ -465,7 +463,7 @@ pub async fn address_page(
     all_outpoints.sort();
     all_outpoints.dedup();
     let outpoint_map =
-        get_outpoint_balances_with_spent_batch(&state.essentials_mdb, &all_outpoints)
+        get_outpoint_balances_with_spent_batch(&state.essentials_provider(), &all_outpoints)
             .unwrap_or_default();
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
         outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()

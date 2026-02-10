@@ -31,9 +31,7 @@ use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::{
-    AlkaneTxSummary, alkane_block_len_key, alkane_block_txid_key, alkane_tx_summary_key,
-};
+use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable};
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_outpoint_balances_with_spent_batch,
 };
@@ -188,6 +186,7 @@ pub async fn block_page(
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let nav_tip = espo_tip.min(tip);
     let espo_indexed = height <= espo_tip;
+    let table = EssentialsTable::new(&state.essentials_mdb);
     let traces_only = q
         .traces
         .as_deref()
@@ -246,7 +245,7 @@ pub async fn block_page(
         if traces_only {
             let total = state
                 .essentials_mdb
-                .get(&alkane_block_len_key(height))
+                .get(&table.alkane_block_len_key(height))
                 .ok()
                 .flatten()
                 .and_then(|b| {
@@ -264,7 +263,7 @@ pub async fn block_page(
                 if total > 0 {
                     let mut txid_keys: Vec<Vec<u8>> = Vec::with_capacity(total);
                     for idx in 0..total {
-                        txid_keys.push(alkane_block_txid_key(height, idx as u64));
+                        txid_keys.push(table.alkane_block_txid_key(height, idx as u64));
                     }
                     let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
                     for v in txid_vals {
@@ -278,8 +277,10 @@ pub async fn block_page(
                     }
                 }
 
-                let summary_keys: Vec<Vec<u8>> =
-                    all_txids.iter().map(|t| alkane_tx_summary_key(&t.to_byte_array())).collect();
+                let summary_keys: Vec<Vec<u8>> = all_txids
+                    .iter()
+                    .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
+                    .collect();
                 let summary_vals =
                     state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
                 let mut summary_map: HashMap<Txid, Option<AlkaneTxSummary>> = HashMap::new();
@@ -348,7 +349,7 @@ pub async fn block_page(
                 if end > off {
                     let mut txid_keys: Vec<Vec<u8>> = Vec::new();
                     for idx in off..end {
-                        txid_keys.push(alkane_block_txid_key(height, idx as u64));
+                        txid_keys.push(table.alkane_block_txid_key(height, idx as u64));
                     }
                     let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
                     let mut txids: Vec<Txid> = Vec::new();
@@ -362,8 +363,10 @@ pub async fn block_page(
                         }
                     }
 
-                    let summary_keys: Vec<Vec<u8>> =
-                        txids.iter().map(|t| alkane_tx_summary_key(&t.to_byte_array())).collect();
+                    let summary_keys: Vec<Vec<u8>> = txids
+                        .iter()
+                        .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
+                        .collect();
                     let summary_vals =
                         state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
 
@@ -432,7 +435,7 @@ pub async fn block_page(
     all_outpoints.sort();
     all_outpoints.dedup();
     let outpoint_map =
-        get_outpoint_balances_with_spent_batch(&state.essentials_mdb, &all_outpoints)
+        get_outpoint_balances_with_spent_batch(&state.essentials_provider(), &all_outpoints)
             .unwrap_or_default();
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
         outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()

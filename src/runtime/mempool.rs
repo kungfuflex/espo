@@ -2,6 +2,7 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
     prettyify_protobuf_trace_json,
 };
+use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use crate::config::{get_bitcoind_rpc_client, get_metashrew_rpc_url};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::EspoOutpoint;
@@ -16,7 +17,7 @@ use bitcoin::{
     Address, Amount, Block, CompactTarget, Network, Sequence, Transaction, TxIn, TxMerkleNode,
     TxOut, Txid, Witness,
 };
-use bitcoincore_rpc::{Client as CoreClient, RpcApi};
+use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize, to_vec};
 use futures::{StreamExt, stream};
 use ordinals::{Artifact, Runestone};

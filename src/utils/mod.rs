@@ -1,6 +1,37 @@
+#[cfg(not(target_arch = "wasm32"))]
 pub mod electrum_like;
 
+use crate::schemas::SchemaAlkaneId;
 use std::time::{Duration, Instant};
+
+/// Parse an alkane ID from a string like "2:68441" (block:tx)
+/// Supports both decimal and hex (0x-prefixed) formats
+pub fn parse_alkane_id(s: &str) -> Option<SchemaAlkaneId> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let parse_u32 = |s: &str| {
+        let trimmed = s.trim();
+        if let Some(x) = trimmed.strip_prefix("0x") {
+            u32::from_str_radix(x, 16).ok()
+        } else {
+            trimmed.parse::<u32>().ok()
+        }
+    };
+
+    let parse_u64 = |s: &str| {
+        let trimmed = s.trim();
+        if let Some(x) = trimmed.strip_prefix("0x") {
+            u64::from_str_radix(x, 16).ok()
+        } else {
+            trimmed.parse::<u64>().ok()
+        }
+    };
+
+    Some(SchemaAlkaneId { block: parse_u32(parts[0])?, tx: parse_u64(parts[1])? })
+}
 
 /// Tracks a simple running *average* of seconds per block.
 pub struct EtaTracker {

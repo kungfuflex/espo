@@ -2,7 +2,7 @@ use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
     EspoSandshrewLikeTraceStatus,
 };
-use crate::runtime::mdb::Mdb;
+use crate::modules::essentials::storage::EssentialsProvider;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_cli_common::alkanes::inspector::types::{AlkaneMetadata, AlkaneMethod};
 use alkanes_cli_common::alkanes::inspector::{AlkaneInspector, InspectionConfig, InspectionResult};
@@ -131,15 +131,17 @@ pub fn decode_inspection(bytes: &[u8]) -> Result<StoredInspectionResult> {
 }
 
 pub fn load_inspection(
-    mdb: &Mdb,
+    provider: &EssentialsProvider,
     alkane: &SchemaAlkaneId,
 ) -> Result<Option<StoredInspectionResult>> {
     // The inspection is now stored alongside the creation record; keep a small
     // helper here for call sites that expect it.
-    if let Some(rec) = crate::modules::essentials::storage::load_creation_record(mdb, alkane)? {
-        return Ok(rec.inspection);
-    }
-    Ok(None)
+    let rec = provider
+        .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
+            alkane: *alkane,
+        })?
+        .record;
+    Ok(rec.and_then(|r| r.inspection))
 }
 
 fn parse_short_id(id: &EspoSandshrewLikeTraceShortId) -> Option<SchemaAlkaneId> {
@@ -171,6 +173,8 @@ pub struct AlkaneCreationRecord {
     pub inspection: Option<StoredInspectionResult>,
     pub names: Vec<String>,
     pub symbols: Vec<String>,
+    pub cap: u128,
+    pub mint_amount: u128,
 }
 
 pub fn created_alkane_records_from_block(block: &EspoBlock) -> Vec<AlkaneCreationRecord> {
@@ -203,6 +207,8 @@ pub fn created_alkane_records_from_block(block: &EspoBlock) -> Vec<AlkaneCreatio
                                 inspection: None,
                                 names: Vec::new(),
                                 symbols: Vec::new(),
+                                cap: 0,
+                                mint_amount: 0,
                             });
                         }
                     }

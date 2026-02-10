@@ -7,6 +7,7 @@ use tarpc::context;
 use tokio::sync::RwLock;
 
 use crate::alkanes::trace::EspoBlock;
+use crate::config::get_module_config;
 use crate::runtime::aof::AofManager;
 use crate::runtime::mdb::Mdb;
 use rocksdb::{DB, Options};
@@ -108,6 +109,17 @@ pub trait EspoModule: Send + Sync {
     /// Modules can only register RPCs via a namespaced registrar.
     /// For a module named "ammdata", all methods will be "ammdata.<suffix>".
     fn register_rpc(&self, reg: &RpcNsRegistrar);
+
+    /// Return Some to declare this module expects a config section.
+    /// The string should describe the expected shape (used for error messages).
+    fn config_spec(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Load the module config section from config.json.
+    fn set_config(&mut self, _config: &serde_json::Value) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Registry that holds modules, the RPC router, and one shared RocksDB
@@ -161,13 +173,19 @@ impl ModuleRegistry {
             }
         } else if name == "essentials" {
             panic!("ModuleRegistry requires essentials to be registered before any other modules");
-        } else if self
-            .modules
-            .first()
-            .map(|m| m.get_name() != "essentials")
-            .unwrap_or(true)
-        {
+        } else if self.modules.first().map(|m| m.get_name() != "essentials").unwrap_or(true) {
             panic!("ModuleRegistry requires essentials to be registered first");
+        }
+
+        if let Some(spec) = module.config_spec() {
+            let cfg = get_module_config(name).unwrap_or_else(|| {
+                panic!(
+                    "No config defined for {name} module, but {name} module was loaded and defines a config. Expected: {spec}"
+                )
+            });
+            if let Err(e) = module.set_config(cfg) {
+                panic!("module '{name}' config invalid; expected: {spec}; error: {e:?}");
+            }
         }
 
         // --- Mdb prefix like "ammdata:" ---

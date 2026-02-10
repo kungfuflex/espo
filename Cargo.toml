@@ -7,31 +7,71 @@ default-run = "espo"
 [lib]
 name = "espo"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "espo"
+path = "src/main.rs"
+required-features = ["binary"]
+
+[features]
+# Feature that's only available for non-WASM builds
+binary = []
+test-utils = ["alkanes", "metashrew-runtime", "rockshrew-runtime", "wasmtime", "protorune/test-utils"]
 
 [dependencies]
 anyhow = "1.0.99"
-clap = { version = "4.5.47", features = ["derive"] }
 hex = "0.4.3"
-rocksdb = "0.24.0"
 serde = { version = "1.0.219", features = ["derive"] }
 protobuf-json-mapping = "3.7.2"
 serde_json = "1.0.143"
-axum = "0.8.4"
-tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "net"] }
-bitcoin = "0.32.7"
-electrum-client = "0.24.0"
-reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
-tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "tcp"] }
 borsh = { version = "1.5.7", features = ["derive"] }
 futures = "0.3.31"
-tokio-stream = "0.1.17"
-tokio-serde = {version = "0.9.0", features = ["json"]}
-alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f"}
-ordinals = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f" }
-protorune-support = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f" }
-metashrew-support = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f" }
-alkanes-cli-common = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f"} 
-bitcoincore-rpc = "0.19.0"
-lru = "0.16.1"
+bitcoin = "0.32.7"
 prost = "0.12.6"
 maud = "0.26.0"
+wasm-bindgen = "0.2.100"
+
+# All alkanes-rs dependencies from develop branch
+alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+ordinals = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+protorune-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+metashrew-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+
+# Non-WASM dependencies (server, network, DB, CLI, etc.)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+base64 = "0.22.0"
+clap = { version = "4.5.47", features = ["derive"] }
+rocksdb = "0.21.0"
+tempfile = "3.22"
+axum = "0.8.4"
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "net"] }
+electrum-client = "0.24.0"
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "tcp"] }
+tokio-stream = "0.1.17"
+tokio-serde = {version = "0.9.0", features = ["json"]}
+time = { version = "0.3.36", features = ["formatting"] }
+alloy-primitives = "0.8.7"
+bitcoincore-rpc = "0.19.0"
+lru = "0.16.1"
+tower-http = { version = "0.5", features = ["cors"] }
+alkanes-cli-common = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+
+# Required dependencies for alkanes support (from alkanes-rs)
+metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+protorune = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+
+# Optional dependencies for test utilities
+alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
+metashrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
+rockshrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
+wasmtime = { version = "18.0", features = ["async"], optional = true }
+
+[dev-dependencies]
+alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }
+metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }
+protorune = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }
+alkanes-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+tower = { version = "0.5", features = ["util"] }
+wasm-bindgen-test = "0.3.49"

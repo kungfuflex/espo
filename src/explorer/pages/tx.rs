@@ -224,7 +224,8 @@ pub async fn tx_page(
     }
 
     let outpoint_fn = |txid: &Txid, vout: u32| -> OutpointLookup {
-        get_outpoint_balances_with_spent(&state.essentials_mdb, txid, vout).unwrap_or_default()
+        get_outpoint_balances_with_spent(&state.essentials_provider(), txid, vout)
+            .unwrap_or_default()
     };
     let outspends_fn = |txid: &Txid| -> Vec<Option<Txid>> {
         electrum_like.transaction_get_outspends(txid).unwrap_or_default()

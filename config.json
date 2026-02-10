@@ -1,7 +1,7 @@
 {
-  "readonly_metashrew_db_dir": "/data/.metashrew/v9",
+  "readonly_metashrew_db_dir": "/data/.metashrew/v9-rb2",
   "electrum_rpc_url": null,
-  "metashrew_rpc_url": "http://127.0.0.1:7044",
+  "metashrew_rpc_url": "http://127.0.0.1:7145",
   "electrs_esplora_url": "http://127.0.0.1:4332",
   "bitcoind_rpc_url": "http://127.0.0.1:8332",
   "bitcoind_rpc_user": "admin",
@@ -12,15 +12,46 @@
   "enable_aof": true,
   "sdb_poll_ms": 5000,
   "indexer_block_delay_ms": 0,
-  "port": 5778,
-  "explorer_host": "0.0.0.0:5779",
+  "port": 5780,
+  "explorer_host": "0.0.0.0:5081",
   "network": "mainnet",
+  "debug": true,
+  "debug_ignore_ms": 50,
+  "debug_backup": {
+    "blocks": [
+      880100, 900000, 903500, 908368, 913765, 916290, 920000, 925000, 930000,
+      933300, 933925
+    ],
+    "dir": "./db-bkp"
+  },
   "metashrew_db_label": null,
-  "debug": false,
+  "strict_mode": {
+    "check_utxos": false,
+    "check_alkane_balances": true,
+    "check_trace_mismatches": true
+  },
   "block_source_mode": "rpc",
   "simulate_reorg": false,
   "explorer_networks": {
-    "mainnet": "https://espo.sh",
+    "mainnet": "https://staging.espo.sh",
     "regtest": "https://espo.subfrost.io/regtest"
+  },
+  "modules": {
+    "oylapi": {
+      "host": "0.0.0.0",
+      "port": 9712,
+      "alkane_icon_cdn": "https://asset.oyl.gg/alkanes/mainnet"
+    },
+    "subfrost": {},
+    "ammdata": {
+      "eth_rpc": "https://eth-mainnet.g.alchemy.com/v2/THWHjh0GMbRvWxCzc865L",
+      "eth_call_throttle": 50,
+      "derived_liquidity": [{ "alkane": "2:0", "strategy": "neutral-vwap" }],
+      "search_index_enabled": true,
+      "search_prefix_min": 2,
+      "search_prefix_max": 6,
+      "search_fallback_scan_cap": 5000,
+      "search_limit_cap": 20
+    }
   }
 }

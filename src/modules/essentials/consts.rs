@@ -16,7 +16,3 @@ pub fn essentials_genesis_block(network: Network) -> u32 {
 
 pub const ESSENTIALS_GENESIS_INSPECTIONS: &[(u32, u64, Option<(&str, &str)>)] =
     &[(2, 0, Some(("DIESEL", "diesel"))), (32, 0, Some(("frBTC", "FRBTC")))];
-
-/// Debug-only balance watch list: (owner, token) as "block:tx".
-pub const ESSENTIALS_DEBUG_BALANCE_WATCH: &[(&str, &str)] =
-    &[("2:68441", "2:0"), ("2:77087", "2:0")];

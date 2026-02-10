@@ -14,15 +14,25 @@ use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
     AlkaneMetaCache, alkane_icon_url_unfiltered, alkane_meta, icon_bg_style,
 };
-use crate::explorer::paths::{explorer_base_path, explorer_path};
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
-use crate::modules::essentials::storage::{BalanceEntry, HolderId, load_creation_record};
-use crate::modules::essentials::utils::balances::{get_alkane_balances, get_holders_for_alkane};
+use crate::explorer::paths::{explorer_base_path, explorer_path};
+use crate::modules::ammdata::config::AmmDataConfig;
+use crate::modules::ammdata::schemas::Timeframe;
+use crate::modules::ammdata::storage::AmmDataTable;
+use crate::modules::essentials::storage::{
+    BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
+};
+use crate::modules::essentials::utils::balances::{
+    get_alkane_balances, get_holders_for_alkane, get_total_received_for_alkane,
+    get_transfer_volume_for_alkane,
+};
 use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
+use crate::modules::pizzafun::storage::PizzafunProvider;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const ADDR_SUFFIX_LEN: usize = 8;
 const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
@@ -40,12 +50,16 @@ pub struct PageQuery {
 enum AlkaneTab {
     Holders,
     Inspect,
+    TransferVolume,
+    TotalReceived,
 }
 
 impl AlkaneTab {
     fn from_query(raw: Option<&str>) -> Self {
         match raw {
             Some("inspect") => AlkaneTab::Inspect,
+            Some("transfer_volume") => AlkaneTab::TransferVolume,
+            Some("total_received") => AlkaneTab::TotalReceived,
             _ => AlkaneTab::Holders,
         }
     }
@@ -83,7 +97,7 @@ pub async fn alkane_page(
     let creation_height = creation_record.as_ref().map(|r| r.creation_height);
     let creation_txid = creation_record.as_ref().map(|r| hex::encode(r.txid));
 
-    let balances_map = get_alkane_balances(&state.essentials_mdb, &alk).unwrap_or_default();
+    let balances_map = get_alkane_balances(&state.essentials_provider(), &alk).unwrap_or_default();
     let mut balance_entries: Vec<BalanceEntry> = balances_map
         .into_iter()
         .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
@@ -93,7 +107,7 @@ pub async fn alkane_page(
     });
 
     let (total, circulating_supply, holders) =
-        get_holders_for_alkane(&state.essentials_mdb, alk, page, limit).unwrap_or((
+        get_holders_for_alkane(&state.essentials_provider(), alk, page, limit).unwrap_or((
             0,
             0,
             Vec::new(),
@@ -110,14 +124,64 @@ pub async fn alkane_page(
     let holders_count = total;
     let supply_f64 = circulating_supply as f64;
 
+    let tv_iframe_src: Option<String> = {
+        let db = crate::config::get_espo_db();
+
+        let series_id = {
+            let pizzafun_mdb = Arc::new(Mdb::from_db(Arc::clone(&db), b"pizzafun:"));
+            let pizzafun = PizzafunProvider::new(pizzafun_mdb);
+            pizzafun.get_series_by_alkane(&alk).ok().flatten().map(|e| e.series_id)
+        };
+
+        let has_market_chart = {
+            // Special-case: 2:0 is the derived liquidity quote token itself, so it won't have
+            // token-derived series. Show its chart if the plain 2:0-usd candle series exists.
+            let is_derived_quote_token = alk.block == 2 && alk.tx == 0;
+
+            let derived_quotes: Vec<SchemaAlkaneId> = AmmDataConfig::load_from_global_config()
+                .ok()
+                .and_then(|c| c.derived_liquidity)
+                .map(|dl| dl.derived_quotes.into_iter().map(|q| q.alkane).collect())
+                .unwrap_or_default();
+
+            let amm_mdb = Mdb::from_db(Arc::clone(&db), b"ammdata:");
+            let table = AmmDataTable::new(&amm_mdb);
+
+            let has_prefix = |rel_prefix: Vec<u8>| -> bool {
+                amm_mdb
+                    .iter_prefix_rev(&amm_mdb.prefixed(&rel_prefix))
+                    .next()
+                    .and_then(|r| r.ok())
+                    .is_some()
+            };
+
+            if is_derived_quote_token {
+                has_prefix(table.token_usd_candle_ns_prefix(&alk, Timeframe::D1))
+            } else if derived_quotes.is_empty() {
+                false
+            } else {
+                derived_quotes.iter().any(|quote| {
+                    has_prefix(table.token_derived_mcusd_candle_ns_prefix(&alk, quote, Timeframe::D1))
+                })
+            }
+        };
+
+        match (series_id, has_market_chart) {
+            (Some(series_id), true) => Some(pizza_tv_iframe_src(&series_id)),
+            _ => None,
+        }
+    };
+    let chart_hidden = if tv_iframe_src.is_some() { "0" } else { "1" };
+
     let inspection = creation_record.as_ref().and_then(|r| r.inspection.as_ref());
     let mut inspect_source = inspection.cloned();
     let mut proxy_target_label: Option<String> = None;
     let inspect_alkane_id = alk_str.clone();
-    if let Some(proxy_target) = resolve_proxy_target_recursive(&alk, &state.essentials_mdb) {
+    if let Some(proxy_target) = resolve_proxy_target_recursive(&alk, &state.essentials_provider()) {
         let label = format!("{}:{}", proxy_target.block, proxy_target.tx);
         proxy_target_label = Some(label.clone());
-        inspect_source = load_inspection(&state.essentials_mdb, &proxy_target).ok().flatten();
+        inspect_source =
+            load_inspection(&state.essentials_provider(), &proxy_target).ok().flatten();
     }
     let (view_methods, write_methods) = split_methods(inspect_source.as_ref());
     let inspect_name = display_name.clone();
@@ -195,6 +259,69 @@ pub async fn alkane_page(
         }
     };
 
+    let (activity_total, activity_entries, activity_label) = match tab {
+        AlkaneTab::TransferVolume => {
+            let (total, entries) =
+                get_transfer_volume_for_alkane(&state.essentials_provider(), alk, page, limit)
+                    .unwrap_or((0, Vec::new()));
+            (total, entries, "Transfer volume")
+        }
+        AlkaneTab::TotalReceived => {
+            let (total, entries) =
+                get_total_received_for_alkane(&state.essentials_provider(), alk, page, limit)
+                    .unwrap_or((0, Vec::new()));
+            (total, entries, "Total received")
+        }
+        _ => (0, Vec::new(), "Transfer volume"),
+    };
+    let activity_off = limit.saturating_mul(page.saturating_sub(1));
+    let activity_len = activity_entries.len();
+    let activity_has_prev = page > 1;
+    let activity_has_next = activity_off + activity_len < activity_total;
+    let activity_display_start =
+        if activity_total > 0 && activity_off < activity_total { activity_off + 1 } else { 0 };
+    let activity_display_end = (activity_off + activity_len).min(activity_total);
+    let activity_last_page =
+        if activity_total > 0 { (activity_total + limit - 1) / limit } else { 1 };
+
+    let activity_rows: Vec<Vec<Markup>> = activity_entries
+        .into_iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let rank = activity_off + idx + 1;
+            let (addr_prefix, addr_suffix) = addr_prefix_suffix(&entry.address);
+            vec![
+                html! {
+                    a class="link mono addr-inline" href=(explorer_path(&format!("/address/{}", entry.address))) {
+                        span class="addr-rank" { (format!("{rank}.")) }
+                        span class="addr-prefix" { (addr_prefix) }
+                        span class="addr-suffix" { (addr_suffix) }
+                    }
+                },
+                html! {
+                    div class="alk-line" {
+                        div class="alk-icon-wrap" aria-hidden="true" {
+                            span class="alk-icon-img" style=(icon_bg_style(&icon_url)) {}
+                            span class="alk-icon-letter" { (fallback_letter) }
+                        }
+                        span class="alk-amt mono" { (fmt_activity_amount(entry.amount)) }
+                        a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk_str}"))) { (coin_label.clone()) }
+                    }
+                },
+            ]
+        })
+        .collect();
+
+    let activity_table_markup = if activity_rows.is_empty() {
+        html! { div class="alkane-panel" { p class="muted" { "No activity yet." } } }
+    } else {
+        html! {
+            div class="alkane-panel alkane-holders-card alkane-activity-card" {
+                (holders_table(&["Address", activity_label], activity_rows))
+            }
+        }
+    };
+
     let balances_markup = if balance_entries.is_empty() {
         html! { p class="muted" { "No alkanes tracked for this alkane." } }
     } else {
@@ -217,62 +344,76 @@ pub async fn alkane_page(
                     }
                 }
 
-                section class="alkane-section" {
-                    h2 class="section-title" { "Overview" }
-                    div class="alkane-overview-card" {
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Symbol" }
-                            div class="alkane-stat-line" {
-                                span class="alkane-stat-value" { (meta.symbol.clone()) }
-                            }
-                        }
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Circulating supply" }
-                            div class="alkane-stat-line" {
-                                span class="alkane-stat-value" { (fmt_alkane_amount(circulating_supply)) }
-                                span class="alkane-stat-sub" { "(with 8 decimals)" }
-                            }
-                        }
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Holders" }
-                            div class="alkane-stat-line" {
-                                span class="alkane-stat-value" { (holders_count) }
-                            }
-                        }
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Deploy date" }
-                            @if let Some(ts) = creation_ts {
-                                div class="alkane-stat-line" data-ts-group="" {
-                                    span class="alkane-stat-value" data-header-ts=(ts) { (ts) }
-                                    span class="alkane-stat-sub" data-header-ts-rel { "" }
-                                }
-                            } @else {
-                                div class="alkane-stat-line" {
-                                    span class="alkane-stat-value muted" { "Unknown" }
+                section class="alkane-section" data-alkane-overview="" {
+                    div class="alkane-overview-grid" data-chart-hidden=(chart_hidden) {
+                        @if let Some(src) = tv_iframe_src.as_ref() {
+                            div class="alkane-market-pane" {
+                                h2 class="section-title alkane-market-title" { "Market" }
+                                div class="alkane-market-card alkane-market-tv" {
+                                    iframe class="alkane-market-iframe" src=(src) title="Market chart" {
+                                        "Market chart"
+                                    }
                                 }
                             }
                         }
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Deploy transaction" }
-                            @if let Some(txid) = creation_txid.as_ref() {
-                                div class="alkane-stat-line" {
-                                    a class="alkane-stat-value link mono" href=(explorer_path(&format!("/tx/{txid}"))) { (short_hex(txid)) }
+                        div class="alkane-overview-pane" {
+                            h2 class="section-title" { "Overview" }
+                            div class="alkane-overview-card" {
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Symbol" }
+                                    div class="alkane-stat-line" {
+                                        span class="alkane-stat-value" { (meta.symbol.clone()) }
+                                    }
                                 }
-                            } @else {
-                                div class="alkane-stat-line" {
-                                    span class="alkane-stat-value muted" { "Unknown" }
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Circulating supply" }
+                                    div class="alkane-stat-line" {
+                                        span class="alkane-stat-value" { (fmt_alkane_amount(circulating_supply)) }
+                                        span class="alkane-stat-sub" { "(with 8 decimals)" }
+                                    }
                                 }
-                            }
-                        }
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Deploy block" }
-                            @if let Some(h) = creation_height {
-                                div class="alkane-stat-line" {
-                                    a class="alkane-stat-value link" href=(explorer_path(&format!("/block/{h}"))) { (h) }
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Holders" }
+                                    div class="alkane-stat-line" {
+                                        span class="alkane-stat-value" { (holders_count) }
+                                    }
                                 }
-                            } @else {
-                                div class="alkane-stat-line" {
-                                    span class="alkane-stat-value muted" { "Unknown" }
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Deploy date" }
+                                    @if let Some(ts) = creation_ts {
+                                        div class="alkane-stat-line" data-ts-group="" {
+                                            span class="alkane-stat-value" data-header-ts=(ts) { (ts) }
+                                            span class="alkane-stat-sub" data-header-ts-rel { "" }
+                                        }
+                                    } @else {
+                                        div class="alkane-stat-line" {
+                                            span class="alkane-stat-value muted" { "Unknown" }
+                                        }
+                                    }
+                                }
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Deploy transaction" }
+                                    @if let Some(txid) = creation_txid.as_ref() {
+                                        div class="alkane-stat-line" {
+                                            a class="alkane-stat-value link mono" href=(explorer_path(&format!("/tx/{txid}"))) { (short_hex(txid)) }
+                                        }
+                                    } @else {
+                                        div class="alkane-stat-line" {
+                                            span class="alkane-stat-value muted" { "Unknown" }
+                                        }
+                                    }
+                                }
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Deploy block" }
+                                    @if let Some(h) = creation_height {
+                                        div class="alkane-stat-line" {
+                                            a class="alkane-stat-value link" href=(explorer_path(&format!("/block/{h}"))) { (h) }
+                                        }
+                                    } @else {
+                                        div class="alkane-stat-line" {
+                                            span class="alkane-stat-value muted" { "Unknown" }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -289,6 +430,10 @@ pub async fn alkane_page(
                         div class="alkane-tab-list" {
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Holders { " active" } else { "" }))
                                 href=(explorer_path(&format!("/alkane/{alk_str}?page={page}&limit={limit}"))) { "Holders" }
+                            a class=(format!("alkane-tab{}", if tab == AlkaneTab::TransferVolume { " active" } else { "" }))
+                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=transfer_volume&page={page}&limit={limit}"))) { "Transfer Volume" }
+                            a class=(format!("alkane-tab{}", if tab == AlkaneTab::TotalReceived { " active" } else { "" }))
+                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=total_received&page={page}&limit={limit}"))) { "Total Received" }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Inspect { " active" } else { "" }))
                                 href=(explorer_path(&format!("/alkane/{alk_str}?tab=inspect&page={page}&limit={limit}"))) { "Inspect contract" }
                         }
@@ -334,11 +479,58 @@ pub async fn alkane_page(
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
                                     }
                                 }
+                            } @else if tab == AlkaneTab::TransferVolume || tab == AlkaneTab::TotalReceived {
+                                (activity_table_markup)
+                                div class="pager" {
+                                    @if activity_has_prev {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page=1&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }))) aria-label="First page" {
+                                            (icon_skip_left())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                                    }
+                                    @if activity_has_prev {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page={}&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }, page - 1))) aria-label="Previous page" {
+                                            (icon_left())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                                    }
+                                    span class="pager-meta muted" { "Showing "
+                                        (if activity_total > 0 { activity_display_start } else { 0 })
+                                        @if activity_total > 0 {
+                                            "-"
+                                            (activity_display_end)
+                                        }
+                                        " / "
+                                        (activity_total)
+                                    }
+                                    @if activity_has_next {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page={}&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }, page + 1))) aria-label="Next page" {
+                                            (icon_right())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                                    }
+                                    @if activity_has_next {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page={}&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }, activity_last_page))) aria-label="Last page" {
+                                            (icon_skip_right())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
+                                    }
+                                }
                             } @else {
                                 div class="alkane-inspect-card" data-alkane-inspect="" data-alkane-id=(inspect_alkane_id.clone()) {
                                     div class="alkane-inspect-header" {
                                         span class="alkane-inspect-name" { (inspect_name.clone()) }
                                         span class="alkane-inspect-id mono" { (inspect_id_label.clone()) }
+                                    }
+                                    div class="alkane-inspect-block-control" {
+                                        span class="alkane-inspect-block-label" { "View as block:" }
+                                        div class="hero-search-input alkane-inspect-block-input-wrap" {
+                                            input class="hero-search-field alkane-inspect-block-input mono" type="text" value="latest" placeholder="latest" data-sim-block-input="" aria-label="View as block" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
+                                        }
                                     }
                                     @if view_methods.is_empty() && write_methods.is_empty() {
                                         p class="muted" { "No contract methods found." }
@@ -446,6 +638,54 @@ fn addr_prefix_suffix(addr: &str) -> (String, String) {
     (prefix, suffix)
 }
 
+fn url_escape_component(raw: &str) -> String {
+    // Minimal percent-encoding for URL query components.
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn pizza_tv_iframe_src(series_id: &str) -> String {
+    let symbol = url_escape_component(series_id);
+    format!(
+        "https://tv.pizza.fun/?symbol={symbol}&timeframe=1d&type=mcap&pool=all&quote=usd&metaprotocol=alkanes&theme=espo"
+    )
+}
+
+fn fmt_activity_amount(raw: u128) -> String {
+    const MILLION: u128 = 1_000_000;
+    const BILLION: u128 = 1_000_000_000;
+    const TRILLION: u128 = 1_000_000_000_000;
+    const QUADRILLION: u128 = 1_000_000_000_000_000;
+
+    let units = raw / crate::explorer::pages::common::ALKANE_SCALE;
+    if units < MILLION {
+        return fmt_alkane_amount(raw);
+    }
+
+    let (unit, suffix) = if units >= QUADRILLION {
+        (QUADRILLION, "Q")
+    } else if units >= TRILLION {
+        (TRILLION, "T")
+    } else if units >= BILLION {
+        (BILLION, "B")
+    } else {
+        (MILLION, "M")
+    };
+
+    let whole = units / unit;
+    let rem = units % unit;
+    let dec = (rem * 10) / unit;
+    if dec == 0 { format!("{whole}{suffix}") } else { format!("{whole}.{dec}{suffix}") }
+}
+
 fn split_methods(
     inspection: Option<&crate::modules::essentials::utils::inspections::StoredInspectionResult>,
 ) -> (Vec<StoredInspectionMethod>, Vec<StoredInspectionMethod>) {
@@ -503,11 +743,15 @@ fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
     Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
 }
 
-fn proxy_target_from_db(alk: &SchemaAlkaneId, mdb: &Mdb) -> Option<SchemaAlkaneId> {
+fn proxy_target_from_db(
+    alk: &SchemaAlkaneId,
+    provider: &EssentialsProvider,
+) -> Option<SchemaAlkaneId> {
     let lookup = |key| {
-        mdb.get(&kv_row_key(alk, key))
+        provider
+            .get_raw_value(GetRawValueParams { key: kv_row_key(alk, key) })
             .ok()
-            .flatten()
+            .and_then(|resp| resp.value)
             .and_then(|raw| {
                 if raw.len() >= 32 {
                     decode_kv_implementation(&raw[32..])
@@ -521,16 +765,16 @@ fn proxy_target_from_db(alk: &SchemaAlkaneId, mdb: &Mdb) -> Option<SchemaAlkaneI
 
 fn resolve_proxy_target_recursive(
     start: &SchemaAlkaneId,
-    mdb: &Mdb,
+    provider: &EssentialsProvider,
 ) -> Option<SchemaAlkaneId> {
     let mut current = *start;
     let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
     for _ in 0..8 {
-        let inspection = load_inspection(mdb, &current).ok().flatten()?;
+        let inspection = load_inspection(provider, &current).ok().flatten()?;
         if !is_upgradeable_proxy(&inspection) {
             return (current != *start).then_some(current);
         }
-        let next = proxy_target_from_db(&current, mdb)?;
+        let next = proxy_target_from_db(&current, provider)?;
         if !seen.insert(next) {
             return None;
         }
@@ -551,6 +795,11 @@ fn inspect_scripts() -> Markup {
   const alkaneId = root.dataset.alkaneId || '';
   if (!alkaneId) return;
   const writeDefault = 'Providing inputs to simulate methods is not currently supported on espo';
+  const blockInput = root.querySelector('[data-sim-block-input]');
+  const currentBlockTag = () => {
+    const value = blockInput && typeof blockInput.value === 'string' ? blockInput.value.trim() : '';
+    return value || 'latest';
+  };
   const clearValueNode = (node) => {
     if (!node) return;
     node.removeAttribute('data-cards');
@@ -649,7 +898,7 @@ fn inspect_scripts() -> Markup {
     setValueText(valueNode, 'Loading...');
 
     try {
-      const payload = { alkane: alkaneId, opcode: Number(opcode) };
+      const payload = { alkane: alkaneId, opcode: Number(opcode), block: currentBlockTag() };
       if (returnsType) {
         payload.returns = returnsType;
       }
@@ -706,6 +955,321 @@ fn inspect_scripts() -> Markup {
       await runSim(details);
     });
   });
+})();
+</script>
+"#;
+    PreEscaped(script.replace("__BASE_PATH__", &base_path_js))
+}
+
+#[allow(dead_code)]
+fn chart_scripts() -> Markup {
+    let base_path_js = format!("{:?}", explorer_base_path());
+    let script = r#"
+<script>
+(() => {
+  const basePath = __BASE_PATH__;
+  const basePrefix = basePath === '/' ? '' : basePath;
+  const card = document.querySelector('[data-alkane-chart]');
+  if (!card) return;
+  const alkaneId = card.dataset.alkaneId || '';
+  if (!alkaneId) return;
+
+  const root = card.querySelector('[data-alkane-chart-root]');
+  const overview = card.closest('[data-alkane-overview]');
+  const grid = overview ? overview.querySelector('[data-alkane-chart-grid]') : null;
+  const head = overview ? overview.querySelector('[data-alkane-chart-head]') : null;
+  const priceEl = card.querySelector('[data-alkane-price]');
+  const changeEl = card.querySelector('[data-alkane-change]');
+  const rangeEl = card.querySelector('[data-alkane-range]');
+  const loadingEl = card.querySelector('[data-alkane-loading]');
+  const tabs = Array.from(card.querySelectorAll('[data-range]'));
+  const defaultRange = (card.dataset.defaultRange || '3m').toLowerCase();
+  let activeRange = defaultRange;
+  let source = null;
+  let quote = null;
+  let chart = null;
+  let canvas = null;
+  let loading = false;
+
+  const rangeLabel = (range) => {
+    switch (range) {
+      case '4h':
+        return 'Past 4 hours';
+      case '1d':
+        return 'Past 24 hours';
+      case '1w':
+        return 'Past 7 days';
+      case '1m':
+        return 'Past 30 days';
+      case '3m':
+      default:
+        return 'Past 3 months';
+    }
+  };
+
+  const formatUsd = (value) => {
+    if (!Number.isFinite(value)) return '$0.00';
+    const digits = value >= 1 ? 2 : 6;
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      maximumFractionDigits: digits
+    }).format(value);
+  };
+
+  const formatPct = (value) => {
+    if (!Number.isFinite(value)) return '0.00%';
+    return `${value.toFixed(2)}%`;
+  };
+
+  const setActiveTab = (range) => {
+    tabs.forEach((tab) => {
+      tab.classList.toggle('active', tab.dataset.range === range);
+    });
+  };
+
+  const ensureScript = (src) => new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.loaded === '1') {
+        resolve();
+      } else {
+        existing.addEventListener('load', () => resolve(), { once: true });
+        existing.addEventListener('error', () => reject(new Error('load_failed')), { once: true });
+      }
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.dataset.chartLib = '1';
+    script.addEventListener(
+      'load',
+      () => {
+        script.dataset.loaded = '1';
+        resolve();
+      },
+      { once: true }
+    );
+    script.addEventListener('error', () => reject(new Error('load_failed')), { once: true });
+    document.head.appendChild(script);
+  });
+
+  const loadChartJs = async () => {
+    if (window.Chart) return;
+    await ensureScript('https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js');
+  };
+
+  const resolveColor = (cssVar, fallback) => {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim();
+    return value || fallback;
+  };
+
+  const ensureCanvas = () => {
+    if (!root) return null;
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      canvas.setAttribute('aria-label', 'Market chart');
+      canvas.setAttribute('role', 'img');
+      root.replaceChildren(canvas);
+    }
+    return canvas.getContext('2d');
+  };
+
+  const renderChart = (points, isUp) => {
+    if (!root || !window.Chart) return;
+    const ctx = ensureCanvas();
+    if (!ctx) return;
+    const lineColor = isUp
+      ? resolveColor('--chart-green', '#33e183')
+      : resolveColor('--chart-red', '#ff5555');
+    const tooltipBg = resolveColor('--panel3', '#1f2228');
+    const tooltipBorder = resolveColor('--panel2', '#353742');
+    const tooltipText = resolveColor('--text', '#ffffff');
+    const labels = points.map((p) => p.ts);
+    const values = points.map((p) => p.close);
+
+    if (chart) {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = values;
+      chart.data.datasets[0].borderColor = lineColor;
+      chart.update('none');
+      return;
+    }
+
+    chart = new window.Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            data: values,
+            borderColor: lineColor,
+            borderWidth: 3,
+            pointRadius: 0,
+            tension: 0.35,
+            cubicInterpolationMode: 'monotone',
+            fill: false
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            enabled: true,
+            displayColors: false,
+            backgroundColor: tooltipBg,
+            borderColor: tooltipBorder,
+            borderWidth: 0,
+            titleColor: tooltipText,
+            bodyColor: tooltipText,
+            callbacks: {
+              title: (items) => {
+                const ts = Number(items && items[0] && items[0].label);
+                if (!Number.isFinite(ts)) return '';
+                return new Intl.DateTimeFormat('en-US', {
+                  dateStyle: 'medium',
+                  timeStyle: 'short'
+                }).format(new Date(ts * 1000));
+              },
+              label: (item) => {
+                const value =
+                  item && item.parsed && typeof item.parsed.y === 'number'
+                    ? item.parsed.y
+                    : item.parsed;
+                return formatUsd(Number(value));
+              }
+            }
+          }
+        },
+        interaction: {
+          mode: 'index',
+          intersect: false
+        },
+        hover: {
+          mode: 'index',
+          intersect: false
+        },
+        scales: {
+          x: { display: false },
+          y: { display: false }
+        },
+        layout: {
+          padding: { top: 48, right: 12, bottom: 16, left: 12 }
+        }
+      }
+    });
+  };
+
+  const fetchRange = async (range) => {
+    const params = new URLSearchParams({ alkane: alkaneId, range });
+    if (source) params.set('source', source);
+    if (quote) params.set('quote', quote);
+    const res = await fetch(`${basePrefix}/api/alkane/chart?${params.toString()}`);
+    const data = await res.json();
+    if (!data || !data.ok) return null;
+    source = data.source || source;
+    quote = data.quote || quote;
+    return data;
+  };
+
+  const setChartHidden = (hidden) => {
+    if (hidden) {
+      card.style.display = 'none';
+    } else {
+      card.style.removeProperty('display');
+    }
+    if (head) {
+      if (hidden) {
+        head.dataset.chartHidden = '1';
+      } else {
+        delete head.dataset.chartHidden;
+      }
+    }
+    if (grid) {
+      if (hidden) {
+        grid.dataset.chartHidden = '1';
+      } else {
+        delete grid.dataset.chartHidden;
+      }
+    }
+  };
+
+  const updateCard = (data, range, canRender) => {
+    if (!data || !Array.isArray(data.candles) || data.candles.length === 0) {
+      setChartHidden(true);
+      if (chart) {
+        chart.destroy();
+        chart = null;
+      }
+      if (canvas) {
+        canvas.remove();
+        canvas = null;
+      }
+      return;
+    }
+    const points = data.candles.slice().sort((a, b) => a.ts - b.ts);
+    const first = points[0].close;
+    const last = points[points.length - 1].close;
+    const change = points.length > 1 && first ? ((last - first) / first) * 100 : 0;
+    const isUp = change >= 0;
+    card.dataset.tone = isUp ? 'up' : 'down';
+    if (priceEl) priceEl.textContent = formatUsd(last);
+    if (changeEl) changeEl.textContent = formatPct(change);
+    if (rangeEl) rangeEl.textContent = rangeLabel(range);
+    if (loadingEl) loadingEl.style.display = 'none';
+    setChartHidden(false);
+    if (canRender) {
+      renderChart(points, isUp);
+    } else if (loadingEl) {
+      loadingEl.textContent = 'Chart unavailable';
+      loadingEl.style.display = '';
+    }
+  };
+
+  const load = async (range) => {
+    if (loading) return;
+    loading = true;
+    if (loadingEl) loadingEl.style.display = '';
+    try {
+      const data = await fetchRange(range);
+      if (!data) {
+        setChartHidden(true);
+        return;
+      }
+      let canRender = true;
+      try {
+        await loadChartJs();
+      } catch (_) {
+        canRender = false;
+      }
+      updateCard(data, range, canRender);
+    } catch (_) {
+      if (loadingEl) {
+        loadingEl.textContent = 'Chart unavailable';
+        loadingEl.style.display = '';
+      }
+    } finally {
+      loading = false;
+    }
+  };
+
+  tabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const range = (tab.dataset.range || '').toLowerCase();
+      if (!range || range === activeRange) return;
+      activeRange = range;
+      setActiveTab(range);
+      load(range);
+    });
+  });
+
+  setActiveTab(activeRange);
+  load(activeRange);
 })();
 </script>
 "#;

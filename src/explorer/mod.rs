@@ -1,12 +1,12 @@
 mod api;
 pub mod components;
 pub mod consts;
-pub mod paths;
 mod pages;
+pub mod paths;
 
 use std::net::SocketAddr;
 
-use api::{carousel_blocks, search_guess, simulate_contract};
+use api::{alkane_chart, carousel_blocks, search_guess, simulate_contract};
 use axum::Router;
 use axum::routing::{get, post};
 use pages::address::address_page;
@@ -19,8 +19,8 @@ use pages::state::ExplorerState;
 use pages::tx::tx_page;
 use tokio::net::TcpListener;
 
-use components::layout::style;
 use crate::config::get_explorer_base_path;
+use components::layout::style;
 
 pub fn explorer_router(state: ExplorerState) -> Router {
     Router::new()
@@ -34,6 +34,7 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/api/blocks/carousel", get(carousel_blocks))
         .route("/api/search/guess", get(search_guess))
         .route("/api/alkane/simulate", post(simulate_contract))
+        .route("/api/alkane/chart", get(alkane_chart))
         .route("/static/style.css", get(style))
         .with_state(state)
 }

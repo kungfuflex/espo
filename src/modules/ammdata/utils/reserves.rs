@@ -1,11 +1,12 @@
-use super::super::consts::K_TOLERANCE;
-use crate::alkanes::trace::EspoTrace;
+use super::super::consts::K_TOLERANCE_BPS;
+use crate::alkanes::trace::{EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoTrace};
 use crate::schemas::SchemaAlkaneId;
 use crate::{
     alkanes::trace::{
         EspoAlkanesTransaction, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
     },
     modules::ammdata::schemas::SchemaMarketDefs,
+    modules::essentials::utils::balances::clean_espo_sandshrew_like_trace,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::VecDeque;
@@ -36,12 +37,22 @@ pub struct NewPoolInfo {
 
 pub fn extract_new_pools_from_espo_transaction(
     transaction: &EspoAlkanesTransaction,
+    host_function_values: &EspoHostFunctionValues,
 ) -> Result<Vec<NewPoolInfo>> {
     /* ---------- helpers ---------- */
     let traces: &Vec<EspoTrace> = match &transaction.traces {
         Some(t) => t,
         None => return Ok(vec![]), // 👈 bail early with empty Vec
     };
+    let cleaned_traces: Vec<EspoSandshrewLikeTrace> = traces
+        .iter()
+        .filter_map(|trace| {
+            clean_espo_sandshrew_like_trace(&trace.sandshrew_trace, host_function_values)
+        })
+        .collect();
+    if cleaned_traces.is_empty() {
+        return Ok(vec![]);
+    }
 
     fn strip_0x(s: &str) -> &str {
         s.strip_prefix("0x").unwrap_or(s)
@@ -94,8 +105,8 @@ pub fn extract_new_pools_from_espo_transaction(
     }
 
     let mut created_ids: HashSet<(String, String)> = HashSet::new();
-    for trace in traces.clone() {
-        for ev in &trace.sandshrew_trace.events {
+    for trace in &cleaned_traces {
+        for ev in &trace.events {
             if let EspoSandshrewLikeTraceEvent::Create(c) = ev {
                 // keep as hex-strings for quick comparison with call-stack ids
                 created_ids.insert((c.block.clone(), c.tx.clone()));
@@ -113,8 +124,8 @@ pub fn extract_new_pools_from_espo_transaction(
     let mut results: Vec<NewPoolInfo> = Vec::new();
     let mut seen_pools: HashSet<(u32, u64)> = HashSet::new(); // dedupe if multiple returns
 
-    for trace in traces {
-        for ev in &trace.sandshrew_trace.events {
+    for trace in &cleaned_traces {
+        for ev in &trace.events {
             match ev {
                 EspoSandshrewLikeTraceEvent::Invoke(inv) => {
                     stack.push_back(inv.context.myself.clone());
@@ -163,8 +174,8 @@ pub fn extract_new_pools_from_espo_transaction(
                         continue;
                     }
 
-                    let factory_id = factory_id
-                        .and_then(|val| schema_id_from_storage_val_32b(val).ok());
+                    let factory_id =
+                        factory_id.and_then(|val| schema_id_from_storage_val_32b(val).ok());
 
                     results.push(NewPoolInfo {
                         pool_id,
@@ -422,13 +433,30 @@ pub fn extract_reserves_from_espo_transaction<'a>(
             (nb, nq, 0u128, 0u128)
         };
 
-        // sanity: K ratio (should be ~1 within tolerance)
-        let k_ratio = if prev_base != 0 && prev_quote != 0 {
-            ((new_base as f64) * (new_quote as f64)) / ((prev_base as f64) * (prev_quote as f64))
-        } else {
-            f64::INFINITY
+        // sanity: K ratio (should be ~1 within tolerance), checked with integer bps math.
+        let k_new = match new_base.checked_mul(new_quote) {
+            Some(v) => v,
+            None => {
+                i = r2 + 1;
+                continue;
+            }
         };
-        if (k_ratio - 1.0).abs() > K_TOLERANCE {
+        let k_diff = k_new.abs_diff(k_prev);
+        let lhs = match k_diff.checked_mul(10_000u128) {
+            Some(v) => v,
+            None => {
+                i = r2 + 1;
+                continue;
+            }
+        };
+        let rhs = match k_prev.checked_mul(K_TOLERANCE_BPS) {
+            Some(v) => v,
+            None => {
+                i = r2 + 1;
+                continue;
+            }
+        };
+        if lhs > rhs {
             i = r2 + 1;
             continue;
         }
@@ -440,7 +468,7 @@ pub fn extract_reserves_from_espo_transaction<'a>(
             prev_reserves: (prev_base, prev_quote),
             new_reserves: (new_base, new_quote),
             volume: (base_in_res, quote_out_res),
-            k_ratio_approx: if k_ratio.is_finite() { Some(k_ratio) } else { None },
+            k_ratio_approx: None,
         });
 
         // continue after this anchor’s twin returns

@@ -15,12 +15,16 @@
   --link-dark2: #2a60be;
   --danger: #ff4141;
   --success: #33e183;
+  --chart-green: rgba(51, 225, 131, 0.85);
+  --chart-red: rgba(255, 85, 85, 0.85);
   --bg-success: #335c45;
   --warning: #fda948;
   --radius: 8px;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-    "Liberation Mono", "Courier New", monospace;
-  --sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+  --mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+  --sans:
+    "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
     Segoe UI, Roboto, Helvetica Neue, Arial, Noto Sans, sans-serif,
     Apple Color Emoji, Segoe UI Emoji, Segoe UI Symbol, Noto Color Emoji;
   --gloria: "Gloria Hallelujah", cursive;
@@ -287,7 +291,9 @@ a:hover {
   opacity: 0;
   pointer-events: none;
   transform: translateY(8px);
-  transition: opacity 160ms ease, transform 160ms ease;
+  transition:
+    opacity 160ms ease,
+    transform 160ms ease;
   z-index: 20;
 }
 .nav[data-menu-open="1"] .nav-menu {
@@ -1021,6 +1027,20 @@ a:hover {
     text-align: right;
     justify-self: end;
   }
+
+  .alkane-activity-card .holders_table tbody tr {
+    grid-template-areas:
+      "holder holder"
+      "amount amount";
+  }
+  .alkane-activity-card .holders_table td:nth-child(2) {
+    grid-area: amount;
+    text-align: left;
+    justify-self: start;
+  }
+  .alkane-activity-card .holders_table td:nth-child(2) .alk-line {
+    justify-content: flex-start;
+  }
 }
 
 .ellipsis {
@@ -1296,6 +1316,20 @@ a:hover {
   text-align: right;
 }
 
+.alkane-activity-card col:nth-child(2),
+.alkane-activity-card col:last-child {
+  width: 240px !important;
+}
+.alkane-activity-card td:nth-child(2),
+.alkane-activity-card th:nth-child(2) {
+  text-align: right;
+}
+.alkane-activity-card td:nth-child(2) .alk-line {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
 .io-amount {
   color: var(--muted3);
   font-size: 15px;
@@ -1345,7 +1379,9 @@ a:hover {
   align-items: center;
   justify-content: center;
   color: var(--muted);
-  transition: transform 120ms ease, color 120ms ease;
+  transition:
+    transform 120ms ease,
+    color 120ms ease;
 }
 .io-opret[open] .opret-caret {
   transform: rotate(90deg);
@@ -1438,7 +1474,9 @@ a:hover {
   align-items: center;
   justify-content: center;
   color: var(--muted);
-  transition: transform 120ms ease, color 120ms ease;
+  transition:
+    transform 120ms ease,
+    color 120ms ease;
 }
 .opret-toggle[open] .opret-toggle-caret {
   transform: rotate(90deg);
@@ -1481,7 +1519,9 @@ a:hover {
   background: var(--panel2);
   border: 1px solid var(--panel3);
   border-radius: 999px;
-  transition: background 120ms ease, border-color 120ms ease;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
 }
 .switch-slider::before {
   content: "";
@@ -1648,6 +1688,159 @@ a:hover {
   display: flex;
   flex-direction: column;
 }
+.alkane-overview-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+  grid-template-areas: "overview market";
+  gap: 14px;
+  align-items: stretch;
+}
+.alkane-market-pane {
+  grid-area: market;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.alkane-overview-pane {
+  grid-area: overview;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.alkane-overview-pane .alkane-overview-card {
+  flex: 1;
+}
+.alkane-market-pane .alkane-market-card {
+  flex: 1;
+  height: auto;
+}
+.alkane-overview-grid[data-chart-hidden="1"] {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "overview";
+}
+.alkane-market-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 14px;
+  min-height: 240px;
+  height: 100%;
+  overflow: hidden;
+}
+.alkane-market-card.alkane-market-tv {
+  padding: 0;
+  min-height: 420px;
+}
+.alkane-market-iframe {
+  position: absolute;
+  top: -1px;
+  left: -1px;
+  width: calc(100% + 2px);
+  height: calc(100% + 2px);
+  border: 0;
+  display: block;
+}
+.alkane-market-title {
+  margin: 0;
+}
+.alkane-market-content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  pointer-events: none;
+}
+.alkane-market-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  pointer-events: none;
+}
+.alkane-market-price {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+.alkane-market-sub {
+  color: var(--muted2);
+  font-size: 13px;
+  font-weight: 600;
+}
+.alkane-market-change {
+  font-size: 18px;
+  font-weight: 700;
+  text-align: right;
+}
+.alkane-market-range {
+  color: var(--muted2);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: right;
+}
+.alkane-market-card[data-tone="up"] .alkane-market-change {
+  color: var(--chart-green);
+}
+.alkane-market-card[data-tone="down"] .alkane-market-change {
+  color: var(--chart-red);
+}
+.alkane-market-chart {
+  position: absolute;
+  top: 50px;
+  right: 0;
+  bottom: 50px;
+  left: 0;
+  border-radius: 10px;
+  background: var(--panel);
+  overflow: hidden;
+  z-index: 0;
+}
+.alkane-market-chart canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+.alkane-market-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  color: var(--muted2);
+}
+.alkane-market-tabs {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: auto;
+  pointer-events: auto;
+  position: relative;
+  z-index: 2;
+}
+.alkane-market-tab {
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--muted2);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.alkane-market-tab.active {
+  color: var(--text);
+  background: var(--panel2);
+}
+.alkane-market-tab:hover {
+  color: var(--text);
+  background: var(--panel2);
+}
 .alkane-stat {
   padding: 12px;
   border-bottom: 1px solid var(--panel2);
@@ -1734,6 +1927,25 @@ a:hover {
   font-weight: 700;
   border-radius: 6px;
 }
+.alkane-inspect-block-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.alkane-inspect-block-label {
+  color: var(--muted2);
+  font-size: 14px;
+  font-weight: 600;
+}
+.alkane-inspect-block-input-wrap {
+  width: min(220px, 100%);
+  padding: 6px 10px;
+  border-radius: 50px;
+}
+.alkane-inspect-block-input {
+  font-size: 14px;
+}
 .alkane-inspect-name {
   font-size: 18px;
 }
@@ -1810,6 +2022,18 @@ button:hover {
 
 .alkane-panel-empty {
   min-height: 140px;
+}
+@media (max-width: 980px) {
+  .alkane-overview-grid {
+    grid-template-columns: 1fr;
+    grid-template-areas: "market" "overview";
+  }
+  .alkane-overview-grid[data-chart-hidden="1"] {
+    grid-template-areas: "overview";
+  }
+  .alkane-market-card.alkane-market-tv {
+    min-height: clamp(460px, 60vh, 600px);
+  }
 }
 @media (max-width: 720px) {
   .alkane-hero-card {
@@ -2265,7 +2489,9 @@ button:hover {
   opacity: 0;
   pointer-events: none;
   transform: translateY(-8px);
-  transition: opacity 160ms ease, transform 160ms ease;
+  transition:
+    opacity 160ms ease,
+    transform 160ms ease;
   z-index: 15;
 }
 .search-results[data-open="1"] {
@@ -2364,7 +2590,9 @@ button:hover {
   color: var(--link);
   pointer-events: none;
   opacity: 0;
-  transition: opacity 120ms ease, transform 120ms ease;
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
   z-index: 5;
 }
 
@@ -2612,7 +2840,9 @@ button:hover {
   height: 40px;
   border-radius: 50%;
   margin-left: auto;
-  transition: background 120ms ease, color 120ms ease;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
 }
 .footer-icon .icon {
   width: 20px;

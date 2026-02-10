@@ -1,5 +1,14 @@
+pub mod activity;
 pub mod candles;
+pub mod index_activity;
+pub mod index_factories;
+pub mod index_finalize;
+pub mod index_pool_metrics;
+pub mod index_pools;
+pub mod index_snapshot;
+pub mod index_state;
+pub mod index_tokens;
 pub mod live_reserves;
 pub mod pathfinder;
 pub mod reserves;
-pub mod activity;
+pub mod search;

@@ -1,7 +1,9 @@
-use crate::modules::ammdata::consts::PRICE_SCALE;
+use crate::modules::ammdata::consts::AMOUNT_SCALE;
 use crate::modules::ammdata::schemas::{ActivityDirection, ActivityKind, SchemaActivityV1};
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams,
+};
 use crate::modules::ammdata::utils::candles::PriceSide;
-use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use borsh::{BorshDeserialize, to_vec};
@@ -26,6 +28,16 @@ fn activity_key(pool: &SchemaAlkaneId, ts: u64, seq: u32) -> Vec<u8> {
     k
 }
 
+#[derive(BorshDeserialize)]
+struct SchemaActivityV1Legacy {
+    pub timestamp: u64,
+    pub txid: [u8; 32],
+    pub kind: ActivityKind,
+    pub direction: Option<ActivityDirection>,
+    pub base_delta: i128,
+    pub quote_delta: i128,
+}
+
 // simple encode/decode (borsh) for SchemaActivityV1
 #[inline]
 fn encode_activity_v1(activity: &SchemaActivityV1) -> Result<Vec<u8>> {
@@ -33,8 +45,21 @@ fn encode_activity_v1(activity: &SchemaActivityV1) -> Result<Vec<u8>> {
 }
 
 #[inline]
-fn decode_activity_v1(v: &[u8]) -> Result<SchemaActivityV1> {
-    Ok(SchemaActivityV1::try_from_slice(v)?)
+pub fn decode_activity_v1(v: &[u8]) -> Result<SchemaActivityV1> {
+    if let Ok(parsed) = SchemaActivityV1::try_from_slice(v) {
+        return Ok(parsed);
+    }
+    let legacy = SchemaActivityV1Legacy::try_from_slice(v)?;
+    Ok(SchemaActivityV1 {
+        timestamp: legacy.timestamp,
+        txid: legacy.txid,
+        kind: legacy.kind,
+        direction: legacy.direction,
+        base_delta: legacy.base_delta,
+        quote_delta: legacy.quote_delta,
+        address_spk: Vec::new(),
+        success: true,
+    })
 }
 
 /* ---------------- index helpers ---------------- */
@@ -272,6 +297,12 @@ impl ActivityWriteAcc {
     }
 }
 
+impl Default for ActivityWriteAcc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Accumulator for secondary index writes and per-pool count deltas.
 #[derive(Clone)]
 pub struct ActivityIndexAcc {
@@ -297,10 +328,7 @@ impl ActivityIndexAcc {
         append_index_entries(&mut self.writes, pool, ts, seq, a, Some(group));
 
         *self.per_pool_delta.entry((pool.block, pool.tx)).or_insert(0) += 1;
-        *self
-            .per_pool_group_delta
-            .entry((pool.block, pool.tx, group))
-            .or_insert(0) += 1;
+        *self.per_pool_group_delta.entry((pool.block, pool.tx, group)).or_insert(0) += 1;
     }
 
     pub fn into_writes(self) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -311,6 +339,12 @@ impl ActivityIndexAcc {
     }
     pub fn per_pool_group_delta(self) -> HashMap<(u32, u64, ActivityGroup), u64> {
         self.per_pool_group_delta
+    }
+}
+
+impl Default for ActivityIndexAcc {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -331,7 +365,7 @@ pub struct ActivityRow {
     /// derived from chosen side + delta sign
     pub side: ActivityUiSide,
 
-    /// absolute volume on the chosen side (scaled by 1e8)
+    /// absolute volume on the chosen side (scaled by AMOUNT_SCALE)
     pub amount: f64,
 }
 
@@ -352,7 +386,7 @@ impl ActivityRow {
 
     #[inline]
     fn scale_u128(x: u128) -> f64 {
-        (x as f64) / (PRICE_SCALE as f64)
+        (x as f64) / (AMOUNT_SCALE as f64)
     }
 
     fn kind_str(kind: ActivityKind, side: &ActivityUiSide) -> &'static str {
@@ -444,22 +478,17 @@ fn parse_ts_from_key_tail(k: &[u8]) -> Option<u64> {
 
 /// Read activity newest→oldest with pagination.
 pub fn read_activity_for_pool(
-    mdb: &Mdb,
+    provider: &AmmDataProvider,
     pool: SchemaAlkaneId,
     page: usize,
     limit: usize,
     side: PriceSide,
     activity_type: ActivityFilter,
 ) -> Result<ActivityPage> {
-    // Build FULL DB prefix once for reverse iteration (iter_prefix_rev expects full prefix)
-    let mut prefix = Vec::with_capacity(mdb.prefix().len() + 64);
-    prefix.extend_from_slice(mdb.prefix());
-    prefix.extend_from_slice(&activity_ns_prefix(&pool));
-
     // Collect newest → oldest
     let mut all: Vec<(u64, SchemaActivityV1)> = Vec::new();
-    for res in mdb.iter_prefix_rev(&prefix) {
-        let (k, v) = res?;
+    let prefix = activity_ns_prefix(&pool);
+    for (k, v) in provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })?.entries {
         let ts = parse_ts_from_key_tail(&k).unwrap_or_default();
         let a = decode_activity_v1(&v)?;
         if let Some(group) = group_from_filter(activity_type) {
@@ -512,7 +541,11 @@ pub enum ActivitySideFilter {
     Sell,
 }
 
-fn idx_prefix_for(pool: &SchemaAlkaneId, k: ActivitySortKey, group: Option<ActivityGroup>) -> Vec<u8> {
+fn idx_prefix_for(
+    pool: &SchemaAlkaneId,
+    k: ActivitySortKey,
+    group: Option<ActivityGroup>,
+) -> Vec<u8> {
     match k {
         ActivitySortKey::Timestamp => idx_prefix_ts(pool, group),
         ActivitySortKey::AmountBaseAbs => idx_prefix_absb(pool, group),
@@ -558,20 +591,22 @@ fn adjust_for_side_filter(
 }
 
 /// Try to get the O(1) count; fallback to reverse scanning when a fixed-side subset is used.
-fn total_for_pool_index(mdb: &Mdb, prefix: &[u8], count_key: Option<Vec<u8>>) -> Result<usize> {
+fn total_for_pool_index(
+    provider: &AmmDataProvider,
+    prefix: &[u8],
+    count_key: Option<Vec<u8>>,
+) -> Result<usize> {
     if let Some(count_k) = count_key {
-        if let Some(v) = mdb.get(&count_k)? {
+        if let Some(v) = provider.get_raw_value(GetRawValueParams { key: count_k })?.value {
             if let Some(n) = decode_u64_be(&v) {
                 return Ok(n as usize);
             }
         }
     }
-    // Fallback: reverse scan of FULL prefix
-    let mut c = 0usize;
-    for _ in mdb.iter_prefix_rev(prefix) {
-        c += 1;
-    }
-    Ok(c)
+    let entries = provider
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.to_vec() })?
+        .entries;
+    Ok(entries.len())
 }
 
 /// Decode (ts, seq) from index value if present, else from key tail (last 12 bytes).
@@ -595,7 +630,7 @@ fn decode_ts_seq_from_entry(key: &[u8], val: &[u8]) -> Option<(u64, u32)> {
 
 /// Read (page, limit) according to the chosen secondary index (sort), direction, and optional side filter.
 pub fn read_activity_for_pool_sorted(
-    mdb: &Mdb,
+    provider: &AmmDataProvider,
     pool: SchemaAlkaneId,
     page: usize,
     limit: usize,
@@ -613,10 +648,8 @@ pub fn read_activity_for_pool_sorted(
     // adjust sort & get side byte (if any) when filtering
     let (eff_sort, fixed_side) = adjust_for_side_filter(sort, chosen_side, filter);
 
-    // base index prefix (FULL) for reverse iteration
-    let mut iprefix = Vec::with_capacity(mdb.prefix().len() + 64);
-    iprefix.extend_from_slice(mdb.prefix());
-    iprefix.extend_from_slice(&idx_prefix_for(&pool, eff_sort, group));
+    // base index prefix (relative) for reverse iteration
+    let mut iprefix = idx_prefix_for(&pool, eff_sort, group);
 
     // if we have a fixed side, narrow the prefix one more byte
     if let Some(sb) = fixed_side {
@@ -639,7 +672,7 @@ pub fn read_activity_for_pool_sorted(
     } else {
         None
     };
-    let total = total_for_pool_index(mdb, &iprefix, count_key)?;
+    let total = total_for_pool_index(provider, &iprefix, count_key)?;
     if limit == 0 {
         return Ok(ActivityPage { activity: vec![], total });
     }
@@ -648,40 +681,22 @@ pub fn read_activity_for_pool_sorted(
 
     // scan index keys and decode (ts, seq) from value (preferred) or key tail
     let read_pairs_from_prefix = |prefix: &[u8]| -> Result<Vec<(u64, u32)>> {
+        let mut entries = provider
+            .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.to_vec() })?
+            .entries;
+        if matches!(dir, SortDir::Asc) {
+            entries.reverse();
+        }
         let mut out: Vec<(u64, u32)> = Vec::with_capacity(limit);
-        match dir {
-            SortDir::Desc => {
-                let mut it = mdb.iter_prefix_rev(prefix);
-                for (i, res) in it.by_ref().enumerate() {
-                    if i < skip {
-                        continue;
-                    }
-                    if out.len() >= limit {
-                        break;
-                    }
-                    let (k, v) = res?;
-                    if let Some(pair) = decode_ts_seq_from_entry(&k, &v) {
-                        out.push(pair);
-                    }
-                }
+        for (i, (k, v)) in entries.into_iter().enumerate() {
+            if i < skip {
+                continue;
             }
-            SortDir::Asc => {
-                let total_here = total_for_pool_index(mdb, prefix, None)?;
-                let start = skip;
-                let end = (skip + limit).min(total_here);
-                if start < end {
-                    let drop_rev = total_here.saturating_sub(end);
-                    let take_rev = end - start;
-                    let mut it = mdb.iter_prefix_rev(prefix);
-                    for _ in it.by_ref().take(drop_rev) {}
-                    for res in it.by_ref().take(take_rev) {
-                        let (k, v) = res?;
-                        if let Some(pair) = decode_ts_seq_from_entry(&k, &v) {
-                            out.push(pair);
-                        }
-                    }
-                    out.reverse();
-                }
+            if out.len() >= limit {
+                break;
+            }
+            if let Some(pair) = decode_ts_seq_from_entry(&k, &v) {
+                out.push(pair);
             }
         }
         Ok(out)
@@ -699,7 +714,7 @@ pub fn read_activity_for_pool_sorted(
         pk.push(b':');
         pk.extend_from_slice(seq.to_string().as_bytes());
 
-        if let Some(v) = mdb.get(&pk)? {
+        if let Some(v) = provider.get_raw_value(GetRawValueParams { key: pk })?.value {
             let a = decode_activity_v1(&v)?;
             if let Some(g) = group {
                 if group_for_kind(a.kind) != g {

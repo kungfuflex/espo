@@ -1,0 +1,37 @@
+{
+  "readonly_metashrew_db_dir": "/data/.metashrew/mainnet-v2.0.0/.metashrew-reconcile",
+  "electrum_rpc_url": null,
+  "metashrew_rpc_url": "http://127.0.0.1:7047",
+  "electrs_esplora_url": "http://127.0.0.1:4332",
+  "bitcoind_rpc_url": "http://127.0.0.1:8332",
+  "bitcoind_rpc_user": "rpcuser",
+  "bitcoind_rpc_pass": "rpcpass",
+  "bitcoind_blocks_dir": "~/.bitcoin/blocks",
+  "reset_mempool_on_startup": false,
+  "db_path": "./db",
+  "enable_aof": false,
+  "sdb_poll_ms": 5000,
+  "indexer_block_delay_ms": 0,
+  "port": 8080,
+  "explorer_host": "127.0.0.1:8081",
+  "explorer_base_path": "/",
+  "network": "mainnet",
+  "metashrew_db_label": null,
+  "strict_mode": {
+    "check_utxos": false,
+    "check_alkane_balances": false,
+    "check_trace_mismatches": false
+  },
+  "debug": false,
+  "safe_tip_hook_script": null,
+  "block_source_mode": "rpc",
+  "simulate_reorg": false,
+  "debug_backup": null,
+  "explorer_networks": {
+    "mainnet": "https://explorer.example.com",
+    "signet": "https://signet.example.com",
+    "testnet3": "https://testnet.example.com",
+    "testnet4": "https://testnet4.example.com",
+    "regtest": "http://127.0.0.1:5081"
+  }
+}

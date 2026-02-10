@@ -5,9 +5,11 @@ use crate::config::{AppConfig, init_config_from};
 use crate::core::blockfetcher::BlockFetchMode;
 use crate::schemas::SchemaAlkaneId;
 use bitcoin::{Txid, hashes::Hash};
+use std::collections::HashMap;
 
 fn init_test_config_from_run_sh() {
     let cfg = AppConfig {
+        debug_backup: None,
         readonly_metashrew_db_dir: "/data/.metashrew/v9/.metashrew-v9".to_string(),
         electrum_rpc_url: None,
         metashrew_rpc_url: "http://127.0.0.1:7044".to_string(),
@@ -27,11 +29,14 @@ fn init_test_config_from_run_sh() {
         explorer_base_path: "/".to_string(),
         network: bitcoin::Network::Bitcoin,
         metashrew_db_label: None,
+        strict_mode: None,
         debug: false,
-        trace_index_strict: false,
+        debug_ignore_ms: 0,
+        safe_tip_hook_script: None,
         block_source_mode: BlockFetchMode::RpcOnly,
         simulate_reorg: false,
         explorer_networks: None,
+        modules: HashMap::new(),
     };
     if let Err(err) = init_config_from(cfg) {
         if !err.to_string().contains("already initialized") {
@@ -66,6 +71,7 @@ fn host_function_values_decode_block_909402() {
 }
 
 #[test]
+#[ignore] // Requires external metashrew database at /data/.metashrew/v9/.metashrew-v9
 fn credits_outflows_for_block_912568_trace() {
     init_test_config_from_run_sh();
     let height = 912568u64;

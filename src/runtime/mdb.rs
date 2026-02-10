@@ -23,7 +23,6 @@ pub struct Mdb {
     prefix: Vec<u8>,
     namespace_label: String,
     aof: Option<Arc<AofManager>>,
-    // Keep the cache alive as long as this handle is alive (important!)
 }
 
 impl Mdb {

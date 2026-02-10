@@ -15,10 +15,10 @@ use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid};
 // use bitcoincore_rpc::RpcApi; // REMOVED: block fetch now via BlockSource
+use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use protorune_support::utils::decode_varint_list;
-use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -494,11 +494,8 @@ pub fn get_espo_block_with_opts(
             .consensus_encode(&mut coinbase_bytes)
             .context("consensus encode coinbase tx for host function values")?;
 
-        let total_fees: u128 = coinbase_tx
-            .output
-            .iter()
-            .map(|out| out.value.to_sat() as u128)
-            .sum();
+        let total_fees: u128 =
+            coinbase_tx.output.iter().map(|out| out.value.to_sat() as u128).sum();
         let total_fees_bytes = total_fees.to_le_bytes().to_vec();
 
         let mut diesel_mints: u128 = 0;
@@ -520,11 +517,8 @@ pub fn get_espo_block_with_opts(
                     if protostone.protocol_tag != 1 {
                         continue;
                     }
-                    let calldata: Vec<u8> = protostone
-                        .message
-                        .iter()
-                        .flat_map(|v| v.to_be_bytes())
-                        .collect();
+                    let calldata: Vec<u8> =
+                        protostone.message.iter().flat_map(|v| v.to_be_bytes()).collect();
                     if calldata.is_empty() {
                         continue;
                     }

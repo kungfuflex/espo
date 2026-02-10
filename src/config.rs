@@ -11,6 +11,7 @@ use clap::Parser;
 use electrum_client::Client;
 use rocksdb::{DB, Options};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -22,8 +23,8 @@ use std::{
 };
 
 // Bitcoin Core / bitcoin::Network
+use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use bitcoincore_rpc::bitcoin::Network;
-use bitcoincore_rpc::{Auth, Client as CoreClient};
 
 // Block fetcher (blk files + RPC fallback)
 use crate::core::blockfetcher::{BlkOrRpcBlockSource, BlockFetchMode};
@@ -106,9 +107,7 @@ fn default_block_source_mode() -> String {
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
-    value
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,6 +145,57 @@ impl ExplorerNetworks {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DebugBackupConfig {
+    pub blocks: Vec<u32>,
+    pub dir: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StrictModeConfig {
+    pub check_utxos: bool,
+    pub check_alkane_balances: bool,
+    pub check_trace_mismatches: bool,
+}
+
+impl<'de> Deserialize<'de> for DebugBackupConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawDebugBackupConfig {
+            pub dir: String,
+            #[serde(default)]
+            pub block: Option<u32>,
+            #[serde(default)]
+            pub blocks: Option<Vec<u32>>,
+        }
+
+        let raw = RawDebugBackupConfig::deserialize(deserializer)?;
+        let dir = raw.dir.trim().to_string();
+        if dir.is_empty() {
+            return Err(serde::de::Error::custom(
+                "debug_backup.dir must be a non-empty string when provided",
+            ));
+        }
+
+        let mut blocks = raw.blocks.unwrap_or_default();
+        if let Some(block) = raw.block {
+            blocks.push(block);
+        }
+        blocks.sort_unstable();
+        blocks.dedup();
+        if blocks.is_empty() {
+            return Err(serde::de::Error::custom(
+                "debug_backup requires 'blocks' (array) or 'block' (number)",
+            ));
+        }
+
+        Ok(DebugBackupConfig { blocks, dir })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigFile {
     pub readonly_metashrew_db_dir: String,
@@ -155,7 +205,9 @@ pub struct ConfigFile {
     #[serde(default)]
     pub electrs_esplora_url: Option<String>,
     pub bitcoind_rpc_url: String,
+    #[serde(default)]
     pub bitcoind_rpc_user: String,
+    #[serde(default)]
     pub bitcoind_rpc_pass: String,
     #[serde(default = "default_bitcoind_blocks_dir")]
     pub bitcoind_blocks_dir: String,
@@ -180,15 +232,23 @@ pub struct ConfigFile {
     #[serde(default)]
     pub metashrew_db_label: Option<String>,
     #[serde(default)]
+    pub strict_mode: Option<StrictModeConfig>,
+    #[serde(default)]
     pub debug: bool,
     #[serde(default)]
-    pub trace_index_strict: bool,
+    pub debug_ignore_ms: u64,
+    #[serde(default)]
+    pub debug_backup: Option<DebugBackupConfig>,
+    #[serde(default)]
+    pub safe_tip_hook_script: Option<String>,
     #[serde(default = "default_block_source_mode")]
     pub block_source_mode: String,
     #[serde(default)]
     pub simulate_reorg: bool,
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
+    #[serde(default)]
+    pub modules: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,11 +272,15 @@ pub struct AppConfig {
     pub explorer_base_path: String,
     pub network: Network,
     pub metashrew_db_label: Option<String>,
+    pub strict_mode: Option<StrictModeConfig>,
     pub debug: bool,
-    pub trace_index_strict: bool,
+    pub debug_ignore_ms: u64,
+    pub debug_backup: Option<DebugBackupConfig>,
+    pub safe_tip_hook_script: Option<String>,
     pub block_source_mode: BlockFetchMode,
     pub simulate_reorg: bool,
     pub explorer_networks: Option<ExplorerNetworks>,
+    pub modules: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -232,18 +296,19 @@ pub struct CliArgs {
 }
 
 fn load_config_file(path: &str) -> Result<ConfigFile> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config file: {path}"))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read config file: {path}"))?;
     serde_json::from_str(&raw).context("failed to parse config JSON")
 }
 
 impl AppConfig {
     fn from_file(file: ConfigFile, view_only: bool) -> Result<Self> {
         let network = parse_network(&file.network)?;
-        let block_source_mode = parse_block_fetch_mode(&file.block_source_mode)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let block_source_mode =
+            parse_block_fetch_mode(&file.block_source_mode).map_err(|e| anyhow::anyhow!(e))?;
         let explorer_base_path = normalize_explorer_base_path(&file.explorer_base_path)?;
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
+        let debug_backup = file.debug_backup;
 
         Ok(Self {
             readonly_metashrew_db_dir: file.readonly_metashrew_db_dir,
@@ -265,11 +330,15 @@ impl AppConfig {
             explorer_base_path,
             network,
             metashrew_db_label: normalize_optional_string(file.metashrew_db_label),
+            strict_mode: file.strict_mode,
             debug: file.debug,
-            trace_index_strict: file.trace_index_strict,
+            debug_ignore_ms: file.debug_ignore_ms,
+            debug_backup,
+            safe_tip_hook_script: normalize_optional_string(file.safe_tip_hook_script),
             block_source_mode,
             simulate_reorg: file.simulate_reorg,
             explorer_networks,
+            modules: file.modules,
         })
     }
 }
@@ -292,18 +361,16 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
 
     let db_root = Path::new(&cfg.db_path);
     if !db_root.exists() {
-        fs::create_dir_all(db_root).map_err(|e| {
-            anyhow::anyhow!("Failed to create db_path {}: {e}", cfg.db_path)
-        })?;
+        fs::create_dir_all(db_root)
+            .map_err(|e| anyhow::anyhow!("Failed to create db_path {}: {e}", cfg.db_path))?;
     } else if !db_root.is_dir() {
         anyhow::bail!("db_path is not a directory: {}", cfg.db_path);
     }
 
     let tmp = db_root.join("tmp");
     if !tmp.exists() {
-        fs::create_dir_all(&tmp).map_err(|e| {
-            anyhow::anyhow!("Failed to create tmp dbs dir {}: {e}", tmp.display())
-        })?;
+        fs::create_dir_all(&tmp)
+            .map_err(|e| anyhow::anyhow!("Failed to create tmp dbs dir {}: {e}", tmp.display()))?;
     } else if !tmp.is_dir() {
         anyhow::bail!("Temporary dbs dir is not a directory: {}", tmp.display());
     }
@@ -366,41 +433,52 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("network already initialized"))?;
 
     // --- init Electrum-like client once ---
-    let electrum_like: Arc<dyn ElectrumLike> = if let Some(url) = electrum_url {
-        let electrum_url = format!("tcp://{}", url);
-        let client: Arc<Client> = Arc::new(Client::new(&electrum_url)?);
-        ELECTRUM_CLIENT
-            .set(client.clone())
-            .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
-        Arc::new(ElectrumRpcClient::new(client))
-    } else {
-        let base =
-            esplora_url.expect("validation ensures esplora url exists when electrum is None");
-        Arc::new(EsploraElectrumLike::new(base)?)
-    };
-    ELECTRUM_LIKE
-        .set(electrum_like)
-        .map_err(|_| anyhow::anyhow!("electrum-like client already initialized"))?;
+    // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
+    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
+        let electrum_like: Arc<dyn ElectrumLike> = if let Some(url) = electrum_url {
+            let electrum_url = format!("tcp://{}", url);
+            let client: Arc<Client> = Arc::new(Client::new(&electrum_url)?);
+            ELECTRUM_CLIENT
+                .set(client.clone())
+                .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
+            Arc::new(ElectrumRpcClient::new(client))
+        } else {
+            let base =
+                esplora_url.expect("validation ensures esplora url exists when electrum is None");
+            Arc::new(EsploraElectrumLike::new(base)?)
+        };
+        ELECTRUM_LIKE
+            .set(electrum_like)
+            .map_err(|_| anyhow::anyhow!("electrum-like client already initialized"))?;
+    }
 
     // --- init Bitcoin Core RPC client once ---
-    let core = CoreClient::new(
-        &cfg.bitcoind_rpc_url,
-        Auth::UserPass(cfg.bitcoind_rpc_user.clone(), cfg.bitcoind_rpc_pass.clone()),
-    )?;
-    BITCOIND_CLIENT
-        .set(core)
-        .map_err(|_| anyhow::anyhow!("bitcoind rpc client already initialized"))?;
+    // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
+    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
+        let auth = if !cfg.bitcoind_rpc_user.is_empty() && !cfg.bitcoind_rpc_pass.is_empty() {
+            Some((cfg.bitcoind_rpc_user.clone(), cfg.bitcoind_rpc_pass.clone()))
+        } else {
+            None
+        };
+        let core = CoreClient::new(&cfg.bitcoind_rpc_url, auth)?;
+        BITCOIND_CLIENT
+            .set(core)
+            .map_err(|_| anyhow::anyhow!("bitcoind rpc client already initialized"))?;
+    }
 
     // --- init Secondary RocksDB (SDB) once ---
-    let secondary_path = get_sdb_path_for_metashrew()?;
-    let sdb = SDB::open(
-        cfg.readonly_metashrew_db_dir.clone(),
-        secondary_path,
-        Duration::from_millis(cfg.sdb_poll_ms as u64),
-    )?;
-    METASHREW_SDB
-        .set(std::sync::Arc::new(sdb))
-        .map_err(|_| anyhow::anyhow!("metashrew SDB already initialized"))?;
+    // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
+    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
+        let secondary_path = get_sdb_path_for_metashrew()?;
+        let sdb = SDB::open(
+            cfg.readonly_metashrew_db_dir.clone(),
+            secondary_path,
+            Duration::from_millis(cfg.sdb_poll_ms as u64),
+        )?;
+        METASHREW_SDB
+            .set(std::sync::Arc::new(sdb))
+            .map_err(|_| anyhow::anyhow!("metashrew SDB already initialized"))?;
+    }
 
     // --- init ESPO RocksDB once ---
     let mut espo_opts = Options::default();
@@ -419,16 +497,23 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("AOF manager already initialized"))?;
     }
 
-    init_block_source()?;
+    // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
+    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
+        init_block_source()?;
+    }
 
     Ok(())
 }
 
 pub fn init_config() -> Result<()> {
     let cli = CliArgs::parse();
-    let file = load_config_file(&cli.config_path)?;
-    let cfg = AppConfig::from_file(file, cli.view_only)?;
+    let cfg = load_config_from_path(&cli.config_path, cli.view_only)?;
     init_config_from(cfg)
+}
+
+pub fn load_config_from_path(path: &str, view_only: bool) -> Result<AppConfig> {
+    let file = load_config_file(path)?;
+    AppConfig::from_file(file, view_only)
 }
 
 // UPDATED: no param; uses global NETWORK
@@ -451,6 +536,10 @@ pub fn init_block_source() -> Result<()> {
 
 pub fn get_config() -> &'static AppConfig {
     CONFIG.get().expect("init_config() must be called once at startup")
+}
+
+pub fn get_module_config(name: &str) -> Option<&'static serde_json::Value> {
+    get_config().modules.get(name)
 }
 
 pub fn get_electrum_client() -> Option<Arc<Client>> {
@@ -477,10 +566,7 @@ pub fn get_metashrew_sdb() -> std::sync::Arc<SDB> {
 
 /// Getter for the ESPO module DB path (directory for RocksDB)
 pub fn get_espo_db_path() -> String {
-    Path::new(&get_config().db_path)
-        .join("espo")
-        .to_string_lossy()
-        .into_owned()
+    Path::new(&get_config().db_path).join("espo").to_string_lossy().into_owned()
 }
 
 /// Cloneable handle to the global ESPO RocksDB
@@ -505,12 +591,40 @@ pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
 }
 
-pub fn is_debug_mode() -> bool {
-    get_config().debug
+pub fn is_strict_mode() -> bool {
+    get_config()
+        .strict_mode
+        .as_ref()
+        .map(|cfg| cfg.check_utxos || cfg.check_alkane_balances || cfg.check_trace_mismatches)
+        .unwrap_or(false)
 }
 
-pub fn is_trace_index_strict() -> bool {
-    get_config().trace_index_strict
+pub fn strict_check_utxos() -> bool {
+    get_config().strict_mode.as_ref().map(|cfg| cfg.check_utxos).unwrap_or(false)
+}
+
+pub fn strict_check_alkane_balances() -> bool {
+    get_config()
+        .strict_mode
+        .as_ref()
+        .map(|cfg| cfg.check_alkane_balances)
+        .unwrap_or(false)
+}
+
+pub fn strict_check_trace_mismatches() -> bool {
+    get_config()
+        .strict_mode
+        .as_ref()
+        .map(|cfg| cfg.check_trace_mismatches)
+        .unwrap_or(false)
+}
+
+pub fn debug_enabled() -> bool {
+    CONFIG.get().map(|cfg| cfg.debug).unwrap_or(false)
+}
+
+pub fn debug_ignore_ms() -> u64 {
+    CONFIG.get().map(|cfg| cfg.debug_ignore_ms).unwrap_or(0)
 }
 
 pub fn get_metashrew() -> MetashrewAdapter {

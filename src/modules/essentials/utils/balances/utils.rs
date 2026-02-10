@@ -117,11 +117,8 @@ fn parse_hex_u128(s: &str) -> Option<u128> {
 
 pub(super) fn compute_nets(
     trace: &EspoSandshrewLikeTrace,
-) -> (
-    Option<BTreeMap<SchemaAlkaneId, u128>>,
-    Option<BTreeMap<SchemaAlkaneId, u128>>,
-    EspoTraceType,
-) {
+) -> (Option<BTreeMap<SchemaAlkaneId, u128>>, Option<BTreeMap<SchemaAlkaneId, u128>>, EspoTraceType)
+{
     let mut netin: Option<BTreeMap<SchemaAlkaneId, u128>> = None;
     for ev in &trace.events {
         if let EspoSandshrewLikeTraceEvent::Invoke(inv) = ev {

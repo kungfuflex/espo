@@ -1,137 +1,125 @@
 use crate::alkanes::trace::EspoBlock;
-use crate::config::{get_espo_db, get_last_safe_tip};
+use crate::config::{debug_enabled, get_espo_db, get_network};
+use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
-use crate::modules::essentials::main::Essentials;
-use crate::modules::essentials::storage::decode_creation_record;
+use crate::modules::essentials::consts::{
+    ESSENTIALS_GENESIS_INSPECTIONS, essentials_genesis_block,
+};
+use crate::modules::essentials::storage::{
+    EssentialsProvider, GetCreationRecordsByIdParams,
+    GetIndexHeightParams as EssentialsGetIndexHeightParams,
+};
+use crate::modules::essentials::utils::inspections::created_alkanes_from_block;
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use bitcoin::Network;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use super::consts::PRIORITY_SERIES_ALKANES;
 use super::rpc;
+use super::storage::{
+    GetIndexHeightParams as PizzafunGetIndexHeightParams, PizzafunProvider, SeriesEntry,
+    series_id_base_from_name,
+};
 
-#[derive(Clone, Debug)]
-pub(crate) struct SeriesEntry {
-    pub series_id: String,
-    pub alkane_id: SchemaAlkaneId,
-    pub creation_height: u32,
+fn parse_alkane_id_str(s: &str) -> Option<SchemaAlkaneId> {
+    let (block_raw, tx_raw) = s.split_once(':')?;
+    let parse_u32 = |v: &str| {
+        if let Some(hex) = v.strip_prefix("0x") {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            v.parse::<u32>().ok()
+        }
+    };
+    let parse_u64 = |v: &str| {
+        if let Some(hex) = v.strip_prefix("0x") {
+            u64::from_str_radix(hex, 16).ok()
+        } else {
+            v.parse::<u64>().ok()
+        }
+    };
+    Some(SchemaAlkaneId { block: parse_u32(block_raw)?, tx: parse_u64(tx_raw)? })
 }
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct SeriesIndex {
-    pub series_to_alkane: HashMap<String, SeriesEntry>,
-    pub alkane_to_series: HashMap<SchemaAlkaneId, SeriesEntry>,
-}
-
-pub(crate) type SharedSeriesIndex = Arc<RwLock<Arc<SeriesIndex>>>;
 
 pub struct Pizzafun {
-    essentials_mdb: Option<Arc<Mdb>>,
+    essentials_provider: Option<Arc<EssentialsProvider>>,
+    provider: Option<Arc<PizzafunProvider>>,
     index_height: Arc<RwLock<Option<u32>>>,
-    series_index: SharedSeriesIndex,
 }
 
 impl Pizzafun {
     pub fn new() -> Self {
         Self {
-            essentials_mdb: None,
+            essentials_provider: None,
+            provider: None,
             index_height: Arc::new(RwLock::new(None)),
-            series_index: Arc::new(RwLock::new(Arc::new(SeriesIndex::default()))),
         }
     }
 
     #[inline]
-    fn essentials_mdb(&self) -> &Mdb {
-        self.essentials_mdb
+    fn essentials_provider(&self) -> &EssentialsProvider {
+        self.essentials_provider
             .as_ref()
             .expect("ModuleRegistry must call set_mdb()")
             .as_ref()
     }
 
+    #[inline]
+    fn provider(&self) -> &PizzafunProvider {
+        self.provider.as_ref().expect("ModuleRegistry must call set_mdb()").as_ref()
+    }
+
     fn load_essentials_index_height(&self) -> Option<u32> {
-        let bytes = self
-            .essentials_mdb()
-            .get(Essentials::k_index_height())
-            .ok()
-            .flatten()?;
-        if bytes.len() != 4 {
-            return None;
-        }
-        let mut arr = [0u8; 4];
-        arr.copy_from_slice(&bytes);
-        Some(u32::from_le_bytes(arr))
+        let resp = self
+            .essentials_provider()
+            .get_index_height(EssentialsGetIndexHeightParams)
+            .ok()?;
+        resp.height
     }
 
-    fn build_series_index(essentials_mdb: &Mdb) -> SeriesIndex {
-        let mut records = Vec::new();
-        let prefix = b"/alkanes/creation/id/";
-        for res in essentials_mdb.iter_from(prefix) {
-            let Ok((k_full, v)) = res else { continue };
-            let rel = &k_full[essentials_mdb.prefix().len()..];
-            if !rel.starts_with(prefix) {
-                break;
-            }
-            match decode_creation_record(&v) {
-                Ok(rec) => records.push(rec),
-                Err(e) => {
-                    eprintln!("[PIZZAFUN] decode creation record failed: {e}");
-                }
+    fn load_index_height(&self) -> Option<u32> {
+        if let Ok(resp) = self.provider().get_index_height(PizzafunGetIndexHeightParams) {
+            if resp.height.is_some() {
+                return resp.height;
             }
         }
+        self.load_essentials_index_height()
+    }
 
-        records.sort_by(|a, b| {
-            (
-                a.creation_height,
-                a.tx_index_in_block,
-                a.alkane.block,
-                a.alkane.tx,
-            )
-                .cmp(&(
-                    b.creation_height,
-                    b.tx_index_in_block,
-                    b.alkane.block,
-                    b.alkane.tx,
-                ))
+    fn priority_index_map() -> HashMap<SchemaAlkaneId, usize> {
+        let mut priority_index: HashMap<SchemaAlkaneId, usize> = HashMap::new();
+        for (idx, raw) in PRIORITY_SERIES_ALKANES.iter().enumerate() {
+            if let Some(id) = parse_alkane_id_str(raw) {
+                priority_index.entry(id).or_insert(idx);
+            }
+        }
+        priority_index
+    }
+
+    fn sort_series_entries(
+        entries: &mut Vec<SeriesEntry>,
+        priority_index: &HashMap<SchemaAlkaneId, usize>,
+    ) {
+        entries.sort_by(|a, b| {
+            let a_pri = priority_index.get(&a.alkane_id);
+            let b_pri = priority_index.get(&b.alkane_id);
+            match (a_pri, b_pri) {
+                (Some(ai), Some(bi)) => ai
+                    .cmp(bi)
+                    .then_with(|| a.creation_height.cmp(&b.creation_height))
+                    .then_with(|| a.alkane_id.cmp(&b.alkane_id)),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => a
+                    .creation_height
+                    .cmp(&b.creation_height)
+                    .then_with(|| a.alkane_id.cmp(&b.alkane_id)),
+            }
         });
-
-        let mut name_counts: HashMap<String, u32> = HashMap::new();
-        let mut series_to_alkane: HashMap<String, SeriesEntry> = HashMap::new();
-        let mut alkane_to_series: HashMap<SchemaAlkaneId, SeriesEntry> = HashMap::new();
-
-        for rec in records {
-            let Some(raw_name) = rec.names.first() else { continue };
-            let Some(name_norm) = normalize_alkane_name(raw_name) else { continue };
-            let idx = name_counts.entry(name_norm.clone()).or_insert(0);
-            let series_id = if *idx == 0 {
-                name_norm.clone()
-            } else {
-                format!("{}-{}", name_norm, idx)
-            };
-            *idx = idx.saturating_add(1);
-
-            let entry = SeriesEntry {
-                series_id: series_id.clone(),
-                alkane_id: rec.alkane,
-                creation_height: rec.creation_height,
-            };
-            series_to_alkane.insert(series_id, entry.clone());
-            alkane_to_series.insert(rec.alkane, entry);
-        }
-
-        SeriesIndex { series_to_alkane, alkane_to_series }
-    }
-
-    fn reload_series_index(&self, reason: &str) {
-        let essentials_mdb = self.essentials_mdb();
-        eprintln!("[PIZZAFUN] rebuilding series index ({reason})...");
-        let index = Self::build_series_index(essentials_mdb);
-        let entry_count = index.series_to_alkane.len();
-        let mut guard = self.series_index.write().expect("series index lock poisoned");
-        *guard = Arc::new(index);
-        eprintln!("[PIZZAFUN] series index ready: {} entries", entry_count);
     }
 }
 
@@ -146,12 +134,13 @@ impl EspoModule for Pizzafun {
         "pizzafun"
     }
 
-    fn set_mdb(&mut self, _mdb: Arc<Mdb>) {
+    fn set_mdb(&mut self, mdb: Arc<Mdb>) {
         let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
-        self.essentials_mdb = Some(Arc::new(essentials_mdb));
+        let essentials_provider = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
+        self.essentials_provider = Some(essentials_provider);
+        self.provider = Some(Arc::new(PizzafunProvider::new(mdb)));
 
-        *self.index_height.write().unwrap() = self.load_essentials_index_height();
-        self.reload_series_index("startup");
+        *self.index_height.write().unwrap() = self.load_index_height();
     }
 
     fn get_genesis_block(&self, network: Network) -> u32 {
@@ -159,20 +148,102 @@ impl EspoModule for Pizzafun {
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
-        if let Some(tip) = get_last_safe_tip() {
-            if block.height >= tip {
-                self.reload_series_index("safe_tip");
+        let t0 = std::time::Instant::now();
+        let debug = debug_enabled();
+        let module = self.get_name();
+
+        let timer = debug::start_if(debug);
+        let mut new_alkanes: Vec<SchemaAlkaneId> = created_alkanes_from_block(&block);
+        let genesis_height = essentials_genesis_block(get_network());
+        if block.height == genesis_height {
+            for (blk, tx, _meta) in ESSENTIALS_GENESIS_INSPECTIONS.iter() {
+                new_alkanes.push(SchemaAlkaneId { block: *blk, tx: *tx });
             }
         }
-        *self.index_height.write().unwrap() = Some(block.height);
+        let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
+        new_alkanes.retain(|a| seen.insert(*a));
+        debug::log_elapsed(module, "collect_created_alkanes", timer);
+
+        let timer = debug::start_if(debug);
+        if !new_alkanes.is_empty() {
+            let records = self
+                .essentials_provider()
+                .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: new_alkanes })?
+                .records;
+
+            let mut by_name: HashMap<String, Vec<SeriesEntry>> = HashMap::new();
+            for rec in records.into_iter().flatten() {
+                let Some(raw_name) = rec.names.first() else { continue };
+                let Some(name_norm) = normalize_alkane_name(raw_name) else { continue };
+                by_name.entry(name_norm).or_default().push(SeriesEntry {
+                    series_id: String::new(),
+                    alkane_id: rec.alkane,
+                    creation_height: rec.creation_height,
+                });
+            }
+
+            if !by_name.is_empty() {
+                let priority_index = Self::priority_index_map();
+                for (name, mut new_entries) in by_name {
+                    let Some(series_base) = series_id_base_from_name(&name) else { continue };
+                    let existing = self.provider().get_series_entries_by_name(&name)?;
+                    if !existing.is_empty() {
+                        let mut existing_ids: HashSet<SchemaAlkaneId> =
+                            existing.iter().map(|e| e.alkane_id).collect();
+                        new_entries.retain(|e| existing_ids.insert(e.alkane_id));
+                    }
+                    if new_entries.is_empty() {
+                        continue;
+                    }
+
+                    let mut combined = existing.clone();
+                    combined.extend(new_entries);
+                    Self::sort_series_entries(&mut combined, &priority_index);
+
+                    let mut updated: Vec<SeriesEntry> = Vec::with_capacity(combined.len());
+                    for (idx, entry) in combined.into_iter().enumerate() {
+                        let series_id = if idx == 0 {
+                            series_base.clone()
+                        } else {
+                            format!("{}-{}", series_base, idx + 1)
+                        };
+                        updated.push(SeriesEntry {
+                            series_id,
+                            alkane_id: entry.alkane_id,
+                            creation_height: entry.creation_height,
+                        });
+                    }
+
+                    self.provider().update_series_for_name(&existing, &updated)?;
+                }
+            }
+        }
+        debug::log_elapsed(module, "update_series_index", timer);
+
+        let timer = debug::start_if(debug);
+        self.provider()
+            .set_index_height(super::storage::SetIndexHeightParams { height: block.height })?;
+        *self.index_height.write().expect("pizzafun index height lock poisoned") =
+            Some(block.height);
+        debug::log_elapsed(module, "store_height", timer);
+
+        let timer = debug::start_if(debug);
+        eprintln!(
+            "[indexer] module={} height={} index_block done in {:?}",
+            self.get_name(),
+            block.height,
+            t0.elapsed()
+        );
+        debug::log_elapsed(module, "finalize", timer);
         Ok(())
     }
 
     fn get_index_height(&self) -> Option<u32> {
-        get_last_safe_tip().or_else(|| *self.index_height.read().unwrap())
+        *self.index_height.read().unwrap()
     }
 
     fn register_rpc(&self, reg: &RpcNsRegistrar) {
-        rpc::register_rpc(reg.clone(), Arc::clone(&self.series_index));
+        let provider = self.provider.as_ref().expect("ModuleRegistry must call set_mdb()");
+        rpc::register_rpc(reg.clone(), Arc::clone(provider));
     }
 }

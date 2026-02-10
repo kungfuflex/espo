@@ -3,8 +3,9 @@ use std::collections::HashMap;
 
 use crate::config::get_metashrew;
 use crate::modules::ammdata::schemas::{SchemaMarketDefs, SchemaPoolSnapshot};
-use crate::modules::ammdata::storage::{decode_reserves_snapshot, reserves_snapshot_key};
-use crate::runtime::mdb::Mdb;
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, GetRawValueParams, decode_reserves_snapshot,
+};
 use crate::schemas::SchemaAlkaneId;
 
 /// Fetch real-time reserves for all pools in `pools` by querying Metashrew balances:
@@ -45,9 +46,13 @@ pub fn fetch_latest_reserves_for_pools(
     Ok(out)
 }
 
-pub fn fetch_all_pools(mdb: &Mdb) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
-    let pools_snapshot_bytes = mdb
-        .get(reserves_snapshot_key())?
+pub fn fetch_all_pools(
+    provider: &AmmDataProvider,
+) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
+    let table = provider.table();
+    let pools_snapshot_bytes = provider
+        .get_raw_value(GetRawValueParams { key: table.reserves_snapshot_key() })?
+        .value
         .ok_or(anyhow!("AMMDATA ERROR: Failed to fetch all pools"))?;
 
     decode_reserves_snapshot(&pools_snapshot_bytes)

@@ -1,26 +1,44 @@
+// Module declarations - these reference lib.rs modules indirectly
+#[cfg(not(target_arch = "wasm32"))]
 pub mod alkanes;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bitcoind_flexible;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod config;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod consts;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod core;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod debug;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod explorer;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod modules;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod runtime;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod schemas;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod utils;
 
 use std::net::SocketAddr;
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
-use crate::config::init_block_source;
+use crate::config::{DebugBackupConfig, init_block_source};
 //modules
 use crate::config::get_metashrew_sdb;
 use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
-use crate::modules::pizzafun::main::Pizzafun;
 use crate::modules::essentials::storage::preload_block_summary_cache;
+use crate::modules::oylapi::main::OylApi;
+use crate::modules::pizzafun::main::Pizzafun;
+use crate::modules::subfrost::main::Subfrost;
 use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
 
@@ -28,8 +46,8 @@ use crate::explorer::run_explorer;
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
     config::{
-        get_aof_manager, get_bitcoind_rpc_client, get_config, get_espo_db, init_config,
-        update_safe_tip,
+        get_aof_manager, get_bitcoind_rpc_client, get_config, get_espo_db, get_module_config,
+        init_config, update_safe_tip,
     },
     consts::alkanes_genesis_block,
     modules::defs::ModuleRegistry,
@@ -47,6 +65,29 @@ use tokio::runtime::Builder as TokioBuilder;
 
 fn should_watch_for_reorg(next_height: u32, safe_tip: u32) -> bool {
     safe_tip.saturating_sub(next_height) <= AOF_REORG_DEPTH
+}
+
+fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> std::io::Result<()> {
+    let db_root = Path::new(db_path);
+    let backup_root = Path::new(&backup.dir);
+    if backup_root.starts_with(db_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "debug_backup.dir may not be inside db_path",
+        ));
+    }
+    std::fs::create_dir_all(backup_root)?;
+    let dest_dir = backup_root.join(format!("bkp-{block}"));
+    eprintln!("[debug_backup] starting copy: '{}' -> '{}'", db_root.display(), dest_dir.display());
+    let status = Command::new("cp").arg("-r").arg(db_root).arg(&dest_dir).status()?;
+    if !status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("cp exited with status {status}"),
+        ));
+    }
+    eprintln!("[debug_backup] finished copy to '{}'", dest_dir.display());
+    Ok(())
 }
 
 fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
@@ -105,6 +146,21 @@ fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
     Some(next_height.saturating_sub(revert_count as u32))
 }
 
+fn run_safe_tip_hook(script: &str, next_height: u32, tip: u32) {
+    let script = script.trim();
+    if script.is_empty() {
+        return;
+    }
+    let script = script.to_string();
+    std::thread::spawn(move || {
+        eprintln!("[safe_tip_hook] running (next_height={}, tip={}): {}", next_height, tip, script);
+        match Command::new("sh").arg("-c").arg(&script).status() {
+            Ok(status) => eprintln!("[safe_tip_hook] finished: {}", status),
+            Err(e) => eprintln!("[safe_tip_hook] failed: {e:?}"),
+        }
+    });
+}
+
 async fn run_indexer_loop(
     mods: ModuleRegistry,
     start_height: u32,
@@ -117,6 +173,7 @@ async fn run_indexer_loop(
     let mut last_tip: Option<u32> = None;
     let mut mempool_started = false;
     let mut logged_start = false;
+    let mut safe_tip_hook_ran = false;
     if cfg.reset_mempool_on_startup {
         if let Err(e) = reset_mempool_store() {
             eprintln!("[mempool] failed to reset store on startup: {e:?}");
@@ -128,6 +185,11 @@ async fn run_indexer_loop(
 
     // ETA tracker
     let mut eta = EtaTracker::new(3.0); // EMA smoothing factor (tweak if you want faster/slower adaptation)
+    let mut debug_backup_remaining: std::collections::HashSet<u32> = cfg
+        .debug_backup
+        .as_ref()
+        .map(|backup| backup.blocks.iter().copied().collect())
+        .unwrap_or_default();
 
     loop {
         if let Err(e) = metashrew_sdb.catch_up_now() {
@@ -195,11 +257,12 @@ async fn run_indexer_loop(
                         .map(|t| t.transaction.compute_txid())
                         .collect();
 
+                    let block_hash = espo_block.block_header.block_hash();
+
                     // Only capture AOF changes when we're near the safe tip; skip during deep catch-up.
                     let aof_for_block =
                         get_aof_manager().filter(|_| should_watch_for_reorg(next_height, tip));
                     if let Some(aof) = &aof_for_block {
-                        let block_hash = espo_block.block_header.block_hash();
                         aof.start_block(next_height, &block_hash);
                     }
 
@@ -239,6 +302,19 @@ async fn run_indexer_loop(
                         }
                     }
 
+                    if let Some(backup) = cfg.debug_backup.as_ref() {
+                        if debug_backup_remaining.remove(&next_height) {
+                            eprintln!(
+                                "[debug_backup] reached block {}, copying db dir '{}' to '{}/bkp-{}'",
+                                next_height, cfg.db_path, backup.dir, next_height
+                            );
+                            match run_debug_backup(&cfg.db_path, backup, next_height) {
+                                Ok(_) => eprintln!("[debug_backup] backup complete"),
+                                Err(e) => eprintln!("[debug_backup] backup failed: {e}"),
+                            }
+                        }
+                    }
+
                     eta.finish_block();
                     next_height = next_height.saturating_add(1);
                     if let Some(h) = ESPO_HEIGHT.get() {
@@ -255,6 +331,12 @@ async fn run_indexer_loop(
                 }
             }
         } else {
+            if !safe_tip_hook_ran {
+                if let Some(script) = cfg.safe_tip_hook_script.as_deref() {
+                    safe_tip_hook_ran = true;
+                    run_safe_tip_hook(script, next_height, tip);
+                }
+            }
             if let Some(new_next) = check_and_handle_reorg(next_height, tip) {
                 if new_next < next_height {
                     next_height = new_next;
@@ -288,6 +370,7 @@ async fn run_indexer_loop(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
 async fn main() -> Result<()> {
     init_config()?;
@@ -335,7 +418,21 @@ async fn main() -> Result<()> {
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
     mods.register_module(Pizzafun::new());
-    mods.register_module(AmmData::new());
+    if get_module_config("ammdata").is_some() {
+        mods.register_module(AmmData::new());
+    } else {
+        eprintln!("[modules] ammdata disabled (missing config)");
+    }
+    if get_module_config("subfrost").is_some() {
+        mods.register_module(Subfrost::new());
+    } else {
+        eprintln!("[modules] subfrost disabled (missing config)");
+    }
+    if get_module_config("oylapi").is_some() {
+        mods.register_module(OylApi::new());
+    } else {
+        eprintln!("[modules] oylapi disabled (missing config)");
+    }
     // mods.register_module(TracesData::new());
 
     let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
@@ -412,14 +509,7 @@ async fn main() -> Result<()> {
             .enable_all()
             .build()
             .expect("build indexer runtime");
-        rt.block_on(run_indexer_loop(
-            mods,
-            start_height,
-            next_height,
-            network,
-            metashrew_sdb,
-            cfg,
-        ));
+        rt.block_on(run_indexer_loop(mods, start_height, next_height, network, metashrew_sdb, cfg));
     });
     std::thread::spawn(move || {
         if let Err(err) = indexer_handle.join() {
@@ -431,4 +521,10 @@ async fn main() -> Result<()> {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
+}
+
+// Dummy main for WASM builds (should never be called)
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    panic!("ESPO binary cannot be compiled for WASM");
 }

@@ -18,10 +18,7 @@ use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
 use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summaries};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::{
-    AlkaneTxSummary, alkane_holders_ordered_prefix, alkane_latest_traces_key,
-    alkane_tx_summary_key, load_creation_record, parse_alkane_holders_ordered_key,
-};
+use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable, load_creation_record};
 use crate::schemas::EspoOutpoint;
 
 struct AlkaneTxRow {
@@ -38,7 +35,8 @@ fn load_top_alkanes_by_holders(
         return rows;
     }
 
-    let prefix_full = mdb.prefixed(alkane_holders_ordered_prefix());
+    let table = EssentialsTable::new(mdb);
+    let prefix_full = mdb.prefixed(&table.alkane_holders_ordered_prefix());
     let it = mdb.iter_prefix_rev(&prefix_full);
     for res in it {
         if rows.len() >= limit {
@@ -46,7 +44,7 @@ fn load_top_alkanes_by_holders(
         }
         let Ok((k, _v)) = res else { continue };
         let rel = &k[mdb.prefix().len()..];
-        let Some((holders, alk)) = parse_alkane_holders_ordered_key(rel) else { continue };
+        let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else { continue };
         let Some(rec) = load_creation_record(mdb, &alk).ok().flatten() else { continue };
 
         let id = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
@@ -107,8 +105,9 @@ fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<A
         return out;
     }
 
+    let table = EssentialsTable::new(mdb);
     let list: Vec<[u8; 32]> = mdb
-        .get(alkane_latest_traces_key())
+        .get(&table.alkane_latest_traces_key())
         .ok()
         .flatten()
         .and_then(|b| Vec::<[u8; 32]>::try_from_slice(&b).ok())
@@ -123,7 +122,7 @@ fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<A
         }
         let Ok(txid) = Txid::from_slice(&txid_bytes) else { continue };
         let summary = mdb
-            .get(&alkane_tx_summary_key(&txid.to_byte_array()))
+            .get(&table.alkane_tx_summary_key(&txid.to_byte_array()))
             .ok()
             .flatten()
             .and_then(|b| AlkaneTxSummary::try_from_slice(&b).ok());

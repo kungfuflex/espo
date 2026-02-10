@@ -58,10 +58,7 @@ fn decode_name_bytes(bytes: &[u8]) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed
-        .chars()
-        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-    {
+    if trimmed.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
         return None;
     }
     Some(trimmed)
@@ -138,8 +135,7 @@ async fn simulate_get_name_async(alkane: &SchemaAlkaneId, height: u32) -> Result
         from: None,
         protocol_tag: 1,
     };
-    let protocol_values =
-        vec![protostone].encipher().context("protostone encode failed")?;
+    let protocol_values = vec![protostone].encipher().context("protostone encode failed")?;
     let runestone =
         Runestone { protocol: Some(protocol_values), pointer: Some(0), ..Default::default() };
     let runestone_script = runestone.encipher();

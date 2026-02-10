@@ -14,9 +14,7 @@ use crate::explorer::components::tx_view::alkane_icon_url;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    HoldersCountEntry, alkane_creation_count_key, alkane_creation_ordered_prefix,
-    alkane_holders_ordered_prefix, decode_creation_record, holders_count_key, load_creation_record,
-    parse_alkane_holders_ordered_key,
+    EssentialsTable, HoldersCountEntry, decode_creation_record, load_creation_record,
 };
 use crate::modules::essentials::utils::inspections::AlkaneCreationRecord;
 
@@ -108,10 +106,11 @@ pub async fn alkanes_page(
     let offset = limit.saturating_mul(page.saturating_sub(1));
     let field = SortField::from_query(q.order.as_deref());
     let dir = SortDir::from_query(q.order.as_deref(), q.dir.as_deref());
+    let table = EssentialsTable::new(&state.essentials_mdb);
 
     let total: u64 = state
         .essentials_mdb
-        .get(alkane_creation_count_key())
+        .get(&table.alkane_creation_count_key())
         .ok()
         .flatten()
         .and_then(|b| {
@@ -128,7 +127,7 @@ pub async fn alkanes_page(
     let holders_for = |rec: &AlkaneCreationRecord| {
         state
             .essentials_mdb
-            .get(&holders_count_key(&rec.alkane))
+            .get(&table.holders_count_key(&rec.alkane))
             .ok()
             .flatten()
             .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
@@ -170,7 +169,8 @@ pub async fn alkanes_page(
     let mut seen: usize = 0;
     match (field, dir) {
         (SortField::Age, SortDir::Desc) => {
-            let prefix_full = state.essentials_mdb.prefixed(alkane_creation_ordered_prefix());
+            let prefix_full =
+                state.essentials_mdb.prefixed(&table.alkane_creation_ordered_prefix());
             let it = state.essentials_mdb.iter_prefix_rev(&prefix_full);
             for res in it {
                 let Ok((_k, v)) = res else { continue };
@@ -188,12 +188,12 @@ pub async fn alkanes_page(
             }
         }
         (SortField::Age, SortDir::Asc) => {
-            let prefix = alkane_creation_ordered_prefix();
-            let it = state.essentials_mdb.iter_from(prefix);
+            let prefix = table.alkane_creation_ordered_prefix();
+            let it = state.essentials_mdb.iter_from(&prefix);
             for res in it {
                 let Ok((k, v)) = res else { continue };
                 let rel = &k[state.essentials_mdb.prefix().len()..];
-                if !rel.starts_with(prefix) {
+                if !rel.starts_with(&prefix) {
                     break;
                 }
                 if seen < offset {
@@ -210,12 +210,14 @@ pub async fn alkanes_page(
             }
         }
         (SortField::Holders, SortDir::Desc) => {
-            let prefix_full = state.essentials_mdb.prefixed(alkane_holders_ordered_prefix());
+            let prefix_full = state.essentials_mdb.prefixed(&table.alkane_holders_ordered_prefix());
             let it = state.essentials_mdb.iter_prefix_rev(&prefix_full);
             for res in it {
                 let Ok((k, _v)) = res else { continue };
                 let rel = &k[state.essentials_mdb.prefix().len()..];
-                let Some((holders, alk)) = parse_alkane_holders_ordered_key(rel) else { continue };
+                let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else {
+                    continue;
+                };
                 if seen < offset {
                     seen += 1;
                     continue;
@@ -232,15 +234,17 @@ pub async fn alkanes_page(
             }
         }
         (SortField::Holders, SortDir::Asc) => {
-            let prefix = alkane_holders_ordered_prefix();
-            let it = state.essentials_mdb.iter_from(prefix);
+            let prefix = table.alkane_holders_ordered_prefix();
+            let it = state.essentials_mdb.iter_from(&prefix);
             for res in it {
                 let Ok((k, _v)) = res else { continue };
                 let rel = &k[state.essentials_mdb.prefix().len()..];
-                if !rel.starts_with(prefix) {
+                if !rel.starts_with(&prefix) {
                     break;
                 }
-                let Some((holders, alk)) = parse_alkane_holders_ordered_key(rel) else { continue };
+                let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else {
+                    continue;
+                };
                 if seen < offset {
                     seen += 1;
                     continue;
@@ -262,11 +266,8 @@ pub async fn alkanes_page(
     let display_end = (offset as u64 + rows.len() as u64).min(total);
     let has_prev = page > 1;
     let has_next = (offset as u64 + rows.len() as u64) < total;
-    let last_page = if total > 0 {
-        ((total + limit as u64 - 1) / limit as u64).max(1) as usize
-    } else {
-        1
-    };
+    let last_page =
+        if total > 0 { ((total + limit as u64 - 1) / limit as u64).max(1) as usize } else { 1 };
     let show_creation_block = has_prev || has_next;
 
     let field_options = [SortField::Age, SortField::Holders];
