@@ -1,34 +1,36 @@
+use crate::runtime::state_at::StateAt;
 use axum::extract::{Path, Query, State};
-use axum::response::Html;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use hex;
-use maud::{Markup, PreEscaped, html};
+use maud::{html, Markup, PreEscaped};
 use serde::Deserialize;
 
 use crate::explorer::components::alk_balances::render_alkane_balance_cards;
 use crate::explorer::components::header::header_scripts;
-use crate::explorer::components::layout::layout;
+use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
-    icon_caret_right, icon_left, icon_right, icon_skip_left, icon_skip_right,
+    icon_caret_right, icon_dropdown_caret, icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
-    AlkaneMetaCache, alkane_icon_url_unfiltered, alkane_meta, icon_bg_style,
+    alkane_icon_url_unfiltered, alkane_meta, icon_bg_style, AlkaneMetaCache,
 };
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
-use crate::explorer::paths::{explorer_base_path, explorer_path};
+use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::schemas::Timeframe;
-use crate::modules::ammdata::storage::AmmDataTable;
+use crate::modules::ammdata::storage::{AmmDataProvider, AmmDataTable, GetListKeysByPrefixParams};
 use crate::modules::essentials::storage::{
-    BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
+    load_creation_record, BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId,
 };
 use crate::modules::essentials::utils::balances::{
     get_alkane_balances, get_holders_for_alkane, get_total_received_for_alkane,
     get_transfer_volume_for_alkane,
 };
-use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
-use crate::modules::pizzafun::storage::PizzafunProvider;
+use crate::modules::essentials::utils::inspections::{load_inspection, StoredInspectionMethod};
+use crate::modules::pizzafun::storage::{GetSeriesByAlkaneParams, PizzafunProvider};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use std::collections::HashSet;
@@ -65,19 +67,55 @@ impl AlkaneTab {
     }
 }
 
+#[derive(Clone)]
+struct AlkaneBalanceChartToken {
+    alkane_id: String,
+    label: String,
+    asset_name: String,
+    symbol: String,
+    icon_url: String,
+    fallback_letter: String,
+}
+
+fn token_fallback_letter(label: &str, fallback: &str) -> String {
+    label
+        .chars()
+        .find(|c| c.is_ascii_alphanumeric())
+        .or_else(|| fallback.chars().find(|c| c.is_ascii_alphanumeric()))
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn alkane_chart_token_icon(icon_url: &str, fallback_letter: &str) -> Markup {
+    html! {
+        span class="alk-icon-wrap address-balance-dropdown-alk-icon" aria-hidden="true" {
+            span class="alk-icon-img" style=(icon_bg_style(icon_url)) {}
+            span class="alk-icon-letter" { (fallback_letter) }
+        }
+    }
+}
+
 pub async fn alkane_page(
     State(state): State<ExplorerState>,
     Path(alkane_raw): Path<String>,
     Query(q): Query<PageQuery>,
-) -> Html<String> {
+) -> Response {
+    let canonical_path_fallback = "/alkane".to_string();
     let Some(alk) = parse_alkane_id(&alkane_raw) else {
-        return layout(
-            "Alkane",
-            html! { p class="error" { "Invalid alkane id; expected \"<block>:<tx>\"." } },
-        );
+        return (
+            StatusCode::NOT_FOUND,
+            layout_with_meta(
+                "Alkane",
+                &canonical_path_fallback,
+                None,
+                html! { p class="error" { "Invalid alkane id; expected \"<block>:<tx>\"." } },
+            ),
+        )
+            .into_response();
     };
 
     let tab = AlkaneTab::from_query(q.tab.as_deref());
+    let all_range_label = if current_language().is_chinese() { "全部" } else { "All" };
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let alk_str = format!("{}:{}", alk.block, alk.tx);
@@ -97,7 +135,8 @@ pub async fn alkane_page(
     let creation_height = creation_record.as_ref().map(|r| r.creation_height);
     let creation_txid = creation_record.as_ref().map(|r| hex::encode(r.txid));
 
-    let balances_map = get_alkane_balances(&state.essentials_provider(), &alk).unwrap_or_default();
+    let balances_map = get_alkane_balances(StateAt::Latest, &state.essentials_provider(), &alk)
+        .unwrap_or_default();
     let mut balance_entries: Vec<BalanceEntry> = balances_map
         .into_iter()
         .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
@@ -105,13 +144,31 @@ pub async fn alkane_page(
     balance_entries.sort_by(|a, b| {
         a.alkane.block.cmp(&b.alkane.block).then_with(|| a.alkane.tx.cmp(&b.alkane.tx))
     });
+    let balance_chart_tokens: Vec<AlkaneBalanceChartToken> = balance_entries
+        .iter()
+        .map(|entry| {
+            let alkane_id = format!("{}:{}", entry.alkane.block, entry.alkane.tx);
+            let token_meta = alkane_meta(&entry.alkane, &mut kv_cache, &state.essentials_mdb);
+            let label = if token_meta.name.known && token_meta.name.value != alkane_id {
+                format!("{} ({})", token_meta.name.value, alkane_id)
+            } else {
+                alkane_id.clone()
+            };
+            AlkaneBalanceChartToken {
+                alkane_id: alkane_id.clone(),
+                label,
+                asset_name: token_meta.name.value.clone(),
+                symbol: token_meta.symbol.clone(),
+                icon_url: token_meta.icon_url.clone(),
+                fallback_letter: token_fallback_letter(&token_meta.name.value, &alkane_id),
+            }
+        })
+        .collect();
+    let default_balance_chart_alkane = balance_chart_tokens.get(0).map(|t| t.alkane_id.clone());
 
     let (total, circulating_supply, holders) =
-        get_holders_for_alkane(&state.essentials_provider(), alk, page, limit).unwrap_or((
-            0,
-            0,
-            Vec::new(),
-        ));
+        get_holders_for_alkane(StateAt::Latest, &state.essentials_provider(), alk, page, limit)
+            .unwrap_or((0, 0, Vec::new()));
     let off = limit.saturating_mul(page.saturating_sub(1));
     let holders_len = holders.len();
     let has_prev = page > 1;
@@ -130,7 +187,14 @@ pub async fn alkane_page(
         let series_id = {
             let pizzafun_mdb = Arc::new(Mdb::from_db(Arc::clone(&db), b"pizzafun:"));
             let pizzafun = PizzafunProvider::new(pizzafun_mdb);
-            pizzafun.get_series_by_alkane(&alk).ok().flatten().map(|e| e.series_id)
+            pizzafun
+                .get_series_by_alkane(GetSeriesByAlkaneParams {
+                    blockhash: StateAt::Latest,
+                    alkane: alk,
+                })
+                .ok()
+                .flatten()
+                .map(|e| e.series_id)
         };
 
         let has_market_chart = {
@@ -146,13 +210,19 @@ pub async fn alkane_page(
 
             let amm_mdb = Mdb::from_db(Arc::clone(&db), b"ammdata:");
             let table = AmmDataTable::new(&amm_mdb);
+            let amm_provider = AmmDataProvider::new(
+                Arc::new(amm_mdb.clone()),
+                Arc::new(state.essentials_provider()),
+            );
 
             let has_prefix = |rel_prefix: Vec<u8>| -> bool {
-                amm_mdb
-                    .iter_prefix_rev(&amm_mdb.prefixed(&rel_prefix))
-                    .next()
-                    .and_then(|r| r.ok())
-                    .is_some()
+                amm_provider
+                    .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+                        blockhash: StateAt::Latest,
+                        prefix: rel_prefix,
+                    })
+                    .map(|res| !res.keys.is_empty())
+                    .unwrap_or(false)
             };
 
             if is_derived_quote_token {
@@ -161,7 +231,11 @@ pub async fn alkane_page(
                 false
             } else {
                 derived_quotes.iter().any(|quote| {
-                    has_prefix(table.token_derived_mcusd_candle_ns_prefix(&alk, quote, Timeframe::D1))
+                    has_prefix(table.token_derived_mcusd_candle_ns_prefix(
+                        &alk,
+                        quote,
+                        Timeframe::D1,
+                    ))
                 })
             }
         };
@@ -261,15 +335,25 @@ pub async fn alkane_page(
 
     let (activity_total, activity_entries, activity_label) = match tab {
         AlkaneTab::TransferVolume => {
-            let (total, entries) =
-                get_transfer_volume_for_alkane(&state.essentials_provider(), alk, page, limit)
-                    .unwrap_or((0, Vec::new()));
+            let (total, entries) = get_transfer_volume_for_alkane(
+                StateAt::Latest,
+                &state.essentials_provider(),
+                alk,
+                page,
+                limit,
+            )
+            .unwrap_or((0, Vec::new()));
             (total, entries, "Transfer volume")
         }
         AlkaneTab::TotalReceived => {
-            let (total, entries) =
-                get_total_received_for_alkane(&state.essentials_provider(), alk, page, limit)
-                    .unwrap_or((0, Vec::new()));
+            let (total, entries) = get_total_received_for_alkane(
+                StateAt::Latest,
+                &state.essentials_provider(),
+                alk,
+                page,
+                limit,
+            )
+            .unwrap_or((0, Vec::new()));
             (total, entries, "Total received")
         }
         _ => (0, Vec::new(), "Transfer volume"),
@@ -328,8 +412,10 @@ pub async fn alkane_page(
         render_alkane_balance_cards(&balance_entries, &state.essentials_mdb)
     };
 
-    layout(
+    layout_with_meta(
         &page_title,
+        &format!("/alkane/{alk_str}"),
+        None,
         html! {
             div class="alkane-page" {
                 div class="alkane-hero-card" {
@@ -423,6 +509,81 @@ pub async fn alkane_page(
                 section class="alkane-section" {
                     h2 class="section-title" { "Alkane Balances" }
                     (balances_markup)
+                    @if let Some(default_alkane) = default_balance_chart_alkane.as_ref() {
+                        div
+                            class="card address-balance-chart-card"
+                            data-alkane-balance-chart=""
+                            data-alkane=(alk_str.clone())
+                            data-default-alkane=(default_alkane)
+                            data-default-range="all"
+                        {
+                            div class="address-balance-chart-head" {
+                                h2 class="h2" { "Balance History" }
+                                div class="address-balance-chart-controls" {
+                                    div class="dropdown address-balance-dropdown" data-dropdown="" data-open="" data-alkane-balance-chart-token="" {
+                                        button
+                                            class="dropdown-trigger"
+                                            type="button"
+                                            aria-label="Alkane"
+                                            aria-haspopup="true"
+                                            aria-expanded="false"
+                                            data-dropdown-toggle=""
+                                        {
+                                            span class="dropdown-icon dropdown-trigger-icon" data-alkane-balance-chart-token-trigger-icon="" {
+                                                (alkane_chart_token_icon(
+                                                    &balance_chart_tokens[0].icon_url,
+                                                    &balance_chart_tokens[0].fallback_letter
+                                                ))
+                                            }
+                                            span class="dropdown-label" data-alkane-balance-chart-token-trigger-label="" {
+                                                (balance_chart_tokens[0].label.clone())
+                                            }
+                                            span class="dropdown-caret" { (icon_dropdown_caret()) }
+                                        }
+                                        div class="dropdown-panel address-balance-dropdown-panel" role="menu" aria-hidden="true" {
+                                            @for token in balance_chart_tokens.iter() {
+                                                @let item_class = if token.alkane_id == balance_chart_tokens[0].alkane_id {
+                                                    "dropdown-item selected"
+                                                } else {
+                                                    "dropdown-item"
+                                                };
+                                                a
+                                                    class=(item_class)
+                                                    href="#"
+                                                    role="menuitem"
+                                                    data-alkane-balance-chart-token-option=""
+                                                    data-alkane-id=(token.alkane_id.clone())
+                                                    data-name=(token.asset_name.clone())
+                                                    data-symbol=(token.symbol.clone())
+                                                    data-label=(token.label.clone())
+                                                {
+                                                    span class="dropdown-icon" {
+                                                        (alkane_chart_token_icon(
+                                                            &token.icon_url,
+                                                            &token.fallback_letter
+                                                        ))
+                                                    }
+                                                    span class="dropdown-label" { (token.label.clone()) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            div class="address-balance-chart-plot" data-alkane-balance-chart-root {
+                                div class="address-balance-chart-loading" data-alkane-balance-chart-loading="" data-spinning="1" {
+                                    span class="spinner address-balance-chart-spinner" data-alkane-balance-chart-loading-spinner="" aria-hidden="true" {}
+                                    span data-address-chart-loading-text="" { "Loading chart..." }
+                                }
+                            }
+                            div class="address-balance-chart-tabs" {
+                                button type="button" class="address-balance-chart-tab" data-range="1d" { "1D" }
+                                button type="button" class="address-balance-chart-tab" data-range="1w" { "1W" }
+                                button type="button" class="address-balance-chart-tab" data-range="1m" { "1M" }
+                                button type="button" class="address-balance-chart-tab active" data-range="all" { (all_range_label) }
+                            }
+                        }
+                    }
                 }
 
                 section class="alkane-section" {
@@ -590,11 +751,15 @@ pub async fn alkane_page(
                 }
             }
             (header_scripts())
+            @if default_balance_chart_alkane.is_some() {
+                (alkane_balance_chart_scripts())
+            }
             @if tab == AlkaneTab::Inspect {
                 (inspect_scripts())
             }
         },
     )
+    .into_response()
 }
 
 fn short_hex(s: &str) -> String {
@@ -654,8 +819,9 @@ fn url_escape_component(raw: &str) -> String {
 
 fn pizza_tv_iframe_src(series_id: &str) -> String {
     let symbol = url_escape_component(series_id);
+    let base = crate::config::get_explorer_pizza_tv_endpoint().trim_end_matches('/');
     format!(
-        "https://tv.pizza.fun/?symbol={symbol}&timeframe=1d&type=mcap&pool=all&quote=usd&metaprotocol=alkanes&theme=espo"
+        "{base}/?symbol={symbol}&timeframe=1d&type=mcap&pool=all&quote=usd&metaprotocol=alkanes&theme=espo"
     )
 }
 
@@ -683,7 +849,11 @@ fn fmt_activity_amount(raw: u128) -> String {
     let whole = units / unit;
     let rem = units % unit;
     let dec = (rem * 10) / unit;
-    if dec == 0 { format!("{whole}{suffix}") } else { format!("{whole}.{dec}{suffix}") }
+    if dec == 0 {
+        format!("{whole}{suffix}")
+    } else {
+        format!("{whole}.{dec}{suffix}")
+    }
 }
 
 fn split_methods(
@@ -749,7 +919,10 @@ fn proxy_target_from_db(
 ) -> Option<SchemaAlkaneId> {
     let lookup = |key| {
         provider
-            .get_raw_value(GetRawValueParams { key: kv_row_key(alk, key) })
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: kv_row_key(alk, key),
+            })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| {
@@ -783,8 +956,448 @@ fn resolve_proxy_target_recursive(
     None
 }
 
+fn alkane_balance_chart_scripts() -> Markup {
+    let script = r#"
+<script>
+(() => {
+  const apiPath = '../api/alkane/balance-chart';
+  const card = document.querySelector('[data-alkane-balance-chart]');
+  if (!card) return;
+
+  const alkane = card.dataset.alkane || '';
+  if (!alkane) return;
+
+  let activeAlkane = card.dataset.defaultAlkane || '';
+  if (!activeAlkane) return;
+
+  const root = card.querySelector('[data-alkane-balance-chart-root]');
+  const loadingEl = card.querySelector('[data-alkane-balance-chart-loading]');
+  const loadingTextEl = card.querySelector(
+    '[data-address-chart-loading-text], [data-alkane-balance-chart-loading-text]'
+  );
+  const loadingSpinnerEl = card.querySelector('[data-alkane-balance-chart-loading-spinner]');
+  const dropdownEl = card.querySelector('[data-alkane-balance-chart-token]');
+  const optionNodes = Array.from(card.querySelectorAll('[data-alkane-balance-chart-token-option]'));
+  const triggerLabelEl = card.querySelector('[data-alkane-balance-chart-token-trigger-label]');
+  const triggerIconEl = card.querySelector('[data-alkane-balance-chart-token-trigger-icon]');
+  const tabs = Array.from(card.querySelectorAll('[data-range]'));
+  const defaultRange = (card.dataset.defaultRange || 'all').toLowerCase();
+
+  let activeRange = defaultRange;
+  let activeName = '';
+  let activeIconHtml = '';
+  let chart = null;
+  let canvas = null;
+  let tooltipEl = null;
+  let loading = false;
+  let pillSmallTheme = (() => {
+    const probe = document.createElement('span');
+    probe.className = 'pill small';
+    probe.style.position = 'absolute';
+    probe.style.visibility = 'hidden';
+    probe.style.pointerEvents = 'none';
+    document.body.appendChild(probe);
+    const styles = getComputedStyle(probe);
+    const theme = {
+      text: styles.color || '#aac8ff',
+      bg: styles.backgroundColor || 'rgba(158, 161, 228, 0.15)'
+    };
+    probe.remove();
+    return theme;
+  })();
+
+  const optionById = (alkaneId) => {
+    if (!alkaneId) return null;
+    return (
+      optionNodes.find(
+        (node) => ((node.dataset && node.dataset.alkaneId) || '').trim() === alkaneId
+      ) || null
+    );
+  };
+
+  const currentOption = () => optionById(activeAlkane) || optionNodes[0] || null;
+
+  const syncSelectedMeta = () => {
+    const option = currentOption();
+    if (!option) {
+      return;
+    }
+    const nextAlkane = ((option.dataset && option.dataset.alkaneId) || '').trim();
+    if (nextAlkane) activeAlkane = nextAlkane;
+    activeName = option.dataset ? (option.dataset.name || '').trim() : '';
+    if (!activeName) {
+      activeName = option.dataset ? (option.dataset.label || '').trim() : '';
+    }
+    if (!activeName) {
+      activeName = activeAlkane;
+    }
+    const icon = option.querySelector('.dropdown-icon');
+    activeIconHtml = icon ? icon.innerHTML : '';
+    if (triggerLabelEl) {
+      const label = (option.dataset && option.dataset.label) || option.textContent || activeAlkane;
+      triggerLabelEl.textContent = (label || activeAlkane).trim();
+    }
+    if (triggerIconEl) {
+      triggerIconEl.innerHTML = activeIconHtml;
+    }
+    optionNodes.forEach((node) => node.classList.toggle('selected', node === option));
+  };
+
+  const formatAmount = (value, maxDigits = 8) => {
+    if (!Number.isFinite(value)) return '0';
+    return new Intl.NumberFormat('en-US', {
+      maximumFractionDigits: maxDigits
+    }).format(value);
+  };
+
+  const formatBlock = (height) => {
+    if (!Number.isFinite(height)) return 'Block';
+    return `Block ${new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(height)}`;
+  };
+
+  const formatTooltipValue = (value) => {
+    const amount = formatAmount(value, 8);
+    const tokenName = activeName || activeAlkane;
+    return tokenName ? `${amount} ${tokenName}` : amount;
+  };
+
+  const setActiveTab = (range) => {
+    tabs.forEach((tab) => {
+      tab.classList.toggle('active', tab.dataset.range === range);
+    });
+  };
+
+  const ensureScript = (src) => new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.loaded === '1') {
+        resolve();
+      } else {
+        existing.addEventListener('load', () => resolve(), { once: true });
+        existing.addEventListener('error', () => reject(new Error('load_failed')), { once: true });
+      }
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.dataset.chartLib = '1';
+    script.addEventListener(
+      'load',
+      () => {
+        script.dataset.loaded = '1';
+        resolve();
+      },
+      { once: true }
+    );
+    script.addEventListener('error', () => reject(new Error('load_failed')), { once: true });
+    document.head.appendChild(script);
+  });
+
+  const loadChartJs = async () => {
+    if (window.Chart) return;
+    await ensureScript('https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js');
+  };
+
+  const ensureTooltip = () => {
+    if (!root) return null;
+    if (tooltipEl && tooltipEl.isConnected) return tooltipEl;
+    tooltipEl = document.createElement('div');
+    tooltipEl.className = 'address-balance-chart-tooltip';
+    tooltipEl.innerHTML = `
+      <div class="address-balance-chart-tooltip-title" data-address-chart-tooltip-title=""></div>
+      <div class="address-balance-chart-tooltip-row">
+        <span class="address-balance-chart-tooltip-icon" data-address-chart-tooltip-icon="" aria-hidden="true"></span>
+        <span class="address-balance-chart-tooltip-value" data-address-chart-tooltip-value=""></span>
+      </div>
+    `;
+    root.appendChild(tooltipEl);
+    return tooltipEl;
+  };
+
+  const hideTooltip = () => {
+    if (!tooltipEl) return;
+    tooltipEl.dataset.visible = '0';
+    tooltipEl.style.opacity = '0';
+  };
+
+  const renderTooltip = (context) => {
+    const tooltip = context && context.tooltip ? context.tooltip : null;
+    const el = ensureTooltip();
+    if (!tooltip || !el) return;
+
+    if (tooltip.opacity === 0 || !tooltip.dataPoints || tooltip.dataPoints.length === 0) {
+      hideTooltip();
+      return;
+    }
+
+    const dataPoint = tooltip.dataPoints[0];
+    const rawHeight = Number(dataPoint ? dataPoint.label : NaN);
+    const rawValue =
+      dataPoint && dataPoint.parsed && typeof dataPoint.parsed.y === 'number'
+        ? dataPoint.parsed.y
+        : dataPoint
+          ? dataPoint.parsed
+          : NaN;
+
+    const titleEl = el.querySelector('[data-address-chart-tooltip-title]');
+    if (titleEl) {
+      titleEl.textContent = formatBlock(rawHeight);
+    }
+
+    const valueEl = el.querySelector('[data-address-chart-tooltip-value]');
+    if (valueEl) {
+      valueEl.textContent = formatTooltipValue(Number(rawValue));
+    }
+
+    const iconEl = el.querySelector('[data-address-chart-tooltip-icon]');
+    if (iconEl) {
+      iconEl.innerHTML = activeIconHtml;
+    }
+
+    const padding = 8;
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    const maxLeft = Math.max(padding, root.clientWidth - width - padding);
+    const maxTop = Math.max(padding, root.clientHeight - height - padding);
+    const left = Math.min(Math.max(tooltip.caretX + 12, padding), maxLeft);
+    const top = Math.min(Math.max(tooltip.caretY + 12, padding), maxTop);
+
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+    el.dataset.visible = '1';
+    el.style.opacity = '1';
+  };
+
+  const ensureCanvas = () => {
+    if (!root) return null;
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      canvas.setAttribute('aria-label', 'Alkane balance history');
+      canvas.setAttribute('role', 'img');
+      if (loadingEl && loadingEl.parentNode === root) {
+        root.insertBefore(canvas, loadingEl);
+      } else {
+        root.appendChild(canvas);
+      }
+    }
+    return canvas.getContext('2d');
+  };
+
+  const clearChart = () => {
+    if (chart) {
+      chart.destroy();
+      chart = null;
+    }
+    hideTooltip();
+    if (canvas) {
+      canvas.remove();
+      canvas = null;
+    }
+  };
+
+  const setLoadingState = (message, spinning) => {
+    if (!loadingEl) return;
+    hideTooltip();
+    if (loadingTextEl) {
+      loadingTextEl.textContent = message;
+    } else {
+      loadingEl.textContent = message;
+    }
+    loadingEl.dataset.spinning = spinning ? '1' : '0';
+    if (loadingSpinnerEl) {
+      loadingSpinnerEl.style.display = spinning ? '' : 'none';
+    }
+    loadingEl.style.display = '';
+  };
+
+  const hideLoading = () => {
+    if (loadingEl) loadingEl.style.display = 'none';
+  };
+
+  const renderChart = (points) => {
+    if (!window.Chart) return;
+    const ctx = ensureCanvas();
+    if (!ctx) return;
+
+    const lineColor = pillSmallTheme.text;
+    const areaColor = pillSmallTheme.bg;
+    const labels = points.map((p) => p.height);
+    const values = points.map((p) => p.value);
+    const minValue = Math.min(...values);
+    const maxValue = Math.max(...values);
+    const span = Math.max(maxValue - minValue, Math.abs(maxValue) || 1);
+    const pad = span * 0.12;
+    const yMin = minValue - pad;
+    const yMax = maxValue + pad;
+
+    if (chart) {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = values;
+      chart.data.datasets[0].borderColor = lineColor;
+      chart.data.datasets[0].backgroundColor = areaColor;
+      chart.data.datasets[0].fill = 'start';
+      chart.options.scales.y.min = yMin;
+      chart.options.scales.y.max = yMax;
+      chart.update('none');
+      return;
+    }
+
+    chart = new window.Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            data: values,
+            borderColor: lineColor,
+            borderWidth: 3,
+            pointRadius: 0,
+            tension: 0.35,
+            cubicInterpolationMode: 'monotone',
+            fill: 'start',
+            backgroundColor: areaColor
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            enabled: false,
+            external: renderTooltip
+          }
+        },
+        interaction: {
+          mode: 'index',
+          intersect: false
+        },
+        hover: {
+          mode: 'index',
+          intersect: false
+        },
+        scales: {
+          x: { display: false },
+          y: {
+            display: false,
+            min: yMin,
+            max: yMax
+          }
+        }
+      }
+    });
+  };
+
+  const fetchRange = async (range) => {
+    const params = new URLSearchParams({
+      alkane,
+      balance_alkane: activeAlkane,
+      range
+    });
+    const res = await fetch(`${apiPath}?${params.toString()}`, {
+      headers: { Accept: 'application/json' }
+    });
+    const data = await res.json();
+    if (!data || !data.ok) return null;
+    return data;
+  };
+
+  const updateCard = (data, canRender) => {
+    const points = Array.isArray(data && data.points) ? data.points.slice() : [];
+    syncSelectedMeta();
+    if (points.length === 0) {
+      clearChart();
+      card.removeAttribute('data-tone');
+      setLoadingState('No chart data for this selection', false);
+      return;
+    }
+
+    points.sort((a, b) => a.height - b.height);
+    const first = Number(points[0].value);
+    const last = Number(points[points.length - 1].value);
+    const change = points.length > 1 && first !== 0 ? ((last - first) / Math.abs(first)) * 100 : 0;
+    const isUp = change >= 0;
+    card.dataset.tone = isUp ? 'up' : 'down';
+    hideLoading();
+
+    if (canRender) {
+      renderChart(points);
+    } else {
+      clearChart();
+      setLoadingState('Chart unavailable', false);
+    }
+  };
+
+  const load = async (range) => {
+    if (loading) return;
+    loading = true;
+    setLoadingState('Loading chart...', true);
+    try {
+      const data = await fetchRange(range);
+      if (!data) {
+        clearChart();
+        setLoadingState('Chart unavailable', false);
+        return;
+      }
+
+      let canRender = true;
+      try {
+        await loadChartJs();
+      } catch (_) {
+        canRender = false;
+      }
+      updateCard(data, canRender);
+    } catch (_) {
+      clearChart();
+      setLoadingState('Chart unavailable', false);
+    } finally {
+      loading = false;
+    }
+  };
+
+  optionNodes.forEach((option) => {
+    option.addEventListener('click', (event) => {
+      event.preventDefault();
+      const selected = ((option.dataset && option.dataset.alkaneId) || '').trim();
+      if (!selected || selected === activeAlkane) return;
+      activeAlkane = selected;
+      syncSelectedMeta();
+      if (dropdownEl) {
+        dropdownEl.dataset.open = '';
+        const toggle = dropdownEl.querySelector('[data-dropdown-toggle]');
+        const panel = dropdownEl.querySelector('.dropdown-panel');
+        if (toggle) toggle.setAttribute('aria-expanded', 'false');
+        if (panel) panel.setAttribute('aria-hidden', 'true');
+      }
+      load(activeRange);
+    });
+  });
+
+  tabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const range = (tab.dataset.range || '').toLowerCase();
+      if (!range || range === activeRange) return;
+      activeRange = range;
+      setActiveTab(range);
+      load(range);
+    });
+  });
+
+  setActiveTab(activeRange);
+  syncSelectedMeta();
+  load(activeRange);
+})();
+</script>
+"#;
+
+    PreEscaped(script.to_string())
+}
+
 fn inspect_scripts() -> Markup {
-    let base_path_js = format!("{:?}", explorer_base_path());
+    let base_path_js = format!("{:?}", explorer_path("/"));
     let script = r#"
 <script>
 (() => {
@@ -963,7 +1576,7 @@ fn inspect_scripts() -> Markup {
 
 #[allow(dead_code)]
 fn chart_scripts() -> Markup {
-    let base_path_js = format!("{:?}", explorer_base_path());
+    let base_path_js = format!("{:?}", explorer_path("/"));
     let script = r#"
 <script>
 (() => {

@@ -471,9 +471,54 @@ pub fn decode_seen_key(raw: &[u8]) -> Option<(u64, Txid)> {
     Some((ts, txid))
 }
 
+pub fn get_seen_txids_page(page: usize, limit: usize) -> (Vec<Txid>, bool) {
+    if limit == 0 {
+        return (Vec::new(), false);
+    }
+    let mdb = get_mempool_mdb();
+    let prefix = b"seen/";
+    let pref = mdb.prefixed(prefix);
+    let offset = limit.saturating_mul(page.saturating_sub(1));
+
+    let mut idx: usize = 0;
+    let mut txids: Vec<Txid> = Vec::new();
+    let mut has_more = false;
+    let mut rel_keys: Vec<Vec<u8>> = Vec::new();
+    for res in mdb.iter_from(prefix) {
+        let Ok((k_full, _)) = res else { continue };
+        if !k_full.starts_with(&pref) {
+            break;
+        }
+        rel_keys.push(k_full[mdb.prefix().len()..].to_vec());
+    }
+    rel_keys.reverse();
+
+    for rel in rel_keys {
+        if idx < offset {
+            idx += 1;
+            continue;
+        }
+        if txids.len() >= limit {
+            has_more = true;
+            break;
+        }
+        if let Some((_, txid)) = decode_seen_key(&rel) {
+            txids.push(txid);
+        }
+        idx += 1;
+    }
+
+    (txids, has_more)
+}
+
 pub fn reset_mempool_store() -> Result<()> {
     let mdb = get_mempool_mdb();
-    let keys = mdb.scan_prefix(b"").unwrap_or_default();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for res in mdb.iter_from(b"") {
+        let (k_full, _v) = res?;
+        let rel = &k_full[mdb.prefix().len()..];
+        keys.push(rel.to_vec());
+    }
     let total = keys.len();
     mdb.bulk_write(|wb| {
         for k in keys {
@@ -572,9 +617,14 @@ fn write_mempool_to_db(
     }
 
     // Existing txids (and records) for cleanup
-    let existing_keys = mdb.scan_prefix(b"tx/").unwrap_or_default();
+    let tx_prefix = b"tx/";
     let mut existing_map: HashMap<Txid, PersistedMempoolTx> = HashMap::new();
-    for rel in existing_keys {
+    for res in mdb.iter_from(tx_prefix) {
+        let (k_full, _v) = res?;
+        let rel = &k_full[mdb.prefix().len()..];
+        if !rel.starts_with(tx_prefix) {
+            break;
+        }
         if let Some(txid_str) = std::str::from_utf8(&rel[3..]).ok() {
             if let Ok(txid) = Txid::from_str(txid_str) {
                 if let Ok(Some(raw)) = mdb.get(&rel) {
@@ -883,12 +933,17 @@ pub fn pending_for_address(addr: &str) -> Vec<MempoolEntry> {
     prefix.extend_from_slice(addr.as_bytes());
     prefix.push(b'/');
 
-    for res in mdb.iter_prefix_rev(&mdb.prefixed(&prefix)) {
+    let mut rel_keys: Vec<Vec<u8>> = Vec::new();
+    for res in mdb.iter_from(&prefix) {
         let Ok((k_full, _)) = res else { continue };
         let rel = &k_full[mdb.prefix().len()..];
         if !rel.starts_with(&prefix) {
             break;
         }
+        rel_keys.push(rel.to_vec());
+    }
+
+    for rel in rel_keys.into_iter().rev() {
         // rel format: addr/<addr>/<first_seen_be>/<txid>
         let parts: Vec<&[u8]> = rel.split(|b| *b == b'/').collect();
         if parts.len() < 4 {
@@ -927,13 +982,15 @@ pub fn purge_confirmed_txids(txids: &[Txid]) -> Result<usize> {
 pub fn purge_confirmed_from_chain() -> Result<usize> {
     let rpc = get_bitcoind_rpc_client();
     let mdb = get_mempool_mdb();
-    let keys = mdb.scan_prefix(b"tx/").unwrap_or_default();
-    if keys.is_empty() {
-        return Ok(0);
-    }
+    let tx_prefix = b"tx/";
 
     let mut confirmed: Vec<Txid> = Vec::new();
-    for rel in keys {
+    for res in mdb.iter_from(tx_prefix) {
+        let (k_full, _v) = res?;
+        let rel = &k_full[mdb.prefix().len()..];
+        if !rel.starts_with(tx_prefix) {
+            break;
+        }
         if rel.len() <= 3 {
             continue;
         }

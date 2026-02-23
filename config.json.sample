@@ -9,7 +9,6 @@
   "bitcoind_blocks_dir": "~/.bitcoin/blocks",
   "reset_mempool_on_startup": false,
   "db_path": "./db",
-  "enable_aof": false,
   "sdb_poll_ms": 5000,
   "indexer_block_delay_ms": 0,
   "port": 8080,
@@ -25,7 +24,6 @@
   "debug": false,
   "safe_tip_hook_script": null,
   "block_source_mode": "rpc",
-  "simulate_reorg": false,
   "debug_backup": null,
   "explorer_networks": {
     "mainnet": "https://explorer.example.com",

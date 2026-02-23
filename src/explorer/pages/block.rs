@@ -3,38 +3,42 @@ use std::str::FromStr;
 
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use axum::extract::{Path, Query, State};
-use axum::response::Html;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, Transaction, Txid};
 use bitcoincore_rpc::RpcApi;
-use borsh::BorshDeserialize;
 use maud::html;
 use serde::Deserialize;
 
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoTrace,
-    GetEspoBlockOpts, get_espo_block_with_opts, traces_for_block_as_prost,
+    get_espo_block_with_opts, traces_for_block_as_prost, EspoSandshrewLikeTrace,
+    EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoTrace, GetEspoBlockOpts,
 };
 use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_network,
 };
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::header::{
-    HeaderPillTone, HeaderProps, HeaderSummaryItem, header, header_scripts,
+    header, header_scripts, HeaderPillTone, HeaderProps, HeaderSummaryItem,
 };
-use crate::explorer::components::layout::layout;
+use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
     icon_arrow_up_right, icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
-use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
+use crate::explorer::components::tx_view::{render_tx, TxPill, TxPillTone};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable};
-use crate::modules::essentials::utils::balances::{
-    OutpointLookup, get_outpoint_balances_with_spent_batch,
+use crate::modules::essentials::storage::{
+    address_index_list_id_alkane_block_txs, get_address_index_list_len, get_address_index_list_range,
+    load_tx_pointer_blob_v3_by_id, load_tx_summary_v2, AddressIndexListKind, AlkaneTxSummary,
 };
+use crate::modules::essentials::utils::balances::{
+    get_outpoint_balances_with_spent_batch, OutpointLookup,
+};
+use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
 
 fn format_with_commas(n: u64) -> String {
@@ -178,7 +182,7 @@ pub async fn block_page(
     State(state): State<ExplorerState>,
     Path(height): Path<u64>,
     Query(q): Query<BlockPageQuery>,
-) -> Html<String> {
+) -> Response {
     let rpc = get_bitcoind_rpc_client();
     let electrum_like = get_electrum_like();
     let network = get_network();
@@ -186,7 +190,7 @@ pub async fn block_page(
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let nav_tip = espo_tip.min(tip);
     let espo_indexed = height <= espo_tip;
-    let table = EssentialsTable::new(&state.essentials_mdb);
+    let essentials_provider = state.essentials_provider();
     let traces_only = q
         .traces
         .as_deref()
@@ -197,14 +201,21 @@ pub async fn block_page(
         .as_deref()
         .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
         .unwrap_or(false);
+    let canonical_path = format!("/block/{height}");
 
     let block_hash = match rpc.get_block_hash(height) {
         Ok(h) => h,
         Err(e) => {
-            return layout(
-                "Block",
-                html! { p class="error" { (format!("Failed to fetch block: {e:?}")) } },
-            );
+            return (
+                StatusCode::NOT_FOUND,
+                layout_with_meta(
+                    "Block",
+                    &canonical_path,
+                    None,
+                    html! { p class="error" { (format!("Failed to fetch block: {e:?}")) } },
+                ),
+            )
+                .into_response();
         }
     };
     let hdr = rpc.get_block_header_info(&block_hash).ok();
@@ -219,10 +230,16 @@ pub async fn block_page(
         match get_espo_block_with_opts(height, nav_tip, Some(GetEspoBlockOpts { page, limit })) {
             Ok(b) => Some(b),
             Err(e) => {
-                return layout(
-                    "Block",
-                    html! { p class="error" { (format!("Failed to fetch block: {e:?}")) } },
-                );
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    layout_with_meta(
+                        "Block",
+                        &canonical_path,
+                        None,
+                        html! { p class="error" { (format!("Failed to fetch block: {e:?}")) } },
+                    ),
+                )
+                    .into_response();
             }
         }
     } else {
@@ -243,53 +260,39 @@ pub async fn block_page(
 
     if espo_indexed {
         if traces_only {
-            let total = state
-                .essentials_mdb
-                .get(&table.alkane_block_len_key(height))
-                .ok()
-                .flatten()
-                .and_then(|b| {
-                    if b.len() == 8 {
-                        let mut arr = [0u8; 8];
-                        arr.copy_from_slice(&b);
-                        Some(u64::from_le_bytes(arr) as usize)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0);
+            let list_id = address_index_list_id_alkane_block_txs(height);
+            let total = get_address_index_list_len(
+                &essentials_provider,
+                StateAt::Latest,
+                AddressIndexListKind::AlkaneBlockTxs,
+                &list_id,
+            )
+            .unwrap_or(0) as usize;
             if hide_diesel_mints {
                 let mut all_txids: Vec<Txid> = Vec::new();
                 if total > 0 {
-                    let mut txid_keys: Vec<Vec<u8>> = Vec::with_capacity(total);
-                    for idx in 0..total {
-                        txid_keys.push(table.alkane_block_txid_key(height, idx as u64));
-                    }
-                    let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
-                    for v in txid_vals {
-                        let Some(bytes) = v else { continue };
-                        if bytes.len() != 32 {
+                    let ids = get_address_index_list_range(
+                        &essentials_provider,
+                        StateAt::Latest,
+                        AddressIndexListKind::AlkaneBlockTxs,
+                        &list_id,
+                        0,
+                        total as u64,
+                    )
+                    .unwrap_or_default();
+                    for id in ids {
+                        let Some(blob) = load_tx_pointer_blob_v3_by_id(&essentials_provider, id)
+                        else {
                             continue;
-                        }
-                        if let Ok(txid) = Txid::from_slice(&bytes) {
-                            all_txids.push(txid);
-                        }
+                        };
+                        all_txids.push(Txid::from_byte_array(blob.txid));
                     }
                 }
 
-                let summary_keys: Vec<Vec<u8>> = all_txids
-                    .iter()
-                    .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
-                    .collect();
-                let summary_vals =
-                    state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
                 let mut summary_map: HashMap<Txid, Option<AlkaneTxSummary>> = HashMap::new();
                 let mut filtered_txids: Vec<Txid> = Vec::new();
-                for (idx, txid) in all_txids.iter().enumerate() {
-                    let summary = summary_vals
-                        .get(idx)
-                        .and_then(|v| v.as_ref())
-                        .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
+                for txid in &all_txids {
+                    let summary = load_tx_summary_v2(&essentials_provider, txid);
                     let traces = summary
                         .as_ref()
                         .map(|s| traces_from_summary(txid, s))
@@ -347,28 +350,23 @@ pub async fn block_page(
                 }
 
                 if end > off {
-                    let mut txid_keys: Vec<Vec<u8>> = Vec::new();
-                    for idx in off..end {
-                        txid_keys.push(table.alkane_block_txid_key(height, idx as u64));
-                    }
-                    let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
                     let mut txids: Vec<Txid> = Vec::new();
-                    for v in txid_vals {
-                        let Some(bytes) = v else { continue };
-                        if bytes.len() != 32 {
+                    let ids = get_address_index_list_range(
+                        &essentials_provider,
+                        StateAt::Latest,
+                        AddressIndexListKind::AlkaneBlockTxs,
+                        &list_id,
+                        off as u64,
+                        end as u64,
+                    )
+                    .unwrap_or_default();
+                    for id in ids {
+                        let Some(blob) = load_tx_pointer_blob_v3_by_id(&essentials_provider, id)
+                        else {
                             continue;
-                        }
-                        if let Ok(txid) = Txid::from_slice(&bytes) {
-                            txids.push(txid);
-                        }
+                        };
+                        txids.push(Txid::from_byte_array(blob.txid));
                     }
-
-                    let summary_keys: Vec<Vec<u8>> = txids
-                        .iter()
-                        .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
-                        .collect();
-                    let summary_vals =
-                        state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
 
                     let raw_txs =
                         electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
@@ -380,10 +378,7 @@ pub async fn block_page(
                         let Ok(tx) = deserialize::<Transaction>(&raw) else {
                             continue;
                         };
-                        let summary = summary_vals
-                            .get(idx)
-                            .and_then(|v| v.as_ref())
-                            .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
+                        let summary = load_tx_summary_v2(&essentials_provider, txid);
                         let traces = summary
                             .as_ref()
                             .map(|s| traces_from_summary(txid, s))
@@ -434,9 +429,12 @@ pub async fn block_page(
     }
     all_outpoints.sort();
     all_outpoints.dedup();
-    let outpoint_map =
-        get_outpoint_balances_with_spent_batch(&state.essentials_provider(), &all_outpoints)
-            .unwrap_or_default();
+    let outpoint_map = get_outpoint_balances_with_spent_batch(
+        StateAt::Latest,
+        &state.essentials_provider(),
+        &all_outpoints,
+    )
+    .unwrap_or_default();
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
         outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
     };
@@ -551,8 +549,10 @@ pub async fn block_page(
         hero_class: None,
     });
 
-    layout(
+    layout_with_meta(
         &format!("Block {height}"),
+        &canonical_path,
+        None,
         html! {
             div class="block-hero full-bleed" {
                 (block_carousel(Some(height), espo_tip))
@@ -670,4 +670,5 @@ pub async fn block_page(
             (header_scripts())
         },
     )
+    .into_response()
 }

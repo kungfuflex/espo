@@ -1,18 +1,22 @@
-use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use maud::{html, Markup, PreEscaped, DOCTYPE};
 
 use crate::config::{get_explorer_networks, get_network};
-use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
+use crate::explorer::components::dropdown::{dropdown, DropdownItem, DropdownProps};
 use crate::explorer::components::footer::footer;
 use crate::explorer::components::svg_assets::{
-    dots, icon_btc, icon_search, icon_signet, icon_testnet, logo_espo,
+    dots, icon_btc, icon_language, icon_search, icon_signet, icon_testnet, logo_espo,
 };
-use crate::explorer::paths::{explorer_base_path, explorer_path};
+use crate::explorer::i18n::translate_html;
+use crate::explorer::paths::{current_language, explorer_base_path, explorer_path};
 
 const STYLE_CSS: &str = include_str!("../assets/style.css");
+const FAVICON_SVG: &str = include_str!("../assets/favicon.svg");
 const SEARCH_DEBOUNCE_MS: u64 = 300;
+const DEFAULT_DESCRIPTION: &str =
+    "Explore blocks, transactions, addresses, and Alkanes on Espo Explorer.";
 const NAV_SCRIPT: &str = r#"
 <script>
 (() => {
@@ -91,16 +95,58 @@ pub async fn style() -> impl IntoResponse {
     (StatusCode::OK, [(CONTENT_TYPE, "text/css; charset=utf-8")], STYLE_CSS)
 }
 
-pub fn layout(title: &str, content: Markup) -> Html<String> {
-    let base_path_js = format!("{:?}", explorer_base_path());
+pub async fn favicon() -> impl IntoResponse {
+    (StatusCode::OK, [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")], FAVICON_SVG)
+}
+
+pub fn layout(_title: &str, content: Markup) -> Html<String> {
+    layout_with_meta("Espo Explorer", "/", None, content)
+}
+
+pub fn layout_with_meta(
+    _title: &str,
+    canonical_path: &str,
+    description: Option<&str>,
+    content: Markup,
+) -> Html<String> {
+    let language = current_language();
+    let base_path_js = format!("{:?}", explorer_path("/"));
+    let root_base_path_js = format!("{:?}", explorer_base_path());
     let network_dropdown = network_dropdown();
+    let lang_toggle_label =
+        if language.is_chinese() { "Switch to English" } else { "切换到中文" };
+    let page_description = description.unwrap_or(DEFAULT_DESCRIPTION);
+    let canonical_path = normalize_canonical_path(canonical_path);
+    let english_path = english_logical_path(&canonical_path);
+    let chinese_path = chinese_logical_path(&english_path);
+    let english_href = with_base_path(&english_path);
+    let chinese_href = with_base_path(&chinese_path);
+    let canonical_href = if language.is_chinese() {
+        chinese_href.clone()
+    } else {
+        english_href.clone()
+    };
     let markup = html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang=(if language.is_chinese() { "zh-Hans" } else { "en" }) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) }
+                title { "Espo Explorer" }
+                meta name="description" content=(page_description);
+                link rel="canonical" href=(canonical_href.clone());
+                link rel="alternate" hreflang="en" href=(english_href.clone());
+                link rel="alternate" hreflang="zh" href=(chinese_href.clone());
+                link rel="alternate" hreflang="x-default" href=(english_href.clone());
+                meta property="og:type" content="website";
+                meta property="og:site_name" content="Espo Explorer";
+                meta property="og:title" content="Espo Explorer";
+                meta property="og:description" content=(page_description);
+                meta property="og:url" content=(canonical_href);
+                meta name="twitter:card" content="summary";
+                meta name="twitter:title" content="Espo Explorer";
+                meta name="twitter:description" content=(page_description);
+                link rel="icon" type="image/svg+xml" href=(explorer_path("/favicon.svg"));
                 link rel="stylesheet" href=(explorer_path("/static/style.css"));
             }
             body {
@@ -114,6 +160,17 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                                 }
                                 @if let Some(dropdown) = network_dropdown {
                                     (dropdown)
+                                }
+                                a
+                                    class=(format!(
+                                        "nav-lang-btn{}",
+                                        if language.is_chinese() { " active" } else { "" }
+                                    ))
+                                    href="#"
+                                    aria-label=(lang_toggle_label)
+                                    data-lang-toggle=""
+                                {
+                                    (icon_language())
                                 }
                             }
                             div class="nav-search hero-search" data-search="" {
@@ -169,14 +226,64 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                 (footer())
                 (search_scripts(&base_path_js))
                 (dropdown_scripts())
+                (language_toggle_script(&root_base_path_js))
                 (PreEscaped(NAV_SCRIPT))
             }
         }
     };
-    Html(markup.into_string())
+    let rendered = translate_html(language, markup.into_string());
+    Html(rendered)
+}
+
+fn normalize_canonical_path(path: &str) -> String {
+    let no_hash = path.split('#').next().unwrap_or(path);
+    let no_query = no_hash.split('?').next().unwrap_or(no_hash);
+    let trimmed = no_query.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return "/".to_string();
+    }
+    let mut normalized = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    if normalized.len() > 1 {
+        normalized = normalized.trim_end_matches('/').to_string();
+    }
+    normalized
+}
+
+fn english_logical_path(path: &str) -> String {
+    if path == "/zh" {
+        return "/".to_string();
+    }
+    if let Some(rest) = path.strip_prefix("/zh/") {
+        return format!("/{rest}");
+    }
+    path.to_string()
+}
+
+fn chinese_logical_path(english_path: &str) -> String {
+    if english_path == "/" {
+        "/zh".to_string()
+    } else {
+        format!("/zh{english_path}")
+    }
+}
+
+fn with_base_path(path: &str) -> String {
+    let base = explorer_base_path();
+    if base == "/" {
+        return path.to_string();
+    }
+    if path == "/" {
+        return base.to_string();
+    }
+    format!("{base}{path}")
 }
 
 fn network_dropdown() -> Option<Markup> {
+    let language = current_language();
     let networks = get_explorer_networks()?;
     if networks.is_empty() {
         return None;
@@ -213,7 +320,7 @@ fn network_dropdown() -> Option<Markup> {
         .iter()
         .map(|(key, label, url)| DropdownItem {
             label: (*label).to_string(),
-            href: url.clone(),
+            href: network_url_for_language(url, language),
             icon: Some(network_icon(key)),
             selected: *key == selected_key,
         })
@@ -227,6 +334,23 @@ fn network_dropdown() -> Option<Markup> {
     }))
 }
 
+fn network_url_for_language(
+    url: &str,
+    language: crate::explorer::i18n::ExplorerLanguage,
+) -> String {
+    let trimmed = if url.ends_with('/') && url.len() > 1 { url.trim_end_matches('/') } else { url };
+    if !language.is_chinese() {
+        return trimmed.to_string();
+    }
+    if trimmed.ends_with("/zh") {
+        return trimmed.to_string();
+    }
+    if trimmed == "/" {
+        return "/zh".to_string();
+    }
+    format!("{trimmed}/zh")
+}
+
 fn network_key(network: bitcoin::Network) -> &'static str {
     match network {
         bitcoin::Network::Bitcoin => "mainnet",
@@ -234,7 +358,11 @@ fn network_key(network: bitcoin::Network) -> &'static str {
         bitcoin::Network::Signet => "signet",
         _ => {
             let tag = network.to_string();
-            if tag == "testnet4" { "testnet4" } else { "testnet3" }
+            if tag == "testnet4" {
+                "testnet4"
+            } else {
+                "testnet3"
+            }
         }
     }
 }
@@ -466,6 +594,48 @@ fn search_scripts(base_path_js: &str) -> Markup {
       }}
     }});
   }}
+}})();
+</script>
+"#
+    );
+    PreEscaped(script)
+}
+
+fn language_toggle_script(root_base_path_js: &str) -> Markup {
+    let script = format!(
+        r#"
+<script>
+(() => {{
+  const basePath = {root_base_path_js};
+  const basePrefix = basePath === '/' ? '' : basePath;
+  const normalize = (path) => {{
+    if (!path || !path.startsWith('/')) return '/';
+    return path;
+  }};
+  const toLocalizedPath = (path) => {{
+    const normalized = normalize(path);
+    if (normalized === '/zh' || normalized.startsWith('/zh/')) {{
+      const rest = normalized.slice(3);
+      return rest ? rest : '/';
+    }}
+    if (normalized === '/') return '/zh';
+    return `/zh${{normalized}}`;
+  }};
+
+  document.querySelectorAll('[data-lang-toggle]').forEach((node) => {{
+    node.addEventListener('click', (event) => {{
+      event.preventDefault();
+      const current = window.location.pathname || '/';
+      let relative = current;
+      if (basePrefix && current.startsWith(basePrefix)) {{
+        relative = current.slice(basePrefix.length) || '/';
+      }}
+      relative = normalize(relative);
+      const nextRelative = toLocalizedPath(relative);
+      const target = `${{basePrefix}}${{nextRelative}}${{window.location.search || ''}}${{window.location.hash || ''}}`;
+      window.location.assign(target);
+    }});
+  }});
 }})();
 </script>
 "#

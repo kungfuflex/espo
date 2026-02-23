@@ -1,10 +1,9 @@
-use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetRawValueParams, encode_reserves_snapshot,
-};
+use crate::modules::ammdata::storage::{AmmDataProvider, GetRawValueParams, encode_pool_snapshot};
 use crate::modules::ammdata::utils::activity::{
     decode_u64_be, encode_u64_be, idx_count_key, idx_count_key_group,
 };
 use crate::modules::ammdata::utils::index_state::IndexState;
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 
@@ -14,6 +13,7 @@ pub struct FinalizeStats {
     pub token_mcusd_candles: usize,
     pub token_derived_usd_candles: usize,
     pub token_derived_mcusd_candles: usize,
+    pub chart_changes: usize,
     pub token_metrics: usize,
     pub token_metrics_index: usize,
     pub token_search_index: usize,
@@ -67,8 +67,12 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         let pool = SchemaAlkaneId { block: blk_id, tx: tx_id };
         let count_k_rel = idx_count_key(&pool);
 
-        let current = if let Some(v) =
-            provider.get_raw_value(GetRawValueParams { key: count_k_rel.clone() })?.value
+        let current = if let Some(v) = provider
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: count_k_rel.clone(),
+            })?
+            .value
         {
             decode_u64_be(&v).unwrap_or(0)
         } else {
@@ -82,8 +86,12 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         let pool = SchemaAlkaneId { block: blk_id, tx: tx_id };
         let count_k_rel = idx_count_key_group(&pool, group);
 
-        let current = if let Some(v) =
-            provider.get_raw_value(GetRawValueParams { key: count_k_rel.clone() })?.value
+        let current = if let Some(v) = provider
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: count_k_rel.clone(),
+            })?
+            .value
         {
             decode_u64_be(&v).unwrap_or(0)
         } else {
@@ -97,7 +105,10 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     if state.token_metrics_index_new > 0 {
         let count_key = table.token_metrics_index_count_key();
         let current = provider
-            .get_raw_value(GetRawValueParams { key: count_key.clone() })?
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: count_key.clone(),
+            })?
             .value
             .and_then(|raw| {
                 if raw.len() == 8 {
@@ -118,7 +129,10 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     if state.pool_metrics_index_new > 0 {
         let count_key = table.pool_metrics_index_count_key();
         let current = provider
-            .get_raw_value(GetRawValueParams { key: count_key.clone() })?
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: count_key.clone(),
+            })?
             .value
             .and_then(|raw| {
                 if raw.len() == 8 {
@@ -143,7 +157,10 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
             }
             let count_key = table.token_derived_metrics_index_count_key(quote);
             let current = provider
-                .get_raw_value(GetRawValueParams { key: count_key.clone() })?
+                .get_raw_value(GetRawValueParams {
+                    blockhash: StateAt::Latest,
+                    key: count_key.clone(),
+                })?
                 .value
                 .and_then(|raw| {
                     if raw.len() == 8 {
@@ -162,14 +179,14 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         }
     }
 
-    let reserves_blob = encode_reserves_snapshot(&state.reserves_snapshot)?;
-    let reserves_key_rel = table.reserves_snapshot_key();
+    let reserves_cnt = state.reserves_snapshot.len();
 
     let c_cnt = state.candle_writes.len();
     let tc_cnt = state.token_usd_candle_writes.len();
     let tmc_cnt = state.token_mcusd_candle_writes.len();
     let tdc_cnt = state.token_derived_usd_candle_writes.len();
     let tdmc_cnt = state.token_derived_mcusd_candle_writes.len();
+    let cc_cnt = state.chart_change_writes.len();
     let tm_cnt = state.token_metrics_writes.len();
     let tmi_cnt = state.token_metrics_index_writes.len();
     let tsi_cnt = state.token_search_index_writes.len();
@@ -208,6 +225,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         || !state.token_mcusd_candle_writes.is_empty()
         || !state.token_derived_usd_candle_writes.is_empty()
         || !state.token_derived_mcusd_candle_writes.is_empty()
+        || !state.chart_change_writes.is_empty()
         || !state.token_metrics_writes.is_empty()
         || !state.token_metrics_index_writes.is_empty()
         || !state.token_metrics_index_deletes.is_empty()
@@ -245,7 +263,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         || !state.amm_history_all_writes.is_empty()
         || !activity_writes.is_empty()
         || !index_writes.is_empty()
-        || !reserves_blob.is_empty();
+        || reserves_cnt > 0;
 
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     puts.extend(std::mem::take(&mut state.candle_writes));
@@ -253,6 +271,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     puts.extend(std::mem::take(&mut state.token_mcusd_candle_writes));
     puts.extend(std::mem::take(&mut state.token_derived_usd_candle_writes));
     puts.extend(std::mem::take(&mut state.token_derived_mcusd_candle_writes));
+    puts.extend(std::mem::take(&mut state.chart_change_writes));
     puts.extend(std::mem::take(&mut state.token_metrics_writes));
     puts.extend(std::mem::take(&mut state.token_metrics_index_writes));
     puts.extend(std::mem::take(&mut state.token_search_index_writes));
@@ -285,7 +304,11 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     puts.extend(std::mem::take(&mut state.amm_history_all_writes));
     puts.extend(activity_writes);
     puts.extend(index_writes);
-    puts.push((reserves_key_rel, reserves_blob));
+    for (pool, snapshot) in &state.reserves_snapshot {
+        if let Ok(enc) = encode_pool_snapshot(snapshot) {
+            puts.push((table.reserves_snapshot_pool_key(pool), enc));
+        }
+    }
 
     let mut deletes: Vec<Vec<u8>> = Vec::new();
     deletes.extend(std::mem::take(&mut state.token_metrics_index_deletes));
@@ -300,6 +323,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         token_mcusd_candles: tmc_cnt,
         token_derived_usd_candles: tdc_cnt,
         token_derived_mcusd_candles: tdmc_cnt,
+        chart_changes: cc_cnt,
         token_metrics: tm_cnt,
         token_metrics_index: tmi_cnt,
         token_search_index: tsi_cnt,

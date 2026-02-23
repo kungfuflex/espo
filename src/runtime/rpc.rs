@@ -1,4 +1,6 @@
-use crate::{config::get_espo_next_height, modules::defs::RpcRegistry};
+use crate::{
+    config::get_espo_next_height, modules::defs::RpcRegistry, runtime::tree_db::get_global_tree_db,
+};
 use axum::{
     Router,
     body::Bytes,
@@ -38,9 +40,12 @@ struct JsonRpcResponse {
 }
 
 const JSONRPC_VERSION: &str = "2.0";
+const MAX_SAFE_INTEGER_F64: f64 = 9_007_199_254_740_991.0;
+const MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 
 // Built-in root method name
 const ROOT_METHOD_GET_ESPO_HEIGHT: &str = "get_espo_height";
+const ROOT_METHOD_GET_METHOD_LINE_CHART: &str = "get_method_line_chart";
 
 fn err_response(id: Value, code: i64, message: &str, data: Option<Value>) -> JsonRpcResponse {
     JsonRpcResponse {
@@ -58,6 +63,305 @@ fn get_espo_tip_height_response(id: Value) -> JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION,
         result: Some(json!({
             "height": height
+        })),
+        error: None,
+        id,
+    }
+}
+
+fn is_builtin_root_method(method: &str) -> bool {
+    method == ROOT_METHOD_GET_ESPO_HEIGHT || method == ROOT_METHOD_GET_METHOD_LINE_CHART
+}
+
+fn parse_optional_u32_param(
+    params: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<u32>, String> {
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+    let Some(num) = value.as_u64() else {
+        return Err(format!("{key} must be an unsigned integer"));
+    };
+    let parsed = u32::try_from(num).map_err(|_| format!("{key} is out of range"))?;
+    Ok(Some(parsed))
+}
+
+fn parse_required_non_empty_string_param<'a>(
+    params: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<&'a str, String> {
+    let Some(value) = params.get(key) else {
+        return Err(format!("{key} is required"));
+    };
+    let Some(as_str) = value.as_str() else {
+        return Err(format!("{key} must be a string"));
+    };
+    let trimmed = as_str.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{key} must not be empty"));
+    }
+    Ok(trimmed)
+}
+
+struct ParsedChartValue {
+    number_value: Option<serde_json::Number>,
+    string_value: String,
+    requires_string: bool,
+}
+
+impl ParsedChartValue {
+    fn zero() -> Self {
+        Self {
+            number_value: Some(serde_json::Number::from(0)),
+            string_value: "0".to_string(),
+            requires_string: false,
+        }
+    }
+
+    fn into_json(self, force_string: bool) -> Value {
+        if force_string || self.requires_string {
+            Value::String(self.string_value)
+        } else {
+            self.number_value.map(Value::Number).unwrap_or(Value::String(self.string_value))
+        }
+    }
+}
+
+fn parse_chart_numeric_value(value: &Value) -> Option<ParsedChartValue> {
+    match value {
+        Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                return Some(ParsedChartValue {
+                    number_value: Some(n.clone()),
+                    string_value: u.to_string(),
+                    requires_string: u > MAX_SAFE_INTEGER_U64,
+                });
+            }
+            if let Some(i) = n.as_i64() {
+                return Some(ParsedChartValue {
+                    number_value: Some(n.clone()),
+                    string_value: i.to_string(),
+                    requires_string: i.unsigned_abs() > MAX_SAFE_INTEGER_U64,
+                });
+            }
+            let parsed = n.as_f64()?;
+            if !parsed.is_finite() {
+                return None;
+            }
+            Some(ParsedChartValue {
+                number_value: Some(n.clone()),
+                string_value: n.to_string(),
+                requires_string: parsed.abs() > MAX_SAFE_INTEGER_F64,
+            })
+        }
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let parsed = trimmed.parse::<f64>().ok()?;
+            if parsed.is_nan() {
+                return None;
+            }
+            if parsed.is_infinite() || parsed.abs() > MAX_SAFE_INTEGER_F64 {
+                return Some(ParsedChartValue {
+                    number_value: None,
+                    string_value: trimmed.to_string(),
+                    requires_string: true,
+                });
+            }
+            let number = serde_json::Number::from_f64(parsed)?;
+            Some(ParsedChartValue {
+                string_value: number.to_string(),
+                number_value: Some(number),
+                requires_string: false,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn extract_value_at_path<'a>(root: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = root;
+    for segment in path {
+        match current {
+            Value::Object(map) => {
+                current = map.get(*segment)?;
+            }
+            Value::Array(items) => {
+                let idx = segment.parse::<usize>().ok()?;
+                current = items.get(idx)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+fn sample_heights(range_min: u32, range_max: u32, range_interval: u32) -> Vec<u32> {
+    let mut heights = Vec::new();
+    let mut current = range_min;
+
+    loop {
+        heights.push(current);
+        if current >= range_max {
+            break;
+        }
+        let Some(next) = current.checked_add(range_interval) else {
+            if heights.last().copied() != Some(range_max) {
+                heights.push(range_max);
+            }
+            break;
+        };
+        if next > range_max {
+            if heights.last().copied() != Some(range_max) {
+                heights.push(range_max);
+            }
+            break;
+        }
+        current = next;
+    }
+
+    heights
+}
+
+fn indexed_height_bounds() -> Result<(u32, u32), String> {
+    let Some(tree) = get_global_tree_db() else {
+        return Err("versioned_tree_unavailable".to_string());
+    };
+    tree.indexed_height_bounds()
+        .map_err(|e| format!("failed to read indexed height bounds: {e}"))?
+        .ok_or_else(|| "no indexed heights available".to_string())
+}
+
+async fn get_method_line_chart_response(
+    state: &RpcState,
+    id: Value,
+    params: Value,
+) -> JsonRpcResponse {
+    let params_obj = match params {
+        Value::Object(obj) => obj,
+        _ => return invalid_params(id, "params must be an object"),
+    };
+
+    let target_method = match parse_required_non_empty_string_param(&params_obj, "method") {
+        Ok(value) => value.to_string(),
+        Err(detail) => return invalid_params(id, &detail),
+    };
+    if is_builtin_root_method(&target_method) {
+        return invalid_params(id, "params.method cannot target a root built-in method");
+    }
+
+    let key = match parse_required_non_empty_string_param(&params_obj, "key") {
+        Ok(value) => value.to_string(),
+        Err(detail) => return invalid_params(id, &detail),
+    };
+    let path_parts: Vec<&str> = key.split('.').collect();
+    if path_parts.iter().any(|p| p.is_empty()) {
+        return invalid_params(id, "key contains an empty path segment");
+    }
+
+    let base_body = match params_obj.get("body") {
+        Some(Value::Object(obj)) => obj.clone(),
+        Some(_) => return invalid_params(id, "body must be an object"),
+        None => return invalid_params(id, "body is required"),
+    };
+
+    let range_min_param = match parse_optional_u32_param(&params_obj, "range_min") {
+        Ok(v) => v,
+        Err(detail) => return invalid_params(id, &detail),
+    };
+    let range_max_param = match parse_optional_u32_param(&params_obj, "range_max") {
+        Ok(v) => v,
+        Err(detail) => return invalid_params(id, &detail),
+    };
+    let range_interval = match parse_optional_u32_param(&params_obj, "range_interval") {
+        Ok(Some(v)) => v,
+        Ok(None) => 50,
+        Err(detail) => return invalid_params(id, &detail),
+    };
+    if range_interval == 0 {
+        return invalid_params(id, "range_interval must be greater than 0");
+    }
+
+    let (default_min, default_max) = match indexed_height_bounds() {
+        Ok(bounds) => bounds,
+        Err(detail) => return internal_error(id, &detail),
+    };
+    let range_min = range_min_param.unwrap_or(default_min);
+    let range_max = range_max_param.unwrap_or(default_max);
+
+    if range_min > range_max {
+        return invalid_params(id, "range_min must be <= range_max");
+    }
+    if range_min < default_min || range_max > default_max {
+        let detail = format!("range must be inside indexed bounds [{default_min}, {default_max}]");
+        return invalid_params(id, &detail);
+    }
+
+    let methods = state.registry.list().await;
+    if !methods.iter().any(|m| m == &target_method) {
+        let detail = format!("target method not found: {target_method}");
+        return invalid_params(id, &detail);
+    }
+
+    let sampled = sample_heights(range_min, range_max, range_interval);
+    let mut raw_points: Vec<(u32, ParsedChartValue)> = Vec::with_capacity(sampled.len());
+    let mut force_string_values = false;
+    for height in sampled {
+        let mut payload = base_body.clone();
+        payload.insert("height".to_string(), json!(height));
+
+        let cx = context::current();
+        let result = match std::panic::AssertUnwindSafe(state.registry.call(
+            cx,
+            target_method.as_str(),
+            Value::Object(payload),
+        ))
+        .catch_unwind()
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => return internal_error(id, "target handler panicked"),
+        };
+
+        let parsed_value = match extract_value_at_path(&result, &path_parts) {
+            None | Some(Value::Null) => ParsedChartValue::zero(),
+            Some(value) => match parse_chart_numeric_value(value) {
+                Some(v) => v,
+                None => {
+                    let detail = format!("value at key is not numeric at height {height}");
+                    return invalid_params(id, &detail);
+                }
+            },
+        };
+
+        if parsed_value.requires_string {
+            force_string_values = true;
+        }
+        raw_points.push((height, parsed_value));
+    }
+
+    let points: Vec<Value> = raw_points
+        .into_iter()
+        .map(|(height, parsed)| {
+            json!({
+                "height": height,
+                "value": parsed.into_json(force_string_values)
+            })
+        })
+        .collect();
+
+    JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION,
+        result: Some(json!({
+            "method": target_method,
+            "key": key,
+            "range_min": range_min,
+            "range_max": range_max,
+            "range_interval": range_interval,
+            "points": points,
         })),
         error: None,
         id,
@@ -142,12 +446,11 @@ async fn handle_single_request(
         }
     };
 
-    // --- Built-in "get_espo_height" support (notifications still receive no reply) ---
+    // --- Built-in root methods support (notifications still receive no reply) ---
     if id_opt.is_none() {
         // Valid notification → process but do not respond
         let method_exists = {
-            // Consider built-in root method as existing
-            if method == ROOT_METHOD_GET_ESPO_HEIGHT {
+            if is_builtin_root_method(method) {
                 true
             } else {
                 let methods = state.registry.list().await;
@@ -158,8 +461,8 @@ async fn handle_single_request(
             // MUST NOT reply to a notification (even if unknown)
             return None;
         }
-        // Fire-and-forget invoke for registered methods; built-in does nothing
-        if method != ROOT_METHOD_GET_ESPO_HEIGHT {
+        // Fire-and-forget invoke for registered methods; built-ins do nothing.
+        if !is_builtin_root_method(method) {
             let cx = context::current();
             let _ = state.registry.call(cx, method, params.clone()).await;
         }
@@ -172,6 +475,9 @@ async fn handle_single_request(
     // If the built-in root method is requested, handle immediately.
     if method == ROOT_METHOD_GET_ESPO_HEIGHT {
         return Some(get_espo_tip_height_response(id));
+    }
+    if method == ROOT_METHOD_GET_METHOD_LINE_CHART {
+        return Some(get_method_line_chart_response(state, id, params).await);
     }
 
     // Check method existence to produce -32601 at the protocol layer

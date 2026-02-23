@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use axum::extract::{Path, State};
-use axum::response::Html;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Network, Transaction, Txid};
@@ -10,25 +11,26 @@ use bitcoincore_rpc::RpcApi;
 use maud::html;
 
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
-    prettyify_protobuf_trace_json, traces_for_block_as_prost,
+    extract_alkane_storage, prettyify_protobuf_trace_json, traces_for_block_as_prost,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace,
 };
 use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_metashrew,
 };
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::header::{
-    HeaderCta, HeaderPillTone, HeaderProps, HeaderSummaryItem, header, header_scripts,
+    header, header_scripts, HeaderCta, HeaderPillTone, HeaderProps, HeaderSummaryItem,
 };
-use crate::explorer::components::layout::layout;
+use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::icon_arrow_up_right;
-use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
+use crate::explorer::components::tx_view::{render_tx, TxPill, TxPillTone};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::utils::balances::{
-    OutpointLookup, get_outpoint_balances_with_spent,
+    get_outpoint_balances_with_spent, OutpointLookup,
 };
 use crate::runtime::mempool::pending_by_txid;
+use crate::runtime::state_at::StateAt;
 
 fn format_with_commas(n: u64) -> String {
     let mut s = n.to_string();
@@ -126,10 +128,22 @@ fn fee_and_rate(
 pub async fn tx_page(
     State(state): State<ExplorerState>,
     Path(txid_str): Path<String>,
-) -> Html<String> {
+) -> Response {
+    let canonical_path = format!("/tx/{txid_str}");
     let txid = match Txid::from_str(&txid_str) {
         Ok(t) => t,
-        Err(_) => return layout("Transaction", html! { p class="error" { "Invalid txid." } }),
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                layout_with_meta(
+                    "Transaction",
+                    &canonical_path,
+                    None,
+                    html! { p class="error" { "Invalid txid." } },
+                ),
+            )
+                .into_response()
+        }
     };
 
     let electrum_like = get_electrum_like();
@@ -143,10 +157,16 @@ pub async fn tx_page(
                 match mempool_entry.as_ref() {
                     Some(m) => m.tx.clone(),
                     None => {
-                        return layout(
-                            "Transaction",
-                            html! { p class="error" { (format!("Failed to decode tx: {e:?}")) } },
-                        );
+                        return (
+                            StatusCode::NOT_FOUND,
+                            layout_with_meta(
+                                "Transaction",
+                                &canonical_path,
+                                None,
+                                html! { p class="error" { (format!("Failed to decode tx: {e:?}")) } },
+                            ),
+                        )
+                            .into_response();
                     }
                 }
             }
@@ -156,10 +176,16 @@ pub async fn tx_page(
             match mempool_entry.as_ref() {
                 Some(m) => m.tx.clone(),
                 None => {
-                    return layout(
-                        "Transaction",
-                        html! { p class="error" { (format!("Failed to fetch raw tx: {e:?}")) } },
-                    );
+                    return (
+                        StatusCode::NOT_FOUND,
+                        layout_with_meta(
+                            "Transaction",
+                            &canonical_path,
+                            None,
+                            html! { p class="error" { (format!("Failed to fetch raw tx: {e:?}")) } },
+                        ),
+                    )
+                        .into_response();
                 }
             }
         }
@@ -224,7 +250,7 @@ pub async fn tx_page(
     }
 
     let outpoint_fn = |txid: &Txid, vout: u32| -> OutpointLookup {
-        get_outpoint_balances_with_spent(&state.essentials_provider(), txid, vout)
+        get_outpoint_balances_with_spent(StateAt::Latest, &state.essentials_provider(), txid, vout)
             .unwrap_or_default()
     };
     let outspends_fn = |txid: &Txid| -> Vec<Option<Txid>> {
@@ -319,8 +345,10 @@ pub async fn tx_page(
         hero_class: None,
     });
 
-    layout(
+    layout_with_meta(
         &format!("Tx {txid}"),
+        &format!("/tx/{txid}"),
+        None,
         html! {
             div class="block-hero full-bleed" {
                 (block_carousel(tx_height, espo_tip))
@@ -339,6 +367,7 @@ pub async fn tx_page(
             (header_scripts())
         },
     )
+    .into_response()
 }
 
 fn fetch_traces_for_tx(

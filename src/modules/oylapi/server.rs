@@ -10,6 +10,7 @@ use crate::modules::oylapi::storage::{
     get_pool_creation_history, get_pool_details, get_pool_mint_history, get_pool_swap_history,
     get_pools, get_token_pairs, get_token_swap_history, get_total_unwrap_amount,
 };
+use crate::runtime::state_at::StateAt;
 use axum::{Json, Router, extract::State, routing::post};
 use serde::Deserialize;
 use serde_json::Value;
@@ -321,32 +322,35 @@ async fn get_alkanes_by_address_handler(
     State(state): State<OylApiState>,
     Json(req): Json<AddressRequest>,
 ) -> Json<Value> {
-    Json(get_alkanes_by_address(&state, &req.address).await)
+    Json(get_alkanes_by_address(StateAt::Latest, &state, &req.address).await)
 }
 
 async fn get_bitcoin_price_handler(State(state): State<OylApiState>) -> Json<Value> {
-    Json(get_bitcoin_price(&state).await)
+    Json(get_bitcoin_price(StateAt::Latest, &state).await)
 }
 
 async fn get_alkanes_utxo_handler(
     State(state): State<OylApiState>,
     Json(req): Json<AddressRequest>,
 ) -> Json<Value> {
-    Json(get_alkanes_utxo(&state, &req.address).await)
+    Json(get_alkanes_utxo(StateAt::Latest, &state, &req.address).await)
 }
 
 async fn get_address_utxos_handler(
     State(state): State<OylApiState>,
     Json(req): Json<AddressUtxosRequest>,
 ) -> Json<Value> {
-    Json(get_address_utxos_portfolio(&state, &req.address, req.spend_strategy).await)
+    Json(
+        get_address_utxos_portfolio(StateAt::Latest, &state, &req.address, req.spend_strategy)
+            .await,
+    )
 }
 
 async fn get_amm_utxos_handler(
     State(state): State<OylApiState>,
     Json(req): Json<AmmUtxosRequest>,
 ) -> Json<Value> {
-    Json(get_amm_utxos(&state, &req.address, req.spend_strategy).await)
+    Json(get_amm_utxos(StateAt::Latest, &state, &req.address, req.spend_strategy).await)
 }
 
 async fn get_alkanes_handler(
@@ -360,28 +364,38 @@ async fn get_alkanes_handler(
         order: req.order,
         search_query: req.search_query,
     };
-    Json(get_alkanes(&state, params).await)
+    Json(get_alkanes(StateAt::Latest, &state, params).await)
 }
 
 async fn global_alkanes_search_handler(
     State(state): State<OylApiState>,
     Json(req): Json<SearchRequest>,
 ) -> Json<Value> {
-    Json(get_global_alkanes_search(&state, &req.search_query).await)
+    Json(get_global_alkanes_search(StateAt::Latest, &state, &req.search_query).await)
 }
 
 async fn get_alkane_details_handler(
     State(state): State<OylApiState>,
     Json(req): Json<AlkaneDetailsRequest>,
 ) -> Json<Value> {
-    Json(get_alkane_details(&state, &req.alkane_id.block, &req.alkane_id.tx).await)
+    Json(get_alkane_details(StateAt::Latest, &state, &req.alkane_id.block, &req.alkane_id.tx).await)
 }
 
 async fn get_pools_handler(
     State(state): State<OylApiState>,
     Json(req): Json<GetPoolsRequest>,
 ) -> Json<Value> {
-    Json(get_pools(&state, &req.factory_id.block, &req.factory_id.tx, req.limit, req.offset).await)
+    Json(
+        get_pools(
+            StateAt::Latest,
+            &state,
+            &req.factory_id.block,
+            &req.factory_id.tx,
+            req.limit,
+            req.offset,
+        )
+        .await,
+    )
 }
 
 async fn get_pool_details_handler(
@@ -390,6 +404,7 @@ async fn get_pool_details_handler(
 ) -> Json<Value> {
     Json(
         get_pool_details(
+            StateAt::Latest,
             &state,
             &req.factory_id.block,
             &req.factory_id.tx,
@@ -406,6 +421,7 @@ async fn get_pool_swap_history_handler(
 ) -> Json<Value> {
     Json(
         get_pool_swap_history(
+            StateAt::Latest,
             &state,
             &req.pool_id.block,
             &req.pool_id.tx,
@@ -424,6 +440,7 @@ async fn get_token_swap_history_handler(
 ) -> Json<Value> {
     Json(
         get_token_swap_history(
+            StateAt::Latest,
             &state,
             &req.token_id.block,
             &req.token_id.tx,
@@ -442,6 +459,7 @@ async fn get_pool_mint_history_handler(
 ) -> Json<Value> {
     Json(
         get_pool_mint_history(
+            StateAt::Latest,
             &state,
             &req.pool_id.block,
             &req.pool_id.tx,
@@ -460,6 +478,7 @@ async fn get_pool_burn_history_handler(
 ) -> Json<Value> {
     Json(
         get_pool_burn_history(
+            StateAt::Latest,
             &state,
             &req.pool_id.block,
             &req.pool_id.tx,
@@ -478,8 +497,15 @@ async fn get_pool_creation_history_handler(
 ) -> Json<Value> {
     let _ = &req.pool_id;
     Json(
-        get_pool_creation_history(&state, req.count, req.offset, req.successful, req.include_total)
-            .await,
+        get_pool_creation_history(
+            StateAt::Latest,
+            &state,
+            req.count,
+            req.offset,
+            req.successful,
+            req.include_total,
+        )
+        .await,
     )
 }
 
@@ -489,6 +515,7 @@ async fn get_address_swap_history_for_pool_handler(
 ) -> Json<Value> {
     Json(
         get_address_swap_history_for_pool(
+            StateAt::Latest,
             &state,
             &req.address,
             &req.pool_id.block,
@@ -508,6 +535,7 @@ async fn get_address_swap_history_for_token_handler(
 ) -> Json<Value> {
     Json(
         get_address_swap_history_for_token(
+            StateAt::Latest,
             &state,
             &req.address,
             &req.token_id.block,
@@ -527,6 +555,7 @@ async fn get_address_wrap_history_handler(
 ) -> Json<Value> {
     Json(
         get_address_wrap_history(
+            StateAt::Latest,
             &state,
             &req.address,
             req.count,
@@ -544,6 +573,7 @@ async fn get_address_unwrap_history_handler(
 ) -> Json<Value> {
     Json(
         get_address_unwrap_history(
+            StateAt::Latest,
             &state,
             &req.address,
             req.count,
@@ -560,8 +590,15 @@ async fn get_all_wrap_history_handler(
     Json(req): Json<AllWrapHistoryRequest>,
 ) -> Json<Value> {
     Json(
-        get_all_wrap_history(&state, req.count, req.offset, req.successful, req.include_total)
-            .await,
+        get_all_wrap_history(
+            StateAt::Latest,
+            &state,
+            req.count,
+            req.offset,
+            req.successful,
+            req.include_total,
+        )
+        .await,
     )
 }
 
@@ -570,8 +607,15 @@ async fn get_all_unwrap_history_handler(
     Json(req): Json<AllWrapHistoryRequest>,
 ) -> Json<Value> {
     Json(
-        get_all_unwrap_history(&state, req.count, req.offset, req.successful, req.include_total)
-            .await,
+        get_all_unwrap_history(
+            StateAt::Latest,
+            &state,
+            req.count,
+            req.offset,
+            req.successful,
+            req.include_total,
+        )
+        .await,
     )
 }
 
@@ -579,7 +623,7 @@ async fn get_total_unwrap_amount_handler(
     State(state): State<OylApiState>,
     Json(req): Json<TotalUnwrapAmountRequest>,
 ) -> Json<Value> {
-    Json(get_total_unwrap_amount(&state, req.block_height, req.successful).await)
+    Json(get_total_unwrap_amount(StateAt::Latest, &state, req.block_height, req.successful).await)
 }
 
 async fn get_address_pool_creation_history_handler(
@@ -589,6 +633,7 @@ async fn get_address_pool_creation_history_handler(
     let _ = &req.pool_id;
     Json(
         get_address_pool_creation_history(
+            StateAt::Latest,
             &state,
             &req.address,
             req.count,
@@ -606,6 +651,7 @@ async fn get_address_pool_mint_history_handler(
 ) -> Json<Value> {
     Json(
         get_address_pool_mint_history(
+            StateAt::Latest,
             &state,
             &req.address,
             req.count,
@@ -623,6 +669,7 @@ async fn get_address_pool_burn_history_handler(
 ) -> Json<Value> {
     Json(
         get_address_pool_burn_history(
+            StateAt::Latest,
             &state,
             &req.address,
             req.count,
@@ -639,8 +686,14 @@ async fn get_address_positions_handler(
     Json(req): Json<AddressPositionsRequest>,
 ) -> Json<Value> {
     Json(
-        get_address_positions(&state, &req.address, &req.factory_id.block, &req.factory_id.tx)
-            .await,
+        get_address_positions(
+            StateAt::Latest,
+            &state,
+            &req.address,
+            &req.factory_id.block,
+            &req.factory_id.tx,
+        )
+        .await,
     )
 }
 
@@ -650,6 +703,7 @@ async fn get_all_pools_details_handler(
 ) -> Json<Value> {
     Json(
         get_all_pools_details(
+            StateAt::Latest,
             &state,
             &req.factory_id.block,
             &req.factory_id.tx,
@@ -671,6 +725,7 @@ async fn get_all_address_amm_tx_history_handler(
     let _ = req.pool_id;
     Json(
         get_all_address_amm_tx_history(
+            StateAt::Latest,
             &state,
             &req.address,
             req.transaction_type,
@@ -690,6 +745,7 @@ async fn get_all_amm_tx_history_handler(
     let _ = req.pool_id;
     Json(
         get_all_amm_tx_history(
+            StateAt::Latest,
             &state,
             req.transaction_type,
             req.count,
@@ -705,7 +761,10 @@ async fn get_all_token_pairs_handler(
     State(state): State<OylApiState>,
     Json(req): Json<GetAllTokenPairsRequest>,
 ) -> Json<Value> {
-    Json(get_all_token_pairs(&state, &req.factory_id.block, &req.factory_id.tx).await)
+    Json(
+        get_all_token_pairs(StateAt::Latest, &state, &req.factory_id.block, &req.factory_id.tx)
+            .await,
+    )
 }
 
 async fn get_token_pairs_handler(
@@ -714,6 +773,7 @@ async fn get_token_pairs_handler(
 ) -> Json<Value> {
     Json(
         get_token_pairs(
+            StateAt::Latest,
             &state,
             &req.factory_id.block,
             &req.factory_id.tx,
@@ -734,6 +794,7 @@ async fn get_alkane_swap_pair_details_handler(
 ) -> Json<Value> {
     Json(
         get_alkane_swap_pair_details(
+            StateAt::Latest,
             &state,
             &req.factory_id.block,
             &req.factory_id.tx,

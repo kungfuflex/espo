@@ -1,16 +1,15 @@
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit};
-use crate::modules::ammdata::schemas::{
-    SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2, Timeframe,
-};
+use crate::modules::ammdata::schemas::{SchemaPoolMetricsV1, SchemaPoolMetricsV2, Timeframe};
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetIterPrefixRevParams, GetPoolCreationInfoParams, GetPoolMetricsV2Params,
+    AmmDataProvider, GetListEntriesDescParams, GetPoolCreationInfoParams, GetPoolMetricsV2Params,
     GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, PoolMetricsIndexField,
-    decode_full_candle_v1, encode_pool_details_snapshot, encode_pool_metrics,
-    encode_pool_metrics_v2, encode_u128_value, parse_change_basis_points,
+    decode_full_candle_v1, encode_f64_value, encode_pool_metrics, encode_pool_metrics_v2,
+    encode_u128_value, parse_change_basis_points,
 };
 use crate::modules::ammdata::utils::candles::bucket_start_for;
 use crate::modules::ammdata::utils::index_state::IndexState;
 use crate::modules::essentials::storage::{EssentialsProvider, GetLatestCirculatingSupplyParams};
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use bitcoin::Network;
@@ -18,6 +17,7 @@ use serde_json::json;
 use std::collections::HashMap;
 
 pub fn derive_pool_metrics(
+    blockhash: StateAt,
     block_ts: u64,
     height: u32,
     provider: &AmmDataProvider,
@@ -42,7 +42,10 @@ pub fn derive_pool_metrics(
             }
             let key = table.candle_key(pool, tf, bucket_ts);
             if let Some(raw) = provider
-                .get_raw_value(crate::modules::ammdata::storage::GetRawValueParams { key })?
+                .get_raw_value(crate::modules::ammdata::storage::GetRawValueParams {
+                    blockhash: blockhash.clone(),
+                    key,
+                })?
                 .value
             {
                 return Ok(Some(decode_full_candle_v1(&raw)?));
@@ -86,7 +89,10 @@ pub fn derive_pool_metrics(
             .cloned()
             .or_else(|| {
                 provider
-                    .get_token_metrics(GetTokenMetricsParams { token: *token })
+                    .get_token_metrics(GetTokenMetricsParams {
+                        blockhash: blockhash.clone(),
+                        token: *token,
+                    })
                     .ok()
                     .map(|res| res.metrics)
             })
@@ -130,8 +136,10 @@ pub fn derive_pool_metrics(
                     };
                 } else {
                     let prefix = table.candle_ns_prefix(&entry.pool_id, Timeframe::M10);
-                    if let Ok(res) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })
-                    {
+                    if let Ok(res) = provider.get_list_entries_desc(GetListEntriesDescParams {
+                        blockhash: StateAt::Latest,
+                        prefix,
+                    }) {
                         if let Some((_k, v)) = res.entries.into_iter().next() {
                             if let Ok(candle) = decode_full_candle_v1(&v) {
                                 price = if use_base_price {
@@ -153,6 +161,7 @@ pub fn derive_pool_metrics(
     let tvl_at_height = |pool: &SchemaAlkaneId, h: u32| -> u128 {
         provider
             .get_tvl_versioned_at_or_before(GetTvlVersionedAtOrBeforeParams {
+                blockhash: StateAt::Latest,
                 pool: *pool,
                 height: h,
             })
@@ -169,9 +178,12 @@ pub fn derive_pool_metrics(
     for pool in state.pools_touched.iter() {
         let Some(defs) = state.pools_map.get(pool) else { continue };
 
-        let mut balances =
-            crate::modules::essentials::utils::balances::get_alkane_balances(essentials, pool)
-                .unwrap_or_default();
+        let mut balances = crate::modules::essentials::utils::balances::get_alkane_balances(
+            StateAt::Latest,
+            essentials,
+            pool,
+        )
+        .unwrap_or_default();
         let token0_amount = balances.remove(&defs.base_alkane_id).unwrap_or(0);
         let token1_amount = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
 
@@ -182,8 +194,8 @@ pub fn derive_pool_metrics(
 
         let mut token0_tvl_usd = token0_amount.saturating_mul(token0_price_usd) / AMOUNT_SCALE;
         let mut token1_tvl_usd = token1_amount.saturating_mul(token1_price_usd) / AMOUNT_SCALE;
-        let token0_tvl_sats = token0_amount.saturating_mul(token0_price_sats) / AMOUNT_SCALE;
-        let token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / AMOUNT_SCALE;
+        let mut token0_tvl_sats = token0_amount.saturating_mul(token0_price_sats) / AMOUNT_SCALE;
+        let mut token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / AMOUNT_SCALE;
 
         if let Some(unit) = canonical_quote_units.get(&defs.base_alkane_id) {
             if let Some(value) = crate::modules::ammdata::canonical_quote_amount_tvl_usd(
@@ -192,6 +204,13 @@ pub fn derive_pool_metrics(
                 state.btc_usd_price,
             ) {
                 token0_tvl_usd = value;
+            }
+            if let Some(value) = crate::modules::ammdata::canonical_quote_amount_tvl_sats(
+                token0_amount,
+                *unit,
+                state.btc_usd_price,
+            ) {
+                token0_tvl_sats = value;
             }
         }
         if let Some(unit) = canonical_quote_units.get(&defs.quote_alkane_id) {
@@ -202,13 +221,20 @@ pub fn derive_pool_metrics(
             ) {
                 token1_tvl_usd = value;
             }
+            if let Some(value) = crate::modules::ammdata::canonical_quote_amount_tvl_sats(
+                token1_amount,
+                *unit,
+                state.btc_usd_price,
+            ) {
+                token1_tvl_sats = value;
+            }
         }
 
         let pool_tvl_usd = token0_tvl_usd.saturating_add(token1_tvl_usd);
         let pool_tvl_sats = token0_tvl_sats.saturating_add(token1_tvl_sats);
 
         let prev_pool_metrics = provider
-            .get_pool_metrics_v2(GetPoolMetricsV2Params { pool: *pool })
+            .get_pool_metrics_v2(GetPoolMetricsV2Params { blockhash: StateAt::Latest, pool: *pool })
             .ok()
             .and_then(|res| res.metrics);
         let full_history = prev_pool_metrics.is_none();
@@ -452,7 +478,10 @@ pub fn derive_pool_metrics(
             .push((table.pool_metrics_v2_key(pool), encode_pool_metrics_v2(&metrics_v2)?));
 
         let lp_supply = essentials
-            .get_latest_circulating_supply(GetLatestCirculatingSupplyParams { alkane: *pool })
+            .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
+                blockhash: blockhash.clone(),
+                alkane: *pool,
+            })
             .map(|res| res.supply)
             .unwrap_or(0);
         state
@@ -462,6 +491,7 @@ pub fn derive_pool_metrics(
         let pool_label =
             crate::modules::ammdata::pool_name_display(&crate::modules::ammdata::strip_lp_suffix(
                 &crate::modules::ammdata::utils::index_pools::get_alkane_label(
+                    blockhash.clone(),
                     essentials,
                     &mut state.alkane_label_cache,
                     pool,
@@ -470,7 +500,10 @@ pub fn derive_pool_metrics(
 
         let creation_info = state.pool_creation_info_cache.get(pool).cloned().or_else(|| {
             provider
-                .get_pool_creation_info(GetPoolCreationInfoParams { pool: *pool })
+                .get_pool_creation_info(GetPoolCreationInfoParams {
+                    blockhash: blockhash.clone(),
+                    pool: *pool,
+                })
                 .ok()
                 .and_then(|res| res.info)
         });
@@ -500,7 +533,7 @@ pub fn derive_pool_metrics(
         let tvl_change_24h = crate::modules::ammdata::parse_change_f64(&metrics.tvl_change_24h);
         let tvl_change_7d = crate::modules::ammdata::parse_change_f64(&metrics.tvl_change_7d);
 
-        let value = json!({
+        let _value = json!({
             "token0": crate::modules::ammdata::alkane_id_json(&defs.base_alkane_id),
             "token1": crate::modules::ammdata::alkane_id_json(&defs.quote_alkane_id),
             "token0Amount": token0_amount.to_string(),
@@ -541,23 +574,45 @@ pub fn derive_pool_metrics(
             "tvlChange": tvl_change_24h,
         });
 
-        let snapshot = SchemaPoolDetailsSnapshot {
-            value_json: serde_json::to_vec(&value)?,
-            token0_tvl_usd,
-            token1_tvl_usd,
-            token0_tvl_sats,
-            token1_tvl_sats,
-            pool_tvl_usd,
-            pool_volume_1d_usd: metrics.pool_volume_1d_usd,
-            pool_volume_30d_usd: metrics.pool_volume_30d_usd,
-            pool_apr,
-            tvl_change_24h,
-            lp_supply,
-        };
-
         state.pool_details_snapshot_writes.push((
-            table.pool_details_snapshot_key(pool),
-            encode_pool_details_snapshot(&snapshot)?,
+            table.pool_details_snapshot_field_key(pool, "token0_tvl_usd"),
+            encode_u128_value(token0_tvl_usd)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "token1_tvl_usd"),
+            encode_u128_value(token1_tvl_usd)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "token0_tvl_sats"),
+            encode_u128_value(token0_tvl_sats)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "token1_tvl_sats"),
+            encode_u128_value(token1_tvl_sats)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "pool_tvl_usd"),
+            encode_u128_value(pool_tvl_usd)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "pool_volume_1d_usd"),
+            encode_u128_value(metrics.pool_volume_1d_usd)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "pool_volume_30d_usd"),
+            encode_u128_value(metrics.pool_volume_30d_usd)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "pool_apr"),
+            encode_f64_value(pool_apr)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "tvl_change_24h"),
+            encode_f64_value(tvl_change_24h)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "lp_supply"),
+            encode_u128_value(lp_supply)?,
         ));
 
         state

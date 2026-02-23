@@ -4,6 +4,7 @@ use crate::modules::subfrost::storage::{
     GetUnwrapEventsAllParams, GetUnwrapEventsByAddressParams, GetWrapEventsAllParams,
     GetWrapEventsByAddressParams, SubfrostProvider,
 };
+use crate::runtime::state_at::StateAt;
 use bitcoin::Address;
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -28,15 +29,23 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                     let offset =
                         payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     let successful = payload.get("successful").and_then(|v| v.as_bool());
-                    provider
-                        .get_wrap_events_by_address(GetWrapEventsByAddressParams {
-                            address_spk: spk,
-                            offset,
-                            limit: count,
-                            successful,
-                        })
-                        .map(|resp| wrap_events_json(resp.entries, resp.total))
-                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                    let height = payload.get("height").and_then(|v| v.as_u64());
+                    let height_present = payload.get("height").is_some();
+                    let view = match provider.with_height(height, height_present) {
+                        Ok(v) => v,
+                        Err(_) => return json!({ "ok": false, "error": "invalid_height" }),
+                    };
+                    view.get_wrap_events_by_address(GetWrapEventsByAddressParams {
+                        blockhash: StateAt::Latest,
+                        address_spk: spk,
+                        offset,
+                        limit: count,
+                        successful,
+                        height,
+                        height_present,
+                    })
+                    .map(|resp| wrap_events_json(resp.entries, resp.total))
+                    .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
                 }
             })
             .await;
@@ -59,15 +68,23 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                     let offset =
                         payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     let successful = payload.get("successful").and_then(|v| v.as_bool());
-                    provider
-                        .get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
-                            address_spk: spk,
-                            offset,
-                            limit: count,
-                            successful,
-                        })
-                        .map(|resp| wrap_events_json(resp.entries, resp.total))
-                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                    let height = payload.get("height").and_then(|v| v.as_u64());
+                    let height_present = payload.get("height").is_some();
+                    let view = match provider.with_height(height, height_present) {
+                        Ok(v) => v,
+                        Err(_) => return json!({ "ok": false, "error": "invalid_height" }),
+                    };
+                    view.get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
+                        blockhash: StateAt::Latest,
+                        address_spk: spk,
+                        offset,
+                        limit: count,
+                        successful,
+                        height,
+                        height_present,
+                    })
+                    .map(|resp| wrap_events_json(resp.entries, resp.total))
+                    .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
                 }
             })
             .await;
@@ -84,14 +101,22 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                     let offset =
                         payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     let successful = payload.get("successful").and_then(|v| v.as_bool());
-                    provider
-                        .get_wrap_events_all(GetWrapEventsAllParams {
-                            offset,
-                            limit: count,
-                            successful,
-                        })
-                        .map(|resp| wrap_events_json(resp.entries, resp.total))
-                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                    let height = payload.get("height").and_then(|v| v.as_u64());
+                    let height_present = payload.get("height").is_some();
+                    let view = match provider.with_height(height, height_present) {
+                        Ok(v) => v,
+                        Err(_) => return json!({ "ok": false, "error": "invalid_height" }),
+                    };
+                    view.get_wrap_events_all(GetWrapEventsAllParams {
+                        blockhash: StateAt::Latest,
+                        offset,
+                        limit: count,
+                        successful,
+                        height,
+                        height_present,
+                    })
+                    .map(|resp| wrap_events_json(resp.entries, resp.total))
+                    .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
                 }
             })
             .await;
@@ -108,14 +133,22 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                     let offset =
                         payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     let successful = payload.get("successful").and_then(|v| v.as_bool());
-                    provider
-                        .get_unwrap_events_all(GetUnwrapEventsAllParams {
-                            offset,
-                            limit: count,
-                            successful,
-                        })
-                        .map(|resp| wrap_events_json(resp.entries, resp.total))
-                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                    let height = payload.get("height").and_then(|v| v.as_u64());
+                    let height_present = payload.get("height").is_some();
+                    let view = match provider.with_height(height, height_present) {
+                        Ok(v) => v,
+                        Err(_) => return json!({ "ok": false, "error": "invalid_height" }),
+                    };
+                    view.get_unwrap_events_all(GetUnwrapEventsAllParams {
+                        blockhash: StateAt::Latest,
+                        offset,
+                        limit: count,
+                        successful,
+                        height,
+                        height_present,
+                    })
+                    .map(|resp| wrap_events_json(resp.entries, resp.total))
+                    .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
                 }
             })
             .await;

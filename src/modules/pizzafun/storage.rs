@@ -1,6 +1,10 @@
 use crate::runtime::mdb::{Mdb, MdbBatch};
+use crate::runtime::pointers::{KvPointer, ListPointer};
+use crate::runtime::state_at::StateAt;
+use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
+use bitcoin::BlockHash;
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -41,83 +45,52 @@ fn series_id_matches_name(series_id: &str, name_norm: &str) -> bool {
     false
 }
 
-#[derive(Clone)]
-pub struct MdbPointer<'a> {
-    mdb: &'a Mdb,
-    key: Vec<u8>,
-}
+fn dedupe_batch_ops(
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: Vec<Vec<u8>>,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
+    let mut seen_puts: HashSet<Vec<u8>> = HashSet::new();
+    let mut dedup_puts_rev: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(puts.len());
+    for (key, value) in puts.into_iter().rev() {
+        if seen_puts.insert(key.clone()) {
+            dedup_puts_rev.push((key, value));
+        }
+    }
+    dedup_puts_rev.reverse();
 
-impl<'a> MdbPointer<'a> {
-    pub fn root(mdb: &'a Mdb) -> Self {
-        Self { mdb, key: Vec::new() }
+    let put_keys: HashSet<Vec<u8>> = dedup_puts_rev.iter().map(|(k, _)| k.clone()).collect();
+    let mut seen_deletes: HashSet<Vec<u8>> = HashSet::new();
+    let mut dedup_deletes: Vec<Vec<u8>> = Vec::with_capacity(deletes.len());
+    for key in deletes {
+        if put_keys.contains(&key) {
+            continue;
+        }
+        if seen_deletes.insert(key.clone()) {
+            dedup_deletes.push(key);
+        }
     }
 
-    pub fn key(&self) -> &[u8] {
-        &self.key
-    }
-
-    pub fn keyword(&self, suffix: &str) -> Self {
-        self.select(suffix.as_bytes())
-    }
-
-    pub fn select(&self, suffix: &[u8]) -> Self {
-        let mut key = self.key.clone();
-        key.extend_from_slice(suffix);
-        Self { mdb: self.mdb, key }
-    }
-
-    pub fn get(&self) -> Result<Option<Vec<u8>>> {
-        self.mdb.get(&self.key).map_err(|e| anyhow!("mdb.get failed: {e}"))
-    }
-
-    pub fn put(&self, value: &[u8]) -> Result<()> {
-        self.mdb.put(&self.key, value).map_err(|e| anyhow!("mdb.put failed: {e}"))
-    }
-
-    pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
-        let full_keys: Vec<Vec<u8>> = keys
-            .iter()
-            .map(|k| {
-                let mut key = self.key.clone();
-                key.extend_from_slice(k);
-                key
-            })
-            .collect();
-        self.mdb.multi_get(&full_keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))
-    }
-
-    pub fn scan_prefix(&self) -> Result<Vec<Vec<u8>>> {
-        self.mdb.scan_prefix(&self.key)
-    }
-
-    pub fn bulk_write<F>(&self, build: F) -> Result<()>
-    where
-        F: FnOnce(&mut MdbBatch<'_>),
-    {
-        self.mdb.bulk_write(build).map_err(|e| anyhow!("mdb.bulk_write failed: {e}"))
-    }
-
-    pub fn mdb(&self) -> &Mdb {
-        self.mdb
-    }
+    (dedup_puts_rev, dedup_deletes)
 }
 
 #[allow(non_snake_case)]
 #[derive(Clone)]
 pub struct PizzafunTable<'a> {
-    pub ROOT: MdbPointer<'a>,
-    pub INDEX_HEIGHT: MdbPointer<'a>,
-    pub SERIES_BY_ID: MdbPointer<'a>,
-    pub SERIES_BY_ALKANE: MdbPointer<'a>,
+    pub ROOT: KvPointer<'a>,
+    pub INDEX_HEIGHT: KvPointer<'a>,
+    pub SERIES_BY_ID: KvPointer<'a>,
+    pub SERIES_BY_ALKANE: KvPointer<'a>,
+    pub SERIES_ALL: ListPointer<'a>,
 }
 
 impl<'a> PizzafunTable<'a> {
     pub fn new(mdb: &'a Mdb) -> Self {
-        let root = MdbPointer::root(mdb);
+        let root = KvPointer::root(mdb);
         Self {
             INDEX_HEIGHT: root.keyword("/index_height"),
             SERIES_BY_ID: root.keyword("/series/by_id/"),
             SERIES_BY_ALKANE: root.keyword("/series/by_alkane/"),
+            SERIES_ALL: root.list_keyword("/series/all/v2/"),
             ROOT: root,
         }
     }
@@ -140,26 +113,96 @@ impl<'a> PizzafunTable<'a> {
     pub fn series_by_alkane_prefix(&self) -> Vec<u8> {
         self.SERIES_BY_ALKANE.key().to_vec()
     }
+
+    pub fn series_all_prefix(&self) -> Vec<u8> {
+        self.SERIES_ALL.key().to_vec()
+    }
+
+    pub fn series_all_entry_prefix(&self) -> Vec<u8> {
+        let mut key = self.series_all_prefix();
+        key.extend_from_slice(b"entry/");
+        key
+    }
+
+    pub fn series_all_entry_key(&self, series_id: &str) -> Vec<u8> {
+        let mut key = self.series_all_entry_prefix();
+        key.extend_from_slice(series_id.as_bytes());
+        key
+    }
 }
 
-pub struct GetIndexHeightParams;
+pub struct GetIndexHeightParams {
+    pub blockhash: StateAt,
+}
 
 pub struct GetIndexHeightResult {
     pub height: Option<u32>,
 }
 
 pub struct SetIndexHeightParams {
+    pub blockhash: StateAt,
+
     pub height: u32,
+}
+
+pub struct GetSeriesByIdParams {
+    pub blockhash: StateAt,
+    pub series_id: String,
+}
+
+pub struct GetSeriesByIdsParams {
+    pub blockhash: StateAt,
+    pub series_ids: Vec<String>,
+}
+
+pub struct GetSeriesByAlkaneParams {
+    pub blockhash: StateAt,
+    pub alkane: SchemaAlkaneId,
+}
+
+pub struct GetSeriesByAlkanesParams {
+    pub blockhash: StateAt,
+    pub alkanes: Vec<SchemaAlkaneId>,
+}
+
+pub struct GetSeriesEntriesByNameParams {
+    pub blockhash: StateAt,
+    pub name_norm: String,
 }
 
 #[derive(Clone)]
 pub struct PizzafunProvider {
     mdb: Arc<Mdb>,
+    view_blockhash: Option<BlockHash>,
 }
 
 impl PizzafunProvider {
     pub fn new(mdb: Arc<Mdb>) -> Self {
-        Self { mdb }
+        Self { mdb, view_blockhash: None }
+    }
+
+    pub fn with_view_blockhash(&self, blockhash: Option<BlockHash>) -> Self {
+        Self { mdb: Arc::clone(&self.mdb), view_blockhash: blockhash }
+    }
+
+    pub fn with_height(&self, height: Option<u64>, height_present: bool) -> Result<Self> {
+        if !height_present {
+            return Ok(self.with_view_blockhash(None));
+        }
+        let Some(height) = height else {
+            return Err(anyhow!("missing_or_invalid_height"));
+        };
+        let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
+        let Some(tree) = get_global_tree_db() else {
+            return Err(anyhow!("versioned_tree_unavailable"));
+        };
+        let Some(blockhash) = tree
+            .blockhash_for_height(height_u32)
+            .map_err(|e| anyhow!("tree lookup failed: {e}"))?
+        else {
+            return Err(anyhow!("height_not_indexed"));
+        };
+        Ok(self.with_view_blockhash(Some(blockhash)))
     }
 
     pub fn table(&self) -> PizzafunTable<'_> {
@@ -170,10 +213,71 @@ impl PizzafunProvider {
         self.mdb.as_ref()
     }
 
+    fn raw_get_at(&self, key: &[u8], blockhash: Option<BlockHash>) -> Result<Option<Vec<u8>>> {
+        match blockhash {
+            Some(blockhash) => self
+                .mdb
+                .get_at_blockhash(&blockhash, key)
+                .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}")),
+            None => self.mdb.get(key).map_err(|e| anyhow!("mdb.get failed: {e}")),
+        }
+    }
+
+    fn raw_multi_get_at(
+        &self,
+        keys: &[Vec<u8>],
+        blockhash: Option<BlockHash>,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        match blockhash {
+            Some(blockhash) => {
+                let mut out = Vec::with_capacity(keys.len());
+                for key in keys {
+                    out.push(self.raw_get_at(key, Some(blockhash))?);
+                }
+                Ok(out)
+            }
+            None => self.mdb.multi_get(keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}")),
+        }
+    }
+
+    fn raw_scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut keys = match self.view_blockhash {
+            Some(blockhash) => self
+                .mdb
+                .scan_prefix_keys_at_blockhash(&blockhash, prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_keys_at_blockhash failed: {e}"))?,
+            None => self
+                .mdb
+                .scan_prefix_keys(prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_keys failed: {e}"))?,
+        };
+        keys.sort();
+        Ok(keys)
+    }
+
+    fn read_series_ids_all(&self, blockhash: Option<BlockHash>) -> Result<Vec<String>> {
+        let table = self.table();
+        let entry_prefix = table.series_all_entry_prefix();
+        let keys = self.with_view_blockhash(blockhash).raw_scan_prefix_keys(&entry_prefix)?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(suffix) = key.strip_prefix(entry_prefix.as_slice()) else {
+                continue;
+            };
+            let Ok(series_id) = std::str::from_utf8(suffix) else {
+                continue;
+            };
+            out.push(series_id.to_string());
+        }
+        Ok(out)
+    }
+
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("pizzafun.get_index_height");
         let table = self.table();
-        let Some(bytes) = table.INDEX_HEIGHT.get()? else {
+        let Some(bytes) = self
+            .raw_get_at(table.INDEX_HEIGHT.key(), _params.blockhash.resolve(self.view_blockhash))?
+        else {
             return Ok(GetIndexHeightResult { height: None });
         };
         if bytes.len() != 4 {
@@ -186,23 +290,31 @@ impl PizzafunProvider {
 
     pub fn set_index_height(&self, params: SetIndexHeightParams) -> Result<()> {
         crate::debug_timer_log!("pizzafun.set_index_height");
+        if params.blockhash.resolve(self.view_blockhash).is_some() {
+            return Err(anyhow!("cannot_write_historical_view"));
+        }
         let table = self.table();
         table.INDEX_HEIGHT.put(&params.height.to_le_bytes())
     }
 
-    pub fn get_series_by_id(&self, series_id: &str) -> Result<Option<SeriesEntry>> {
+    pub fn get_series_by_id(&self, params: GetSeriesByIdParams) -> Result<Option<SeriesEntry>> {
         let table = self.table();
-        let key = table.series_by_id_key(series_id);
-        let Some(bytes) = self.mdb.get(&key).map_err(|e| anyhow!("mdb.get failed: {e}"))? else {
+        let key = table.series_by_id_key(&params.series_id);
+        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
+        else {
             return Ok(None);
         };
         Ok(Some(SeriesEntry::try_from_slice(&bytes)?))
     }
 
-    pub fn get_series_by_ids(&self, series_ids: &[String]) -> Result<Vec<Option<SeriesEntry>>> {
+    pub fn get_series_by_ids(
+        &self,
+        params: GetSeriesByIdsParams,
+    ) -> Result<Vec<Option<SeriesEntry>>> {
         let table = self.table();
-        let keys: Vec<Vec<u8>> = series_ids.iter().map(|s| table.series_by_id_key(s)).collect();
-        let raw = self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let keys: Vec<Vec<u8>> =
+            params.series_ids.iter().map(|s| table.series_by_id_key(s)).collect();
+        let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
         let mut out = Vec::with_capacity(raw.len());
         for item in raw {
             match item {
@@ -213,10 +325,14 @@ impl PizzafunProvider {
         Ok(out)
     }
 
-    pub fn get_series_by_alkane(&self, alkane: &SchemaAlkaneId) -> Result<Option<SeriesEntry>> {
+    pub fn get_series_by_alkane(
+        &self,
+        params: GetSeriesByAlkaneParams,
+    ) -> Result<Option<SeriesEntry>> {
         let table = self.table();
-        let key = table.series_by_alkane_key(alkane);
-        let Some(bytes) = self.mdb.get(&key).map_err(|e| anyhow!("mdb.get failed: {e}"))? else {
+        let key = table.series_by_alkane_key(&params.alkane);
+        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
+        else {
             return Ok(None);
         };
         Ok(Some(SeriesEntry::try_from_slice(&bytes)?))
@@ -224,11 +340,12 @@ impl PizzafunProvider {
 
     pub fn get_series_by_alkanes(
         &self,
-        alkanes: &[SchemaAlkaneId],
+        params: GetSeriesByAlkanesParams,
     ) -> Result<Vec<Option<SeriesEntry>>> {
         let table = self.table();
-        let keys: Vec<Vec<u8>> = alkanes.iter().map(|a| table.series_by_alkane_key(a)).collect();
-        let raw = self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let keys: Vec<Vec<u8>> =
+            params.alkanes.iter().map(|a| table.series_by_alkane_key(a)).collect();
+        let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
         let mut out = Vec::with_capacity(raw.len());
         for item in raw {
             match item {
@@ -239,43 +356,44 @@ impl PizzafunProvider {
         Ok(out)
     }
 
-    pub fn get_series_entries_by_name(&self, name_norm: &str) -> Result<Vec<SeriesEntry>> {
+    pub fn get_series_entries_by_name(
+        &self,
+        params: GetSeriesEntriesByNameParams,
+    ) -> Result<Vec<SeriesEntry>> {
         let table = self.table();
-        let base_prefix = table.series_by_id_prefix();
-        let mut lookup_names: Vec<String> = vec![name_norm.to_string()];
-        if let Some(series_base) = series_id_base_from_name(name_norm) {
-            if series_base != name_norm {
+        let mut lookup_names: Vec<String> = vec![params.name_norm.clone()];
+        if let Some(series_base) = series_id_base_from_name(&params.name_norm) {
+            if series_base != params.name_norm {
                 lookup_names.push(series_base);
             }
         }
 
-        let mut filtered_keys: Vec<Vec<u8>> = Vec::new();
-        let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
-        for lookup_name in lookup_names {
-            let mut prefix = base_prefix.clone();
-            prefix.extend_from_slice(lookup_name.as_bytes());
-            let keys = self.mdb.scan_prefix(&prefix)?;
+        let mut filtered_ids: Vec<String> = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        for name in &lookup_names {
+            let prefix = table.series_by_id_key(name);
+            let keys = self
+                .with_view_blockhash(params.blockhash.resolve(self.view_blockhash))
+                .raw_scan_prefix_keys(&prefix)?;
             for key in keys {
-                if !key.starts_with(base_prefix.as_slice()) {
+                let Some(suffix) = key.strip_prefix(table.series_by_id_prefix().as_slice()) else {
                     continue;
-                }
-                let raw_id = &key[base_prefix.len()..];
-                let Ok(series_id) = std::str::from_utf8(raw_id) else { continue };
-                if series_id_matches_name(series_id, &lookup_name) && seen_keys.insert(key.clone())
-                {
-                    filtered_keys.push(key);
+                };
+                let Ok(series_id) = std::str::from_utf8(suffix) else {
+                    continue;
+                };
+                if series_id_matches_name(series_id, name) && seen_ids.insert(series_id.to_string()) {
+                    filtered_ids.push(series_id.to_string());
                 }
             }
         }
 
-        if filtered_keys.is_empty() {
+        if filtered_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        let raw = self
-            .mdb
-            .multi_get(&filtered_keys)
-            .map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let keys: Vec<Vec<u8>> = filtered_ids.iter().map(|id| table.series_by_id_key(id)).collect();
+        let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
         let mut out = Vec::with_capacity(raw.len());
         for item in raw {
             if let Some(bytes) = item {
@@ -291,18 +409,22 @@ impl PizzafunProvider {
         updated: &[SeriesEntry],
     ) -> Result<()> {
         let table = self.table();
-        let mut deletes: Vec<Vec<u8>> = Vec::with_capacity(existing.len() * 2);
+        let mut deletes: Vec<Vec<u8>> = Vec::with_capacity(existing.len() * 3);
         for entry in existing {
             deletes.push(table.series_by_id_key(&entry.series_id));
             deletes.push(table.series_by_alkane_key(&entry.alkane_id));
+            deletes.push(table.series_all_entry_key(&entry.series_id));
         }
 
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(updated.len() * 2);
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> =
+            Vec::with_capacity(updated.len() * 3);
         for entry in updated {
             let encoded = borsh::to_vec(entry)?;
             puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
             puts.push((table.series_by_alkane_key(&entry.alkane_id), encoded));
+            puts.push((table.series_all_entry_key(&entry.series_id), Vec::new()));
         }
+        let (puts, deletes) = dedupe_batch_ops(puts, deletes);
 
         self.mdb
             .bulk_write(|wb: &mut MdbBatch<'_>| {
@@ -318,15 +440,35 @@ impl PizzafunProvider {
 
     pub fn replace_series_entries(&self, entries: &[SeriesEntry], height: u32) -> Result<()> {
         let table = self.table();
-        let mut deletes = table.SERIES_BY_ID.scan_prefix()?;
-        deletes.extend(table.SERIES_BY_ALKANE.scan_prefix()?);
+        let existing_ids = self.read_series_ids_all(None)?;
+        let mut deletes: Vec<Vec<u8>> = Vec::new();
+        if !existing_ids.is_empty() {
+            let existing_rows = self.get_series_by_ids(GetSeriesByIdsParams {
+                blockhash: StateAt::Latest,
+                series_ids: existing_ids.clone(),
+            })?;
+            for (idx, maybe_entry) in existing_rows.into_iter().enumerate() {
+                let Some(entry) = maybe_entry else { continue };
+                if let Some(series_id) = existing_ids.get(idx) {
+                    deletes.push(table.series_by_id_key(series_id));
+                    deletes.push(table.series_all_entry_key(series_id));
+                } else {
+                    deletes.push(table.series_by_id_key(&entry.series_id));
+                    deletes.push(table.series_all_entry_key(&entry.series_id));
+                }
+                deletes.push(table.series_by_alkane_key(&entry.alkane_id));
+            }
+        }
 
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len() * 2);
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> =
+            Vec::with_capacity(entries.len() * 3);
         for entry in entries {
             let encoded = borsh::to_vec(entry)?;
             puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
             puts.push((table.series_by_alkane_key(&entry.alkane_id), encoded));
+            puts.push((table.series_all_entry_key(&entry.series_id), Vec::new()));
         }
+        let (puts, deletes) = dedupe_batch_ops(puts, deletes);
 
         self.mdb
             .bulk_write(|wb: &mut MdbBatch<'_>| {

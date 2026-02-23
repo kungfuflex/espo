@@ -75,6 +75,7 @@ pub struct IndexState {
     pub token_mcusd_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_derived_usd_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_derived_mcusd_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub chart_change_writes: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl IndexState {
@@ -141,6 +142,7 @@ impl IndexState {
             token_mcusd_candle_writes: Vec::new(),
             token_derived_usd_candle_writes: Vec::new(),
             token_derived_mcusd_candle_writes: Vec::new(),
+            chart_change_writes: Vec::new(),
         }
     }
 }

@@ -1,9 +1,5 @@
 use crate::alkanes::metashrew::MetashrewAdapter;
-use crate::runtime::{
-    aof::{AOF_REORG_DEPTH, AofManager},
-    dbpaths::get_sdb_path_for_metashrew,
-    sdb::SDB,
-};
+use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB, tree_db::init_global_tree_db};
 use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
 use crate::{ESPO_HEIGHT, SAFE_TIP};
 use anyhow::{Context, Result};
@@ -36,7 +32,6 @@ static BITCOIND_CLIENT: OnceLock<CoreClient> = OnceLock::new();
 static METASHREW_SDB: OnceLock<std::sync::Arc<SDB>> = OnceLock::new();
 static ESPO_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
 static BLOCK_SOURCE: OnceLock<BlkOrRpcBlockSource> = OnceLock::new();
-static AOF_MANAGER: OnceLock<std::sync::Arc<AofManager>> = OnceLock::new();
 
 // NEW: Global bitcoin::Network
 static NETWORK: OnceLock<Network> = OnceLock::new();
@@ -98,12 +93,24 @@ fn default_explorer_base_path() -> String {
     "/".to_string()
 }
 
+fn default_explorer_pizza_tv_endpoint() -> String {
+    "https://tv.pizza.fun".to_string()
+}
+
 fn default_network() -> String {
     "mainnet".to_string()
 }
 
 fn default_block_source_mode() -> String {
     "rpc".to_string()
+}
+
+fn default_compact_tx_trace_rows() -> bool {
+    true
+}
+
+fn default_address_index_chunk_size() -> u32 {
+    512
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -215,8 +222,6 @@ pub struct ConfigFile {
     pub reset_mempool_on_startup: bool,
     #[serde(default = "default_db_path")]
     pub db_path: String,
-    #[serde(default)]
-    pub enable_aof: bool,
     #[serde(default = "default_sdb_poll_ms")]
     pub sdb_poll_ms: u16,
     #[serde(default)]
@@ -227,6 +232,8 @@ pub struct ConfigFile {
     pub explorer_host: Option<SocketAddr>,
     #[serde(default = "default_explorer_base_path")]
     pub explorer_base_path: String,
+    #[serde(default = "default_explorer_pizza_tv_endpoint")]
+    pub explorer_pizza_tv_endpoint: String,
     #[serde(default = "default_network")]
     pub network: String,
     #[serde(default)]
@@ -243,8 +250,10 @@ pub struct ConfigFile {
     pub safe_tip_hook_script: Option<String>,
     #[serde(default = "default_block_source_mode")]
     pub block_source_mode: String,
-    #[serde(default)]
-    pub simulate_reorg: bool,
+    #[serde(default = "default_compact_tx_trace_rows")]
+    pub compact_tx_trace_rows: bool,
+    #[serde(default = "default_address_index_chunk_size")]
+    pub address_index_chunk_size: u32,
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
     #[serde(default)]
@@ -264,12 +273,12 @@ pub struct AppConfig {
     pub reset_mempool_on_startup: bool,
     pub view_only: bool,
     pub db_path: String,
-    pub enable_aof: bool,
     pub sdb_poll_ms: u16,
     pub indexer_block_delay_ms: u64,
     pub port: u16,
     pub explorer_host: Option<SocketAddr>,
     pub explorer_base_path: String,
+    pub explorer_pizza_tv_endpoint: String,
     pub network: Network,
     pub metashrew_db_label: Option<String>,
     pub strict_mode: Option<StrictModeConfig>,
@@ -278,7 +287,8 @@ pub struct AppConfig {
     pub debug_backup: Option<DebugBackupConfig>,
     pub safe_tip_hook_script: Option<String>,
     pub block_source_mode: BlockFetchMode,
-    pub simulate_reorg: bool,
+    pub compact_tx_trace_rows: bool,
+    pub address_index_chunk_size: u32,
     pub explorer_networks: Option<ExplorerNetworks>,
     pub modules: HashMap<String, serde_json::Value>,
 }
@@ -307,6 +317,9 @@ impl AppConfig {
         let block_source_mode =
             parse_block_fetch_mode(&file.block_source_mode).map_err(|e| anyhow::anyhow!(e))?;
         let explorer_base_path = normalize_explorer_base_path(&file.explorer_base_path)?;
+        let explorer_pizza_tv_endpoint =
+            normalize_optional_string(Some(file.explorer_pizza_tv_endpoint))
+                .unwrap_or_else(default_explorer_pizza_tv_endpoint);
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
         let debug_backup = file.debug_backup;
 
@@ -322,12 +335,12 @@ impl AppConfig {
             reset_mempool_on_startup: file.reset_mempool_on_startup,
             view_only,
             db_path: file.db_path,
-            enable_aof: file.enable_aof,
             sdb_poll_ms: file.sdb_poll_ms,
             indexer_block_delay_ms: file.indexer_block_delay_ms,
             port: file.port,
             explorer_host: file.explorer_host,
             explorer_base_path,
+            explorer_pizza_tv_endpoint,
             network,
             metashrew_db_label: normalize_optional_string(file.metashrew_db_label),
             strict_mode: file.strict_mode,
@@ -336,7 +349,8 @@ impl AppConfig {
             debug_backup,
             safe_tip_hook_script: normalize_optional_string(file.safe_tip_hook_script),
             block_source_mode,
-            simulate_reorg: file.simulate_reorg,
+            compact_tx_trace_rows: file.compact_tx_trace_rows,
+            address_index_chunk_size: file.address_index_chunk_size,
             explorer_networks,
             modules: file.modules,
         })
@@ -384,17 +398,6 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
         anyhow::bail!("espo db dir is not a directory: {}", espo_dir.display());
     }
 
-    if cfg.enable_aof {
-        let aof_dir = db_root.join("aof");
-        if !aof_dir.exists() {
-            fs::create_dir_all(&aof_dir).map_err(|e| {
-                anyhow::anyhow!("Failed to create aof db dir {}: {e}", aof_dir.display())
-            })?;
-        } else if !aof_dir.is_dir() {
-            anyhow::bail!("aof db dir is not a directory: {}", aof_dir.display());
-        }
-    }
-
     if cfg.block_source_mode != BlockFetchMode::RpcOnly {
         let blocks_dir = Path::new(&cfg.bitcoind_blocks_dir);
         if !blocks_dir.exists() {
@@ -407,6 +410,9 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
 
     if cfg.sdb_poll_ms == 0 {
         anyhow::bail!("sdb_poll_ms must be greater than 0");
+    }
+    if cfg.address_index_chunk_size == 0 {
+        anyhow::bail!("address_index_chunk_size must be greater than 0");
     }
 
     cfg.explorer_base_path = normalize_explorer_base_path(&cfg.explorer_base_path)?;
@@ -489,13 +495,7 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
         .set(espo_db.clone())
         .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
 
-    if cfg.enable_aof {
-        let aof_path = Path::new(&cfg.db_path).join("aof");
-        let mgr = AofManager::new(espo_db.clone(), aof_path, AOF_REORG_DEPTH)?;
-        AOF_MANAGER
-            .set(std::sync::Arc::new(mgr))
-            .map_err(|_| anyhow::anyhow!("AOF manager already initialized"))?;
-    }
+    init_global_tree_db(espo_db.clone())?;
 
     // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
     if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
@@ -574,11 +574,6 @@ pub fn get_espo_db() -> std::sync::Arc<DB> {
     std::sync::Arc::clone(ESPO_DB.get().expect("init_config() must be called once at startup"))
 }
 
-/// Optional handle to the global AOF manager (only present when --enable-aof is set).
-pub fn get_aof_manager() -> Option<std::sync::Arc<AofManager>> {
-    AOF_MANAGER.get().cloned()
-}
-
 /// Global accessor for the block source (blk files + RPC fallback)
 pub fn get_block_source() -> &'static BlkOrRpcBlockSource {
     BLOCK_SOURCE
@@ -589,6 +584,14 @@ pub fn get_block_source() -> &'static BlkOrRpcBlockSource {
 /// NEW: Global accessor for bitcoin::Network
 pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
+}
+
+pub fn compact_tx_trace_rows_enabled() -> bool {
+    get_config().compact_tx_trace_rows
+}
+
+pub fn get_address_index_chunk_size() -> usize {
+    get_config().address_index_chunk_size.max(1) as usize
 }
 
 pub fn is_strict_mode() -> bool {
@@ -639,6 +642,10 @@ pub fn get_metashrew_rpc_url() -> &'static str {
 
 pub fn get_explorer_base_path() -> &'static str {
     &get_config().explorer_base_path
+}
+
+pub fn get_explorer_pizza_tv_endpoint() -> &'static str {
+    &get_config().explorer_pizza_tv_endpoint
 }
 
 pub fn get_explorer_networks() -> Option<&'static ExplorerNetworks> {

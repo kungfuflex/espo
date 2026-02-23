@@ -154,9 +154,9 @@ impl BlkOrRpcBlockSource {
     fn build_height_map(mdb: &Mdb, rpc: &CoreClient) -> Result<HashMap<u32, BlockHash>> {
         let mut out: HashMap<u32, BlockHash> = HashMap::new();
         eprintln!("[BLOCKFETCHER] Loading height map from DB (first run may take a bit)...");
-        let keys = mdb.scan_prefix(&[]).context("scan_prefix for block_core_index/")?;
-
-        for rel in keys {
+        for res in mdb.iter_from(b"") {
+            let (k_full, _v) = res.context("iter_from for block_core_index/")?;
+            let rel = &k_full[mdb.prefix().len()..];
             if rel.len() != 32 {
                 continue; // skip 'F' markers or anything unexpected
             }

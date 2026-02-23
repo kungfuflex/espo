@@ -3,6 +3,7 @@ use crate::alkanes::trace::{
 };
 use crate::config::get_metashrew_rpc_url;
 use crate::modules::essentials::utils::inspections::StoredInspectionResult;
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId;
@@ -93,10 +94,12 @@ fn has_get_name_method(inspection: &StoredInspectionResult) -> bool {
 }
 
 pub fn get_name(
+    blockhash: StateAt,
     block: &EspoBlock,
     alkane: &SchemaAlkaneId,
     inspection: Option<&StoredInspectionResult>,
 ) -> Option<String> {
+    let _ = blockhash;
     if let Some(name) = name_from_creation_trace(block, alkane) {
         return Some(name);
     }

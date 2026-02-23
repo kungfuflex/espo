@@ -1,25 +1,30 @@
+use crate::runtime::state_at::StateAt;
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use axum::extract::State;
 use axum::response::Html;
-use bitcoin::Txid;
 use bitcoin::hashes::Hash;
+use bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
 use borsh::BorshDeserialize;
-use maud::{Markup, html};
+use maud::{html, Markup};
 use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
 use crate::config::{get_bitcoind_rpc_client, get_espo_next_height};
 use crate::explorer::components::block_carousel::block_carousel;
-use crate::explorer::components::layout::layout;
+use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::icon_right;
-use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
+use crate::explorer::components::table::{alkanes_table, AlkaneTableRow};
 use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summaries};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable, load_creation_record};
+use crate::modules::essentials::storage::{
+    load_creation_record, load_tx_summary_v2, AlkaneTxSummary, EssentialsProvider, EssentialsTable,
+    GetHoldersOrderedPageParams, HoldersCountEntry,
+};
 use crate::schemas::EspoOutpoint;
+use std::sync::Arc;
 
 struct AlkaneTxRow {
     txid: Txid,
@@ -36,16 +41,28 @@ fn load_top_alkanes_by_holders(
     }
 
     let table = EssentialsTable::new(mdb);
-    let prefix_full = mdb.prefixed(&table.alkane_holders_ordered_prefix());
-    let it = mdb.iter_prefix_rev(&prefix_full);
-    for res in it {
+    let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
+    let ids = provider
+        .get_holders_ordered_page(GetHoldersOrderedPageParams {
+            blockhash: StateAt::Latest,
+            offset: 0,
+            limit: limit as u64,
+            desc: true,
+        })
+        .map(|res| res.ids)
+        .unwrap_or_default();
+    for alk in ids {
         if rows.len() >= limit {
             break;
         }
-        let Ok((k, _v)) = res else { continue };
-        let rel = &k[mdb.prefix().len()..];
-        let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else { continue };
         let Some(rec) = load_creation_record(mdb, &alk).ok().flatten() else { continue };
+        let holders = mdb
+            .get(&table.holders_count_key(&alk))
+            .ok()
+            .flatten()
+            .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
+            .map(|hc| hc.count)
+            .unwrap_or(0);
 
         let id = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
         let name = rec
@@ -106,26 +123,44 @@ fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<A
     }
 
     let table = EssentialsTable::new(mdb);
-    let list: Vec<[u8; 32]> = mdb
-        .get(&table.alkane_latest_traces_key())
+    let mut txid_vals: Vec<Option<Vec<u8>>> = Vec::new();
+
+    // Newer layout: /alkane_latest_traces/v2/{length,idx}
+    let len = mdb
+        .get(&table.latest_traces_length_key())
         .ok()
         .flatten()
-        .and_then(|b| Vec::<[u8; 32]>::try_from_slice(&b).ok())
-        .unwrap_or_default();
-    if list.is_empty() {
+        .and_then(|b| {
+            if b.len() == 4 {
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(&b);
+                Some(u32::from_le_bytes(arr))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    if len > 0 {
+        let mut keys = Vec::with_capacity(len as usize);
+        for idx in 0..len {
+            keys.push(table.latest_traces_idx_key(idx));
+        }
+        txid_vals = mdb.multi_get(&keys).unwrap_or_default();
+    }
+
+    if txid_vals.is_empty() {
         return out;
     }
 
-    for txid_bytes in list {
+    let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
+
+    for v in txid_vals {
         if out.len() >= limit {
             break;
         }
+        let Some(txid_bytes) = v else { continue };
         let Ok(txid) = Txid::from_slice(&txid_bytes) else { continue };
-        let summary = mdb
-            .get(&table.alkane_tx_summary_key(&txid.to_byte_array()))
-            .ok()
-            .flatten()
-            .and_then(|b| AlkaneTxSummary::try_from_slice(&b).ok());
+        let summary = load_tx_summary_v2(&provider, &txid);
         let Some(summary) = summary else { continue };
         let mut traces = traces_from_summary(&txid, &summary);
         if traces.is_empty() {
@@ -147,6 +182,7 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
     let latest_alkane_txs = load_latest_alkane_txs(&state.essentials_mdb, 4);
     let latest_block_link = explorer_path(&format!("/block/{espo_tip}?traces=1"));
     let alkanes_link = explorer_path("/alkanes");
+    let recent_block_heights: Vec<u64> = (latest_height.saturating_sub(9)..=latest_height).rev().collect();
 
     let top_alkanes_table: Markup = if top_alkanes.is_empty() {
         html! { p class="muted" { "No alkanes found." } }
@@ -175,11 +211,22 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
         }
     };
 
-    layout(
+    layout_with_meta(
         "Blocks",
+        "/",
+        None,
         html! {
             div class="block-hero full-bleed" {
                 (block_carousel(Some(latest_height), espo_tip))
+            }
+            div class="home-recent-blocks muted" {
+                "Latest blocks: "
+                @for (idx, height) in recent_block_heights.iter().enumerate() {
+                    @if idx > 0 {
+                        " · "
+                    }
+                    a class="link mono" href=(explorer_path(&format!("/block/{height}"))) { (height) }
+                }
             }
 
             div class="home-table-intro" {

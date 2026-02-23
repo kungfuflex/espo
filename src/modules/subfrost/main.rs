@@ -2,7 +2,8 @@ use super::consts::get_frbtc_alkane;
 use super::rpc::register_rpc;
 use super::schemas::SchemaWrapEventV1;
 use super::storage::{
-    GetIndexHeightParams, SetBatchParams, SetIndexHeightParams, SubfrostProvider,
+    BuildEventListAppendsParams, BuildUnwrapTotalPointAppendsParams, GetIndexHeightParams,
+    SetBatchParams, SetIndexHeightParams, SubfrostProvider, UnwrapTotalPoint,
 };
 use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceInvokeData,
@@ -13,6 +14,7 @@ use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::utils::balances::clean_espo_sandshrew_like_trace;
 use crate::runtime::mdb::Mdb;
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::consensus::deserialize;
@@ -39,23 +41,25 @@ impl Subfrost {
     }
 
     fn load_index_height(&self) -> Result<Option<u32>> {
-        let resp = self.provider().get_index_height(GetIndexHeightParams)?;
+        let resp = self
+            .provider()
+            .get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })?;
         Ok(resp.height)
     }
 
-    fn persist_index_height(&self, height: u32) -> Result<()> {
+    fn persist_index_height(&self, height: u32, blockhash: StateAt) -> Result<()> {
         self.provider()
-            .set_index_height(SetIndexHeightParams { height })
+            .set_index_height(SetIndexHeightParams { blockhash, height })
             .map_err(|e| anyhow!("[SUBFROST] rocksdb put(/index_height) failed: {e}"))
     }
 
-    fn set_index_height(&self, new_height: u32) -> Result<()> {
+    fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
         if let Some(prev) = *self.index_height.read().unwrap() {
             if new_height < prev {
                 eprintln!("[SUBFROST] index height rollback detected ({} -> {})", prev, new_height);
             }
         }
-        self.persist_index_height(new_height)?;
+        self.persist_index_height(new_height, blockhash)?;
         *self.index_height.write().unwrap() = Some(new_height);
         Ok(())
     }
@@ -94,6 +98,7 @@ impl EspoModule for Subfrost {
         let provider = self.provider();
         let table = provider.table();
         let height = block.height;
+        let block_hash = block.block_header.block_hash();
         if let Some(prev) = *self.index_height.read().unwrap() {
             if height <= prev {
                 eprintln!("[SUBFROST] skipping already indexed block #{height} (last={prev})");
@@ -111,11 +116,14 @@ impl EspoModule for Subfrost {
         }
         let mut prev_tx_cache: HashMap<Txid, Transaction> = HashMap::new();
 
-        let mut wrap_seq: u32 = 0;
-        let mut unwrap_seq: u32 = 0;
+        let mut wrap_count: usize = 0;
+        let mut unwrap_count: usize = 0;
         let mut unwrap_delta_all: u128 = 0;
         let mut unwrap_delta_success: u128 = 0;
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut wrap_events_all: Vec<SchemaWrapEventV1> = Vec::new();
+        let mut unwrap_events_all: Vec<SchemaWrapEventV1> = Vec::new();
+        let mut wrap_events_by_address: HashMap<Vec<u8>, Vec<SchemaWrapEventV1>> = HashMap::new();
+        let mut unwrap_events_by_address: HashMap<Vec<u8>, Vec<SchemaWrapEventV1>> = HashMap::new();
         debug::log_elapsed(module, "init_context", timer);
 
         let timer = debug::start_if(debug);
@@ -176,29 +184,22 @@ impl EspoModule for Subfrost {
                                         unwrap_delta_success.saturating_add(amount);
                                 }
                             }
-                            let bytes = borsh::to_vec(&event)?;
                             match pending.kind {
                                 WrapKind::Wrap => {
-                                    let key = table.wrap_events_all_key(block_ts, wrap_seq);
-                                    let addr_key = table.wrap_events_by_address_key(
-                                        &event.address_spk,
-                                        block_ts,
-                                        wrap_seq,
-                                    );
-                                    puts.push((key, bytes.clone()));
-                                    puts.push((addr_key, bytes));
-                                    wrap_seq = wrap_seq.saturating_add(1);
+                                    wrap_events_by_address
+                                        .entry(event.address_spk.clone())
+                                        .or_default()
+                                        .push(event.clone());
+                                    wrap_events_all.push(event);
+                                    wrap_count = wrap_count.saturating_add(1);
                                 }
                                 WrapKind::Unwrap => {
-                                    let key = table.unwrap_events_all_key(block_ts, unwrap_seq);
-                                    let addr_key = table.unwrap_events_by_address_key(
-                                        &event.address_spk,
-                                        block_ts,
-                                        unwrap_seq,
-                                    );
-                                    puts.push((key, bytes.clone()));
-                                    puts.push((addr_key, bytes));
-                                    unwrap_seq = unwrap_seq.saturating_add(1);
+                                    unwrap_events_by_address
+                                        .entry(event.address_spk.clone())
+                                        .or_default()
+                                        .push(event.clone());
+                                    unwrap_events_all.push(event);
+                                    unwrap_count = unwrap_count.saturating_add(1);
                                 }
                             }
                         }
@@ -209,18 +210,50 @@ impl EspoModule for Subfrost {
         }
         debug::log_elapsed(module, "process_traces", timer);
 
-        if !puts.is_empty() {
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        if !wrap_events_all.is_empty() {
+            puts.extend(provider.build_event_list_appends(BuildEventListAppendsParams {
+                list_prefix: table.WRAP_EVENTS_ALL.key().to_vec(),
+                events: wrap_events_all,
+            })?);
+        }
+        if !unwrap_events_all.is_empty() {
+            puts.extend(provider.build_event_list_appends(BuildEventListAppendsParams {
+                list_prefix: table.UNWRAP_EVENTS_ALL.key().to_vec(),
+                events: unwrap_events_all,
+            })?);
+        }
+        for (spk, events) in wrap_events_by_address {
+            puts.extend(provider.build_event_list_appends(BuildEventListAppendsParams {
+                list_prefix: table.wrap_events_by_address_prefix(&spk),
+                events,
+            })?);
+        }
+        for (spk, events) in unwrap_events_by_address {
+            puts.extend(provider.build_event_list_appends(BuildEventListAppendsParams {
+                list_prefix: table.unwrap_events_by_address_prefix(&spk),
+                events,
+            })?);
+        }
+
+        if !puts.is_empty() || unwrap_delta_all > 0 || unwrap_delta_success > 0 {
             let timer = debug::start_if(debug);
             if unwrap_delta_all > 0 || unwrap_delta_success > 0 {
                 let prev_all = provider
                     .get_unwrap_total_latest(super::storage::GetUnwrapTotalLatestParams {
+                        blockhash: StateAt::Block(block_hash),
                         successful: false,
+                        height: None,
+                        height_present: false,
                     })
                     .map(|res| res.total)
                     .unwrap_or(0);
                 let prev_success = provider
                     .get_unwrap_total_latest(super::storage::GetUnwrapTotalLatestParams {
+                        blockhash: StateAt::Block(block_hash),
                         successful: true,
+                        height: None,
+                        height_present: false,
                     })
                     .map(|res| res.total)
                     .unwrap_or(0);
@@ -236,19 +269,40 @@ impl EspoModule for Subfrost {
                     table.unwrap_total_by_height_key(block.height, true),
                     encode_u128_value(total_success),
                 ));
+                puts.extend(provider.build_unwrap_total_point_appends(
+                    BuildUnwrapTotalPointAppendsParams {
+                        successful: false,
+                        points: vec![UnwrapTotalPoint { height: block.height, total: total_all }],
+                    },
+                )?);
+                puts.extend(provider.build_unwrap_total_point_appends(
+                    BuildUnwrapTotalPointAppendsParams {
+                        successful: true,
+                        points: vec![UnwrapTotalPoint {
+                            height: block.height,
+                            total: total_success,
+                        }],
+                    },
+                )?);
             }
             debug::log_elapsed(module, "update_totals", timer);
             let timer = debug::start_if(debug);
-            let _ = provider.set_batch(SetBatchParams { puts, deletes: Vec::new() });
+            provider
+                .set_batch(SetBatchParams {
+                    blockhash: StateAt::Latest,
+                    puts,
+                    deletes: Vec::new(),
+                })
+                .map_err(|e| anyhow!("[SUBFROST] set_batch failed at height {}: {e}", height))?;
             debug::log_elapsed(module, "write_batch", timer);
         }
 
         println!(
             "[SUBFROST] finished block #{} (wraps={}, unwraps={})",
-            block.height, wrap_seq, unwrap_seq
+            block.height, wrap_count, unwrap_count
         );
         let timer = debug::start_if(debug);
-        self.set_index_height(block.height)?;
+        self.set_index_height(block.height, StateAt::Latest)?;
         debug::log_elapsed(module, "finalize", timer);
         eprintln!(
             "[indexer] module={} height={} index_block done in {:?}",

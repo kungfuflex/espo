@@ -88,6 +88,25 @@ a:hover {
   gap: 20px;
 }
 
+.nav-lang-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text);
+  background: var(--panel2);
+  text-decoration: none;
+}
+.nav-lang-btn:hover {
+  color: var(--link);
+  text-decoration: none;
+}
+.nav-lang-btn.active {
+  color: var(--link);
+}
+
 .brand-logo {
   display: block;
   width: 34px;
@@ -778,6 +797,9 @@ a:hover {
   margin-top: 12px;
   align-items: stretch;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+.home-recent-blocks {
+  display: none;
 }
 .home-table-intro {
   margin: 28px 0 90px;
@@ -1540,6 +1562,176 @@ a:hover {
 }
 .switch-input:checked + .switch-slider::before {
   transform: translateX(20px);
+}
+.address-balance-chart-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+}
+.address-balance-chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 40px;
+  flex-wrap: wrap;
+}
+.address-balance-chart-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.address-balance-dropdown .dropdown-trigger {
+  min-width: 230px;
+  justify-content: space-between;
+}
+.address-balance-dropdown .dropdown-label {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.address-balance-dropdown-panel {
+  right: 0;
+  left: auto;
+  min-width: 260px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.address-balance-dropdown .dropdown-icon {
+  width: 22px;
+  height: 22px;
+}
+.address-balance-dropdown-alk-icon {
+  width: 22px;
+  height: 22px;
+}
+.address-balance-dropdown-alk-icon .alk-icon-letter {
+  font-size: 11px;
+}
+.address-balance-chart-plot {
+  position: relative;
+  height: 250px;
+  border-radius: 10px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.address-balance-chart-plot canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+.address-balance-chart-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted2);
+  background: rgba(31, 34, 40, 0.3);
+}
+.address-balance-chart-spinner {
+  width: 22px;
+  height: 22px;
+  border-width: 3px;
+}
+.address-balance-chart-loading[data-spinning="0"]
+  .address-balance-chart-spinner {
+  display: none;
+}
+.address-balance-chart-loading[data-spinning="1"]
+  [data-address-chart-loading-text] {
+  display: none;
+}
+.address-balance-chart-tooltip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 4;
+  pointer-events: none;
+  opacity: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: none;
+  background: var(--panel3);
+  color: var(--text);
+  box-shadow: 0 0px 4px rgba(0, 0, 0, 0.4);
+  font-size: 12px;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+.address-balance-chart-tooltip-title {
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.address-balance-chart-tooltip-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.address-balance-chart-tooltip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+}
+.address-balance-chart-tooltip-icon .alk-icon-wrap {
+  width: 18px;
+  height: 18px;
+}
+.address-balance-chart-tooltip-icon .alk-icon-letter {
+  font-size: 9px;
+}
+.address-balance-chart-tooltip-value {
+  font-weight: 600;
+}
+.address-balance-chart-tabs {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.address-balance-chart-tab {
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--muted2);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.address-balance-chart-tab.active,
+.address-balance-chart-tab:hover {
+  color: var(--text);
+  background: var(--panel2);
+}
+@media (max-width: 720px) {
+  .address-balance-chart-head {
+    gap: 0;
+  }
+  .address-balance-chart-controls {
+    width: 100%;
+    margin-left: 0;
+  }
+  .address-balance-dropdown {
+    width: 100%;
+  }
+  .address-balance-dropdown .dropdown-trigger {
+    width: 100%;
+  }
+  .address-balance-dropdown-panel {
+    width: 100%;
+    min-width: 0;
+    right: auto;
+    left: 0;
+  }
+  .address-balance-chart-side {
+    text-align: left;
+  }
 }
 .trace-summary {
   background: var(--panel2);
@@ -2757,7 +2949,7 @@ button:hover {
   font-size: 15px;
 }
 .bc-traces {
-  font-size: 16px;
+  font-size: 15px;
   color: #fff;
 }
 .bc-time {

@@ -1,9 +1,10 @@
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, PRICE_SCALE};
 use crate::modules::ammdata::schemas::{SchemaCandleV1, SchemaFullCandleV1, Timeframe};
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams,
+    AmmDataProvider, GetListEntriesDescParams, GetRawValueParams,
 };
 use crate::modules::ammdata::storage::{decode_full_candle_v1, encode_full_candle_v1};
 use anyhow::Result;
@@ -149,8 +150,9 @@ impl CandleCache {
         for (ck, dc_new) in self.map.into_iter() {
             let k = table.candle_key(&ck.pool, ck.tf, ck.bucket_ts);
 
-            let merged = if let Some(raw) =
-                provider.get_raw_value(GetRawValueParams { key: k.clone() })?.value
+            let merged = if let Some(raw) = provider
+                .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: k.clone() })?
+                .value
             {
                 let existing = decode_full_candle_v1(&raw)?;
 
@@ -215,7 +217,10 @@ pub fn read_candles_v1(
     let logical = table.candle_ns_prefix(&pool, tf);
     let mut per_bucket: BTreeMap<u64, SchemaFullCandleV1> = BTreeMap::new();
     for (k, v) in provider
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest,
+            prefix: logical,
+        })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {

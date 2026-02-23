@@ -19,6 +19,7 @@ use crate::modules::essentials::utils::names::{
     get_name as get_alkane_name, normalize_alkane_name,
 };
 use crate::runtime::mdb::Mdb;
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use bitcoin::Network;
@@ -112,18 +113,21 @@ impl Essentials {
     }
 
     fn load_index_height(&self) -> Result<Option<u32>> {
-        let resp = self
-            .provider()
-            .get_index_height(crate::modules::essentials::storage::GetIndexHeightParams)?;
+        let resp = self.provider().get_index_height(
+            crate::modules::essentials::storage::GetIndexHeightParams {
+                blockhash: StateAt::Latest,
+            },
+        )?;
         Ok(resp.height)
     }
 
-    fn persist_index_height(&self, height: u32) -> Result<()> {
-        self.provider()
-            .set_index_height(crate::modules::essentials::storage::SetIndexHeightParams { height })
+    fn persist_index_height(&self, height: u32, blockhash: StateAt) -> Result<()> {
+        self.provider().set_index_height(
+            crate::modules::essentials::storage::SetIndexHeightParams { blockhash, height },
+        )
     }
 
-    fn set_index_height(&self, new_height: u32) -> Result<()> {
+    fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
         if let Some(prev) = *self.index_height.read().unwrap() {
             if new_height < prev {
                 eprintln!(
@@ -132,7 +136,7 @@ impl Essentials {
                 );
             }
         }
-        self.persist_index_height(new_height)?;
+        self.persist_index_height(new_height, blockhash)?;
         *self.index_height.write().unwrap() = Some(new_height);
         Ok(())
     }
@@ -173,6 +177,7 @@ impl EspoModule for Essentials {
         let provider = self.provider();
         let table = provider.table();
         let height = block.height;
+        let block_hash = block.block_header.block_hash();
         if let Some(prev) = *self.index_height.read().unwrap() {
             if height <= prev {
                 eprintln!("[ESSENTIALS] skipping already indexed block #{height} (last={prev})");
@@ -190,9 +195,9 @@ impl EspoModule for Essentials {
         // dedup directory markers:
         //   dir_row_key(alk,skey) -> ()
         let mut dir_rows: HashSet<Vec<u8>> = HashSet::new();
-        // creation records rows (by id and by ordered key):
+        // creation records rows (by id and sequence index):
         let mut creation_rows_by_id: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-        let mut creation_rows_ordered: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut creation_rows_seq: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut holders_index_rows: HashSet<Vec<u8>> = HashSet::new();
         // in-block name/symbol updates detected from storage writes
         let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> = HashMap::new();
@@ -437,7 +442,10 @@ impl EspoModule for Essentials {
                         } else {
                             let key = table.orbital_collection_name_key(&factory_id);
                             let name = provider
-                                .get_raw_value(GetRawValueParams { key })
+                                .get_raw_value(GetRawValueParams {
+                                    blockhash: StateAt::Block(block_hash),
+                                    key,
+                                })
                                 .ok()
                                 .and_then(|resp| resp.value)
                                 .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -455,9 +463,12 @@ impl EspoModule for Essentials {
                     }
 
                     if base_name.is_none() && rec.names.is_empty() {
-                        if let Some(name) =
-                            get_alkane_name(&block, &rec.alkane, rec.inspection.as_ref())
-                        {
+                        if let Some(name) = get_alkane_name(
+                            StateAt::Block(block_hash),
+                            &block,
+                            &rec.alkane,
+                            rec.inspection.as_ref(),
+                        ) {
                             name_from_simulate = Some(name.clone());
                             base_name = orbital_base_name(&name);
                         }
@@ -488,7 +499,12 @@ impl EspoModule for Essentials {
             }
 
             if rec.names.is_empty() && !applied_orbital_name {
-                if let Some(name) = get_alkane_name(&block, &rec.alkane, rec.inspection.as_ref()) {
+                if let Some(name) = get_alkane_name(
+                    StateAt::Block(block_hash),
+                    &block,
+                    &rec.alkane,
+                    rec.inspection.as_ref(),
+                ) {
                     rec.names.push(name);
                 }
             }
@@ -498,14 +514,22 @@ impl EspoModule for Essentials {
         let meta_timer = debug::start_if(debug);
         for rec in created_records.iter_mut() {
             if rec.cap == 0 && !cap_updates.contains_key(&rec.alkane) {
-                if let Some(cap) = get_cap(block.height, &rec.alkane, rec.inspection.as_ref()) {
+                if let Some(cap) = get_cap(
+                    StateAt::Block(block_hash),
+                    block.height,
+                    &rec.alkane,
+                    rec.inspection.as_ref(),
+                ) {
                     rec.cap = cap;
                 }
             }
             if rec.mint_amount == 0 && !mint_updates.contains_key(&rec.alkane) {
-                if let Some(mint_amount) =
-                    get_value_per_mint(block.height, &rec.alkane, rec.inspection.as_ref())
-                {
+                if let Some(mint_amount) = get_value_per_mint(
+                    StateAt::Block(block_hash),
+                    block.height,
+                    &rec.alkane,
+                    rec.inspection.as_ref(),
+                ) {
                     rec.mint_amount = mint_amount;
                 }
             }
@@ -524,14 +548,29 @@ impl EspoModule for Essentials {
         }
 
         debug::log_elapsed(module, "build_creation_indexes", timer);
+        let mut creations_in_block: Vec<SchemaAlkaneId> = Vec::new();
+        let mut seen_creations_in_block: HashSet<SchemaAlkaneId> = HashSet::new();
+        for rec in created_records.iter() {
+            if seen_creations_in_block.insert(rec.alkane) {
+                creations_in_block.push(rec.alkane);
+            }
+        }
         // Dedup against existing records to avoid double-counting if re-run.
         let timer = debug::start_if(debug);
         let mut new_creations_added: u64 = 0;
+        let mut next_creation_seq = provider
+            .get_creation_count(crate::modules::essentials::storage::GetCreationCountParams {
+                blockhash: StateAt::Block(block_hash),
+            })?
+            .count;
         if !created_records.is_empty() {
             let alkanes: Vec<SchemaAlkaneId> = created_records.iter().map(|r| r.alkane).collect();
             let existing = provider
                 .get_creation_records_by_id(
-                    crate::modules::essentials::storage::GetCreationRecordsByIdParams { alkanes },
+                    crate::modules::essentials::storage::GetCreationRecordsByIdParams {
+                        blockhash: StateAt::Block(block_hash),
+                        alkanes,
+                    },
                 )?
                 .records;
             let id_keys: Vec<Vec<u8>> = created_records
@@ -597,27 +636,21 @@ impl EspoModule for Essentials {
                                 continue;
                             }
                         };
-                        creation_rows_by_id.insert(key_id.clone(), encoded_updated.clone());
-                        let key_ord = table.alkane_creation_ordered_key(
-                            updated.creation_timestamp,
-                            updated.creation_height,
-                            updated.tx_index_in_block,
-                            &updated.alkane,
-                        );
-                        creation_rows_ordered.insert(key_ord, encoded_updated);
+                        creation_rows_by_id.insert(key_id.clone(), encoded_updated);
                     }
                     continue;
                 }
 
                 new_creations_added += 1;
-                creation_rows_by_id.insert(key_id.clone(), encoded.clone());
-                let key_ord = table.alkane_creation_ordered_key(
-                    rec.creation_timestamp,
-                    rec.creation_height,
-                    rec.tx_index_in_block,
-                    &rec.alkane,
+                creation_rows_by_id.insert(key_id.clone(), encoded);
+                let mut alkane_id_bytes = Vec::with_capacity(12);
+                alkane_id_bytes.extend_from_slice(&rec.alkane.block.to_be_bytes());
+                alkane_id_bytes.extend_from_slice(&rec.alkane.tx.to_be_bytes());
+                creation_rows_seq.insert(
+                    table.alkane_creation_seq_key(next_creation_seq),
+                    alkane_id_bytes,
                 );
-                creation_rows_ordered.insert(key_ord, encoded);
+                next_creation_seq = next_creation_seq.saturating_add(1);
                 holders_index_rows.insert(table.alkane_holders_ordered_key(0, &rec.alkane));
             }
         }
@@ -630,6 +663,7 @@ impl EspoModule for Essentials {
             }
             let Some(mut rec) = provider
                 .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
+                    blockhash: StateAt::Block(block_hash),
                     alkane: *alk,
                 })
                 .ok()
@@ -678,14 +712,7 @@ impl EspoModule for Essentials {
                     continue;
                 }
             };
-            creation_rows_by_id.insert(key_id, encoded.clone());
-            let key_ord = table.alkane_creation_ordered_key(
-                rec.creation_timestamp,
-                rec.creation_height,
-                rec.tx_index_in_block,
-                &rec.alkane,
-            );
-            creation_rows_ordered.insert(key_ord, encoded);
+            creation_rows_by_id.insert(key_id, encoded);
         }
 
         debug::log_elapsed(module, "dedup_and_update_creations", timer);
@@ -697,9 +724,8 @@ impl EspoModule for Essentials {
         dir_keys.sort_unstable();
         let mut creation_keys_by_id: Vec<Vec<u8>> = creation_rows_by_id.keys().cloned().collect();
         creation_keys_by_id.sort_unstable();
-        let mut creation_keys_ordered: Vec<Vec<u8>> =
-            creation_rows_ordered.keys().cloned().collect();
-        creation_keys_ordered.sort_unstable();
+        let mut creation_keys_seq: Vec<Vec<u8>> = creation_rows_seq.keys().cloned().collect();
+        creation_keys_seq.sort_unstable();
         let mut name_index_keys: Vec<Vec<u8>> = name_index_rows.keys().cloned().collect();
         name_index_keys.sort_unstable();
         let mut symbol_index_keys: Vec<Vec<u8>> = symbol_index_rows.keys().cloned().collect();
@@ -711,11 +737,7 @@ impl EspoModule for Essentials {
         holders_index_keys.sort_unstable();
         let mut creation_count_row: Option<[u8; 8]> = None;
         if new_creations_added > 0 {
-            let current = provider
-                .get_creation_count(crate::modules::essentials::storage::GetCreationCountParams)?
-                .count;
-            let updated = current.saturating_add(new_creations_added);
-            creation_count_row = Some(updated.to_le_bytes());
+            creation_count_row = Some(next_creation_seq.to_le_bytes());
         }
 
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -732,8 +754,8 @@ impl EspoModule for Essentials {
                 puts.push((k.clone(), v.clone()));
             }
         }
-        for k in &creation_keys_ordered {
-            if let Some(v) = creation_rows_ordered.get(k) {
+        for k in &creation_keys_seq {
+            if let Some(v) = creation_rows_seq.get(k) {
                 puts.push((k.clone(), v.clone()));
             }
         }
@@ -759,10 +781,17 @@ impl EspoModule for Essentials {
         if let Some(count_bytes) = creation_count_row {
             puts.push((table.alkane_creation_count_key(), count_bytes.to_vec()));
         }
+        if !creations_in_block.is_empty() {
+            puts.push((
+                table.alkane_creations_in_block_key(block.height),
+                borsh::to_vec(&creations_in_block)?,
+            ));
+        }
 
         debug::log_elapsed(module, "prepare_batch", timer);
         let timer = debug::start_if(debug);
         if let Err(e) = provider.set_batch(crate::modules::essentials::storage::SetBatchParams {
+            blockhash: StateAt::Latest,
             puts,
             deletes: Vec::new(),
         }) {
@@ -774,6 +803,14 @@ impl EspoModule for Essentials {
         debug::log_elapsed(module, "write_batch", timer);
         // ✅ also update alkane balances/holders for this block
         let timer = debug::start_if(debug);
+        if debug {
+            eprintln!(
+                "[debug] module={} section=update_balances.start height={} txs={}",
+                module,
+                block.height,
+                block.transactions.len()
+            );
+        }
         if let Err(e) = bulk_update_balances_for_block(provider, &block) {
             eprintln!(
                 "[ESSENTIALS] bulk_update_balances_for_block failed at block #{}: {e}",
@@ -782,13 +819,19 @@ impl EspoModule for Essentials {
             return Err(e);
         }
         debug::log_elapsed(module, "update_balances", timer);
+        if debug {
+            eprintln!(
+                "[debug] module={} section=update_balances.done height={}",
+                module, block.height
+            );
+        }
 
         let new_alkanes_saved = creation_rows_by_id.len();
         eprintln!(
             "[ESSENTIALS] block #{} indexed {} key/value updates (deduped); new alkanes {}",
             block.height, total_pairs_dedup, new_alkanes_saved
         );
-        self.set_index_height(block.height)?;
+        self.set_index_height(block.height, StateAt::Latest)?;
         eprintln!(
             "[indexer] module={} height={} index_block done in {:?}",
             self.get_name(),

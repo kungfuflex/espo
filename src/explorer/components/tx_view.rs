@@ -2,30 +2,30 @@ use std::collections::{HashMap, HashSet};
 
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction, Txid, opcodes};
-use maud::{Markup, PreEscaped, html};
+use bitcoin::{opcodes, Address, Amount, Network, ScriptBuf, Transaction, Txid};
+use maud::{html, Markup, PreEscaped};
 
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoSandshrewLikeTraceStatus,
-    EspoTrace, prettyify_protobuf_trace_json,
+    prettyify_protobuf_trace_json, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
+    EspoSandshrewLikeTraceStatus, EspoTrace,
 };
 use crate::explorer::components::svg_assets::{
     arrow_svg, icon_arrow_bend_down_right, icon_caret_right, icon_magic_wand,
 };
 use crate::explorer::consts::{
-    ALKANE_CONTRACT_ICON_BASE, ALKANE_TOKEN_ICON_BASE, alkane_contract_name_overrides,
-    alkane_factory_icon_blacklist, alkane_icon_overrides, alkane_name_overrides,
+    alkane_contract_name_overrides, alkane_factory_icon_blacklist, alkane_icon_overrides,
+    alkane_name_overrides, ALKANE_CONTRACT_ICON_BASE, ALKANE_TOKEN_ICON_BASE,
 };
 use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount};
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider, load_creation_record};
+use crate::modules::essentials::storage::{load_creation_record, BalanceEntry, EssentialsProvider};
 use crate::modules::essentials::utils::balances::OutpointLookup;
-use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
+use crate::modules::essentials::utils::inspections::{load_inspection, StoredInspectionResult};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 const ADDR_SUFFIX_LEN: usize = 8;
@@ -269,7 +269,11 @@ fn decode_trace_response(data_hex: &str) -> Option<String> {
     }
     let text = String::from_utf8_lossy(&bytes).to_string();
     let trimmed = text.trim_matches('\u{0}').to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn kv_row_key(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {
@@ -605,6 +609,14 @@ fn summarize_contract_call(
             effective_name = ResolvedName { value: name, known: true };
         }
     }
+    let contract_meta = alkane_meta(&contract_id, meta_cache, mdb);
+    if factory_pair.is_none() && contract_meta.name.known {
+        // Prefer concrete alkane metadata in tx summaries when available,
+        // but keep factory clone source rows on contract/template metadata.
+        effective_name = contract_meta.name.clone();
+        icon_id = contract_id;
+        link_id = contract_id;
+    }
 
     Some(ContractCallSummary {
         contract_id,
@@ -877,7 +889,7 @@ fn render_vouts(
         } @else {
             div class="io-list" {
                 @for (vout, o) in tx.output.iter().enumerate() {
-                    @let OutpointLookup { balances, spent_by: db_spent } = outpoint_fn(txid, vout as u32);
+                    @let OutpointLookup { balances, spent_by: db_spent, .. } = outpoint_fn(txid, vout as u32);
                     @let spent_by = outspends.get(vout).cloned().flatten().or(db_spent);
                     @let opret = decode_op_return_payload(&o.script_pubkey);
                     @let is_opret = opret.is_some();

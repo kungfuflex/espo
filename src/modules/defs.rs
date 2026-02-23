@@ -8,7 +8,6 @@ use tokio::sync::RwLock;
 
 use crate::alkanes::trace::EspoBlock;
 use crate::config::get_module_config;
-use crate::runtime::aof::AofManager;
 use crate::runtime::mdb::Mdb;
 use rocksdb::{DB, Options};
 
@@ -127,17 +126,12 @@ pub struct ModuleRegistry {
     modules: Vec<Arc<dyn EspoModule>>,
     pub router: RpcRegistry,
     module_db: Arc<DB>,
-    aof: Option<Arc<AofManager>>,
 }
 
 impl ModuleRegistry {
     /// Construct from an existing Arc<DB> (one global DB shared by all modules).
     pub fn with_db(module_db: Arc<DB>) -> Self {
-        Self { modules: Vec::new(), router: RpcRegistry::default(), module_db, aof: None }
-    }
-
-    pub fn with_db_and_aof(module_db: Arc<DB>, aof: Option<Arc<AofManager>>) -> Self {
-        Self { modules: Vec::new(), router: RpcRegistry::default(), module_db, aof }
+        Self { modules: Vec::new(), router: RpcRegistry::default(), module_db }
     }
 
     /// Convenience: open a global read-write DB at a path, create if missing.
@@ -145,7 +139,7 @@ impl ModuleRegistry {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let db = Arc::new(DB::open(&opts, path)?);
-        Ok(Self::with_db_and_aof(db, None))
+        Ok(Self::with_db(db))
     }
 
     /// Convenience: open a global read-only DB at a path.
@@ -193,12 +187,7 @@ impl ModuleRegistry {
         prefix_kv.extend_from_slice(name.as_bytes());
         prefix_kv.push(b':');
 
-        let mdb = Arc::new(Mdb::from_db_with_aof(
-            self.module_db.clone(),
-            prefix_kv,
-            self.aof.clone(),
-            Some(name.to_string()),
-        ));
+        let mdb = Arc::new(Mdb::from_db(self.module_db.clone(), prefix_kv));
         module.set_mdb(mdb);
 
         // --- RPC prefix like "ammdata." ---

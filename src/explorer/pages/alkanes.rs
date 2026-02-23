@@ -1,20 +1,22 @@
+use crate::runtime::state_at::StateAt;
 use axum::extract::{Query, State};
 use axum::response::Html;
 use borsh::BorshDeserialize;
-use maud::{Markup, html};
+use maud::{html, Markup};
 use serde::Deserialize;
 
-use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
-use crate::explorer::components::layout::layout;
+use crate::explorer::components::dropdown::{dropdown, DropdownItem, DropdownProps};
+use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
     icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
-use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
+use crate::explorer::components::table::{alkanes_table, AlkaneTableRow};
 use crate::explorer::components::tx_view::alkane_icon_url;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    EssentialsTable, HoldersCountEntry, decode_creation_record, load_creation_record,
+    load_creation_record, EssentialsTable, GetCreationRecordsOrderedPageParams,
+    GetHoldersOrderedPageParams, HoldersCountEntry,
 };
 use crate::modules::essentials::utils::inspections::AlkaneCreationRecord;
 
@@ -104,6 +106,7 @@ pub async fn alkanes_page(
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(50).clamp(1, 50);
     let offset = limit.saturating_mul(page.saturating_sub(1));
+    let provider = state.essentials_provider();
     let field = SortField::from_query(q.order.as_deref());
     let dir = SortDir::from_query(q.order.as_deref(), q.dir.as_deref());
     let table = EssentialsTable::new(&state.essentials_mdb);
@@ -166,98 +169,73 @@ pub async fn alkanes_page(
     };
 
     let mut rows: Vec<AlkaneTableRow> = Vec::new();
-    let mut seen: usize = 0;
     match (field, dir) {
         (SortField::Age, SortDir::Desc) => {
-            let prefix_full =
-                state.essentials_mdb.prefixed(&table.alkane_creation_ordered_prefix());
-            let it = state.essentials_mdb.iter_prefix_rev(&prefix_full);
-            for res in it {
-                let Ok((_k, v)) = res else { continue };
-                if seen < offset {
-                    seen += 1;
-                    continue;
-                }
-                if rows.len() >= limit {
-                    break;
-                }
-                let Ok(rec) = decode_creation_record(&v) else { continue };
+            let records = provider
+                .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
+                    blockhash: StateAt::Latest,
+                    offset: offset as u64,
+                    limit: limit as u64,
+                    desc: true,
+                })
+                .map(|res| res.records)
+                .unwrap_or_default();
+            for rec in records {
                 let holders = holders_for(&rec);
                 rows.push(build_row(&rec, holders));
-                seen += 1;
             }
         }
         (SortField::Age, SortDir::Asc) => {
-            let prefix = table.alkane_creation_ordered_prefix();
-            let it = state.essentials_mdb.iter_from(&prefix);
-            for res in it {
-                let Ok((k, v)) = res else { continue };
-                let rel = &k[state.essentials_mdb.prefix().len()..];
-                if !rel.starts_with(&prefix) {
-                    break;
-                }
-                if seen < offset {
-                    seen += 1;
-                    continue;
-                }
-                if rows.len() >= limit {
-                    break;
-                }
-                let Ok(rec) = decode_creation_record(&v) else { continue };
+            let records = provider
+                .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
+                    blockhash: StateAt::Latest,
+                    offset: offset as u64,
+                    limit: limit as u64,
+                    desc: false,
+                })
+                .map(|res| res.records)
+                .unwrap_or_default();
+            for rec in records {
                 let holders = holders_for(&rec);
                 rows.push(build_row(&rec, holders));
-                seen += 1;
             }
         }
         (SortField::Holders, SortDir::Desc) => {
-            let prefix_full = state.essentials_mdb.prefixed(&table.alkane_holders_ordered_prefix());
-            let it = state.essentials_mdb.iter_prefix_rev(&prefix_full);
-            for res in it {
-                let Ok((k, _v)) = res else { continue };
-                let rel = &k[state.essentials_mdb.prefix().len()..];
-                let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else {
-                    continue;
-                };
-                if seen < offset {
-                    seen += 1;
-                    continue;
-                }
-                if rows.len() >= limit {
-                    break;
-                }
+            let ids = provider
+                .get_holders_ordered_page(GetHoldersOrderedPageParams {
+                    blockhash: StateAt::Latest,
+                    offset: offset as u64,
+                    limit: limit as u64,
+                    desc: true,
+                })
+                .map(|res| res.ids)
+                .unwrap_or_default();
+            for alk in ids {
                 let Some(rec) = load_creation_record(&state.essentials_mdb, &alk).ok().flatten()
                 else {
                     continue;
                 };
+                let holders = holders_for(&rec);
                 rows.push(build_row(&rec, holders));
-                seen += 1;
             }
         }
         (SortField::Holders, SortDir::Asc) => {
-            let prefix = table.alkane_holders_ordered_prefix();
-            let it = state.essentials_mdb.iter_from(&prefix);
-            for res in it {
-                let Ok((k, _v)) = res else { continue };
-                let rel = &k[state.essentials_mdb.prefix().len()..];
-                if !rel.starts_with(&prefix) {
-                    break;
-                }
-                let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else {
-                    continue;
-                };
-                if seen < offset {
-                    seen += 1;
-                    continue;
-                }
-                if rows.len() >= limit {
-                    break;
-                }
+            let ids = provider
+                .get_holders_ordered_page(GetHoldersOrderedPageParams {
+                    blockhash: StateAt::Latest,
+                    offset: offset as u64,
+                    limit: limit as u64,
+                    desc: false,
+                })
+                .map(|res| res.ids)
+                .unwrap_or_default();
+            for alk in ids {
                 let Some(rec) = load_creation_record(&state.essentials_mdb, &alk).ok().flatten()
                 else {
                     continue;
                 };
+                let holders = holders_for(&rec);
                 rows.push(build_row(&rec, holders));
-                seen += 1;
             }
         }
     }
@@ -307,8 +285,10 @@ pub async fn alkanes_page(
         html! { div class="alkanes-card" { (alkanes_table(&rows, true, show_creation_block, true)) } }
     };
 
-    layout(
+    layout_with_meta(
         "Alkanes",
+        "/alkanes",
+        None,
         html! {
             div class="row" {
                 h1 class="h1" { "All Alkanes" }

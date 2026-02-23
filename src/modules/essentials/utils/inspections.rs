@@ -3,6 +3,7 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTraceStatus,
 };
 use crate::modules::essentials::storage::EssentialsProvider;
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_cli_common::alkanes::inspector::types::{AlkaneMetadata, AlkaneMethod};
 use alkanes_cli_common::alkanes::inspector::{AlkaneInspector, InspectionConfig, InspectionResult};
@@ -138,6 +139,7 @@ pub fn load_inspection(
     // helper here for call sites that expect it.
     let rec = provider
         .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
+            blockhash: StateAt::Latest,
             alkane: *alkane,
         })?
         .record;

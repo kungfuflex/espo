@@ -33,12 +33,12 @@ impl TestConfigBuilder {
             reset_mempool_on_startup: false,
             view_only: true, // Default to view-only for tests
             db_path: espo_path,
-            enable_aof: false, // Disabled by default for tests
-            sdb_poll_ms: 100,  // Fast polling for tests
+            sdb_poll_ms: 100, // Fast polling for tests
             indexer_block_delay_ms: 0,
             port: 0, // Let OS assign port
             explorer_host: None,
             explorer_base_path: "/".to_string(),
+            explorer_pizza_tv_endpoint: "https://tv.pizza.fun".to_string(),
             network: Network::Regtest, // Default to regtest
             metashrew_db_label: None,
             strict_mode: None,
@@ -47,7 +47,8 @@ impl TestConfigBuilder {
             debug_backup: None,
             safe_tip_hook_script: None,
             block_source_mode: BlockFetchMode::RpcOnly,
-            simulate_reorg: false,
+            compact_tx_trace_rows: true,
+            address_index_chunk_size: 512,
             explorer_networks: None,
             modules: HashMap::new(),
         };
@@ -58,12 +59,6 @@ impl TestConfigBuilder {
     /// Set the network (mainnet, testnet, regtest, etc.)
     pub fn with_network(mut self, network: Network) -> Self {
         self.config.network = network;
-        self
-    }
-
-    /// Enable AOF (Append-Only File) logging
-    pub fn with_aof_enabled(mut self, enabled: bool) -> Self {
-        self.config.enable_aof = enabled;
         self
     }
 
@@ -147,7 +142,6 @@ mod tests {
 
         assert_eq!(config.network, Network::Regtest);
         assert_eq!(config.view_only, true);
-        assert_eq!(config.enable_aof, false);
         assert!(config.strict_mode.is_none());
     }
 
@@ -156,12 +150,10 @@ mod tests {
         let (config, _temp_dirs) = TestConfigBuilder::new()
             .with_network(Network::Testnet)
             .with_strict_mode(true)
-            .with_aof_enabled(true)
             .build();
 
         assert_eq!(config.network, Network::Testnet);
         assert!(config.strict_mode.is_some());
-        assert_eq!(config.enable_aof, true);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::{DebugBackupConfig, init_block_source};
@@ -46,26 +46,24 @@ use crate::explorer::run_explorer;
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
     config::{
-        get_aof_manager, get_bitcoind_rpc_client, get_config, get_espo_db, get_module_config,
-        init_config, update_safe_tip,
+        get_bitcoind_rpc_client, get_config, get_espo_db, get_module_config, init_config,
+        update_safe_tip,
     },
     consts::alkanes_genesis_block,
     modules::defs::ModuleRegistry,
-    runtime::aof::AOF_REORG_DEPTH,
     runtime::mdb::Mdb,
     runtime::mempool::{
         purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service,
     },
     runtime::rpc::run_rpc,
+    runtime::tree_db::get_global_tree_db,
 };
 use bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
 pub use espo::{ESPO_HEIGHT, SAFE_TIP};
 use tokio::runtime::Builder as TokioBuilder;
 
-fn should_watch_for_reorg(next_height: u32, safe_tip: u32) -> bool {
-    safe_tip.saturating_sub(next_height) <= AOF_REORG_DEPTH
-}
+const NO_REWIND: u32 = u32::MAX;
 
 fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> std::io::Result<()> {
     let db_root = Path::new(db_path);
@@ -90,60 +88,106 @@ fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> st
     Ok(())
 }
 
-fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
-    let Some(aof) = get_aof_manager() else { return None };
-    if !should_watch_for_reorg(next_height, safe_tip) {
+fn detect_first_divergence_height(
+    indexed_tip: u32,
+    safe_tip: u32,
+    genesis_height: u32,
+) -> Option<u32> {
+    let Some(tree) = get_global_tree_db() else { return None };
+    let check_tip = indexed_tip.min(safe_tip);
+    if check_tip < genesis_height {
         return None;
     }
-
-    let logs = match aof.recent_blocks(AOF_REORG_DEPTH as usize) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[aof] failed to load recent blocks: {e:?}");
-            return None;
-        }
-    };
-    if logs.is_empty() {
-        return None;
-    }
-
     let rpc = get_bitcoind_rpc_client();
-    let mut mismatch = false;
-    for log in &logs {
-        match rpc.get_block_hash(log.height as u64) {
-            Ok(h) => {
-                if h.to_string() != log.block_hash {
-                    mismatch = true;
-                    break;
-                }
-            }
+
+    let mut h = check_tip;
+    loop {
+        let chain_hash = match rpc.get_block_hash(h as u64) {
+            Ok(hash) => hash,
             Err(e) => {
-                eprintln!("[aof] failed to fetch block hash for {}: {e:?}", log.height);
+                eprintln!("[reorg] failed to fetch chain hash at {}: {e:?}", h);
                 return None;
             }
+        };
+        let indexed_hash = match tree.blockhash_for_height(h) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[reorg] failed to read indexed hash at {}: {e:?}", h);
+                return None;
+            }
+        };
+
+        if matches!(indexed_hash, Some(stored) if stored == chain_hash) {
+            if h == check_tip {
+                return None;
+            }
+            return Some(h.saturating_add(1));
         }
+
+        if h == genesis_height {
+            return Some(genesis_height);
+        }
+        h = h.saturating_sub(1);
     }
+}
 
-    if !mismatch {
-        return None;
+async fn run_reorg_poller(
+    rewind_target: Arc<AtomicU32>,
+    shutdown_requested: Arc<AtomicBool>,
+    genesis_height: u32,
+) {
+    const REORG_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+    loop {
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let safe_tip = match get_safe_tip() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[reorg] failed to fetch safe tip: {e:?}");
+                tokio::time::sleep(REORG_POLL_INTERVAL).await;
+                continue;
+            }
+        };
+        update_safe_tip(safe_tip);
+
+        let indexed_tip = ESPO_HEIGHT
+            .get()
+            .map(|h| h.load(Ordering::Relaxed).saturating_sub(1))
+            .unwrap_or(genesis_height.saturating_sub(1));
+
+        if indexed_tip < safe_tip {
+            tokio::time::sleep(REORG_POLL_INTERVAL).await;
+            continue;
+        }
+
+        if let Some(divergence_height) =
+            detect_first_divergence_height(indexed_tip, safe_tip, genesis_height)
+        {
+            let mut current = rewind_target.load(Ordering::Relaxed);
+            while divergence_height < current {
+                match rewind_target.compare_exchange(
+                    current,
+                    divergence_height,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => {
+                        eprintln!(
+                            "[reorg] detected divergence at height {} (indexed_tip={}, safe_tip={})",
+                            divergence_height, indexed_tip, safe_tip
+                        );
+                        break;
+                    }
+                    Err(observed) => current = observed,
+                }
+            }
+        }
+
+        tokio::time::sleep(REORG_POLL_INTERVAL).await;
     }
-
-    let revert_count = logs.len().min(AOF_REORG_DEPTH as usize);
-    eprintln!(
-        "[aof] detected reorg near height {} (safe tip {}); reverting {} blocks",
-        next_height, safe_tip, revert_count
-    );
-
-    if let Err(e) = aof.revert_last_blocks(revert_count) {
-        eprintln!("[aof] rollback failed: {e:?}");
-        return None;
-    }
-
-    if let Err(e) = reset_mempool_store() {
-        eprintln!("[mempool] failed to reset store after reorg: {e:?}");
-    }
-
-    Some(next_height.saturating_sub(revert_count as u32))
 }
 
 fn run_safe_tip_hook(script: &str, next_height: u32, tip: u32) {
@@ -161,6 +205,25 @@ fn run_safe_tip_hook(script: &str, next_height: u32, tip: u32) {
     });
 }
 
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c().context("failed to wait for shutdown signal")?;
+    Ok(())
+}
+
 async fn run_indexer_loop(
     mods: ModuleRegistry,
     start_height: u32,
@@ -168,12 +231,16 @@ async fn run_indexer_loop(
     network: bitcoin::Network,
     metashrew_sdb: std::sync::Arc<crate::runtime::sdb::SDB>,
     cfg: crate::config::AppConfig,
+    shutdown_requested: Arc<AtomicBool>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
+    let genesis_height = alkanes_genesis_block(network);
+    let rewind_target = Arc::new(AtomicU32::new(NO_REWIND));
     let mut last_tip: Option<u32> = None;
     let mut mempool_started = false;
     let mut logged_start = false;
     let mut safe_tip_hook_ran = false;
+    let mut reorg_poller_started = false;
     if cfg.reset_mempool_on_startup {
         if let Err(e) = reset_mempool_store() {
             eprintln!("[mempool] failed to reset store on startup: {e:?}");
@@ -192,6 +259,22 @@ async fn run_indexer_loop(
         .unwrap_or_default();
 
     loop {
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let requested_rewind = rewind_target.swap(NO_REWIND, Ordering::SeqCst);
+        if requested_rewind != NO_REWIND && requested_rewind < next_height {
+            next_height = requested_rewind;
+            if let Some(h) = ESPO_HEIGHT.get() {
+                h.store(next_height, Ordering::Relaxed);
+            }
+            if let Err(e) = reset_mempool_store() {
+                eprintln!("[mempool] failed to reset store after reorg switch: {e:?}");
+            }
+            eprintln!("[reorg] switching indexer to height {}", next_height);
+        }
+
         if let Err(e) = metashrew_sdb.catch_up_now() {
             eprintln!("[indexer] metashrew catch_up before tip fetch: {e:?}");
         }
@@ -227,6 +310,10 @@ async fn run_indexer_loop(
             logged_start = true;
         }
 
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
+        }
+
         if next_height <= tip {
             // Compute a fresh ETA before starting the block
             let remaining = tip.saturating_sub(next_height) + 1;
@@ -259,11 +346,17 @@ async fn run_indexer_loop(
 
                     let block_hash = espo_block.block_header.block_hash();
 
-                    // Only capture AOF changes when we're near the safe tip; skip during deep catch-up.
-                    let aof_for_block =
-                        get_aof_manager().filter(|_| should_watch_for_reorg(next_height, tip));
-                    if let Some(aof) = &aof_for_block {
-                        aof.start_block(next_height, &block_hash);
+                    if let Some(tree) = get_global_tree_db() {
+                        if let Err(e) = tree.begin_block(
+                            next_height,
+                            &block_hash,
+                            &espo_block.block_header.prev_blockhash,
+                        ) {
+                            eprintln!(
+                                "[tree] failed to begin block {} ({}): {e:?}",
+                                next_height, block_hash
+                            );
+                        }
                     }
 
                     for m in mods.modules() {
@@ -276,6 +369,12 @@ async fn run_indexer_loop(
                                 );
                             }
                         }
+                    }
+                    if let Err(e) = crate::debug::flush_timer_totals() {
+                        eprintln!(
+                            "[debug] failed to flush timer totals at height {}: {}",
+                            next_height, e
+                        );
                     }
 
                     match purge_confirmed_txids(&block_txids) {
@@ -293,12 +392,9 @@ async fn run_indexer_loop(
                         ),
                     }
 
-                    if let Some(aof) = &aof_for_block {
-                        if let Err(e) = aof.finish_block() {
-                            eprintln!(
-                                "[aof] failed to persist block {} changes: {e:?}",
-                                next_height
-                            );
+                    if let Some(tree) = get_global_tree_db() {
+                        if let Err(e) = tree.finish_block() {
+                            eprintln!("[tree] failed to finish block {}: {e:?}", next_height);
                         }
                     }
 
@@ -337,17 +433,22 @@ async fn run_indexer_loop(
                     run_safe_tip_hook(script, next_height, tip);
                 }
             }
-            if let Some(new_next) = check_and_handle_reorg(next_height, tip) {
-                if new_next < next_height {
-                    next_height = new_next;
-                    if let Some(h) = ESPO_HEIGHT.get() {
-                        h.store(next_height, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    eprintln!("[aof] rollback complete, restarting from height {}", next_height);
-                }
+            if !reorg_poller_started {
+                reorg_poller_started = true;
+                let shutdown_for_poller = shutdown_requested.clone();
+                let rewind_target_for_poller = rewind_target.clone();
+                tokio::spawn(async move {
+                    eprintln!("[reorg] poller started (10s cadence) after reaching safe tip");
+                    run_reorg_poller(rewind_target_for_poller, shutdown_for_poller, genesis_height)
+                        .await;
+                });
             }
             // Caught up; chill then poll again
             tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
         }
 
         if !mempool_started && next_height >= tip.saturating_sub(1) {
@@ -386,35 +487,8 @@ async fn main() -> Result<()> {
     }
     let metashrew_sdb = get_metashrew_sdb();
 
-    if cfg.simulate_reorg {
-        if view_only {
-            eprintln!("[aof] simulate-reorg ignored in view-only mode");
-        } else {
-            match get_aof_manager() {
-                Some(aof) => match aof.revert_all_blocks() {
-                    Ok(Some(h)) => {
-                        eprintln!(
-                            "[aof] simulate-reorg: reverted through height {}, will reindex",
-                            h
-                        );
-                        if let Err(e) = reset_mempool_store() {
-                            eprintln!(
-                                "[mempool] failed to reset store after simulated reorg: {e:?}"
-                            );
-                        }
-                    }
-                    Ok(None) => eprintln!("[aof] simulate-reorg set but no AOF logs to revert"),
-                    Err(e) => eprintln!("[aof] simulate-reorg failed: {e:?}"),
-                },
-                None => {
-                    eprintln!("[aof] simulate-reorg set but AOF is disabled; nothing to revert")
-                }
-            }
-        }
-    }
-
     // Build module registry with the global ESPO DB
-    let mut mods = ModuleRegistry::with_db_and_aof(get_espo_db(), get_aof_manager());
+    let mut mods = ModuleRegistry::with_db(get_espo_db());
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
     mods.register_module(Pizzafun::new());
@@ -503,24 +577,55 @@ async fn main() -> Result<()> {
         }
     }
 
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_for_indexer = shutdown_requested.clone();
     let indexer_handle = std::thread::spawn(move || {
         let rt = TokioBuilder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("build indexer runtime");
-        rt.block_on(run_indexer_loop(mods, start_height, next_height, network, metashrew_sdb, cfg));
-    });
-    std::thread::spawn(move || {
-        if let Err(err) = indexer_handle.join() {
-            eprintln!("[indexer] thread panicked: {err:?}");
-            std::process::abort();
-        }
+        rt.block_on(run_indexer_loop(
+            mods,
+            start_height,
+            next_height,
+            network,
+            metashrew_sdb,
+            cfg,
+            shutdown_for_indexer,
+        ));
     });
 
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
     loop {
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        if indexer_handle.is_finished() {
+            if let Err(err) = indexer_handle.join() {
+                eprintln!("[indexer] thread panicked: {err:?}");
+                std::process::abort();
+            }
+            return Ok(());
+        }
+
+        tokio::select! {
+            result = &mut shutdown_signal => {
+                result?;
+                eprintln!("[PROCESS] exit signal received , waiting for modules");
+                shutdown_requested.store(true, Ordering::Relaxed);
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
     }
+
+    let join_result = tokio::task::spawn_blocking(move || indexer_handle.join())
+        .await
+        .context("failed to await indexer thread join task")?;
+    if let Err(err) = join_result {
+        eprintln!("[indexer] thread panicked: {err:?}");
+        std::process::abort();
+    }
+    Ok(())
 }
 
 // Dummy main for WASM builds (should never be called)

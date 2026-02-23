@@ -357,15 +357,15 @@ impl MetashrewAdapter {
     ) -> Result<Vec<(SupportAlkaneId, u128)>> {
         let ptr = self.outpoint_runes_ptr(db, outpoint)?;
         let id_base = ptr.keyword("/id_to_balance");
-        let scan_prefix = id_base.key_with_label();
+        let walk_prefix = id_base.key_with_label();
 
         let mut seen_ids: HashSet<Vec<u8>> = HashSet::new();
-        let mut it = db.iterator(IteratorMode::From(&scan_prefix, Direction::Forward));
+        let mut it = db.iterator(IteratorMode::From(&walk_prefix, Direction::Forward));
         while let Some(Ok((k, _v))) = it.next() {
-            if !k.starts_with(&scan_prefix) {
+            if !k.starts_with(&walk_prefix) {
                 break;
             }
-            let suffix = &k[scan_prefix.len()..];
+            let suffix = &k[walk_prefix.len()..];
             if suffix.len() < 32 {
                 continue;
             }
@@ -488,7 +488,7 @@ impl MetashrewAdapter {
 
         let mut traces_by_outpoint: HashMap<Vec<u8>, Option<AlkanesTrace>> = HashMap::new();
 
-        let mut scan_prefix = |tx_bytes: &[u8], tx_bytes_are_be: bool| -> Result<()> {
+        let mut walk_prefix = |tx_bytes: &[u8], tx_bytes_are_be: bool| -> Result<()> {
             let mut prefix = b"/trace/".to_vec();
             prefix.extend_from_slice(tx_bytes);
             let prefix = self.root.apply_label(&prefix);
@@ -525,9 +525,9 @@ impl MetashrewAdapter {
             Ok(())
         };
 
-        scan_prefix(&tx_be, true)?;
+        walk_prefix(&tx_be, true)?;
         if tx_le != tx_be {
-            scan_prefix(&tx_le, false)?;
+            walk_prefix(&tx_le, false)?;
         }
 
         let mut out: Vec<PartialEspoTrace> = Vec::new();

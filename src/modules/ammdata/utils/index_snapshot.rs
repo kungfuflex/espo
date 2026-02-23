@@ -1,7 +1,6 @@
 use crate::modules::ammdata::schemas::{SchemaMarketDefs, SchemaPoolSnapshot};
-use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetRawValueParams, decode_reserves_snapshot,
-};
+use crate::modules::ammdata::storage::{AmmDataProvider, GetReservesSnapshotParams};
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -9,21 +8,10 @@ use std::collections::HashMap;
 pub fn load_reserves_snapshot(
     provider: &AmmDataProvider,
 ) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
-    let table = provider.table();
-    let snapshot = if let Some(bytes) = provider
-        .get_raw_value(GetRawValueParams { key: table.reserves_snapshot_key() })?
-        .value
-    {
-        match decode_reserves_snapshot(&bytes) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[AMMDATA] WARNING: failed to decode reserves snapshot: {e:?}");
-                HashMap::new()
-            }
-        }
-    } else {
-        HashMap::new()
-    };
+    let snapshot = provider
+        .get_reserves_snapshot(GetReservesSnapshotParams { blockhash: StateAt::Latest })?
+        .snapshot
+        .unwrap_or_default();
     Ok(snapshot)
 }
 

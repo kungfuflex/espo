@@ -1,5 +1,6 @@
 use crate::config::get_metashrew_rpc_url;
 use crate::modules::essentials::utils::inspections::StoredInspectionResult;
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId;
@@ -41,10 +42,12 @@ fn decode_u128_bytes(bytes: &[u8]) -> Option<u128> {
 }
 
 pub fn get_cap(
+    blockhash: StateAt,
     height: u32,
     alkane: &SchemaAlkaneId,
     inspection: Option<&StoredInspectionResult>,
 ) -> Option<u128> {
+    let _ = blockhash;
     let Some(inspection) = inspection else { return None };
     if !has_method(inspection, "get_cap", 102) {
         return None;
@@ -62,10 +65,12 @@ pub fn get_cap(
 }
 
 pub fn get_value_per_mint(
+    blockhash: StateAt,
     height: u32,
     alkane: &SchemaAlkaneId,
     inspection: Option<&StoredInspectionResult>,
 ) -> Option<u128> {
+    let _ = blockhash;
     let Some(inspection) = inspection else { return None };
     if !has_method(inspection, "get_value_per_mint", 104) {
         return None;

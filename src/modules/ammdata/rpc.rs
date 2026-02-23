@@ -1,6 +1,7 @@
 use crate::modules::ammdata::storage::{
     AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
-    RpcGetBestMevSwapParams, RpcGetCandlesParams, RpcGetPoolsParams, RpcPingParams,
+    RpcGetBestMevSwapParams, RpcGetCandlesParams, RpcGetChartChangeBlockParams,
+    RpcGetChartChangesBlockParams, RpcGetPoolsParams, RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -32,7 +33,86 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         side: payload.get("side").and_then(|v| v.as_str()).map(|s| s.to_string()),
                         now: payload.get("now").and_then(|v| v.as_u64()),
                     };
-                    mdb.rpc_get_candles(params)
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_candles(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_chart_change = reg.clone();
+    let mdb_ptr_chart_change: Arc<AmmDataProvider> = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_chart_change
+            .register("get_chart_change_block", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_ptr_chart_change);
+                async move {
+                    let params = RpcGetChartChangeBlockParams {
+                        chart: payload
+                            .get("chart")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        height: payload.get("height").and_then(|v| v.as_u64()),
+                    };
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_chart_change_block(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_chart_changes = reg.clone();
+    let mdb_ptr_chart_changes: Arc<AmmDataProvider> = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_chart_changes
+            .register("get_chart_changes_block", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_ptr_chart_changes);
+                async move {
+                    let params = RpcGetChartChangesBlockParams {
+                        height: payload.get("height").and_then(|v| v.as_u64()),
+                    };
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_chart_changes_block(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -68,8 +148,20 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string()),
                     };
-                    mdb_for_handler
-                        .rpc_get_activity(params)
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_activity(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -88,8 +180,20 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         page: payload.get("page").and_then(|v| v.as_u64()),
                         limit: payload.get("limit").and_then(|v| v.as_u64()),
                     };
-                    mdb_for_handler
-                        .rpc_get_pools(params)
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_pools(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -108,8 +212,20 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         page: payload.get("page").and_then(|v| v.as_u64()),
                         limit: payload.get("limit").and_then(|v| v.as_u64()),
                     };
-                    mdb_for_handler
-                        .rpc_get_amm_factories(params)
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_amm_factories(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -142,8 +258,20 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         amount_in_max: payload.get("amount_in_max").cloned(),
                         available_in: payload.get("available_in").cloned(),
                     };
-                    mdb_for_handler
-                        .rpc_find_best_swap_path(params)
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_find_best_swap_path(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -163,8 +291,20 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         fee_bps: payload.get("fee_bps").and_then(|v| v.as_u64()),
                         max_hops: payload.get("max_hops").and_then(|v| v.as_u64()),
                     };
-                    mdb_for_handler
-                        .rpc_get_best_mev_swap(params)
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_best_mev_swap(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -176,10 +316,23 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
     let mdb_ping = Arc::clone(&mdb_ptr);
     tokio::spawn(async move {
         reg_ping
-            .register("ping", move |_cx, _payload| {
+            .register("ping", move |_cx, payload| {
                 let mdb = Arc::clone(&mdb_ping);
                 async move {
-                    mdb.rpc_ping(RpcPingParams)
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_ping(RpcPingParams)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| Value::String("pong".to_string()))
                 }

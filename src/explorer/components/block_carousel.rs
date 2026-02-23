@@ -1,16 +1,19 @@
-use maud::{Markup, PreEscaped, html};
+use maud::{html, Markup, PreEscaped};
 
-use crate::explorer::paths::explorer_base_path;
+use crate::explorer::paths::{current_language, explorer_path};
 
 /// Carousel of blocks around the current height. Uses Embla (CDN) for smooth drag/scroll.
 pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     let current_height = current_height.unwrap_or(espo_tip);
-    let base_path_js = format!("{:?}", explorer_base_path());
+    let base_path_js = format!("{:?}", explorer_path("/"));
+    let is_chinese = current_language().is_chinese();
+    let loading_label = if is_chinese { "区块加载中…" } else { "Loading blocks…" };
 
     let script = PreEscaped(format!(
         r#"
 (function() {{
   const basePath = {base_path_js};
+  const isChinese = {is_chinese};
   const basePrefix = basePath === '/' ? '' : basePath;
   const root = document.querySelector('[data-block-carousel]');
   if (!root) return;
@@ -55,12 +58,27 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     const mins = Math.floor(diff / 60);
     const hrs = Math.floor(mins / 60);
     const days = Math.floor(hrs / 24);
+    if (isChinese) {{
+      if (days > 365) return `${{Math.floor(days/365)}}年前`;
+      if (days > 30) return `${{Math.floor(days/30)}}个月前`;
+      if (days > 0) return `${{days}}天前`;
+      if (hrs > 0) return `${{hrs}}小时前`;
+      if (mins > 0) return `${{mins}}分钟前`;
+      return '刚刚';
+    }}
     if (days > 365) return `${{Math.floor(days/365)}}y ago`;
     if (days > 30) return `${{Math.floor(days/30)}}mo ago`;
     if (days > 0) return `${{days}}d ago`;
     if (hrs > 0) return `${{hrs}}h ago`;
     if (mins > 0) return `${{mins}}m ago`;
     return 'just now';
+  }}
+
+  function formatTraces(count) {{
+    const amount = Number.isFinite(Number(count))
+      ? new Intl.NumberFormat('en-US', {{ maximumFractionDigits: 0 }}).format(Number(count))
+      : String(count);
+    return isChinese ? `${{amount}} 条跟踪` : `${{amount}} traces`;
   }}
 
   function ensureIndicator() {{
@@ -129,7 +147,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
         </div>
         <a class="bc-card${{b.height === current ? ' current' : ''}}" href="${{basePrefix}}/block/${{b.height}}">
           <div class="bc-face">
-            <div class="bc-traces">${{b.traces}} traces</div>
+            <div class="bc-traces">${{formatTraces(b.traces)}}</div>
             <div class="bc-time">${{formatAgo(b.time)}}</div>
           </div>
         </a>
@@ -307,7 +325,9 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
 
   ensureEmbla(() => fetchAround(current));
 }})();
-"#
+"#,
+        base_path_js = base_path_js,
+        is_chinese = is_chinese
     ));
 
     html! {
@@ -317,7 +337,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
                 div class="bc-embla-wrap" {
                     div class="bc-embla" data-bc-viewport {
                         div class="bc-embla__container" data-bc-container {
-                            div class="muted" { "Loading blocks…" }
+                            div class="muted" { (loading_label) }
                         }
                     }
                     div class="bc-loader left" aria-hidden="true" { div class="spinner" {} }

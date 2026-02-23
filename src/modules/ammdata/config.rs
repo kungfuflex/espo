@@ -25,6 +25,7 @@ pub struct DerivedLiquidityConfig {
 pub struct AmmDataConfig {
     pub eth_rpc: String,
     pub eth_call_throttle_ms: u64,
+    pub use_historical_backfill: bool,
     pub search_index_enabled: bool,
     pub search_prefix_min_len: u8,
     pub search_prefix_max_len: u8,
@@ -35,7 +36,7 @@ pub struct AmmDataConfig {
 
 impl AmmDataConfig {
     pub fn spec() -> &'static str {
-        "{ \"eth_rpc\": \"<url>\", \"eth_call_throttle\": <ms>, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
+        "{ \"eth_rpc\": \"<url>\", \"eth_call_throttle\": <ms>, \"use_historical_backfill\": <bool=true>, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
@@ -62,6 +63,8 @@ impl AmmDataConfig {
                 Self::spec()
             )
         })?;
+        let use_historical_backfill =
+            obj.get("use_historical_backfill").and_then(|v| v.as_bool()).unwrap_or(true);
 
         let search_index_enabled =
             obj.get("search_index_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -163,6 +166,7 @@ impl AmmDataConfig {
         Ok(Self {
             eth_rpc,
             eth_call_throttle_ms,
+            use_historical_backfill,
             search_index_enabled,
             search_prefix_min_len,
             search_prefix_max_len,
