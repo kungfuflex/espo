@@ -37,14 +37,12 @@ fn try_decode_trace_event_prost(raw: &[u8]) -> Option<AlkanesTraceEvent> {
 /// This helper handles both by decoding any hex payload and stripping the
 /// optional 4-byte trailer some entries carry.
 pub fn decode_trace_blob(bytes: &[u8]) -> Option<AlkanesTrace> {
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        if let Some((_block, hex_part)) = s.split_once(':') {
-            if let Ok(decoded) = hex::decode(hex_part) {
-                if let Some(trace) = try_decode_trace_prost(&decoded) {
-                    return Some(trace);
-                }
-            }
-        }
+    if let Ok(s) = std::str::from_utf8(bytes)
+        && let Some((_block, hex_part)) = s.split_once(':')
+        && let Ok(decoded) = hex::decode(hex_part)
+        && let Some(trace) = try_decode_trace_prost(&decoded)
+    {
+        return Some(trace);
     }
 
     try_decode_trace_prost(bytes)
@@ -52,14 +50,12 @@ pub fn decode_trace_blob(bytes: &[u8]) -> Option<AlkanesTrace> {
 
 /// Trace events can be stored as raw protobuf bytes or as UTF-8 "height:HEX" blobs.
 pub fn decode_trace_event_blob(bytes: &[u8]) -> Option<AlkanesTraceEvent> {
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        if let Some((_block, hex_part)) = s.split_once(':') {
-            if let Ok(decoded) = hex::decode(hex_part) {
-                if let Some(event) = try_decode_trace_event_prost(&decoded) {
-                    return Some(event);
-                }
-            }
-        }
+    if let Ok(s) = std::str::from_utf8(bytes)
+        && let Some((_block, hex_part)) = s.split_once(':')
+        && let Ok(decoded) = hex::decode(hex_part)
+        && let Some(event) = try_decode_trace_event_prost(&decoded)
+    {
+        return Some(event);
     }
 
     try_decode_trace_event_prost(bytes)
@@ -118,7 +114,7 @@ impl SdbPointer<'static> {
         SdbPointer { sdb: None, key: Arc::new(Vec::new()), label: label.map(Arc::new) }
     }
 
-    fn from_bytes<'a>(&self, sdb: &'a SDB, key: Vec<u8>) -> SdbPointer<'a> {
+    fn pointer_from_bytes<'a>(&self, sdb: &'a SDB, key: Vec<u8>) -> SdbPointer<'a> {
         SdbPointer { sdb: Some(sdb), key: Arc::new(key), label: self.label.clone() }
     }
 }
@@ -231,10 +227,10 @@ impl<'a> KeyValuePointer for SdbPointer<'a> {
             bytes = decoded;
         }
 
-        if self.is_length_key() {
-            if let Some(converted) = ascii_length_to_le(&bytes) {
-                bytes = converted;
-            }
+        if self.is_length_key()
+            && let Some(converted) = ascii_length_to_le(&bytes)
+        {
+            bytes = converted;
         }
 
         Arc::new(bytes)
@@ -391,6 +387,7 @@ impl MetashrewAdapter {
         if len == 0 { None } else { Some(base.select_index(len.saturating_sub(1))) }
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn load_wasm_inner(
         &self,
         ptr: &SdbPointer<'_>,
@@ -460,7 +457,7 @@ impl MetashrewAdapter {
     pub fn get_alkanes_tip_height(&self) -> Result<u32> {
         static LAST_LOGGED_HEIGHT: AtomicU32 = AtomicU32::new(u32::MAX);
         let db = get_metashrew_sdb();
-        let height_ptr = self.root.from_bytes(db.as_ref(), b"__INTERNAL/height".to_vec());
+        let height_ptr = self.root.pointer_from_bytes(db.as_ref(), b"__INTERNAL/height".to_vec());
         let height = height_ptr.get_value::<u32>();
         let prev = LAST_LOGGED_HEIGHT.load(Ordering::Relaxed);
         if prev != height {
@@ -515,10 +512,11 @@ impl MetashrewAdapter {
                 outpoint.extend_from_slice(vout_le);
 
                 let entry = traces_by_outpoint.entry(outpoint).or_insert(None);
-                if entry.is_none() && suffix.len() == 4 {
-                    if let Some(trace) = decode_trace_blob(&v) {
-                        *entry = Some(trace);
-                    }
+                if entry.is_none()
+                    && suffix.len() == 4
+                    && let Some(trace) = decode_trace_blob(&v)
+                {
+                    *entry = Some(trace);
                 }
             }
 

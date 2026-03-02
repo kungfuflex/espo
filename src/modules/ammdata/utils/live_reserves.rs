@@ -68,10 +68,9 @@ pub fn fetch_all_pools(
             }
             if let Ok(v) =
                 provider.get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool })
+                && let Some(defs) = v.defs
             {
-                if let Some(defs) = v.defs {
-                    pools.insert(pool, defs);
-                }
+                pools.insert(pool, defs);
             }
         }
     }

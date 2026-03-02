@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use bitcoin::BlockHash;
 use bitcoin::hashes::{Hash as _, sha256};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -230,33 +232,33 @@ impl VersionedTreeDb {
 
         let mut state = TreeState::default();
 
-        if let Some(bytes) = db.get(META_ACTIVE_ROOT)? {
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                state.active_root = arr;
-            }
+        if let Some(bytes) = db.get(META_ACTIVE_ROOT)?
+            && bytes.len() == 32
+        {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            state.active_root = arr;
         }
-        if let Some(bytes) = db.get(META_ACTIVE_BLOCK)? {
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                state.active_block = Some(arr);
-            }
+        if let Some(bytes) = db.get(META_ACTIVE_BLOCK)?
+            && bytes.len() == 32
+        {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            state.active_block = Some(arr);
         }
-        if let Some(bytes) = db.get(META_PINNED_ROOT)? {
-            if bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                state.pinned_root = Some(arr);
-            }
+        if let Some(bytes) = db.get(META_PINNED_ROOT)?
+            && bytes.len() == 32
+        {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            state.pinned_root = Some(arr);
         }
-        if let Some(bytes) = db.get(META_PIN_UNTIL_HEIGHT)? {
-            if bytes.len() == 4 {
-                let mut arr = [0u8; 4];
-                arr.copy_from_slice(&bytes);
-                state.pin_until_height = Some(u32::from_be_bytes(arr));
-            }
+        if let Some(bytes) = db.get(META_PIN_UNTIL_HEIGHT)?
+            && bytes.len() == 4
+        {
+            let mut arr = [0u8; 4];
+            arr.copy_from_slice(&bytes);
+            state.pin_until_height = Some(u32::from_be_bytes(arr));
         }
 
         Ok(Self { db, state: RwLock::new(state) })
@@ -462,10 +464,10 @@ impl VersionedTreeDb {
     ) -> Result<Option<[u8; 32]>, RocksError> {
         {
             let st = self.state.read().expect("tree state poisoned");
-            if let Some(ctx) = st.current_block {
-                if &ctx.block_hash == block_hash {
-                    return Ok(Some(ctx.working_root));
-                }
+            if let Some(ctx) = st.current_block
+                && &ctx.block_hash == block_hash
+            {
+                return Ok(Some(ctx.working_root));
             }
         }
         let Some(bytes) = self.db.get(block_root_key(block_hash))? else {
@@ -683,10 +685,10 @@ impl VersionedTreeDb {
             };
 
             for entry in leaf.entries.iter().skip(start_idx) {
-                if let Some(end) = end_exclusive {
-                    if entry.key.as_slice() >= end {
-                        return Ok(out);
-                    }
+                if let Some(end) = end_exclusive
+                    && entry.key.as_slice() >= end
+                {
+                    return Ok(out);
                 }
                 if let Some(v) = &entry.value {
                     out.push((entry.key.clone(), v.clone()));
@@ -734,7 +736,7 @@ impl VersionedTreeDb {
                     keys: vec![separator],
                     children: vec![left, right],
                 });
-                self.store_node_with_ctx(&new_root, batch_ctx.as_deref_mut())?
+                self.store_node_with_ctx(&new_root, batch_ctx)?
             }
         };
 
@@ -965,7 +967,7 @@ impl VersionedTreeDb {
                         keys: right_keys,
                         children: right_children,
                     }),
-                    batch_ctx.as_deref_mut(),
+                    batch_ctx,
                 )?;
 
                 Ok(MutationResult {
@@ -1059,10 +1061,10 @@ impl VersionedTreeDb {
         id: &[u8; 32],
         batch_ctx: Option<&BatchWriteContext>,
     ) -> Result<BptreeNode, RocksError> {
-        if let Some(ctx) = batch_ctx {
-            if let Some(node) = ctx.pending_nodes.get(id) {
-                return Ok(node.clone());
-            }
+        if let Some(ctx) = batch_ctx
+            && let Some(node) = ctx.pending_nodes.get(id)
+        {
+            return Ok(node.clone());
         }
         self.load_node(id)
     }

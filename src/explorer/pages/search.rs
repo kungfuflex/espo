@@ -31,22 +31,18 @@ pub async fn search(Query(q): Query<SearchQuery>) -> Response {
             .into_response();
     }
 
-    if let Ok(addr) = Address::from_str(&query) {
-        if let Ok(addr) = addr.require_network(get_network()) {
-            return Redirect::to(&explorer_path(&format!("/address/{addr}"))).into_response();
-        }
+    if let Ok(addr) = Address::from_str(&query)
+        && let Ok(addr) = addr.require_network(get_network())
+    {
+        return Redirect::to(&explorer_path(&format!("/address/{addr}"))).into_response();
     }
 
     if query.len() == 64 && query.chars().all(|c| c.is_ascii_hexdigit()) {
-        match bitcoincore_rpc::bitcoin::BlockHash::from_str(&query) {
-            Ok(hash) => match get_bitcoind_rpc_client().get_block_header_info(&hash) {
-                Ok(info) => {
-                    return Redirect::to(&explorer_path(&format!("/block/{}", info.height)))
-                        .into_response();
-                }
-                Err(_) => {}
-            },
-            Err(_) => {}
+        if let Ok(hash) = bitcoincore_rpc::bitcoin::BlockHash::from_str(&query)
+            && let Ok(info) = get_bitcoind_rpc_client().get_block_header_info(&hash)
+        {
+            return Redirect::to(&explorer_path(&format!("/block/{}", info.height)))
+                .into_response();
         }
 
         return Redirect::to(&explorer_path(&format!("/tx/{query}"))).into_response();

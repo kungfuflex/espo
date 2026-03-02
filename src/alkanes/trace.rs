@@ -173,19 +173,18 @@ pub fn extract_alkane_storage(
         if let Some(evt) = &ev.event {
             match evt {
                 Event::EnterContext(enter) => {
-                    if let Some(ctx) = enter.context.as_ref() {
-                        if let Some(inner) = ctx.inner.as_ref() {
-                            if let Some(myself) = inner.myself.as_ref() {
-                                let owner: SchemaAlkaneId = myself.clone().try_into()?;
-                                stack.push(owner);
-                            }
-                        }
+                    if let Some(ctx) = enter.context.as_ref()
+                        && let Some(inner) = ctx.inner.as_ref()
+                        && let Some(myself) = inner.myself.as_ref()
+                    {
+                        let owner: SchemaAlkaneId = myself.clone().try_into()?;
+                        stack.push(owner);
                     }
                 }
                 Event::ExitContext(exit) => {
                     let Some(owner) = stack.pop() else { continue };
                     if let Some(resp) = exit.response.as_ref() {
-                        let entry = out.entry(owner).or_insert_with(HashMap::new);
+                        let entry = out.entry(owner).or_default();
                         for kv in &resp.storage {
                             let k = kv.key.clone();
                             let v = kv.value.clone();
@@ -226,7 +225,7 @@ fn bytes_to_string_or_hex(b: &[u8]) -> String {
 }
 
 pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
-    let mut out: Vec<Value> = Vec::with_capacity(trace.events.len() as usize);
+    let mut out: Vec<Value> = Vec::with_capacity(trace.events.len());
 
     for ev in &trace.events {
         if let Some(event) = &ev.event {
@@ -367,7 +366,7 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
         }
     }
 
-    Ok(serde_json::to_string(&out).context("serialize normalized events")?)
+    serde_json::to_string(&out).context("serialize normalized events")
 }
 
 fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
@@ -476,7 +475,7 @@ pub fn get_espo_block_with_opts(
     eprintln!("[TRACE::get_espo_block] got block at height={}, txs={}", h32, total_txs);
 
     // Header from block source
-    let block_header: Header = full_block.header.clone();
+    let block_header: Header = full_block.header;
     let host_function_values = {
         let mut header_bytes = Vec::new();
         full_block
@@ -486,7 +485,7 @@ pub fn get_espo_block_with_opts(
 
         let coinbase_tx = full_block
             .txdata
-            .get(0)
+            .first()
             .cloned()
             .context("block has no coinbase transaction for host function values")?;
         let mut coinbase_bytes = Vec::new();
@@ -537,14 +536,13 @@ pub fn get_espo_block_with_opts(
                     if varint_list.len() < 2 {
                         continue;
                     }
-                    if let Ok(cellpack) = TryInto::<Cellpack>::try_into(varint_list) {
-                        if cellpack.target == AlkaneId::new(2, 0)
-                            && !cellpack.inputs.is_empty()
-                            && cellpack.inputs[0] == 77
-                        {
-                            diesel_mints = diesel_mints.saturating_add(1);
-                            break;
-                        }
+                    if let Ok(cellpack) = TryInto::<Cellpack>::try_into(varint_list)
+                        && cellpack.target == AlkaneId::new(2, 0)
+                        && !cellpack.inputs.is_empty()
+                        && cellpack.inputs[0] == 77
+                    {
+                        diesel_mints = diesel_mints.saturating_add(1);
+                        break;
                     }
                 }
             }

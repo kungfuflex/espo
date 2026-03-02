@@ -53,10 +53,10 @@ impl Subfrost {
     }
 
     fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
-        if let Some(prev) = self.load_index_height()? {
-            if new_height < prev {
-                eprintln!("[SUBFROST] index height rollback detected ({} -> {})", prev, new_height);
-            }
+        if let Some(prev) = self.load_index_height()?
+            && new_height < prev
+        {
+            eprintln!("[SUBFROST] index height rollback detected ({} -> {})", prev, new_height);
         }
         self.persist_index_height(new_height, blockhash)?;
         Ok(())
@@ -338,7 +338,7 @@ fn parse_wrap_invoke(
     if myself != frbtc {
         return None;
     }
-    let opcode0 = invoke.context.inputs.get(0).and_then(|s| parse_hex_u64(s));
+    let opcode0 = invoke.context.inputs.first().and_then(|s| parse_hex_u64(s));
     let opcode2 = invoke.context.inputs.get(2).and_then(|s| parse_hex_u64(s));
     let opcode = match opcode0 {
         Some(0x4d) | Some(0x4e) => opcode0,
@@ -431,9 +431,8 @@ fn tx_owner_spk(
             if raw.is_empty() {
                 None
             } else {
-                deserialize::<Transaction>(&raw).ok().map(|tx| {
+                deserialize::<Transaction>(&raw).ok().inspect(|tx| {
                     prev_tx_cache.insert(prev_txid, tx.clone());
-                    tx
                 })
             }
         };
@@ -441,7 +440,7 @@ fn tx_owner_spk(
         let idx = vin.previous_output.vout as usize;
         let Some(prev_out) = prev_tx.output.get(idx) else { continue };
         let value = prev_out.value.to_sat();
-        if lowest_value.map_or(true, |v| value < v) {
+        if lowest_value.is_none_or(|v| value < v) {
             lowest_value = Some(value);
             lowest_spk = Some(prev_out.script_pubkey.clone());
         }

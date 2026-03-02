@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use bitcoin::Network;
 
 //tests to run before running a full reindex if u changed balances.rs

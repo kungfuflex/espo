@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use bitcoin::BlockHash;
 use rocksdb::{
     BlockBasedOptions, Cache, DB, Direction, Error as RocksError, IteratorMode, Options,

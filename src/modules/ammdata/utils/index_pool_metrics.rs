@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit};
 use crate::modules::ammdata::schemas::{SchemaPoolMetricsV1, SchemaPoolMetricsV2, Timeframe};
 use crate::modules::ammdata::storage::{
@@ -32,26 +34,24 @@ pub fn derive_pool_metrics(
 
     let table = provider.table();
 
-    let load_pool_candle =
-        |pool: &SchemaAlkaneId,
-         tf: Timeframe,
-         bucket_ts: u64|
-         -> Result<Option<crate::modules::ammdata::schemas::SchemaFullCandleV1>> {
-            if let Some(c) = state.pool_candle_overrides.get(&(*pool, tf, bucket_ts)) {
-                return Ok(Some(*c));
-            }
-            let key = table.candle_key(pool, tf, bucket_ts);
-            if let Some(raw) = provider
-                .get_raw_value(crate::modules::ammdata::storage::GetRawValueParams {
-                    blockhash: blockhash.clone(),
-                    key,
-                })?
-                .value
-            {
-                return Ok(Some(decode_full_candle_v1(&raw)?));
-            }
-            Ok(None)
-        };
+    let load_pool_candle = |pool: &SchemaAlkaneId,
+                            tf: Timeframe,
+                            bucket_ts: u64|
+     -> Result<
+        Option<crate::modules::ammdata::schemas::SchemaFullCandleV1>,
+    > {
+        if let Some(c) = state.pool_candle_overrides.get(&(*pool, tf, bucket_ts)) {
+            return Ok(Some(*c));
+        }
+        let key = table.candle_key(pool, tf, bucket_ts);
+        if let Some(raw) = provider
+            .get_raw_value(crate::modules::ammdata::storage::GetRawValueParams { blockhash, key })?
+            .value
+        {
+            return Ok(Some(decode_full_candle_v1(&raw)?));
+        }
+        Ok(None)
+    };
 
     let mut canonical_pools_by_token: HashMap<
         SchemaAlkaneId,
@@ -89,10 +89,7 @@ pub fn derive_pool_metrics(
             .cloned()
             .or_else(|| {
                 provider
-                    .get_token_metrics(GetTokenMetricsParams {
-                        blockhash: blockhash.clone(),
-                        token: *token,
-                    })
+                    .get_token_metrics(GetTokenMetricsParams { blockhash, token: *token })
                     .ok()
                     .map(|res| res.metrics)
             })
@@ -139,16 +136,14 @@ pub fn derive_pool_metrics(
                     if let Ok(res) = provider.get_list_entries_desc(GetListEntriesDescParams {
                         blockhash: StateAt::Latest,
                         prefix,
-                    }) {
-                        if let Some((_k, v)) = res.entries.into_iter().next() {
-                            if let Ok(candle) = decode_full_candle_v1(&v) {
-                                price = if use_base_price {
-                                    candle.base_candle.close
-                                } else {
-                                    candle.quote_candle.close
-                                };
-                            }
-                        }
+                    }) && let Some((_k, v)) = res.entries.into_iter().next()
+                        && let Ok(candle) = decode_full_candle_v1(&v)
+                    {
+                        price = if use_base_price {
+                            candle.base_candle.close
+                        } else {
+                            candle.quote_candle.close
+                        };
                     }
                 }
                 break;
@@ -238,17 +233,15 @@ pub fn derive_pool_metrics(
             .ok()
             .and_then(|res| res.metrics);
         let full_history = prev_pool_metrics.is_none();
-        let trade_windows = match crate::modules::ammdata::pool_trade_windows(
+        let trade_windows = crate::modules::ammdata::pool_trade_windows(
             provider,
             pool,
             block_ts,
             &state.in_block_trade_volumes,
             &mut pool_trade_window_cache,
             full_history,
-        ) {
-            Ok(v) => v,
-            Err(_) => crate::modules::ammdata::PoolTradeWindows::default(),
-        };
+        )
+        .unwrap_or_default();
 
         let token0_volume_1d = trade_windows.token0_1d;
         let token1_volume_1d = trade_windows.token1_1d;
@@ -457,11 +450,11 @@ pub fn derive_pool_metrics(
         if let Some(prev) = prev_pool_metrics.as_ref() {
             let prev_keys = build_pool_index_keys(prev);
             for (idx, (_field, new_key)) in new_pool_index_keys.iter().enumerate() {
-                if let Some((_pf, prev_key)) = prev_keys.get(idx) {
-                    if prev_key != new_key {
-                        state.pool_metrics_index_deletes.push(prev_key.clone());
-                        state.pool_metrics_index_writes.push((new_key.clone(), Vec::new()));
-                    }
+                if let Some((_pf, prev_key)) = prev_keys.get(idx)
+                    && prev_key != new_key
+                {
+                    state.pool_metrics_index_deletes.push(prev_key.clone());
+                    state.pool_metrics_index_writes.push((new_key.clone(), Vec::new()));
                 }
             }
         } else {
@@ -479,7 +472,7 @@ pub fn derive_pool_metrics(
 
         let lp_supply = essentials
             .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
-                blockhash: blockhash.clone(),
+                blockhash,
                 alkane: *pool,
             })
             .map(|res| res.supply)
@@ -491,7 +484,7 @@ pub fn derive_pool_metrics(
         let pool_label =
             crate::modules::ammdata::pool_name_display(&crate::modules::ammdata::strip_lp_suffix(
                 &crate::modules::ammdata::utils::index_pools::get_alkane_label(
-                    blockhash.clone(),
+                    blockhash,
                     essentials,
                     &mut state.alkane_label_cache,
                     pool,
@@ -500,10 +493,7 @@ pub fn derive_pool_metrics(
 
         let creation_info = state.pool_creation_info_cache.get(pool).cloned().or_else(|| {
             provider
-                .get_pool_creation_info(GetPoolCreationInfoParams {
-                    blockhash: blockhash.clone(),
-                    pool: *pool,
-                })
+                .get_pool_creation_info(GetPoolCreationInfoParams { blockhash, pool: *pool })
                 .ok()
                 .and_then(|res| res.info)
         });

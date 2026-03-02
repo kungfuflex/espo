@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
@@ -7,6 +9,8 @@ use bitcoin::BlockHash;
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::HashSet;
 use std::sync::Arc;
+
+use super::snapshot::BondedSnapshotRowV1;
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct SeriesEntry {
@@ -36,10 +40,10 @@ fn series_id_matches_name(series_id: &str, name_norm: &str) -> bool {
     if series_id == name_norm {
         return true;
     }
-    if let Some(rest) = series_id.strip_prefix(name_norm) {
-        if let Some(num) = rest.strip_prefix('-') {
-            return !num.is_empty() && num.chars().all(|c| c.is_ascii_digit());
-        }
+    if let Some(rest) = series_id.strip_prefix(name_norm)
+        && let Some(num) = rest.strip_prefix('-')
+    {
+        return !num.is_empty() && num.chars().all(|c| c.is_ascii_digit());
     }
     false
 }
@@ -80,6 +84,7 @@ pub struct PizzafunTable<'a> {
     pub SERIES_BY_ID: KvPointer<'a>,
     pub SERIES_BY_ALKANE: KvPointer<'a>,
     pub SERIES_ALL: ListPointer<'a>,
+    pub BONDED_ROWS: KvPointer<'a>,
 }
 
 impl<'a> PizzafunTable<'a> {
@@ -90,6 +95,7 @@ impl<'a> PizzafunTable<'a> {
             SERIES_BY_ID: root.keyword("/series/by_id/"),
             SERIES_BY_ALKANE: root.keyword("/series/by_alkane/"),
             SERIES_ALL: root.list_keyword("/series/all/v2/"),
+            BONDED_ROWS: root.keyword("/bonded/rows/v1/"),
             ROOT: root,
         }
     }
@@ -127,6 +133,14 @@ impl<'a> PizzafunTable<'a> {
         let mut key = self.series_all_entry_prefix();
         key.extend_from_slice(series_id.as_bytes());
         key
+    }
+
+    pub fn bonded_row_key(&self, series_id: &str) -> Vec<u8> {
+        self.BONDED_ROWS.select(series_id.as_bytes()).key().to_vec()
+    }
+
+    pub fn bonded_row_prefix(&self) -> Vec<u8> {
+        self.BONDED_ROWS.key().to_vec()
     }
 }
 
@@ -167,6 +181,11 @@ pub struct GetSeriesByAlkanesParams {
 pub struct GetSeriesEntriesByNameParams {
     pub blockhash: StateAt,
     pub name_norm: String,
+}
+
+pub struct GetBondedRowParams {
+    pub blockhash: StateAt,
+    pub series_id: String,
 }
 
 #[derive(Clone)]
@@ -359,10 +378,10 @@ impl PizzafunProvider {
     ) -> Result<Vec<SeriesEntry>> {
         let table = self.table();
         let mut lookup_names: Vec<String> = vec![params.name_norm.clone()];
-        if let Some(series_base) = series_id_base_from_name(&params.name_norm) {
-            if series_base != params.name_norm {
-                lookup_names.push(series_base);
-            }
+        if let Some(series_base) = series_id_base_from_name(&params.name_norm)
+            && series_base != params.name_norm
+        {
+            lookup_names.push(series_base);
         }
 
         let mut filtered_ids: Vec<String> = Vec::new();
@@ -393,10 +412,8 @@ impl PizzafunProvider {
         let keys: Vec<Vec<u8>> = filtered_ids.iter().map(|id| table.series_by_id_key(id)).collect();
         let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
         let mut out = Vec::with_capacity(raw.len());
-        for item in raw {
-            if let Some(bytes) = item {
-                out.push(SeriesEntry::try_from_slice(&bytes)?);
-            }
+        for bytes in raw.into_iter().flatten() {
+            out.push(SeriesEntry::try_from_slice(&bytes)?);
         }
         Ok(out)
     }
@@ -433,6 +450,44 @@ impl PizzafunProvider {
                 }
             })
             .map_err(|e| anyhow!("mdb.bulk_write failed: {e}"))
+    }
+
+    pub fn get_bonded_row(
+        &self,
+        params: GetBondedRowParams,
+    ) -> Result<Option<BondedSnapshotRowV1>> {
+        let table = self.table();
+        let key = table.bonded_row_key(&params.series_id);
+        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(BondedSnapshotRowV1::try_from_slice(&bytes)?))
+    }
+
+    pub fn get_all_bonded_rows(&self, blockhash: StateAt) -> Result<Vec<BondedSnapshotRowV1>> {
+        let table = self.table();
+        let prefix = table.bonded_row_prefix();
+        let resolved = blockhash.resolve(self.view_blockhash);
+        let keys = self.with_view_blockhash(resolved).raw_scan_prefix_keys(&prefix)?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(bytes) = self.raw_get_at(&key, resolved)? else { continue };
+            out.push(BondedSnapshotRowV1::try_from_slice(&bytes)?);
+        }
+        out.sort_by(|a, b| a.series_id.cmp(&b.series_id));
+        Ok(out)
+    }
+
+    pub fn upsert_bonded_row(&self, row: &BondedSnapshotRowV1) -> Result<()> {
+        let table = self.table();
+        let encoded = borsh::to_vec(row)?;
+        self.mdb
+            .put(&table.bonded_row_key(&row.series_id), &encoded)
+            .map_err(|e| anyhow!("mdb.put failed: {e}"))
     }
 
     pub fn replace_series_entries(&self, entries: &[SeriesEntry], height: u32) -> Result<()> {

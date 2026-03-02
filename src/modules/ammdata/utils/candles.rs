@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, PRICE_SCALE};
 use crate::modules::ammdata::schemas::{SchemaCandleV1, SchemaFullCandleV1, Timeframe};
 use crate::runtime::state_at::StateAt;
@@ -223,15 +225,12 @@ pub fn read_candles_v1(
         })?
         .entries
     {
-        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
-            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
-                if let Ok(ts) = ts_str.parse::<u64>() {
-                    let fc = decode_full_candle_v1(&v)?;
-                    if !per_bucket.contains_key(&ts) {
-                        per_bucket.insert(ts, fc);
-                    }
-                }
-            }
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next()
+            && let Ok(ts_str) = std::str::from_utf8(ts_bytes)
+            && let Ok(ts) = ts_str.parse::<u64>()
+        {
+            let fc = decode_full_candle_v1(&v)?;
+            per_bucket.entry(ts).or_insert(fc);
         }
     }
 

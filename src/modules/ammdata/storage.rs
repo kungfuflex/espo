@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use super::schemas::{
     ActivityKind, SchemaActivityV1, SchemaCandleV1, SchemaCanonicalPoolEntry, SchemaMarketDefs,
     SchemaPoolCreationInfoV1, SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2,
@@ -94,6 +96,7 @@ pub struct AmmDataTable<'a> {
     pub POOL_METRICS_INDEX_COUNT: KvPointer<'a>,
     pub TOKEN_SEARCH_INDEX: ListPointer<'a>,
     pub TOKEN_DERIVED_SEARCH_INDEX: ListPointer<'a>,
+    pub TOKEN_MARKET_UPDATES: KvPointer<'a>,
     pub POOL_NAME_INDEX: ListPointer<'a>,
     // Factory + pool indices.
     pub AMM_FACTORIES: ListPointer<'a>,
@@ -149,6 +152,7 @@ impl<'a> AmmDataTable<'a> {
             POOL_METRICS_INDEX_COUNT: root.keyword("/pool_metrics/index_count"),
             TOKEN_SEARCH_INDEX: root.list_keyword("/token_search_index/v1/"),
             TOKEN_DERIVED_SEARCH_INDEX: root.list_keyword("/token_search_index/derived/v1/"),
+            TOKEN_MARKET_UPDATES: root.keyword("/token_market_updates/v1/"),
             POOL_NAME_INDEX: root.list_keyword("/pool_name_index/"),
             AMM_FACTORIES: root.list_keyword("/amm_factories/v1/"),
             FACTORY_BOOTSTRAP_CREATION_COUNT: root
@@ -789,6 +793,10 @@ impl<'a> AmmDataTable<'a> {
         suffix.extend_from_slice(&token.block.to_be_bytes());
         suffix.extend_from_slice(&token.tx.to_be_bytes());
         self.TOKEN_METRICS.select(&suffix).key().to_vec()
+    }
+
+    pub fn token_market_updates_key(&self, height: u32) -> Vec<u8> {
+        self.TOKEN_MARKET_UPDATES.select(&height.to_be_bytes()).key().to_vec()
     }
 
     pub fn token_derived_metrics_key(
@@ -1435,10 +1443,10 @@ fn read_amm_history(
             Some(v) => v,
             None => continue,
         };
-        if let Some(want) = kind_filter {
-            if want != kind {
-                continue;
-            }
+        if let Some(want) = kind_filter
+            && want != kind
+        {
+            continue;
         }
         let pool = match decode_alkane_id_be(&rest[13..25]) {
             Some(p) => p,
@@ -1527,10 +1535,10 @@ impl AmmDataProvider {
             let Some(height) = table.parse_btc_usd_price_key(&k) else {
                 continue;
             };
-            if let Ok(price) = decode_u128_value(&v) {
-                if price > 0 {
-                    return Ok(Some((height, price)));
-                }
+            if let Ok(price) = decode_u128_value(&v)
+                && price > 0
+            {
+                return Ok(Some((height, price)));
             }
         }
         Ok(None)
@@ -1847,6 +1855,22 @@ impl AmmDataProvider {
         Ok(GetTokenMetricsByIdResult { metrics })
     }
 
+    pub fn get_token_market_updated_alkanes_in_block(
+        &self,
+        params: GetTokenMarketUpdatedAlkanesInBlockParams,
+    ) -> Result<GetTokenMarketUpdatedAlkanesInBlockResult> {
+        crate::debug_timer_log!("get_token_market_updated_alkanes_in_block");
+        let table = self.table();
+        let key = table.token_market_updates_key(params.height);
+        let updates = self
+            .get_raw_value(GetRawValueParams { blockhash: params.blockhash, key })?
+            .value
+            .map(|raw| Vec::<SchemaAlkaneId>::try_from_slice(&raw))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(GetTokenMarketUpdatedAlkanesInBlockResult { alkanes: updates })
+    }
+
     pub fn get_token_derived_metrics_by_id(
         &self,
         params: GetTokenDerivedMetricsByIdParams,
@@ -2106,10 +2130,10 @@ impl AmmDataProvider {
         let mut ids = Vec::new();
         let mut seen = HashSet::new();
         for key in keys {
-            if let Some((_name, id)) = table.parse_pool_name_index_key(&key) {
-                if seen.insert(id) {
-                    ids.push(id);
-                }
+            if let Some((_name, id)) = table.parse_pool_name_index_key(&key)
+                && seen.insert(id)
+            {
+                ids.push(id);
             }
         }
         Ok(GetPoolIdsByNamePrefixResult { ids })
@@ -2337,15 +2361,16 @@ impl AmmDataProvider {
                 Ok(e) => e,
                 Err(_) => continue,
             };
-            if let Some(ref kinds) = params.kinds {
-                if !kinds.contains(&entry.kind) {
-                    continue;
-                }
+            if let Some(ref kinds) = params.kinds
+                && !kinds.contains(&entry.kind)
+            {
+                continue;
             }
-            if let Some(want) = params.successful {
-                if want && !entry.success {
-                    continue;
-                }
+            if let Some(want) = params.successful
+                && want
+                && !entry.success
+            {
+                continue;
             }
             total += 1;
             if seen < params.offset {
@@ -2861,12 +2886,10 @@ impl AmmDataProvider {
                         } else {
                             read_token_mcusd_candles_v1(self, pool, spot_tf, now)
                         }
+                    } else if let Some(quote) = derived_quote {
+                        read_token_derived_usd_candles_v1(self, pool, quote, spot_tf, now)
                     } else {
-                        if let Some(quote) = derived_quote {
-                            read_token_derived_usd_candles_v1(self, pool, quote, spot_tf, now)
-                        } else {
-                            read_token_usd_candles_v1(self, pool, spot_tf, now)
-                        }
+                        read_token_usd_candles_v1(self, pool, spot_tf, now)
                     };
                     spot_slice
                         .ok()
@@ -2925,12 +2948,12 @@ impl AmmDataProvider {
                         let global_idx = offset + i;
                         let ts = newest_ts.saturating_sub((global_idx as u64) * dur);
                         let mut candle = *c;
-                        if global_idx == 0 {
-                            if let Some(spot_close) = spot_close_10m {
-                                candle.close = spot_close;
-                                candle.high = candle.high.max(candle.open).max(candle.close);
-                                candle.low = candle.low.min(candle.open).min(candle.close);
-                            }
+                        if global_idx == 0
+                            && let Some(spot_close) = spot_close_10m
+                        {
+                            candle.close = spot_close;
+                            candle.high = candle.high.max(candle.open).max(candle.close);
+                            candle.low = candle.low.min(candle.open).min(candle.close);
                         }
                         if is_sats || is_mcsats {
                             let btc_price = btc_slice
@@ -3397,7 +3420,7 @@ impl AmmDataProvider {
         };
 
         let fee_bps = params.fee_bps.map(|n| n as u32).unwrap_or(DEFAULT_FEE_BPS);
-        let max_hops = params.max_hops.map(|n| n as usize).unwrap_or(3).max(1).min(6);
+        let max_hops = params.max_hops.map(|n| n as usize).unwrap_or(3).clamp(1, 6);
 
         let plan = match mode.as_str() {
             "exact_in" => {
@@ -3820,6 +3843,15 @@ pub struct GetTokenMetricsByIdParams {
 
 pub struct GetTokenMetricsByIdResult {
     pub metrics: Vec<Option<SchemaTokenMetricsV1>>,
+}
+
+pub struct GetTokenMarketUpdatedAlkanesInBlockParams {
+    pub blockhash: StateAt,
+    pub height: u32,
+}
+
+pub struct GetTokenMarketUpdatedAlkanesInBlockResult {
+    pub alkanes: Vec<SchemaAlkaneId>,
 }
 
 pub struct GetTokenDerivedMetricsByIdParams {
@@ -4539,16 +4571,13 @@ fn read_token_usd_candles_v1(
         })?
         .entries
     {
-        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
-            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
-                if let Ok(ts) = ts_str.parse::<u64>() {
-                    if !per_bucket.contains_key(&ts) {
-                        if let Ok(c) = decode_candle_v1(&v) {
-                            per_bucket.insert(ts, c);
-                        }
-                    }
-                }
-            }
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next()
+            && let Ok(ts_str) = std::str::from_utf8(ts_bytes)
+            && let Ok(ts) = ts_str.parse::<u64>()
+            && !per_bucket.contains_key(&ts)
+            && let Ok(c) = decode_candle_v1(&v)
+        {
+            per_bucket.insert(ts, c);
         }
     }
 
@@ -4638,16 +4667,13 @@ fn read_token_derived_usd_candles_v1(
         })?
         .entries
     {
-        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
-            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
-                if let Ok(ts) = ts_str.parse::<u64>() {
-                    if !per_bucket.contains_key(&ts) {
-                        if let Ok(c) = decode_candle_v1(&v) {
-                            per_bucket.insert(ts, c);
-                        }
-                    }
-                }
-            }
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next()
+            && let Ok(ts_str) = std::str::from_utf8(ts_bytes)
+            && let Ok(ts) = ts_str.parse::<u64>()
+            && !per_bucket.contains_key(&ts)
+            && let Ok(c) = decode_candle_v1(&v)
+        {
+            per_bucket.insert(ts, c);
         }
     }
 
@@ -4737,16 +4763,13 @@ fn read_token_derived_mcusd_candles_v1(
         })?
         .entries
     {
-        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
-            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
-                if let Ok(ts) = ts_str.parse::<u64>() {
-                    if !per_bucket.contains_key(&ts) {
-                        if let Ok(c) = decode_candle_v1(&v) {
-                            per_bucket.insert(ts, c);
-                        }
-                    }
-                }
-            }
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next()
+            && let Ok(ts_str) = std::str::from_utf8(ts_bytes)
+            && let Ok(ts) = ts_str.parse::<u64>()
+            && !per_bucket.contains_key(&ts)
+            && let Ok(c) = decode_candle_v1(&v)
+        {
+            per_bucket.insert(ts, c);
         }
     }
 
@@ -4835,16 +4858,13 @@ fn read_token_mcusd_candles_v1(
         })?
         .entries
     {
-        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
-            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
-                if let Ok(ts) = ts_str.parse::<u64>() {
-                    if !per_bucket.contains_key(&ts) {
-                        if let Ok(c) = decode_candle_v1(&v) {
-                            per_bucket.insert(ts, c);
-                        }
-                    }
-                }
-            }
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next()
+            && let Ok(ts_str) = std::str::from_utf8(ts_bytes)
+            && let Ok(ts) = ts_str.parse::<u64>()
+            && !per_bucket.contains_key(&ts)
+            && let Ok(c) = decode_candle_v1(&v)
+        {
+            per_bucket.insert(ts, c);
         }
     }
 
@@ -4932,16 +4952,13 @@ fn read_btc_usd_line_v1(
         })?
         .entries
     {
-        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
-            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
-                if let Ok(ts) = ts_str.parse::<u64>() {
-                    if !per_bucket.contains_key(&ts) {
-                        if let Ok(p) = decode_u128_value(&v) {
-                            per_bucket.insert(ts, p);
-                        }
-                    }
-                }
-            }
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next()
+            && let Ok(ts_str) = std::str::from_utf8(ts_bytes)
+            && let Ok(ts) = ts_str.parse::<u64>()
+            && !per_bucket.contains_key(&ts)
+            && let Ok(p) = decode_u128_value(&v)
+        {
+            per_bucket.insert(ts, p);
         }
     }
 

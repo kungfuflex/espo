@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{HashMap, HashSet};
 
 use bitcoin::blockdata::script::Instruction;
@@ -306,10 +308,10 @@ fn kv_implementation_value(
     cache: &mut AlkaneImplCache,
     mdb: &Mdb,
 ) -> Option<SchemaAlkaneId> {
-    if let Some(meta) = cache.get(alk) {
-        if let Some(stored) = &meta.implementation {
-            return *stored;
-        }
+    if let Some(meta) = cache.get(alk)
+        && let Some(stored) = &meta.implementation
+    {
+        return *stored;
     }
     let mut meta = cache.get(alk).cloned().unwrap_or_default();
     let lookup = |key| {
@@ -378,7 +380,7 @@ fn upgradeable_proxy_target(
     impl_cache: &mut AlkaneImplCache,
     mdb: &Mdb,
 ) -> Option<SchemaAlkaneId> {
-    if !inspection.map_or(false, is_upgradeable_proxy) {
+    if !inspection.is_some_and(is_upgradeable_proxy) {
         return None;
     }
     let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
@@ -403,12 +405,12 @@ fn upgradeable_proxy_target(
         } else {
             kv_implementation_value(&current, impl_cache, mdb)
         };
-        let Some(target) = next else { return None };
+        let target = next?;
         if !seen.insert(target) {
             return None;
         }
         let target_inspection = load_inspection(&provider_from_mdb(mdb), &target).ok().flatten();
-        if !target_inspection.as_ref().map_or(false, is_upgradeable_proxy) {
+        if !target_inspection.as_ref().is_some_and(is_upgradeable_proxy) {
             return Some(target);
         }
         current = target;
@@ -425,10 +427,10 @@ fn contract_display_name(
     if let Some(name) = contract_name_override(id) {
         return ResolvedName { value: name, known: true };
     }
-    if let Some(meta) = inspection.and_then(|i| i.metadata.as_ref()) {
-        if !meta.name.trim().is_empty() {
-            return ResolvedName { value: meta.name.clone(), known: true };
-        }
+    if let Some(meta) = inspection.and_then(|i| i.metadata.as_ref())
+        && !meta.name.trim().is_empty()
+    {
+        return ResolvedName { value: meta.name.clone(), known: true };
     }
 
     let meta = alkane_meta(id, meta_cache, mdb);
@@ -544,7 +546,7 @@ fn summarize_contract_call(
             }
             EspoSandshrewLikeTraceEvent::Create(c) => {
                 if created_alkane.is_none() {
-                    created_alkane = parse_short_id_to_schema(&c);
+                    created_alkane = parse_short_id_to_schema(c);
                 }
             }
         }
@@ -578,12 +580,11 @@ fn summarize_contract_call(
         icon_id = contract_id;
     }
     let mut factory_pair = parse_factory_clone(first_invoke_inputs.as_ref(), created_alkane);
-    if factory_pair.is_none() {
-        if let (Some(factory_id), Some(created)) = (inspection_factory_id, created_alkane) {
-            if factory_id != contract_id || created != contract_id {
-                factory_pair = Some((factory_id, Some(created)));
-            }
-        }
+    if factory_pair.is_none()
+        && let (Some(factory_id), Some(created)) = (inspection_factory_id, created_alkane)
+        && (factory_id != contract_id || created != contract_id)
+    {
+        factory_pair = Some((factory_id, Some(created)));
     }
     let mut link_id = active_id;
     let mut effective_name = contract_name;
@@ -600,10 +601,8 @@ fn summarize_contract_call(
     if let Some(created) = factory_pair.as_ref().and_then(|(_, c)| *c) {
         created_meta = Some(alkane_meta(&created, meta_cache, mdb));
     }
-    if using_proxy_template {
-        if let Some(name) = contract_name_override(&contract_id) {
-            effective_name = ResolvedName { value: name, known: true };
-        }
+    if using_proxy_template && let Some(name) = contract_name_override(&contract_id) {
+        effective_name = ResolvedName { value: name, known: true };
     }
     let contract_meta = alkane_meta(&contract_id, meta_cache, mdb);
     if factory_pair.is_none() && contract_meta.name.known {
@@ -662,7 +661,7 @@ fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
                 }
                 span class="io-arrow" { (arrow_svg()) }
             }
-            @if summary.method_name.is_some() || (summary.opcode.is_some() && !is_factory_clone) || is_factory_clone {
+            @if summary.method_name.is_some() || summary.opcode.is_some() || is_factory_clone {
                 div class="trace-method-pill" {
                     @if is_factory_clone {
                         span class="trace-method-icon" aria-hidden="true" { (icon_magic_wand()) }
@@ -997,7 +996,7 @@ fn render_op_return(
                 div class="opret-body protostone-body" {
                     @for (idx, ((trace_raw, trace_parsed), trace)) in trace_views.iter().zip(traces.iter()).enumerate() {
                         @let label = format!("Alkanes Trace #{}", idx + 1);
-                        @let summary = summarize_contract_call(*trace, inspection_cache, meta_cache, impl_cache, essentials_mdb);
+                        @let summary = summarize_contract_call(trace, inspection_cache, meta_cache, impl_cache, essentials_mdb);
                         div class="trace-view" {
                             @if let Some(s) = summary {
                                 (render_trace_summary(&s))

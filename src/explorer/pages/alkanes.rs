@@ -244,8 +244,7 @@ pub async fn alkanes_page(
     let display_end = (offset as u64 + rows.len() as u64).min(total);
     let has_prev = page > 1;
     let has_next = (offset as u64 + rows.len() as u64) < total;
-    let last_page =
-        if total > 0 { ((total + limit as u64 - 1) / limit as u64).max(1) as usize } else { 1 };
+    let last_page = if total > 0 { total.div_ceil(limit as u64).max(1) as usize } else { 1 };
     let show_creation_block = has_prev || has_next;
 
     let field_options = [SortField::Age, SortField::Holders];

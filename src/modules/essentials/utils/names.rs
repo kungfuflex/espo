@@ -103,7 +103,7 @@ pub fn get_name(
     if let Some(name) = name_from_creation_trace(block, alkane) {
         return Some(name);
     }
-    let Some(inspection) = inspection else { return None };
+    let inspection = inspection?;
     if !has_get_name_method(inspection) {
         return None;
     }

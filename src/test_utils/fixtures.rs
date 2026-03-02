@@ -1,4 +1,4 @@
-/// Shared test fixtures and data
+//! Shared test fixtures and data
 
 /// Get the alkanes.wasm binary for testing
 ///

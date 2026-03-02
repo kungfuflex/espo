@@ -48,7 +48,7 @@ pub fn get_cap(
     inspection: Option<&StoredInspectionResult>,
 ) -> Option<u128> {
     let _ = blockhash;
-    let Some(inspection) = inspection else { return None };
+    let inspection = inspection?;
     if !has_method(inspection, "get_cap", 102) {
         return None;
     }
@@ -71,7 +71,7 @@ pub fn get_value_per_mint(
     inspection: Option<&StoredInspectionResult>,
 ) -> Option<u128> {
     let _ = blockhash;
-    let Some(inspection) = inspection else { return None };
+    let inspection = inspection?;
     if !has_method(inspection, "get_value_per_mint", 104) {
         return None;
     }

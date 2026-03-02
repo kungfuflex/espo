@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use crate::alkanes::trace::EspoBlock;
 use crate::modules::ammdata::storage::{AmmDataProvider, GetAmmFactoriesParams};
 use crate::modules::essentials::storage::{
@@ -30,16 +32,13 @@ pub fn prepare_factories(
     let table = provider.table();
     let blockhash = StateAt::Block(block.block_header.block_hash());
     let mut amm_factories: HashSet<SchemaAlkaneId> = provider
-        .get_amm_factories(GetAmmFactoriesParams { blockhash: blockhash.clone() })
+        .get_amm_factories(GetAmmFactoriesParams { blockhash })
         .map(|res| res.factories.into_iter().collect())
         .unwrap_or_default();
     let mut amm_factory_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut proxy_target_cache: HashMap<SchemaAlkaneId, Option<SchemaAlkaneId>> = HashMap::new();
     let created_alkanes = essentials
-        .get_creation_ids_in_block(GetCreationIdsInBlockParams {
-            blockhash: blockhash.clone(),
-            height: block.height,
-        })
+        .get_creation_ids_in_block(GetCreationIdsInBlockParams { blockhash, height: block.height })
         .map(|res| res.alkanes)
         .unwrap_or_default();
 
@@ -48,45 +47,31 @@ pub fn prepare_factories(
             continue;
         }
         let mut is_factory = false;
-        if let Ok(resp) = essentials.get_creation_record(GetCreationRecordParams {
-            blockhash: blockhash.clone(),
-            alkane: alk,
-        }) {
-            if let Some(rec) = resp.record {
-                if let Some(inspection) = rec.inspection.as_ref() {
-                    if crate::modules::ammdata::inspection_is_amm_factory(inspection) {
-                        is_factory = true;
-                    }
-                    if let Some(factory_id) = inspection.factory_alkane {
-                        if !amm_factories.contains(&factory_id) {
-                            amm_factories.insert(factory_id);
-                            amm_factory_writes
-                                .push((table.amm_factory_key(&factory_id), Vec::new()));
-                        }
-                    }
-                }
+        if let Ok(resp) =
+            essentials.get_creation_record(GetCreationRecordParams { blockhash, alkane: alk })
+            && let Some(rec) = resp.record
+            && let Some(inspection) = rec.inspection.as_ref()
+        {
+            if crate::modules::ammdata::inspection_is_amm_factory(inspection) {
+                is_factory = true;
+            }
+            if let Some(factory_id) = inspection.factory_alkane
+                && !amm_factories.contains(&factory_id)
+            {
+                amm_factories.insert(factory_id);
+                amm_factory_writes.push((table.amm_factory_key(&factory_id), Vec::new()));
             }
         }
-        if !is_factory {
-            if let Some(proxy_target) = lookup_proxy_target_cached(
-                blockhash.clone(),
-                essentials,
-                &mut proxy_target_cache,
-                alk,
-            ) {
-                if let Ok(resp) = essentials.get_creation_record(GetCreationRecordParams {
-                    blockhash: blockhash.clone(),
-                    alkane: proxy_target,
-                }) {
-                    if let Some(rec) = resp.record {
-                        if let Some(inspection) = rec.inspection.as_ref() {
-                            if crate::modules::ammdata::inspection_is_amm_factory(inspection) {
-                                is_factory = true;
-                            }
-                        }
-                    }
-                }
-            }
+        if !is_factory
+            && let Some(proxy_target) =
+                lookup_proxy_target_cached(blockhash, essentials, &mut proxy_target_cache, alk)
+            && let Ok(resp) = essentials
+                .get_creation_record(GetCreationRecordParams { blockhash, alkane: proxy_target })
+            && let Some(rec) = resp.record
+            && let Some(inspection) = rec.inspection.as_ref()
+            && crate::modules::ammdata::inspection_is_amm_factory(inspection)
+        {
+            is_factory = true;
         }
         if is_factory {
             amm_factories.insert(alk);

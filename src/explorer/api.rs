@@ -171,7 +171,7 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
         });
 
         let (traces, time) = if let Some(summary) = summary {
-            let time = deserialize::<Header>(&summary.header).ok().map(|hdr| hdr.time as u32);
+            let time = deserialize::<Header>(&summary.header).ok().map(|hdr| hdr.time);
             (summary.trace_count as usize, time)
         } else {
             (0, None)
@@ -474,22 +474,22 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         );
     }
 
-    if let Ok(addr) = Address::from_str(&query) {
-        if let Ok(addr) = addr.require_network(get_network()) {
-            let addr_str = addr.to_string();
-            let label = if addr_str.len() > 24 {
-                format!("{}...{}", &addr_str[..8], &addr_str[addr_str.len().saturating_sub(6)..])
-            } else {
-                addr_str.clone()
-            };
-            addresses.push(SearchGuessItem {
-                label,
-                value: addr_str.clone(),
-                href: Some(explorer_path(&format!("/address/{addr_str}"))),
-                icon_url: None,
-                fallback_letter: None,
-            });
-        }
+    if let Ok(addr) = Address::from_str(&query)
+        && let Ok(addr) = addr.require_network(get_network())
+    {
+        let addr_str = addr.to_string();
+        let label = if addr_str.len() > 24 {
+            format!("{}...{}", &addr_str[..8], &addr_str[addr_str.len().saturating_sub(6)..])
+        } else {
+            addr_str.clone()
+        };
+        addresses.push(SearchGuessItem {
+            label,
+            value: addr_str.clone(),
+            href: Some(explorer_path(&format!("/address/{addr_str}"))),
+            icon_url: None,
+            fallback_letter: None,
+        });
     }
 
     if query.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -737,7 +737,7 @@ pub async fn address_chart(Query(q): Query<AddressChartQuery>) -> Json<AddressCh
         });
     };
 
-    let chain_tip = (get_espo_next_height().saturating_sub(1)) as u32;
+    let chain_tip = get_espo_next_height().saturating_sub(1);
     let range_max = chain_tip.min(indexed_max);
     let range_min = match lookback_blocks {
         Some(lookback) => range_max.saturating_sub(lookback).max(indexed_min),
@@ -884,7 +884,7 @@ pub async fn alkane_balance_chart(
         });
     };
 
-    let chain_tip = (get_espo_next_height().saturating_sub(1)) as u32;
+    let chain_tip = get_espo_next_height().saturating_sub(1);
     let range_max = chain_tip.min(indexed_max);
     let range_min = match lookback_blocks {
         Some(lookback) => range_max.saturating_sub(lookback).max(indexed_min),
@@ -1357,7 +1357,7 @@ fn strip_u128_prefix(bytes: &[u8]) -> Option<(usize, &[u8])> {
         return None;
     }
     let remaining = bytes.len() - 16;
-    if remaining % 32 != 0 {
+    if !remaining.is_multiple_of(32) {
         return None;
     }
     let mut count_bytes = [0u8; 16];

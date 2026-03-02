@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
 };
@@ -169,14 +171,14 @@ fn parse_paged_cursor_u64(raw: &str) -> Option<u64> {
     if let Some(hex_str) = s.strip_prefix("0x") {
         return u64::from_str_radix(hex_str, 16).ok();
     }
-    if s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        if let Ok(bytes) = hex::decode(s) {
-            if bytes.len() == 8 {
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(&bytes);
-                return Some(u64::from_be_bytes(arr));
-            }
-        }
+    if s.len() == 16
+        && s.chars().all(|c| c.is_ascii_hexdigit())
+        && let Ok(bytes) = hex::decode(s)
+        && bytes.len() == 8
+    {
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes);
+        return Some(u64::from_be_bytes(arr));
     }
     s.parse::<u64>().ok()
 }
@@ -2195,10 +2197,10 @@ impl EssentialsProvider {
         let mut ids = Vec::new();
         let mut seen = HashSet::new();
         for key in keys {
-            if let Some((_name, id)) = table.parse_alkane_name_index_key(&key) {
-                if seen.insert(id) {
-                    ids.push(id);
-                }
+            if let Some((_name, id)) = table.parse_alkane_name_index_key(&key)
+                && seen.insert(id)
+            {
+                ids.push(id);
             }
         }
         Ok(GetAlkaneIdsByNamePrefixResult { ids })
@@ -2224,16 +2226,16 @@ impl EssentialsProvider {
         let mut unique_skipped: u64 = 0;
 
         for key in keys {
-            if let Some((_name, id)) = table.parse_alkane_name_index_key(&key) {
-                if seen.insert(id) {
-                    if unique_skipped < params.offset {
-                        unique_skipped += 1;
-                        continue;
-                    }
-                    ids.push(id);
-                    if ids.len() >= params.limit as usize {
-                        break;
-                    }
+            if let Some((_name, id)) = table.parse_alkane_name_index_key(&key)
+                && seen.insert(id)
+            {
+                if unique_skipped < params.offset {
+                    unique_skipped += 1;
+                    continue;
+                }
+                ids.push(id);
+                if ids.len() >= params.limit as usize {
+                    break;
                 }
             }
         }
@@ -2257,10 +2259,10 @@ impl EssentialsProvider {
         let mut ids = Vec::new();
         let mut seen = HashSet::new();
         for key in keys {
-            if let Some((_sym, id)) = table.parse_alkane_symbol_index_key(&key) {
-                if seen.insert(id) {
-                    ids.push(id);
-                }
+            if let Some((_sym, id)) = table.parse_alkane_symbol_index_key(&key)
+                && seen.insert(id)
+            {
+                ids.push(id);
             }
         }
         Ok(GetAlkaneIdsBySymbolPrefixResult { ids })
@@ -2286,16 +2288,16 @@ impl EssentialsProvider {
         let mut unique_skipped: u64 = 0;
 
         for key in keys {
-            if let Some((_symbol, id)) = table.parse_alkane_symbol_index_key(&key) {
-                if seen.insert(id) {
-                    if unique_skipped < params.offset {
-                        unique_skipped += 1;
-                        continue;
-                    }
-                    ids.push(id);
-                    if ids.len() >= params.limit as usize {
-                        break;
-                    }
+            if let Some((_symbol, id)) = table.parse_alkane_symbol_index_key(&key)
+                && seen.insert(id)
+            {
+                if unique_skipped < params.offset {
+                    unique_skipped += 1;
+                    continue;
+                }
+                ids.push(id);
+                if ids.len() >= params.limit as usize {
+                    break;
                 }
             }
         }
@@ -2560,7 +2562,7 @@ impl EssentialsProvider {
                 if idx < offset {
                     continue;
                 }
-                if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
+                if entry.traces.as_ref().is_none_or(|t| t.is_empty()) {
                     continue;
                 }
                 if items.len() >= limit {
@@ -2586,7 +2588,7 @@ impl EssentialsProvider {
                     .ok()
                     .and_then(|resp| resp.entry);
                 let Some(entry) = entry else { continue };
-                if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
+                if entry.traces.as_ref().is_none_or(|t| t.is_empty()) {
                     continue;
                 }
                 if let Some(t) = entry.traces.as_ref() {
@@ -3757,7 +3759,7 @@ impl EssentialsProvider {
                 })
                 .ok()
                 .and_then(|resp| resp.value)
-                .unwrap_or_else(Vec::new),
+                .unwrap_or_default(),
         ) {
             Ok(count_value) => count_value.count,
             Err(_) => {
@@ -4044,10 +4046,8 @@ impl EssentialsProvider {
         let mut items: Vec<Value> = Vec::new();
 
         if !tx_rows.is_empty() {
-            let chain_tip = get_bitcoind_rpc_client()
-                .get_blockchain_info()
-                .ok()
-                .map(|info| info.blocks as u64);
+            let chain_tip =
+                get_bitcoind_rpc_client().get_blockchain_info().ok().map(|info| info.blocks);
             let heights: Vec<Option<u64>> = tx_rows.iter().map(|(_, h)| Some(*h as u64)).collect();
             let txid_rows: Vec<Txid> = tx_rows.iter().map(|(txid, _)| *txid).collect();
             let raw_txs =
@@ -4064,14 +4064,14 @@ impl EssentialsProvider {
                 let mut protostones = Value::Array(Vec::new());
                 let mut has_protostones = false;
                 let raw = raw_txs.get(idx).cloned().unwrap_or_default();
-                if !raw.is_empty() {
-                    if let Ok(tx) = deserialize::<Transaction>(&raw) {
-                        let (runestone_json, protostone_items) = runestone_data(&tx);
-                        has_protostones = !protostone_items.is_empty();
-                        protostones = Value::Array(protostone_items);
-                        if let Some(value) = runestone_json {
-                            runestone = value;
-                        }
+                if !raw.is_empty()
+                    && let Ok(tx) = deserialize::<Transaction>(&raw)
+                {
+                    let (runestone_json, protostone_items) = runestone_data(&tx);
+                    has_protostones = !protostone_items.is_empty();
+                    protostones = Value::Array(protostone_items);
+                    if let Some(value) = runestone_json {
+                        runestone = value;
                     }
                 }
 
@@ -4147,7 +4147,7 @@ impl EssentialsProvider {
         let pending_filtered: Vec<MempoolEntry> = pending_entries
             .into_iter()
             .filter(|entry| {
-                !only_alkane_txs || entry.traces.as_ref().map_or(false, |t| !t.is_empty())
+                !only_alkane_txs || entry.traces.as_ref().is_some_and(|t| !t.is_empty())
             })
             .collect();
         let pending_total = pending_filtered.len();
@@ -4172,10 +4172,8 @@ impl EssentialsProvider {
         }
 
         let remaining_slots = limit.saturating_sub(tx_renders.len());
-        let chain_tip = get_bitcoind_rpc_client()
-            .get_blockchain_info()
-            .ok()
-            .map(|info| info.blocks as u64);
+        let chain_tip =
+            get_bitcoind_rpc_client().get_blockchain_info().ok().map(|info| info.blocks);
         let mut confirmed_total = if only_alkane_txs {
             get_address_index_list_len(
                 self,
@@ -5121,11 +5119,11 @@ pub fn preload_block_summary_cache(mdb: &Mdb) -> usize {
         if loaded >= BLOCK_SUMMARY_CACHE_CAP {
             break;
         }
-        if let Ok(Some(raw)) = mdb.get(&table.block_summary_key(height)) {
-            if let Ok(summary) = BlockSummary::try_from_slice(&raw) {
-                cache_block_summary(height, summary);
-                loaded += 1;
-            }
+        if let Ok(Some(raw)) = mdb.get(&table.block_summary_key(height))
+            && let Ok(summary) = BlockSummary::try_from_slice(&raw)
+        {
+            cache_block_summary(height, summary);
+            loaded += 1;
         }
         if height == 0 {
             break;
@@ -5300,17 +5298,16 @@ fn resolve_visible_u64_entry(
     let mut active_visibility_cache: HashMap<BlockHash, bool> = HashMap::new();
     for entry in entries {
         let entry_blockhash = BlockHash::from_byte_array(entry.blockhash);
-        if let (Some(target_blockhash), Some(active_tip)) = (target, fast_active_tip) {
-            if target_blockhash == active_tip {
-                let visible =
-                    *active_visibility_cache.entry(entry_blockhash).or_insert_with(|| {
-                        provider.blockhash_is_on_active_chain(&entry_blockhash).unwrap_or(false)
-                    });
-                if visible {
-                    return Some(entry.value);
-                }
-                continue;
+        if let (Some(target_blockhash), Some(active_tip)) = (target, fast_active_tip)
+            && target_blockhash == active_tip
+        {
+            let visible = *active_visibility_cache.entry(entry_blockhash).or_insert_with(|| {
+                provider.blockhash_is_on_active_chain(&entry_blockhash).unwrap_or(false)
+            });
+            if visible {
+                return Some(entry.value);
             }
+            continue;
         }
         if version_visible_for_target(provider, target, entry_blockhash) {
             return Some(entry.value);
@@ -5330,17 +5327,16 @@ fn resolve_visible_bytes32_entry(
     let mut active_visibility_cache: HashMap<BlockHash, bool> = HashMap::new();
     for entry in entries {
         let entry_blockhash = BlockHash::from_byte_array(entry.blockhash);
-        if let (Some(target_blockhash), Some(active_tip)) = (target, fast_active_tip) {
-            if target_blockhash == active_tip {
-                let visible =
-                    *active_visibility_cache.entry(entry_blockhash).or_insert_with(|| {
-                        provider.blockhash_is_on_active_chain(&entry_blockhash).unwrap_or(false)
-                    });
-                if visible {
-                    return Some(entry.value);
-                }
-                continue;
+        if let (Some(target_blockhash), Some(active_tip)) = (target, fast_active_tip)
+            && target_blockhash == active_tip
+        {
+            let visible = *active_visibility_cache.entry(entry_blockhash).or_insert_with(|| {
+                provider.blockhash_is_on_active_chain(&entry_blockhash).unwrap_or(false)
+            });
+            if visible {
+                return Some(entry.value);
             }
+            continue;
         }
         if version_visible_for_target(provider, target, entry_blockhash) {
             return Some(entry.value);
@@ -5774,7 +5770,7 @@ pub fn get_address_index_list_range(
             let chunk_size_u64 = u64::from(chunk_size.max(1));
             let first_chunk = usize::try_from(start / chunk_size_u64).unwrap_or(usize::MAX);
             let mut last_chunk_excl =
-                usize::try_from((end + chunk_size_u64 - 1) / chunk_size_u64).unwrap_or(usize::MAX);
+                usize::try_from(end.div_ceil(chunk_size_u64)).unwrap_or(usize::MAX);
             if first_chunk >= chunk_ids.len() {
                 return Ok(Vec::new());
             }
@@ -5953,7 +5949,7 @@ pub fn encode_outpoint_pointer_blob_v3(
     tx_idx: u32,
     address: &str,
     spk: &[u8],
-    balances: &Vec<BalanceEntry>,
+    balances: &[BalanceEntry],
 ) -> Result<Vec<u8>> {
     borsh::to_vec(&OutpointPointerBlobV3 {
         txid: *txid,
@@ -5962,7 +5958,7 @@ pub fn encode_outpoint_pointer_blob_v3(
         tx_idx,
         address: address.to_string(),
         spk: spk.to_vec(),
-        balances: balances.clone(),
+        balances: balances.to_owned(),
     })
     .map_err(|e| anyhow!("encode outpoint pointer blob v3 failed: {e}"))
 }
@@ -5975,12 +5971,12 @@ pub fn decode_outpoint_pointer_blob_v3(bytes: &[u8]) -> Result<OutpointPointerBl
 pub fn encode_outpoint_row_v2(
     address: &str,
     spk: &[u8],
-    balances: &Vec<BalanceEntry>,
+    balances: &[BalanceEntry],
 ) -> Result<Vec<u8>> {
     borsh::to_vec(&OutpointRowV2 {
         address: address.to_string(),
         spk: spk.to_vec(),
-        balances: balances.clone(),
+        balances: balances.to_owned(),
     })
     .map_err(|e| anyhow!("encode outpoint row v2 failed: {e}"))
 }
@@ -6167,14 +6163,12 @@ fn parse_trace_outpoint_vout(outpoint: &str) -> Option<u32> {
 }
 
 pub fn encode_tx_trace_row(trace: &EspoSandshrewLikeTrace, compact: bool) -> Result<Vec<u8>> {
-    if compact {
-        if let Some(vout) = parse_trace_outpoint_vout(&trace.outpoint) {
-            let compact_row = CompactTxTraceRowV1 { vout, events: trace.events.clone() };
-            let mut bytes = Vec::with_capacity(1 + trace.events.len() * 16);
-            bytes.push(TX_TRACE_ROW_COMPACT_V1);
-            bytes.extend_from_slice(&borsh::to_vec(&compact_row)?);
-            return Ok(bytes);
-        }
+    if compact && let Some(vout) = parse_trace_outpoint_vout(&trace.outpoint) {
+        let compact_row = CompactTxTraceRowV1 { vout, events: trace.events.clone() };
+        let mut bytes = Vec::with_capacity(1 + trace.events.len() * 16);
+        bytes.push(TX_TRACE_ROW_COMPACT_V1);
+        bytes.extend_from_slice(&borsh::to_vec(&compact_row)?);
+        return Ok(bytes);
     }
     Ok(borsh::to_vec(trace)?)
 }
@@ -6292,14 +6286,13 @@ fn enriched_transaction_json(
         obj.insert("vout".to_string(), json!(vin.previous_output.vout));
         if vin.previous_output.is_null() {
             obj.insert("isCoinbase".to_string(), json!(true));
-        } else if let Some(prev_tx) = prev_map.get(&vin.previous_output.txid) {
-            if let Some(prev_out) = prev_tx.output.get(vin.previous_output.vout as usize) {
-                input_sum = input_sum.saturating_add(prev_out.value.to_sat());
-                obj.insert("amount".to_string(), json!(prev_out.value.to_sat()));
-                if let Ok(addr) = Address::from_script(prev_out.script_pubkey.as_script(), network)
-                {
-                    obj.insert("address".to_string(), json!(addr.to_string()));
-                }
+        } else if let Some(prev_tx) = prev_map.get(&vin.previous_output.txid)
+            && let Some(prev_out) = prev_tx.output.get(vin.previous_output.vout as usize)
+        {
+            input_sum = input_sum.saturating_add(prev_out.value.to_sat());
+            obj.insert("amount".to_string(), json!(prev_out.value.to_sat()));
+            if let Ok(addr) = Address::from_script(prev_out.script_pubkey.as_script(), network) {
+                obj.insert("address".to_string(), json!(addr.to_string()));
             }
         }
         inputs.push(Value::Object(obj));
@@ -6491,10 +6484,11 @@ fn parse_alkane_from_str(s: &str) -> Option<SchemaAlkaneId> {
 }
 
 fn parse_key_str_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if let Some(hex) = s.strip_prefix("0x") {
-        if hex.len() % 2 == 0 && !hex.is_empty() {
-            return hex::decode(hex).ok();
-        }
+    if let Some(hex) = s.strip_prefix("0x")
+        && hex.len() % 2 == 0
+        && !hex.is_empty()
+    {
+        return hex::decode(hex).ok();
     }
     Some(s.as_bytes().to_vec())
 }

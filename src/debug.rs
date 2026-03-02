@@ -88,17 +88,11 @@ impl From<TimerTotalsDiskV1> for TimerTotals {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct TimerState {
     loaded: bool,
     totals: HashMap<TimerKey, TimerTotals>,
     dirty: HashSet<TimerKey>,
-}
-
-impl Default for TimerState {
-    fn default() -> Self {
-        Self { loaded: false, totals: HashMap::new(), dirty: HashSet::new() }
-    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -354,8 +348,8 @@ impl Drop for DebugTimer {
 #[macro_export]
 macro_rules! debug_timer_log {
     ($name:expr) => {
-        let _debug_timer = if crate::config::debug_enabled() {
-            Some(crate::debug::DebugTimer::new(std::module_path!(), $name))
+        let _debug_timer = if $crate::config::debug_enabled() {
+            Some($crate::debug::DebugTimer::new(std::module_path!(), $name))
         } else {
             None
         };

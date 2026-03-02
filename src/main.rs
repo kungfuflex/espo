@@ -77,10 +77,7 @@ fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> st
     eprintln!("[debug_backup] starting copy: '{}' -> '{}'", db_root.display(), dest_dir.display());
     let status = Command::new("cp").arg("-r").arg(db_root).arg(&dest_dir).status()?;
     if !status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("cp exited with status {status}"),
-        ));
+        return Err(std::io::Error::other(format!("cp exited with status {status}")));
     }
     eprintln!("[debug_backup] finished copy to '{}'", dest_dir.display());
     Ok(())
@@ -239,10 +236,10 @@ async fn run_indexer_loop(
     let mut logged_start = false;
     let mut safe_tip_hook_ran = false;
     let mut reorg_poller_started = false;
-    if cfg.reset_mempool_on_startup {
-        if let Err(e) = reset_mempool_store() {
-            eprintln!("[mempool] failed to reset store on startup: {e:?}");
-        }
+    if cfg.reset_mempool_on_startup
+        && let Err(e) = reset_mempool_store()
+    {
+        eprintln!("[mempool] failed to reset store on startup: {e:?}");
     }
     if let Err(e) = purge_confirmed_from_chain() {
         eprintln!("[mempool] failed to purge confirmed txs on startup: {e:?}");
@@ -286,15 +283,14 @@ async fn run_indexer_loop(
             }
         };
         update_safe_tip(tip);
-        if let Some(prev_tip) = last_tip {
-            if tip > prev_tip {
-                if let Err(e) = metashrew_sdb.catch_up_now() {
-                    eprintln!(
-                        "[indexer] metashrew catch_up after new tip {} (prev {}) detected: {e:?}",
-                        tip, prev_tip
-                    );
-                }
-            }
+        if let Some(prev_tip) = last_tip
+            && tip > prev_tip
+            && let Err(e) = metashrew_sdb.catch_up_now()
+        {
+            eprintln!(
+                "[indexer] metashrew catch_up after new tip {} (prev {}) detected: {e:?}",
+                tip, prev_tip
+            );
         }
         last_tip = Some(tip);
 
@@ -435,16 +431,16 @@ async fn run_indexer_loop(
                         ),
                     }
 
-                    if let Some(backup) = cfg.debug_backup.as_ref() {
-                        if debug_backup_remaining.remove(&next_height) {
-                            eprintln!(
-                                "[debug_backup] reached block {}, copying db dir '{}' to '{}/bkp-{}'",
-                                next_height, cfg.db_path, backup.dir, next_height
-                            );
-                            match run_debug_backup(&cfg.db_path, backup, next_height) {
-                                Ok(_) => eprintln!("[debug_backup] backup complete"),
-                                Err(e) => eprintln!("[debug_backup] backup failed: {e}"),
-                            }
+                    if let Some(backup) = cfg.debug_backup.as_ref()
+                        && debug_backup_remaining.remove(&next_height)
+                    {
+                        eprintln!(
+                            "[debug_backup] reached block {}, copying db dir '{}' to '{}/bkp-{}'",
+                            next_height, cfg.db_path, backup.dir, next_height
+                        );
+                        match run_debug_backup(&cfg.db_path, backup, next_height) {
+                            Ok(_) => eprintln!("[debug_backup] backup complete"),
+                            Err(e) => eprintln!("[debug_backup] backup failed: {e}"),
                         }
                     }
 
@@ -464,11 +460,9 @@ async fn run_indexer_loop(
                 }
             }
         } else {
-            if !safe_tip_hook_ran {
-                if let Some(script) = cfg.safe_tip_hook_script.as_deref() {
-                    safe_tip_hook_ran = true;
-                    run_safe_tip_hook(script, next_height, tip);
-                }
+            if !safe_tip_hook_ran && let Some(script) = cfg.safe_tip_hook_script.as_deref() {
+                safe_tip_hook_ran = true;
+                run_safe_tip_hook(script, next_height, tip);
             }
             if !reorg_poller_started {
                 reorg_poller_started = true;
@@ -528,11 +522,17 @@ async fn main() -> Result<()> {
     let mut mods = ModuleRegistry::new();
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
-    mods.register_module(Pizzafun::new());
     if get_module_config("ammdata").is_some() {
         mods.register_module(AmmData::new());
     } else {
         eprintln!("[modules] ammdata disabled (missing config)");
+    }
+    if get_module_config("pizzafun").is_some() && get_module_config("ammdata").is_some() {
+        mods.register_module(Pizzafun::new());
+    } else if get_module_config("pizzafun").is_some() {
+        eprintln!("[modules] pizzafun disabled (requires ammdata)");
+    } else {
+        eprintln!("[modules] pizzafun disabled (missing config)");
     }
     if get_module_config("subfrost").is_some() {
         mods.register_module(Subfrost::new());

@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use super::defs::EspoTraceType;
 use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceReturnData,

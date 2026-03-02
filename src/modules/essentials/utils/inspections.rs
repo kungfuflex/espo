@@ -197,23 +197,22 @@ pub fn created_alkane_records_from_block(block: &EspoBlock) -> Vec<AlkaneCreatio
                 continue;
             }
             for ev in trace.sandshrew_trace.events.iter() {
-                if let EspoSandshrewLikeTraceEvent::Create(create) = ev {
-                    if let Some(id) = parse_short_id(&create) {
-                        if seen.insert(id) {
-                            out.push(AlkaneCreationRecord {
-                                alkane: id,
-                                txid,
-                                creation_height: block.height,
-                                creation_timestamp: block.block_header.time,
-                                tx_index_in_block: tx_index as u32,
-                                inspection: None,
-                                names: Vec::new(),
-                                symbols: Vec::new(),
-                                cap: 0,
-                                mint_amount: 0,
-                            });
-                        }
-                    }
+                if let EspoSandshrewLikeTraceEvent::Create(create) = ev
+                    && let Some(id) = parse_short_id(create)
+                    && seen.insert(id)
+                {
+                    out.push(AlkaneCreationRecord {
+                        alkane: id,
+                        txid,
+                        creation_height: block.height,
+                        creation_timestamp: block.block_header.time,
+                        tx_index_in_block: tx_index as u32,
+                        inspection: None,
+                        names: Vec::new(),
+                        symbols: Vec::new(),
+                        cap: 0,
+                        mint_amount: 0,
+                    });
                 }
             }
         }

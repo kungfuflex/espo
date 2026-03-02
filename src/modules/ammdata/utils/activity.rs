@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::modules::ammdata::consts::AMOUNT_SCALE;
 use crate::modules::ammdata::schemas::{ActivityDirection, ActivityKind, SchemaActivityV1};
 use crate::modules::ammdata::storage::{
@@ -467,12 +469,11 @@ fn parse_ts_from_key_tail(k: &[u8]) -> Option<u64> {
     // key ends with "...:<ts>:<seq>"
     let mut parts = k.rsplit(|&b| b == b':');
     let _seq_b = parts.next();
-    if let Some(ts_b) = parts.next() {
-        if let Ok(ts_s) = std::str::from_utf8(ts_b) {
-            if let Ok(ts) = ts_s.parse::<u64>() {
-                return Some(ts);
-            }
-        }
+    if let Some(ts_b) = parts.next()
+        && let Ok(ts_s) = std::str::from_utf8(ts_b)
+        && let Ok(ts) = ts_s.parse::<u64>()
+    {
+        return Some(ts);
     }
     None
 }
@@ -495,10 +496,10 @@ pub fn read_activity_for_pool(
     {
         let ts = parse_ts_from_key_tail(&k).unwrap_or_default();
         let a = decode_activity_v1(&v)?;
-        if let Some(group) = group_from_filter(activity_type) {
-            if group_for_kind(a.kind) != group {
-                continue;
-            }
+        if let Some(group) = group_from_filter(activity_type)
+            && group_for_kind(a.kind) != group
+        {
+            continue;
         }
         all.push((ts, a));
     }
@@ -600,15 +601,13 @@ fn total_for_pool_index(
     prefix: &[u8],
     count_key: Option<Vec<u8>>,
 ) -> Result<usize> {
-    if let Some(count_k) = count_key {
-        if let Some(v) = provider
+    if let Some(count_k) = count_key
+        && let Some(v) = provider
             .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: count_k })?
             .value
-        {
-            if let Some(n) = decode_u64_be(&v) {
-                return Ok(n as usize);
-            }
-        }
+        && let Some(n) = decode_u64_be(&v)
+    {
+        return Ok(n as usize);
     }
     let entries = provider
         .get_list_entries_desc(GetListEntriesDescParams {
@@ -732,10 +731,10 @@ pub fn read_activity_for_pool_sorted(
             .value
         {
             let a = decode_activity_v1(&v)?;
-            if let Some(g) = group {
-                if group_for_kind(a.kind) != g {
-                    continue;
-                }
+            if let Some(g) = group
+                && group_for_kind(a.kind) != g
+            {
+                continue;
             }
             // sanity: if filtering, enforce it (robust even if very old index existed)
             if let Some(sb) = fixed_side {

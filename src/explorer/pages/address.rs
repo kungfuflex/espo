@@ -276,7 +276,7 @@ pub async fn address_page(
     );
 
     let chain_tip_t0 = Instant::now();
-    let chain_tip = get_bitcoind_rpc_client().get_blockchain_info().ok().map(|i| i.blocks as u64);
+    let chain_tip = get_bitcoind_rpc_client().get_blockchain_info().ok().map(|i| i.blocks);
     log_address_page_perf(
         &address_str,
         "bitcoind.get_blockchain_info",
@@ -290,7 +290,7 @@ pub async fn address_page(
     pending_entries.sort_by(|a, b| b.txid.cmp(&a.txid));
     let pending_filtered: Vec<MempoolEntry> = pending_entries
         .into_iter()
-        .filter(|e| !traces_only || e.traces.as_ref().map_or(false, |t| !t.is_empty()))
+        .filter(|e| !traces_only || e.traces.as_ref().is_some_and(|t| !t.is_empty()))
         .collect();
     let pending_total = pending_filtered.len();
     log_address_page_perf(
@@ -601,7 +601,7 @@ pub async fn address_page(
 
     let display_start = if tx_total > 0 && off < tx_total { off + 1 } else { 0 };
     let display_end = (off + tx_renders.len()).min(tx_total);
-    let last_page = if tx_total > 0 { (tx_total + limit - 1) / limit } else { 1 };
+    let last_page = if tx_total > 0 { tx_total.div_ceil(limit) } else { 1 };
     let use_cursor = !traces_only && history_error.is_none();
     let prev_cursor = cursor_stack.last().cloned();
     let prev_stack = if cursor_stack.len() > 1 {
@@ -972,17 +972,13 @@ pub async fn address_page(
                 } @else {
                     div class="list" {
                         @for item in tx_renders {
-                            @let traces_ref: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
+                            @let traces_ref: Option<&[EspoTrace]> = item.traces.as_deref();
                             @let pill = if item.is_mempool {
                                 Some(TxPill { label: "Unconfirmed".to_string(), tone: TxPillTone::Danger })
-                            } else if let Some(c) = item.confirmations {
-                                Some(TxPill {
+                            } else { item.confirmations.map(|c| TxPill {
                                     label: format!("{} confirmations", format_with_commas(c)),
                                     tone: TxPillTone::Success,
-                                })
-                            } else {
-                                None
-                            };
+                                }) };
                             (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, true))
                         }
                     }

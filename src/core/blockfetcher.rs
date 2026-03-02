@@ -21,8 +21,6 @@ use crate::runtime::mdb::Mdb;
 const MAX_BLOCK_PAYLOAD: u32 = 8_000_000;
 /// If height is within this distance from tip, fetch via RPC (avoid file tail races).
 const NEAR_TIP_RPC_THRESHOLD: u32 = 6_000;
-/// ============================================================================
-
 /// Public trait: source of blocks for a given height.
 pub trait BlockSource {
     /// Returns the full block for `height`. `tip` is used to optionally route near-tip to RPC.
@@ -163,7 +161,7 @@ impl BlkOrRpcBlockSource {
         let mut out: HashMap<u32, BlockHash> = HashMap::new();
         eprintln!("[BLOCKFETCHER] Loading height map from DB (first run may take a bit)...");
         let entries = mdb
-            .scan_prefix_entries(&[b'H'])
+            .scan_prefix_entries(b"H")
             .context("scan_prefix_entries(H) for block_core_index/")?;
         for (k_rel, v) in entries {
             let Some(height) = Self::parse_meta_key_height_to_hash(&k_rel) else {
@@ -530,13 +528,11 @@ impl BlkOrRpcBlockSource {
             return Ok(true);
         }
 
-        if let Some(stop_hash) = self.genesis_stop_hash {
-            if self.index_get(&stop_hash)?.is_some() {
-                eprintln!(
-                    "[BLOCKFETCHER] stop-hash already indexed; target not found → stop scanning"
-                );
-                return Ok(false);
-            }
+        if let Some(stop_hash) = self.genesis_stop_hash
+            && self.index_get(&stop_hash)?.is_some()
+        {
+            eprintln!("[BLOCKFETCHER] stop-hash already indexed; target not found → stop scanning");
+            return Ok(false);
         }
 
         let files = self.list_blk_files_desc()?;
@@ -557,14 +553,14 @@ impl BlkOrRpcBlockSource {
             }
 
             // Stop once stop-hash present in index (no pre-genesis scanning).
-            if let Some(stop_hash) = self.genesis_stop_hash {
-                if self.index_get(&stop_hash)?.is_some() {
-                    eprintln!(
-                        "[BLOCKFETCHER] stop-hash {} present after {} files; ending scan",
-                        stop_hash, i
-                    );
-                    break;
-                }
+            if let Some(stop_hash) = self.genesis_stop_hash
+                && self.index_get(&stop_hash)?.is_some()
+            {
+                eprintln!(
+                    "[BLOCKFETCHER] stop-hash {} present after {} files; ending scan",
+                    stop_hash, i
+                );
+                break;
             }
 
             let file_no = match Self::parse_file_no(p) {
@@ -606,10 +602,8 @@ impl BlkOrRpcBlockSource {
         }
 
         // If we indexed anything this pass, rebuild (and log) the height→hash map now.
-        if indexed_any {
-            if let Err(e) = self.refresh_height_map_from_db() {
-                eprintln!("[BLOCKFETCHER] warn: failed to refresh height map after scan: {:?}", e);
-            }
+        if indexed_any && let Err(e) = self.refresh_height_map_from_db() {
+            eprintln!("[BLOCKFETCHER] warn: failed to refresh height map after scan: {:?}", e);
         }
 
         Ok(self.index_get(hash)?.is_some())
@@ -724,18 +718,18 @@ impl BlockSource for BlkOrRpcBlockSource {
         }
 
         // 0) First: consult the preloaded height→hash map (already filtered to active chain)
-        if let Some(h) = self.height_to_hash.lock().unwrap().get(&height).cloned() {
-            if let Some(loc) = self.index_get(&h)? {
-                eprintln!(
-                    "[BLOCKFETCHER] height={} (preloaded map) using BLK (file={}, off={}, len={})",
-                    height, loc.file_no, loc.offset, loc.len
-                );
-                let blk = self.read_block_from_loc(&h, &loc)?;
-                eprintln!("[BLOCKFETCHER] height={} BLK ok in {:.2?}", height, t0.elapsed());
-                return Ok(blk);
-            }
-            // If the map has the hash but location is missing (shouldn't happen), fall through.
+        if let Some(h) = self.height_to_hash.lock().unwrap().get(&height).cloned()
+            && let Some(loc) = self.index_get(&h)?
+        {
+            eprintln!(
+                "[BLOCKFETCHER] height={} (preloaded map) using BLK (file={}, off={}, len={})",
+                height, loc.file_no, loc.offset, loc.len
+            );
+            let blk = self.read_block_from_loc(&h, &loc)?;
+            eprintln!("[BLOCKFETCHER] height={} BLK ok in {:.2?}", height, t0.elapsed());
+            return Ok(blk);
         }
+        // If the map has the hash but location is missing (shouldn't happen), fall through.
 
         // 1) height → hash via RPC (canonical)
         let hash: BlockHash = self
@@ -759,16 +753,16 @@ impl BlockSource for BlkOrRpcBlockSource {
 
         // 3) Lazily index files until found (but stop once stop-hash is present)
         eprintln!("[BLOCKFETCHER] height={} hash={} not in index → lazy index", height, hash);
-        if self.ensure_index_contains(&hash, height)? {
-            if let Some(loc) = self.index_get(&hash)? {
-                eprintln!(
-                    "[BLOCKFETCHER] height={} found after indexing → BLK (file={}, off={}, len={})",
-                    height, loc.file_no, loc.offset, loc.len
-                );
-                let blk = self.read_block_from_loc(&hash, &loc)?;
-                eprintln!("[BLOCKFETCHER] height={} BLK ok in {:.2?}", height, t0.elapsed());
-                return Ok(blk);
-            }
+        if self.ensure_index_contains(&hash, height)?
+            && let Some(loc) = self.index_get(&hash)?
+        {
+            eprintln!(
+                "[BLOCKFETCHER] height={} found after indexing → BLK (file={}, off={}, len={})",
+                height, loc.file_no, loc.offset, loc.len
+            );
+            let blk = self.read_block_from_loc(&hash, &loc)?;
+            eprintln!("[BLOCKFETCHER] height={} BLK ok in {:.2?}", height, t0.elapsed());
+            return Ok(blk);
         }
 
         // 4) Fallback to RPC (e.g., pruned file or not in local blk files)
@@ -793,5 +787,5 @@ impl BlockSource for BlkOrRpcBlockSource {
 #[inline]
 fn approx_height_map_kb(entries: usize) -> usize {
     // ~36 bytes per entry (u32 + 32B hash) — HashMap overhead not included.
-    ((entries * 36) + 1023) / 1024
+    (entries * 36).div_ceil(1024)
 }

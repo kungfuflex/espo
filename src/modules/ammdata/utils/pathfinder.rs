@@ -240,19 +240,19 @@ fn best_first_exact_in(
             continue;
         }
 
-        if at == dst && depth > 0 {
-            if let Some(q) = pathquote_from_edges_exact_in(g, &hops, amount_in, fee_bps) {
-                if q.amount_out > best_out_at_dst {
-                    best_out_at_dst = q.amount_out;
-                    best_quote = Some(q);
-                }
-            }
+        if at == dst
+            && depth > 0
+            && let Some(q) = pathquote_from_edges_exact_in(g, &hops, amount_in, fee_bps)
+            && q.amount_out > best_out_at_dst
+        {
+            best_out_at_dst = q.amount_out;
+            best_quote = Some(q);
         }
 
-        if let Some(&best_amt) = best_seen.get(&(at, depth)) {
-            if amount <= best_amt {
-                continue;
-            }
+        if let Some(&best_amt) = best_seen.get(&(at, depth))
+            && amount <= best_amt
+        {
+            continue;
         }
         best_seen.insert((at, depth), amount);
 
@@ -264,7 +264,7 @@ fn best_first_exact_in(
                 }
 
                 // Avoid immediate ping-pong on the SAME pool
-                let is_immediate_backtrack_same_pool = hops.last().map_or(false, |prev| {
+                let is_immediate_backtrack_same_pool = hops.last().is_some_and(|prev| {
                     prev.pool == ek.pool && prev.token_in == *to && prev.token_out == at
                 });
                 if is_immediate_backtrack_same_pool {
@@ -338,18 +338,18 @@ fn best_first_exact_out(
         if at == src && depth > 0 {
             let mut fwd = hops_rev.clone();
             fwd.reverse();
-            if let Some(q) = pathquote_from_edges_exact_out(g, &fwd, amount_out, fee_bps) {
-                if best_in_at_src.map_or(true, |cur| q.amount_in < cur) {
-                    best_in_at_src = Some(q.amount_in);
-                    best_quote = Some(q);
-                }
+            if let Some(q) = pathquote_from_edges_exact_out(g, &fwd, amount_out, fee_bps)
+                && best_in_at_src.is_none_or(|cur| q.amount_in < cur)
+            {
+                best_in_at_src = Some(q.amount_in);
+                best_quote = Some(q);
             }
         }
 
-        if let Some(&best_need) = best_seen.get(&(at, depth)) {
-            if need_in >= best_need {
-                continue;
-            }
+        if let Some(&best_need) = best_seen.get(&(at, depth))
+            && need_in >= best_need
+        {
+            continue;
         }
         best_seen.insert((at, depth), need_in);
 
@@ -359,7 +359,7 @@ fn best_first_exact_out(
                     continue;
                 }
 
-                let is_immediate_backtrack_same_pool = hops_rev.last().map_or(false, |prev| {
+                let is_immediate_backtrack_same_pool = hops_rev.last().is_some_and(|prev| {
                     prev.pool == ek.pool && prev.token_out == *from && prev.token_in == at
                 });
                 if is_immediate_backtrack_same_pool {
@@ -626,7 +626,7 @@ fn dfs_cycles(
             let edge = Edge { pool: ek.pool, token_in: ek.token_in, token_out: ek.token_out };
 
             // Avoid immediate backtrack on SAME pool while building.
-            if acc.last().map_or(false, |prev| {
+            if acc.last().is_some_and(|prev| {
                 prev.pool == edge.pool && prev.token_in == *to && prev.token_out == cur
             }) {
                 continue;

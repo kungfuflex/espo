@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use super::consts::KEY_INDEX_HEIGHT;
 use super::schemas::SchemaWrapEventV1;
 use crate::runtime::mdb::{Mdb, MdbBatch};
@@ -503,10 +505,11 @@ fn read_events_from_list(
     let mut seen = 0usize;
 
     for entry in all.into_iter().rev() {
-        if let Some(want) = successful {
-            if want && !entry.success {
-                continue;
-            }
+        if let Some(want) = successful
+            && want
+            && !entry.success
+        {
+            continue;
         }
         total = total.saturating_add(1);
         if seen < offset {

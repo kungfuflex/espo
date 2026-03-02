@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use super::defs::{EspoTraceType, SignedU128, SignedU128MapExt};
 use super::utils::{
     Unallocated, compute_nets, is_op_return, parse_protostones, parse_short_id,
@@ -167,10 +169,10 @@ pub(crate) fn clean_espo_sandshrew_like_trace(
         if data_bytes.len() == 80 && deserialize::<Header>(data_bytes).is_ok() {
             return true;
         }
-        if let Ok(tx) = deserialize::<Transaction>(data_bytes) {
-            if tx.is_coinbase() {
-                return true;
-            }
+        if let Ok(tx) = deserialize::<Transaction>(data_bytes)
+            && tx.is_coinbase()
+        {
+            return true;
         }
         false
     };
@@ -191,14 +193,11 @@ pub(crate) fn clean_espo_sandshrew_like_trace(
                     if ret.status == EspoSandshrewLikeTraceStatus::Success
                         && ret.response.alkanes.is_empty()
                         && ret.response.storage.is_empty()
+                        && let Some(data_bytes) = decode_data(&ret.response.data)
+                        && (host_match(&data_bytes)
+                            || (allow_fuzzy && fuzzy_host_match(&data_bytes)))
                     {
-                        if let Some(data_bytes) = decode_data(&ret.response.data) {
-                            if host_match(&data_bytes) {
-                                is_candidate = true;
-                            } else if allow_fuzzy && fuzzy_host_match(&data_bytes) {
-                                is_candidate = true;
-                            }
-                        }
+                        is_candidate = true;
                     }
                     if is_candidate {
                         total_candidates += 1;
@@ -207,9 +206,7 @@ pub(crate) fn clean_espo_sandshrew_like_trace(
 
                     depth -= 1;
                     if depth < 0 {
-                        let Some(remove_idx) = candidate_stack.pop() else {
-                            return None;
-                        };
+                        let remove_idx = candidate_stack.pop()?;
                         remove_indices.insert(remove_idx);
                         depth += 1;
                     }
@@ -300,7 +297,7 @@ fn mint_deltas_from_trace(
                         || inv
                             .context
                             .inputs
-                            .get(0)
+                            .first()
                             .and_then(|s| parse_u128_from_str(s))
                             .filter(|op| *op == 77)
                             .is_some();
@@ -331,9 +328,7 @@ fn mint_deltas_from_trace(
                 });
             }
             EspoSandshrewLikeTraceEvent::Return(ret) => {
-                let Some(frame) = stack.pop() else {
-                    return None;
-                };
+                let frame = stack.pop()?;
                 if !frame.mint_candidate {
                     continue;
                 }
@@ -731,7 +726,6 @@ fn apply_transfers_multi(
                 *sheet.entry(*rid).or_default() =
                     sheet.get(rid).copied().unwrap_or(0).saturating_add(amt);
             }
-            return;
         }
         // else burn by omission
     }
@@ -876,35 +870,35 @@ fn apply_transfers_multi(
         // Metashrew can omit incoming_alkanes on reverted traces; fall back to NOTRACE
         // so original VIN balances are still available for edicts/pointers.
         let revert_missing_incoming =
-            status == EspoTraceType::REVERT && net_in.as_ref().map_or(true, |m| m.is_empty());
+            status == EspoTraceType::REVERT && net_in.as_ref().is_none_or(|m| m.is_empty());
         let status = if revert_missing_incoming { EspoTraceType::NOTRACE } else { status };
 
         // On success, consume incoming amounts so only returned/minted balances remain.
-        if status == EspoTraceType::SUCCESS {
-            if let Some(ref net_in_map) = net_in {
-                for (rid, amt) in net_in_map {
-                    if *amt == 0 {
-                        continue;
-                    }
-                    let entry = sheet.entry(*rid).or_default();
-                    *entry = entry.saturating_sub(*amt);
-                    if *entry == 0 {
-                        sheet.remove(rid);
-                    }
+        if status == EspoTraceType::SUCCESS
+            && let Some(ref net_in_map) = net_in
+        {
+            for (rid, amt) in net_in_map {
+                if *amt == 0 {
+                    continue;
+                }
+                let entry = sheet.entry(*rid).or_default();
+                *entry = entry.saturating_sub(*amt);
+                if *entry == 0 {
+                    sheet.remove(rid);
                 }
             }
         }
 
         // add net_out to sheet
-        if status == EspoTraceType::SUCCESS {
-            if let Some(ref net_out_map) = net_out {
-                for (rid, amt) in net_out_map {
-                    if *amt == 0 {
-                        continue;
-                    }
-                    *sheet.entry(*rid).or_default() =
-                        sheet.get(rid).copied().unwrap_or(0).saturating_add(*amt);
+        if status == EspoTraceType::SUCCESS
+            && let Some(ref net_out_map) = net_out
+        {
+            for (rid, amt) in net_out_map {
+                if *amt == 0 {
+                    continue;
                 }
+                *sheet.entry(*rid).or_default() =
+                    sheet.get(rid).copied().unwrap_or(0).saturating_add(*amt);
             }
         }
         // merge VIN balances ONLY into protostone 0’s sheet
@@ -920,23 +914,23 @@ fn apply_transfers_multi(
 
         // If we have a status and it is Failure → refund net_in (only), skip edicts.
         if status == EspoTraceType::REVERT {
-            if let Some(ref net_in_map) = net_in {
-                if let Some(refund_ptr) = ps.refund {
-                    route_delta(
-                        refund_ptr,
-                        &net_in_map,
-                        &mut out_map,
-                        &mut incoming_shadow,
-                        tx,
-                        &spendable_vouts,
-                        n_outputs,
-                        multicast_index,
-                        shadow_base,
-                        shadow_end,
-                    );
-                }
-                // if no refund pointer → burn (do nothing)
+            if let Some(ref net_in_map) = net_in
+                && let Some(refund_ptr) = ps.refund
+            {
+                route_delta(
+                    refund_ptr,
+                    net_in_map,
+                    &mut out_map,
+                    &mut incoming_shadow,
+                    tx,
+                    &spendable_vouts,
+                    n_outputs,
+                    multicast_index,
+                    shadow_base,
+                    shadow_end,
+                );
             }
+            // if no refund pointer → burn (do nothing)
             // Skip edicts on failure
             continue;
         }
@@ -998,7 +992,7 @@ fn holder_order_key(id: &HolderId) -> String {
     }
 }
 
-fn sort_address_amount_entries(entries: &mut Vec<AddressAmountEntry>) {
+fn sort_address_amount_entries(entries: &mut [AddressAmountEntry]) {
     entries.sort_by(|a, b| match b.amount.cmp(&a.amount) {
         std::cmp::Ordering::Equal => a.address.cmp(&b.address),
         o => o,
@@ -1235,15 +1229,15 @@ pub fn bulk_update_balances_for_block(
             if !lookup.balances.is_empty() {
                 balances_by_outpoint.insert(key, lookup.balances.clone());
             }
-            if let Some(addr) = lookup.address.as_ref() {
-                if !addr.is_empty() {
-                    addr_by_outpoint.insert((txid, vout), addr.clone());
-                }
+            if let Some(addr) = lookup.address.as_ref()
+                && !addr.is_empty()
+            {
+                addr_by_outpoint.insert((txid, vout), addr.clone());
             }
-            if let Some(spk) = lookup.spk.as_ref() {
-                if !spk.is_empty() {
-                    spk_by_outpoint.insert((txid, vout), spk.clone());
-                }
+            if let Some(spk) = lookup.spk.as_ref()
+                && !spk.is_empty()
+            {
+                spk_by_outpoint.insert((txid, vout), spk.clone());
             }
         }
 
@@ -1269,7 +1263,7 @@ pub fn bulk_update_balances_for_block(
     let mut trace_prevout_txids: Vec<Txid> = Vec::new();
     let mut trace_prevout_set: HashSet<Txid> = HashSet::new();
     for atx in &block.transactions {
-        let has_traces = atx.traces.as_ref().map_or(false, |t| !t.is_empty());
+        let has_traces = atx.traces.as_ref().is_some_and(|t| !t.is_empty());
         if !has_traces {
             continue;
         }
@@ -1325,7 +1319,7 @@ pub fn bulk_update_balances_for_block(
         let mut tx_transfer_participants_by_alkane: HashMap<SchemaAlkaneId, HashSet<String>> =
             HashMap::new();
         let mut has_alkane_vin = false;
-        let has_traces = atx.traces.as_ref().map_or(false, |t| !t.is_empty());
+        let has_traces = atx.traces.as_ref().is_some_and(|t| !t.is_empty());
         let mut holder_alkanes_changed: HashSet<SchemaAlkaneId> = HashSet::new();
         let mut local_alkane_delta: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>> =
             HashMap::new();
@@ -1365,14 +1359,13 @@ pub fn bulk_update_balances_for_block(
 
             if !input.previous_output.is_null() {
                 let mut input_addr: Option<String> = None;
-                if let Some(idx) = block_tx_index.get(&input.previous_output.txid) {
-                    if let Some(prev_out) = block.transactions[*idx]
+                if let Some(idx) = block_tx_index.get(&input.previous_output.txid)
+                    && let Some(prev_out) = block.transactions[*idx]
                         .transaction
                         .output
                         .get(input.previous_output.vout as usize)
-                    {
-                        input_addr = spk_to_address_str(&prev_out.script_pubkey, network);
-                    }
+                {
+                    input_addr = spk_to_address_str(&prev_out.script_pubkey, network);
                 }
                 if input_addr.is_none() {
                     if let Some(addr) = addr_by_outpoint.get(&in_key) {
@@ -1381,14 +1374,12 @@ pub fn bulk_update_balances_for_block(
                         input_addr = spk_to_address_str(spk, network);
                     }
                 }
-                if input_addr.is_none() && has_traces {
-                    if let Some(prev_tx) = trace_prev_tx_map.get(&input.previous_output.txid) {
-                        if let Some(prev_out) =
-                            prev_tx.output.get(input.previous_output.vout as usize)
-                        {
-                            input_addr = spk_to_address_str(&prev_out.script_pubkey, network);
-                        }
-                    }
+                if input_addr.is_none()
+                    && has_traces
+                    && let Some(prev_tx) = trace_prev_tx_map.get(&input.previous_output.txid)
+                    && let Some(prev_out) = prev_tx.output.get(input.previous_output.vout as usize)
+                {
+                    input_addr = spk_to_address_str(&prev_out.script_pubkey, network);
                 }
                 if let Some(addr) = input_addr {
                     tx_addrs.insert(addr.clone());
@@ -1447,10 +1438,10 @@ pub fn bulk_update_balances_for_block(
                 has_alkane_vin = true;
                 // resolve address: /outpoint_addr first, else /utxo_spk → address
                 let mut resolved_addr = addr_by_outpoint.get(&in_key).cloned();
-                if resolved_addr.is_none() {
-                    if let Some(spk) = spk_by_outpoint.get(&in_key) {
-                        resolved_addr = spk_to_address_str(spk, network);
-                    }
+                if resolved_addr.is_none()
+                    && let Some(spk) = spk_by_outpoint.get(&in_key)
+                {
+                    resolved_addr = spk_to_address_str(spk, network);
                 }
 
                 if let Some(ref addr) = resolved_addr {
@@ -1713,7 +1704,7 @@ pub fn bulk_update_balances_for_block(
             }
 
             let mut outflows: Vec<AlkaneBalanceTxEntry> = Vec::new();
-            for (_owner, per_token) in &local_alkane_delta {
+            for per_token in local_alkane_delta.values() {
                 if per_token.is_empty() {
                     continue;
                 }
@@ -2132,17 +2123,17 @@ pub fn bulk_update_balances_for_block(
             }
         }
 
-        if let Some(ref spent_by) = row.outpoint.tx_spent {
-            if spent_by.len() == 32 {
-                let outpoint_id = created_outpoint_ids
-                    .get(&key)
-                    .copied()
-                    .or_else(|| external_spent_ids.get(&key).copied());
-                if let Some(id) = outpoint_id {
-                    let mut spender_arr = [0u8; 32];
-                    spender_arr.copy_from_slice(spent_by);
-                    outpoint_spent_updates.insert(id, spender_arr);
-                }
+        if let Some(ref spent_by) = row.outpoint.tx_spent
+            && spent_by.len() == 32
+        {
+            let outpoint_id = created_outpoint_ids
+                .get(&key)
+                .copied()
+                .or_else(|| external_spent_ids.get(&key).copied());
+            if let Some(id) = outpoint_id {
+                let mut spender_arr = [0u8; 32];
+                spender_arr.copy_from_slice(spent_by);
+                outpoint_spent_updates.insert(id, spender_arr);
             }
         }
         if let Some(ref spk_bytes) = row.uspk_val {
@@ -3416,10 +3407,7 @@ pub fn bulk_update_balances_for_block(
                     HashMap::new();
 
                 for (owner, token) in changed_pairs {
-                    if !local_cache.contains_key(&owner) {
-                        let balances = balances_from_rows(&owner);
-                        local_cache.insert(owner, balances);
-                    }
+                    local_cache.entry(owner).or_insert_with(|| balances_from_rows(&owner));
                     let local_balance =
                         local_cache.get(&owner).and_then(|m| m.get(&token).copied()).unwrap_or(0);
 
@@ -4275,12 +4263,11 @@ fn resolve_outpoint_spent_by_v2(
     blockhash: StateAt,
 ) -> Result<Option<Txid>> {
     let outpoint_id = resolve_outpoint_id_v2(provider, blockhash, txid.as_byte_array(), vout)?;
-    if let Some(outpoint_id) = outpoint_id {
-        if let Some(raw_txid) = resolve_outpoint_spent_by_id_v2(provider, blockhash, outpoint_id)? {
-            if let Ok(txid) = Txid::from_slice(&raw_txid) {
-                return Ok(Some(txid));
-            }
-        }
+    if let Some(outpoint_id) = outpoint_id
+        && let Some(raw_txid) = resolve_outpoint_spent_by_id_v2(provider, blockhash, outpoint_id)?
+        && let Ok(txid) = Txid::from_slice(&raw_txid)
+    {
+        return Ok(Some(txid));
     }
     Ok(None)
 }
@@ -4299,10 +4286,9 @@ fn load_outpoint_row_v2(
         if let Some(row_raw) = provider
             .get_blob_raw_value(GetRawValueParams { blockhash, key: row_key })?
             .value
+            && let Ok(row) = decode_outpoint_pointer_blob_v3(&row_raw)
         {
-            if let Ok(row) = decode_outpoint_pointer_blob_v3(&row_raw) {
-                return Ok(Some(row));
-            }
+            return Ok(Some(row));
         }
     }
     Ok(None)

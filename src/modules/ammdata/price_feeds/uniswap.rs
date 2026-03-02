@@ -221,7 +221,7 @@ impl UniswapPriceFeed {
         token1: Address,
     ) -> Result<u128> {
         let scale = 10u128
-            .checked_pow((PRICE_SCALE_DECIMALS + WBTC_DECIMALS - USDC_DECIMALS) as u32)
+            .checked_pow(PRICE_SCALE_DECIMALS + WBTC_DECIMALS - USDC_DECIMALS)
             .ok_or_else(|| anyhow!("price scale overflow"))?;
         let scale = U512::from(scale);
         let sqrt = U512::from(sqrt_price_x96);

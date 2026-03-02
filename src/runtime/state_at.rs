@@ -1,15 +1,10 @@
 use bitcoin::BlockHash;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
 pub enum StateAt {
+    #[default]
     Latest,
     Block(BlockHash),
-}
-
-impl Default for StateAt {
-    fn default() -> Self {
-        Self::Latest
-    }
 }
 
 impl StateAt {

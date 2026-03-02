@@ -457,12 +457,12 @@ impl ElectrumLike for EsploraElectrumLike {
 
                 let start_idx = offset.saturating_sub(consumed);
                 for tx in page.iter().skip(start_idx) {
-                    if let Ok(txid) = Txid::from_str(&tx.txid) {
-                        if seen.insert(txid) {
-                            out.push(AddressHistoryEntry { txid, height: tx.status.block_height });
-                            if out.len() >= limit {
-                                break;
-                            }
+                    if let Ok(txid) = Txid::from_str(&tx.txid)
+                        && seen.insert(txid)
+                    {
+                        out.push(AddressHistoryEntry { txid, height: tx.status.block_height });
+                        if out.len() >= limit {
+                            break;
                         }
                     }
                 }
@@ -519,12 +519,12 @@ impl ElectrumLike for EsploraElectrumLike {
 
                 last_page_len = page.len();
                 for tx in page.iter() {
-                    if let Ok(txid) = Txid::from_str(&tx.txid) {
-                        if seen.insert(txid) {
-                            out.push(AddressHistoryEntry { txid, height: tx.status.block_height });
-                            if out.len() >= limit {
-                                break;
-                            }
+                    if let Ok(txid) = Txid::from_str(&tx.txid)
+                        && seen.insert(txid)
+                    {
+                        out.push(AddressHistoryEntry { txid, height: tx.status.block_height });
+                        if out.len() >= limit {
+                            break;
                         }
                     }
                 }

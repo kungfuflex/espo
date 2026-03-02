@@ -15,6 +15,7 @@ pub struct FinalizeStats {
     pub token_derived_mcusd_candles: usize,
     pub chart_changes: usize,
     pub token_metrics: usize,
+    pub token_market_updates: usize,
     pub token_metrics_index: usize,
     pub token_search_index: usize,
     pub derived_metrics: usize,
@@ -188,6 +189,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     let tdmc_cnt = state.token_derived_mcusd_candle_writes.len();
     let cc_cnt = state.chart_change_writes.len();
     let tm_cnt = state.token_metrics_writes.len();
+    let tmu_cnt = state.token_market_update_writes.len();
     let tmi_cnt = state.token_metrics_index_writes.len();
     let tsi_cnt = state.token_search_index_writes.len();
     let tdm_cnt = state.derived_metrics_writes.len();
@@ -273,6 +275,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     puts.extend(std::mem::take(&mut state.token_derived_mcusd_candle_writes));
     puts.extend(std::mem::take(&mut state.chart_change_writes));
     puts.extend(std::mem::take(&mut state.token_metrics_writes));
+    puts.extend(std::mem::take(&mut state.token_market_update_writes));
     puts.extend(std::mem::take(&mut state.token_metrics_index_writes));
     puts.extend(std::mem::take(&mut state.token_search_index_writes));
     puts.extend(std::mem::take(&mut state.derived_metrics_writes));
@@ -325,6 +328,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         token_derived_mcusd_candles: tdmc_cnt,
         chart_changes: cc_cnt,
         token_metrics: tm_cnt,
+        token_market_updates: tmu_cnt,
         token_metrics_index: tmi_cnt,
         token_search_index: tsi_cnt,
         derived_metrics: tdm_cnt,

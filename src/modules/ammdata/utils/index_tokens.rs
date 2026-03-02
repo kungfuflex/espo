@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::modules::ammdata::config::{DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE};
 use crate::modules::ammdata::price_feeds::{
@@ -231,6 +233,7 @@ pub fn derive_token_data(
     state: &mut IndexState,
 ) -> Result<()> {
     let table = provider.table();
+    let mut token_market_updated: HashSet<SchemaAlkaneId> = HashSet::new();
     // Essentials circulating supply is amount-scaled (1e8). Market-cap outputs are price-scaled
     // (1e16), so we multiply by supply and divide by AMOUNT_SCALE.
     let scale_price_by_supply = |price_scaled: u128, supply_amount_scaled: u128| -> u128 {
@@ -277,19 +280,18 @@ pub fn derive_token_data(
             if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams {
                 blockhash: StateAt::Latest,
                 prefix,
-            }) {
-                if let Some((_k, v)) = resp.entries.into_iter().next() {
-                    price = decode_u128_value(&v).ok();
-                }
+            }) && let Some((_k, v)) = resp.entries.into_iter().next()
+            {
+                price = decode_u128_value(&v).ok();
             }
         }
 
-        if let Some(p) = price {
-            if let Ok(encoded) = encode_u128_value(p) {
-                state
-                    .btc_usd_price_writes
-                    .push((table.btc_usd_price_key(height as u64), encoded));
-            }
+        if let Some(p) = price
+            && let Ok(encoded) = encode_u128_value(p)
+        {
+            state
+                .btc_usd_price_writes
+                .push((table.btc_usd_price_key(height as u64), encoded));
         }
         state.btc_usd_price = price;
 
@@ -670,10 +672,10 @@ pub fn derive_token_data(
                                       target: u64|
              -> Option<(u64, SchemaFullCandleV1)> {
                 let mut best: Option<(u64, SchemaFullCandleV1)> = None;
-                if let Some(map) = pool_overrides_by_pool_tf.get(&(*pool, tf)) {
-                    if let Some((&ts, candle)) = map.range(..=target).next_back() {
-                        best = Some((ts, *candle));
-                    }
+                if let Some(map) = pool_overrides_by_pool_tf.get(&(*pool, tf))
+                    && let Some((&ts, candle)) = map.range(..=target).next_back()
+                {
+                    best = Some((ts, *candle));
                 }
                 let prefix = table.candle_ns_prefix(pool, tf);
                 if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams {
@@ -702,10 +704,10 @@ pub fn derive_token_data(
                                            target: u64|
              -> Option<(u64, SchemaCandleV1)> {
                 let mut best: Option<(u64, SchemaCandleV1)> = None;
-                if let Some(map) = token_usd_overrides_by_token_tf.get(&(*token, tf)) {
-                    if let Some((&ts, candle)) = map.range(..=target).next_back() {
-                        best = Some((ts, *candle));
-                    }
+                if let Some(map) = token_usd_overrides_by_token_tf.get(&(*token, tf))
+                    && let Some((&ts, candle)) = map.range(..=target).next_back()
+                {
+                    best = Some((ts, *candle));
                 }
                 let prefix = table.token_usd_candle_ns_prefix(token, tf);
                 if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams {
@@ -739,10 +741,10 @@ pub fn derive_token_data(
                                          target: u64|
              -> Option<(u64, SchemaCandleV1)> {
                 let mut best: Option<(u64, SchemaCandleV1)> = None;
-                if let Some(bucket_map) = map.get(&(*token, *quote, tf)) {
-                    if let Some((&ts, candle)) = bucket_map.range(..=target).next_back() {
-                        best = Some((ts, *candle));
-                    }
+                if let Some(bucket_map) = map.get(&(*token, *quote, tf))
+                    && let Some((&ts, candle)) = bucket_map.range(..=target).next_back()
+                {
+                    best = Some((ts, *candle));
                 }
                 let prefix = table.token_derived_usd_candle_ns_prefix(token, quote, tf);
                 if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams {
@@ -942,7 +944,7 @@ pub fn derive_token_data(
                 let last_derived_close = last_derived_candle.map(|c| c.close).unwrap_or(0);
 
                 if info.is_none() {
-                    let mut final_candle = token_usd_bucket_candle.or_else(|| {
+                    let mut final_candle = token_usd_bucket_candle.or({
                         if last_derived_close != 0 {
                             Some(SchemaCandleV1 {
                                 open: last_derived_close,
@@ -1376,7 +1378,7 @@ pub fn derive_token_data(
                 prev_raw.value.as_ref().and_then(|raw| decode_token_metrics(raw).ok());
 
             let full_history = prev_metrics.is_none();
-            let token_trade = match crate::modules::ammdata::token_trade_windows(
+            let token_trade = crate::modules::ammdata::token_trade_windows(
                 provider,
                 &state.pools_map,
                 token,
@@ -1384,10 +1386,8 @@ pub fn derive_token_data(
                 &state.in_block_trade_volumes,
                 &mut pool_trade_window_cache,
                 full_history,
-            ) {
-                Ok(v) => v,
-                Err(_) => crate::modules::ammdata::TokenTradeWindows::default(),
-            };
+            )
+            .unwrap_or_default();
 
             let volume_1d = token_trade.amount_1d.saturating_mul(price_usd) / AMOUNT_SCALE;
             let volume_7d = token_trade.amount_7d.saturating_mul(price_usd) / AMOUNT_SCALE;
@@ -1539,11 +1539,11 @@ pub fn derive_token_data(
             if let Some(prev) = prev_metrics.as_ref() {
                 let prev_keys = build_index_keys(prev);
                 for (idx, (_field, new_key)) in new_keys.iter().enumerate() {
-                    if let Some((_pf, prev_key)) = prev_keys.get(idx) {
-                        if prev_key != new_key {
-                            state.token_metrics_index_deletes.push(prev_key.clone());
-                            state.token_metrics_index_writes.push((new_key.clone(), Vec::new()));
-                        }
+                    if let Some((_pf, prev_key)) = prev_keys.get(idx)
+                        && prev_key != new_key
+                    {
+                        state.token_metrics_index_deletes.push(prev_key.clone());
+                        state.token_metrics_index_writes.push((new_key.clone(), Vec::new()));
                     }
                 }
             } else {
@@ -1617,53 +1617,53 @@ pub fn derive_token_data(
                                 Vec::new(),
                             ));
 
-                            if let Some(prev) = prev_marketcap {
-                                if prev != new_marketcap {
-                                    state.token_search_index_deletes.push(
-                                        table.token_search_index_key_u128(
-                                            SearchIndexField::Marketcap,
-                                            &prefix,
-                                            prev,
-                                            token,
-                                        ),
-                                    );
-                                }
+                            if let Some(prev) = prev_marketcap
+                                && prev != new_marketcap
+                            {
+                                state.token_search_index_deletes.push(
+                                    table.token_search_index_key_u128(
+                                        SearchIndexField::Marketcap,
+                                        &prefix,
+                                        prev,
+                                        token,
+                                    ),
+                                );
                             }
-                            if let Some(prev) = prev_volume_7d {
-                                if prev != new_volume_7d {
-                                    state.token_search_index_deletes.push(
-                                        table.token_search_index_key_u128(
-                                            SearchIndexField::Volume7d,
-                                            &prefix,
-                                            prev,
-                                            token,
-                                        ),
-                                    );
-                                }
+                            if let Some(prev) = prev_volume_7d
+                                && prev != new_volume_7d
+                            {
+                                state.token_search_index_deletes.push(
+                                    table.token_search_index_key_u128(
+                                        SearchIndexField::Volume7d,
+                                        &prefix,
+                                        prev,
+                                        token,
+                                    ),
+                                );
                             }
-                            if let Some(prev) = prev_change_7d {
-                                if prev != new_change_7d {
-                                    state.token_search_index_deletes.push(
-                                        table.token_search_index_key_i64(
-                                            SearchIndexField::Change7d,
-                                            &prefix,
-                                            prev,
-                                            token,
-                                        ),
-                                    );
-                                }
+                            if let Some(prev) = prev_change_7d
+                                && prev != new_change_7d
+                            {
+                                state.token_search_index_deletes.push(
+                                    table.token_search_index_key_i64(
+                                        SearchIndexField::Change7d,
+                                        &prefix,
+                                        prev,
+                                        token,
+                                    ),
+                                );
                             }
-                            if let Some(prev) = prev_volume_all {
-                                if prev != new_volume_all {
-                                    state.token_search_index_deletes.push(
-                                        table.token_search_index_key_u128(
-                                            SearchIndexField::VolumeAllTime,
-                                            &prefix,
-                                            prev,
-                                            token,
-                                        ),
-                                    );
-                                }
+                            if let Some(prev) = prev_volume_all
+                                && prev != new_volume_all
+                            {
+                                state.token_search_index_deletes.push(
+                                    table.token_search_index_key_u128(
+                                        SearchIndexField::VolumeAllTime,
+                                        &prefix,
+                                        prev,
+                                        token,
+                                    ),
+                                );
                             }
                         }
                     }
@@ -1673,6 +1673,7 @@ pub fn derive_token_data(
             state.token_metrics_cache.insert(*token, metrics.clone());
             let encoded = encode_token_metrics(&metrics)?;
             state.token_metrics_writes.push((metrics_key, encoded));
+            token_market_updated.insert(*token);
         }
 
         let mut derived_tokens_for_metrics: HashSet<(SchemaAlkaneId, SchemaAlkaneId)> =
@@ -1742,7 +1743,7 @@ pub fn derive_token_data(
                 prev_raw.value.as_ref().and_then(|raw| decode_token_metrics(raw).ok());
 
             let full_history = prev_metrics.is_none();
-            let token_trade = match crate::modules::ammdata::token_trade_windows(
+            let token_trade = crate::modules::ammdata::token_trade_windows(
                 provider,
                 &state.pools_map,
                 token,
@@ -1750,10 +1751,8 @@ pub fn derive_token_data(
                 &state.in_block_trade_volumes,
                 &mut pool_trade_window_cache,
                 full_history,
-            ) {
-                Ok(v) => v,
-                Err(_) => crate::modules::ammdata::TokenTradeWindows::default(),
-            };
+            )
+            .unwrap_or_default();
 
             let volume_1d = token_trade.amount_1d.saturating_mul(price_usd) / AMOUNT_SCALE;
             let volume_7d = token_trade.amount_7d.saturating_mul(price_usd) / AMOUNT_SCALE;
@@ -1917,11 +1916,11 @@ pub fn derive_token_data(
             if let Some(prev) = prev_metrics.as_ref() {
                 let prev_keys = build_index_keys(prev);
                 for (idx, (_field, new_key)) in new_keys.iter().enumerate() {
-                    if let Some((_pf, prev_key)) = prev_keys.get(idx) {
-                        if prev_key != new_key {
-                            state.derived_metrics_index_deletes.push(prev_key.clone());
-                            state.derived_metrics_index_writes.push((new_key.clone(), Vec::new()));
-                        }
+                    if let Some((_pf, prev_key)) = prev_keys.get(idx)
+                        && prev_key != new_key
+                    {
+                        state.derived_metrics_index_deletes.push(prev_key.clone());
+                        state.derived_metrics_index_writes.push((new_key.clone(), Vec::new()));
                     }
                 }
             } else {
@@ -1999,57 +1998,57 @@ pub fn derive_token_data(
                                 Vec::new(),
                             ));
 
-                            if let Some(prev) = prev_marketcap {
-                                if prev != new_marketcap {
-                                    state.derived_search_index_deletes.push(
-                                        table.token_derived_search_index_key_u128(
-                                            quote,
-                                            SearchIndexField::Marketcap,
-                                            &prefix,
-                                            prev,
-                                            token,
-                                        ),
-                                    );
-                                }
+                            if let Some(prev) = prev_marketcap
+                                && prev != new_marketcap
+                            {
+                                state.derived_search_index_deletes.push(
+                                    table.token_derived_search_index_key_u128(
+                                        quote,
+                                        SearchIndexField::Marketcap,
+                                        &prefix,
+                                        prev,
+                                        token,
+                                    ),
+                                );
                             }
-                            if let Some(prev) = prev_volume_7d {
-                                if prev != new_volume_7d {
-                                    state.derived_search_index_deletes.push(
-                                        table.token_derived_search_index_key_u128(
-                                            quote,
-                                            SearchIndexField::Volume7d,
-                                            &prefix,
-                                            prev,
-                                            token,
-                                        ),
-                                    );
-                                }
+                            if let Some(prev) = prev_volume_7d
+                                && prev != new_volume_7d
+                            {
+                                state.derived_search_index_deletes.push(
+                                    table.token_derived_search_index_key_u128(
+                                        quote,
+                                        SearchIndexField::Volume7d,
+                                        &prefix,
+                                        prev,
+                                        token,
+                                    ),
+                                );
                             }
-                            if let Some(prev) = prev_change_7d {
-                                if prev != new_change_7d {
-                                    state.derived_search_index_deletes.push(
-                                        table.token_derived_search_index_key_i64(
-                                            quote,
-                                            SearchIndexField::Change7d,
-                                            &prefix,
-                                            prev,
-                                            token,
-                                        ),
-                                    );
-                                }
+                            if let Some(prev) = prev_change_7d
+                                && prev != new_change_7d
+                            {
+                                state.derived_search_index_deletes.push(
+                                    table.token_derived_search_index_key_i64(
+                                        quote,
+                                        SearchIndexField::Change7d,
+                                        &prefix,
+                                        prev,
+                                        token,
+                                    ),
+                                );
                             }
-                            if let Some(prev) = prev_volume_all {
-                                if prev != new_volume_all {
-                                    state.derived_search_index_deletes.push(
-                                        table.token_derived_search_index_key_u128(
-                                            quote,
-                                            SearchIndexField::VolumeAllTime,
-                                            &prefix,
-                                            prev,
-                                            token,
-                                        ),
-                                    );
-                                }
+                            if let Some(prev) = prev_volume_all
+                                && prev != new_volume_all
+                            {
+                                state.derived_search_index_deletes.push(
+                                    table.token_derived_search_index_key_u128(
+                                        quote,
+                                        SearchIndexField::VolumeAllTime,
+                                        &prefix,
+                                        prev,
+                                        token,
+                                    ),
+                                );
                             }
                         }
                     }
@@ -2059,6 +2058,14 @@ pub fn derive_token_data(
             let encoded = encode_token_metrics(&metrics)?;
             state.derived_metrics_writes.push((metrics_key, encoded));
         }
+    }
+
+    if !token_market_updated.is_empty() {
+        let mut updates: Vec<SchemaAlkaneId> = token_market_updated.into_iter().collect();
+        updates.sort();
+        state
+            .token_market_update_writes
+            .push((table.token_market_updates_key(height), borsh::to_vec(&updates)?));
     }
 
     Ok(())

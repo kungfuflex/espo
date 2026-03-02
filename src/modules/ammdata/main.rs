@@ -155,19 +155,19 @@ pub(crate) fn parse_factory_create_call(
     factories: &HashSet<SchemaAlkaneId>,
 ) -> Option<SchemaAlkaneId> {
     let inputs = &inv.context.inputs;
-    let opcode0 = inputs.get(0).and_then(|s| parse_hex_u128(s));
+    let opcode0 = inputs.first().and_then(|s| parse_hex_u128(s));
     let opcode2 = inputs.get(2).and_then(|s| parse_hex_u128(s));
     if opcode0 != Some(1) && opcode2 != Some(1) {
         return None;
     }
 
     // Legacy layout: [factory_block, factory_tx, opcode, ...]
-    if opcode2 == Some(1) {
-        if let (Some(block), Some(tx)) = (parse_hex_u32(&inputs[0]), parse_hex_u64(&inputs[1])) {
-            let id = SchemaAlkaneId { block, tx };
-            if factories.contains(&id) {
-                return Some(id);
-            }
+    if opcode2 == Some(1)
+        && let (Some(block), Some(tx)) = (parse_hex_u32(&inputs[0]), parse_hex_u64(&inputs[1]))
+    {
+        let id = SchemaAlkaneId { block, tx };
+        if factories.contains(&id) {
+            return Some(id);
         }
     }
 
@@ -347,10 +347,10 @@ pub(crate) fn pool_trade_windows(
     cache: &mut HashMap<SchemaAlkaneId, PoolTradeWindows>,
     full_history: bool,
 ) -> Result<PoolTradeWindows> {
-    if let Some(cached) = cache.get(pool) {
-        if !full_history || cached.has_all_time {
-            return Ok(*cached);
-        }
+    if let Some(cached) = cache.get(pool)
+        && (!full_history || cached.has_all_time)
+    {
+        return Ok(*cached);
     }
 
     let start_1d = now_ts.saturating_sub(24 * 60 * 60);
@@ -598,10 +598,10 @@ impl AmmData {
     }
 
     fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
-        if let Some(prev) = self.load_index_height()? {
-            if new_height < prev {
-                eprintln!("[AMMDATA] index height rollback detected ({} -> {})", prev, new_height);
-            }
+        if let Some(prev) = self.load_index_height()?
+            && new_height < prev
+        {
+            eprintln!("[AMMDATA] index height rollback detected ({} -> {})", prev, new_height);
         }
         self.persist_index_height(new_height, blockhash)?;
         Ok(())
@@ -674,7 +674,7 @@ impl EspoModule for AmmData {
 
         let timer = debug::start_if(debug);
         let reserves_snapshot =
-            crate::modules::ammdata::utils::index_snapshot::load_reserves_snapshot(&provider)?;
+            crate::modules::ammdata::utils::index_snapshot::load_reserves_snapshot(provider)?;
         let pools_map = crate::modules::ammdata::utils::index_snapshot::pools_map_from_snapshot(
             &reserves_snapshot,
         );
@@ -702,7 +702,7 @@ impl EspoModule for AmmData {
         let timer = debug::start_if(debug);
         let boot_cnt =
             crate::modules::ammdata::utils::index_pools::bootstrap_pools_from_creation_records(
-                blockhash_state.clone(),
+                blockhash_state,
                 height,
                 provider,
                 essentials,
@@ -720,7 +720,7 @@ impl EspoModule for AmmData {
 
         let timer = debug::start_if(debug);
         let discovery = crate::modules::ammdata::utils::index_pools::discover_new_pools(
-            blockhash_state.clone(),
+            blockhash_state,
             &block,
             block_ts,
             height,
@@ -763,7 +763,7 @@ impl EspoModule for AmmData {
 
         let timer = debug::start_if(debug);
         crate::modules::ammdata::utils::index_pool_metrics::derive_pool_metrics(
-            blockhash_state.clone(),
+            blockhash_state,
             block_ts,
             height,
             provider,
@@ -778,7 +778,7 @@ impl EspoModule for AmmData {
         let finalize =
             crate::modules::ammdata::utils::index_finalize::prepare_batch(provider, &mut state)?;
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_derived_mcusd_candles={tdmc_cnt}, chart_changes={cc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, btc_usd_price={btc_cnt}, btc_usd_line={btcl_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_metrics_index={pmi_cnt}, pool_lp_supply={pls_cnt}, pool_details_snapshot={pds_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_derived_mcusd_candles={tdmc_cnt}, chart_changes={cc_cnt}, token_metrics={tm_cnt}, token_market_updates={tmu_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, btc_usd_price={btc_cnt}, btc_usd_line={btcl_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_metrics_index={pmi_cnt}, pool_lp_supply={pls_cnt}, pool_details_snapshot={pds_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = finalize.stats.candle_writes,
             tc_cnt = finalize.stats.token_usd_candles,
@@ -787,6 +787,7 @@ impl EspoModule for AmmData {
             tdmc_cnt = finalize.stats.token_derived_mcusd_candles,
             cc_cnt = finalize.stats.chart_changes,
             tm_cnt = finalize.stats.token_metrics,
+            tmu_cnt = finalize.stats.token_market_updates,
             tmi_cnt = finalize.stats.token_metrics_index,
             tsi_cnt = finalize.stats.token_search_index,
             tdm_cnt = finalize.stats.derived_metrics,

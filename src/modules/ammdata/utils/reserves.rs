@@ -196,7 +196,7 @@ pub fn extract_new_pools_from_espo_transaction(
 
     Ok(results)
 }
-pub fn extract_reserves_from_espo_transaction<'a>(
+pub fn extract_reserves_from_espo_transaction(
     transaction: &EspoAlkanesTransaction,
     pools: &HashMap<SchemaAlkaneId, SchemaMarketDefs>,
 ) -> Result<Vec<ReserveExtraction>> {
@@ -277,10 +277,8 @@ pub fn extract_reserves_from_espo_transaction<'a>(
         Ok(u128::from_str_radix(strip_0x(s), 16)?)
     }
 
-    let evs: Vec<EspoSandshrewLikeTraceEvent> = traces
-        .into_iter()
-        .flat_map(|trace| trace.sandshrew_trace.events.clone())
-        .collect();
+    let evs: Vec<EspoSandshrewLikeTraceEvent> =
+        traces.iter().flat_map(|trace| trace.sandshrew_trace.events.clone()).collect();
 
     let mut results: Vec<ReserveExtraction> = Vec::new();
     let mut i = 0usize;
@@ -405,9 +403,7 @@ pub fn extract_reserves_from_espo_transaction<'a>(
         // 4) constant-product solve using *opposite* side as OUT:
         //    - base_in = a:  (b + a) * (q - y) = b*q  => y = q - floor( (b*q)/(b+a) )
         //    - quote_in = a: (b - x) * (q + a) = b*q  => x = b - floor( (b*q)/(q+a) )
-        let k_prev = (prev_base as u128)
-            .checked_mul(prev_quote as u128)
-            .ok_or_else(|| anyhow!("k overflow"))?;
+        let k_prev = prev_base.checked_mul(prev_quote).ok_or_else(|| anyhow!("k overflow"))?;
 
         let (new_base, new_quote, base_in_res, quote_out_res) = if base_in > 0 {
             // base_in → quote_out

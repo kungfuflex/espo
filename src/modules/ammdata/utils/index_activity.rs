@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::modules::ammdata::consts::CanonicalQuoteUnit;
 use crate::modules::ammdata::schemas::{ActivityDirection, ActivityKind, Timeframe};
 use crate::modules::ammdata::storage::AmmDataProvider;

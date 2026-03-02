@@ -166,7 +166,7 @@ fn is_diesel_mint_trace(trace: &EspoTrace) -> bool {
     if opcode != 77 {
         return false;
     }
-    iter.all(|s| parse_u128_from_str(s).map_or(false, |v| v == 0))
+    iter.all(|s| parse_u128_from_str(s) == Some(0))
 }
 
 fn is_diesel_mint_tx(traces: Option<&[EspoTrace]>) -> bool {
@@ -312,7 +312,7 @@ pub async fn block_page(
                 if tx_total > 0 && off < tx_total {
                     display_start = off + 1;
                     display_end = (off + end.saturating_sub(off)).min(tx_total);
-                    last_page = (tx_total + limit - 1) / limit;
+                    last_page = tx_total.div_ceil(limit);
                 }
 
                 if end > off {
@@ -347,7 +347,7 @@ pub async fn block_page(
                 if tx_total > 0 && off < tx_total {
                     display_start = off + 1;
                     display_end = (off + end.saturating_sub(off)).min(tx_total);
-                    last_page = (tx_total + limit - 1) / limit;
+                    last_page = tx_total.div_ceil(limit);
                 }
 
                 if end > off {
@@ -412,7 +412,7 @@ pub async fn block_page(
             if tx_total > 0 {
                 display_start = off + 1;
                 display_end = (off + tx_items.len()).min(tx_total);
-                last_page = (tx_total + limit - 1) / limit;
+                last_page = tx_total.div_ceil(limit);
             }
         }
     }
@@ -619,7 +619,7 @@ pub async fn block_page(
                     };
                     div class="list" {
                         @for item in tx_items {
-                            @let traces: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
+                            @let traces: Option<&[EspoTrace]> = item.traces.as_deref();
                             (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), true))
                         }
                     }

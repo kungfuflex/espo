@@ -75,18 +75,18 @@ fn match_trace_outpoint(outpoint: &[u8], txid: &Txid) -> Option<(Vec<u8>, u32)> 
     let (tx_bytes, vout_le) = outpoint.split_at(32);
     let vout = u32::from_le_bytes(vout_le[..4].try_into().ok()?);
 
-    if let Ok(trace_txid) = Txid::from_slice(tx_bytes) {
-        if trace_txid == *txid {
-            return Some((tx_bytes.to_vec(), vout));
-        }
+    if let Ok(trace_txid) = Txid::from_slice(tx_bytes)
+        && trace_txid == *txid
+    {
+        return Some((tx_bytes.to_vec(), vout));
     }
 
     let mut txid_be = tx_bytes.to_vec();
     txid_be.reverse();
-    if let Ok(trace_txid) = Txid::from_slice(&txid_be) {
-        if trace_txid == *txid {
-            return Some((txid_be, vout));
-        }
+    if let Ok(trace_txid) = Txid::from_slice(&txid_be)
+        && trace_txid == *txid
+    {
+        return Some((txid_be, vout));
     }
 
     None
@@ -190,7 +190,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
 
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let rpc = get_bitcoind_rpc_client();
-    let chain_tip = rpc.get_blockchain_info().ok().map(|i| i.blocks as u64);
+    let chain_tip = rpc.get_blockchain_info().ok().map(|i| i.blocks);
     let tx_info = rpc.get_raw_transaction_info(&txid, None).ok();
     let tx_block_info = tx_info
         .as_ref()
@@ -286,7 +286,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
             }
         })
     };
-    let traces_ref: Option<&[EspoTrace]> = traces_for_tx.as_ref().map(|v| v.as_slice());
+    let traces_ref: Option<&[EspoTrace]> = traces_for_tx.as_deref();
     let tx_pill = if tx_height.is_none() {
         Some(TxPill { label: "Unconfirmed".to_string(), tone: TxPillTone::Danger })
     } else {

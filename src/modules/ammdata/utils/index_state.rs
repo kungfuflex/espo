@@ -51,6 +51,7 @@ pub struct IndexState {
     pub pool_creation_info_cache: HashMap<SchemaAlkaneId, SchemaPoolCreationInfoV1>,
 
     pub token_metrics_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub token_market_update_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_metrics_index_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_metrics_index_deletes: Vec<Vec<u8>>,
     pub token_metrics_index_new: u64,
@@ -121,6 +122,7 @@ impl IndexState {
             alkane_label_cache: HashMap::new(),
             pool_creation_info_cache: HashMap::new(),
             token_metrics_writes: Vec::new(),
+            token_market_update_writes: Vec::new(),
             token_metrics_index_writes: Vec::new(),
             token_metrics_index_deletes: Vec::new(),
             token_metrics_index_new: 0,

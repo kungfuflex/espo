@@ -62,7 +62,7 @@ impl ChainBuilder {
     fn create_regtest_genesis() -> Block {
         // Regtest genesis block
         let coinbase_tx = Self::create_coinbase_tx(0, &[]);
-        let merkle_root = Self::compute_merkle_root(&[coinbase_tx.clone()]);
+        let merkle_root = Self::compute_merkle_root(std::slice::from_ref(&coinbase_tx));
 
         let header = Header {
             version: Version::from_consensus(1),
@@ -86,7 +86,7 @@ impl ChainBuilder {
         let coinbase_tx = Self::create_coinbase_tx(height, &self.salt.to_le_bytes());
 
         // Compute merkle root
-        let merkle_root = Self::compute_merkle_root(&[coinbase_tx.clone()]);
+        let merkle_root = Self::compute_merkle_root(std::slice::from_ref(&coinbase_tx));
 
         let header = Header {
             version: Version::from_consensus(1),

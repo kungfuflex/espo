@@ -99,10 +99,7 @@ pub struct Essentials {
 
 impl Essentials {
     pub fn new() -> Self {
-        Self {
-            provider: None,
-            inspection_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        }
+        Self { provider: None, inspection_cache: Arc::new(std::sync::RwLock::new(HashMap::new())) }
     }
 
     #[inline]
@@ -126,13 +123,10 @@ impl Essentials {
     }
 
     fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
-        if let Some(prev) = self.load_index_height()? {
-            if new_height < prev {
-                eprintln!(
-                    "[ESSENTIALS] index height rollback detected ({} -> {})",
-                    prev, new_height
-                );
-            }
+        if let Some(prev) = self.load_index_height()?
+            && new_height < prev
+        {
+            eprintln!("[ESSENTIALS] index height rollback detected ({} -> {})", prev, new_height);
         }
         self.persist_index_height(new_height, blockhash)?;
         Ok(())
@@ -230,10 +224,10 @@ impl EspoModule for Essentials {
             for trace in traces.iter() {
                 let mut created_in_trace: HashSet<SchemaAlkaneId> = HashSet::new();
                 for ev in trace.sandshrew_trace.events.iter() {
-                    if let EspoSandshrewLikeTraceEvent::Create(create) = ev {
-                        if let Some(id) = parse_short_id(create) {
-                            created_in_trace.insert(id);
-                        }
+                    if let EspoSandshrewLikeTraceEvent::Create(create) = ev
+                        && let Some(id) = parse_short_id(create)
+                    {
+                        created_in_trace.insert(id);
                     }
                 }
 
@@ -261,15 +255,15 @@ impl EspoModule for Essentials {
                              name: Option<String>,
                              symbol: Option<String>| {
                                 let entry = map.entry(alk).or_default();
-                                if let Some(n) = name {
-                                    if !entry.0.iter().any(|v| v == &n) {
-                                        entry.0.push(n);
-                                    }
+                                if let Some(n) = name
+                                    && !entry.0.iter().any(|v| v == &n)
+                                {
+                                    entry.0.push(n);
                                 }
-                                if let Some(s) = symbol {
-                                    if !entry.1.iter().any(|v| v == &s) {
-                                        entry.1.push(s);
-                                    }
+                                if let Some(s) = symbol
+                                    && !entry.1.iter().any(|v| v == &s)
+                                {
+                                    entry.1.push(s);
                                 }
                             };
                         if skey.as_slice() == b"/name" {
@@ -291,10 +285,10 @@ impl EspoModule for Essentials {
                                 if let Some(mint_amount) = decode_u128_le_bytes(value) {
                                     mint_updates.insert(*alk, mint_amount);
                                 }
-                            } else if skey.as_slice() == b"/index" {
-                                if let Some(idx) = decode_u128_le_bytes(value) {
-                                    orbital_index_updates.insert(*alk, idx);
-                                }
+                            } else if skey.as_slice() == b"/index"
+                                && let Some(idx) = decode_u128_le_bytes(value)
+                            {
+                                orbital_index_updates.insert(*alk, idx);
                             }
                         }
 
@@ -423,106 +417,109 @@ impl EspoModule for Essentials {
         let names_timer = debug::start_if(debug);
         for rec in created_records.iter_mut() {
             let mut applied_orbital_name = false;
-            if let Some(inspection) = rec.inspection.as_ref() {
-                if is_orbital_instance(inspection) {
-                    rec.symbols.clear();
-                    let factory_id = inspection.factory_alkane.unwrap_or(rec.alkane);
-                    let mut base_name =
-                        if let Some(cached) = orbital_collection_name_cache.get(&factory_id) {
-                            cached.clone()
-                        } else {
-                            let key = table.orbital_collection_name_key(&factory_id);
-                            let name = provider
-                                .get_raw_value(GetRawValueParams {
-                                    blockhash: StateAt::Block(block_hash),
-                                    key,
-                                })
-                                .ok()
-                                .and_then(|resp| resp.value)
-                                .and_then(|bytes| String::from_utf8(bytes).ok())
-                                .map(|s| s.trim_matches('\0').trim().to_string())
-                                .filter(|s| !s.is_empty());
-                            orbital_collection_name_cache.insert(factory_id, name.clone());
-                            name
-                        };
-                    let mut name_from_simulate: Option<String> = None;
+            if let Some(inspection) = rec.inspection.as_ref()
+                && is_orbital_instance(inspection)
+            {
+                rec.symbols.clear();
+                let factory_id = inspection.factory_alkane.unwrap_or(rec.alkane);
+                let mut base_name =
+                    if let Some(cached) = orbital_collection_name_cache.get(&factory_id) {
+                        cached.clone()
+                    } else {
+                        let key = table.orbital_collection_name_key(&factory_id);
+                        let name = provider
+                            .get_raw_value(GetRawValueParams {
+                                blockhash: StateAt::Block(block_hash),
+                                key,
+                            })
+                            .ok()
+                            .and_then(|resp| resp.value)
+                            .and_then(|bytes| String::from_utf8(bytes).ok())
+                            .map(|s| s.trim_matches('\0').trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        orbital_collection_name_cache.insert(factory_id, name.clone());
+                        name
+                    };
+                let mut name_from_simulate: Option<String> = None;
 
-                    if base_name.is_none() {
-                        if let Some(existing_name) = rec.names.first() {
-                            base_name = orbital_base_name(existing_name);
-                        }
+                if base_name.is_none()
+                    && let Some(existing_name) = rec.names.first()
+                {
+                    base_name = orbital_base_name(existing_name);
+                }
+
+                if base_name.is_none()
+                    && rec.names.is_empty()
+                    && let Some(name) = get_alkane_name(
+                        StateAt::Block(block_hash),
+                        &block,
+                        &rec.alkane,
+                        rec.inspection.as_ref(),
+                    )
+                {
+                    name_from_simulate = Some(name.clone());
+                    base_name = orbital_base_name(&name);
+                }
+
+                if let Some(base) = base_name.as_ref() {
+                    let existing =
+                        orbital_collection_name_cache.get(&factory_id).and_then(|v| v.as_ref());
+                    if existing.is_none() {
+                        let key = table.orbital_collection_name_key(&factory_id);
+                        orbital_collection_name_rows.insert(key, base.as_bytes().to_vec());
+                        orbital_collection_name_cache.insert(factory_id, Some(base.to_string()));
                     }
-
-                    if base_name.is_none() && rec.names.is_empty() {
-                        if let Some(name) = get_alkane_name(
-                            StateAt::Block(block_hash),
-                            &block,
-                            &rec.alkane,
-                            rec.inspection.as_ref(),
-                        ) {
-                            name_from_simulate = Some(name.clone());
-                            base_name = orbital_base_name(&name);
-                        }
-                    }
-
-                    if let Some(base) = base_name.as_ref() {
-                        let existing =
-                            orbital_collection_name_cache.get(&factory_id).and_then(|v| v.as_ref());
-                        if existing.is_none() {
-                            let key = table.orbital_collection_name_key(&factory_id);
-                            orbital_collection_name_rows.insert(key, base.as_bytes().to_vec());
-                            orbital_collection_name_cache
-                                .insert(factory_id, Some(base.to_string()));
-                        }
-                        if let Some(idx) = orbital_index_updates.get(&rec.alkane).copied() {
-                            let constructed = format!("{base} #{}", idx.saturating_add(1));
-                            ensure_primary_name(&mut rec.names, &constructed);
-                            applied_orbital_name = true;
-                        } else if let Some(name) = name_from_simulate.as_ref() {
-                            ensure_primary_name(&mut rec.names, name);
-                            applied_orbital_name = true;
-                        }
+                    if let Some(idx) = orbital_index_updates.get(&rec.alkane).copied() {
+                        let constructed = format!("{base} #{}", idx.saturating_add(1));
+                        ensure_primary_name(&mut rec.names, &constructed);
+                        applied_orbital_name = true;
                     } else if let Some(name) = name_from_simulate.as_ref() {
                         ensure_primary_name(&mut rec.names, name);
                         applied_orbital_name = true;
                     }
+                } else if let Some(name) = name_from_simulate.as_ref() {
+                    ensure_primary_name(&mut rec.names, name);
+                    applied_orbital_name = true;
                 }
             }
 
-            if rec.names.is_empty() && !applied_orbital_name {
-                if let Some(name) = get_alkane_name(
+            if rec.names.is_empty()
+                && !applied_orbital_name
+                && let Some(name) = get_alkane_name(
                     StateAt::Block(block_hash),
                     &block,
                     &rec.alkane,
                     rec.inspection.as_ref(),
-                ) {
-                    rec.names.push(name);
-                }
+                )
+            {
+                rec.names.push(name);
             }
         }
         debug::log_elapsed(module, "inspect_and_enrich.names", names_timer);
 
         let meta_timer = debug::start_if(debug);
         for rec in created_records.iter_mut() {
-            if rec.cap == 0 && !cap_updates.contains_key(&rec.alkane) {
-                if let Some(cap) = get_cap(
+            if rec.cap == 0
+                && !cap_updates.contains_key(&rec.alkane)
+                && let Some(cap) = get_cap(
                     StateAt::Block(block_hash),
                     block.height,
                     &rec.alkane,
                     rec.inspection.as_ref(),
-                ) {
-                    rec.cap = cap;
-                }
+                )
+            {
+                rec.cap = cap;
             }
-            if rec.mint_amount == 0 && !mint_updates.contains_key(&rec.alkane) {
-                if let Some(mint_amount) = get_value_per_mint(
+            if rec.mint_amount == 0
+                && !mint_updates.contains_key(&rec.alkane)
+                && let Some(mint_amount) = get_value_per_mint(
                     StateAt::Block(block_hash),
                     block.height,
                     &rec.alkane,
                     rec.inspection.as_ref(),
-                ) {
-                    rec.mint_amount = mint_amount;
-                }
+                )
+            {
+                rec.mint_amount = mint_amount;
             }
         }
         debug::log_elapsed(module, "inspect_and_enrich.cap_mint", meta_timer);
@@ -785,7 +782,7 @@ impl EspoModule for Essentials {
             deletes: Vec::new(),
         }) {
             eprintln!("[ESSENTIALS] bulk_write failed at block #{}: {e}", block.height);
-            return Err(e.into());
+            return Err(e);
         }
         cache_block_summary(block.height, block_summary);
 

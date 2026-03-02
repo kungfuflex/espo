@@ -163,7 +163,7 @@ pub async fn alkane_page(
             }
         })
         .collect();
-    let default_balance_chart_alkane = balance_chart_tokens.get(0).map(|t| t.alkane_id.clone());
+    let default_balance_chart_alkane = balance_chart_tokens.first().map(|t| t.alkane_id.clone());
 
     let (total, circulating_supply, holders) =
         get_holders_for_alkane(StateAt::Latest, &state.essentials_provider(), alk, page, limit)
@@ -174,7 +174,7 @@ pub async fn alkane_page(
     let has_next = off + holders_len < total;
     let display_start = if total > 0 && off < total { off + 1 } else { 0 };
     let display_end = (off + holders_len).min(total);
-    let last_page = if total > 0 { (total + limit - 1) / limit } else { 1 };
+    let last_page = if total > 0 { total.div_ceil(limit) } else { 1 };
     let icon_url = meta.icon_url.clone();
     let coin_label = meta.name.value.clone();
     let holders_count = total;
@@ -360,8 +360,7 @@ pub async fn alkane_page(
     let activity_display_start =
         if activity_total > 0 && activity_off < activity_total { activity_off + 1 } else { 0 };
     let activity_display_end = (activity_off + activity_len).min(activity_total);
-    let activity_last_page =
-        if activity_total > 0 { (activity_total + limit - 1) / limit } else { 1 };
+    let activity_last_page = if activity_total > 0 { activity_total.div_ceil(limit) } else { 1 };
 
     let activity_rows: Vec<Vec<Markup>> = activity_entries
         .into_iter()

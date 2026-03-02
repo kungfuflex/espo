@@ -11,6 +11,12 @@ pub struct ExplorerState {
     pub network: Network,
 }
 
+impl Default for ExplorerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExplorerState {
     pub fn new() -> Self {
         let essentials_mdb = get_espo_module_mdb("essentials").as_ref().clone();

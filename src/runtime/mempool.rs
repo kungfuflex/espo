@@ -93,9 +93,7 @@ fn shadow_base(tx: &Transaction) -> u32 {
 }
 
 fn encode_outpoint_hex(txid: &Txid, vout: u32) -> String {
-    let mut outpoint = protorune::Outpoint::default();
-    outpoint.txid = txid.to_byte_array().to_vec();
-    outpoint.vout = vout;
+    let outpoint = protorune::Outpoint { txid: txid.to_byte_array().to_vec(), vout };
     let bytes = outpoint.encode_to_vec();
     format!("0x{}", hex::encode(bytes))
 }
@@ -116,9 +114,7 @@ fn build_preview_block_hex(tx: &Transaction) -> Result<String> {
         }],
     };
 
-    let mut txs = Vec::with_capacity(2);
-    txs.push(coinbase);
-    txs.push(tx.clone());
+    let txs = vec![coinbase, tx.clone()];
 
     let txids: Vec<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
     let merkle_root_txid =
@@ -182,19 +178,16 @@ fn collect_addresses(
                 .ok()
                 .and_then(|hex_str| hex::decode(hex_str).ok())
                 .and_then(|raw| deserialize::<Transaction>(&raw).ok())
-                .map(|ptx| {
+                .inspect(|ptx| {
                     prev_cache.insert(prev_txid, ptx.clone());
-                    ptx
                 })
         };
 
-        if let Some(prev_tx) = prev {
-            if let Some(prev_out) = prev_tx.output.get(vin.previous_output.vout as usize) {
-                if let Ok(addr) = Address::from_script(prev_out.script_pubkey.as_script(), network)
-                {
-                    out.insert(addr.to_string());
-                }
-            }
+        if let Some(prev_tx) = prev
+            && let Some(prev_out) = prev_tx.output.get(vin.previous_output.vout as usize)
+            && let Ok(addr) = Address::from_script(prev_out.script_pubkey.as_script(), network)
+        {
+            out.insert(addr.to_string());
         }
     }
 
@@ -409,9 +402,7 @@ async fn preview_traces_for_tx(
                 let result_hex = resp_json.get("result").and_then(|v| v.as_str()).or_else(|| {
                     resp_json.get("result").and_then(|v| v.get("trace")).and_then(|v| v.as_str())
                 });
-                let Some(result_hex) = result_hex else {
-                    return None;
-                };
+                let result_hex = result_hex?;
                 match decode_trace_hex(result_hex, &txid, tx, *vout) {
                     Ok(trace) => Some(trace),
                     Err(e) => {
@@ -443,10 +434,10 @@ fn load_existing_first_seen(txids: &[Txid]) -> HashMap<Txid, u64> {
     let mut out = HashMap::new();
     if let Ok(values) = mdb.multi_get(&keys) {
         for (i, maybe) in values.into_iter().enumerate() {
-            if let Some(raw) = maybe {
-                if let Some(p) = decode_persisted_tx(&txids[i], &raw) {
-                    out.insert(txids[i], p.first_seen);
-                }
+            if let Some(raw) = maybe
+                && let Some(p) = decode_persisted_tx(&txids[i], &raw)
+            {
+                out.insert(txids[i], p.first_seen);
             }
         }
     }
@@ -540,7 +531,7 @@ async fn build_processed_entries(
         .iter()
         .map(|(txid, tx)| {
             let protos = protostones_for_tx(tx);
-            (txid.clone(), tx.clone(), protos.len())
+            (*txid, tx.clone(), protos.len())
         })
         .collect();
 
@@ -566,11 +557,11 @@ async fn build_processed_entries(
         let mut traces_found = 0usize;
         futures::pin_mut!(stream);
         while let Some((txid, traces)) = stream.next().await {
-            if let Some(ref t) = traces {
-                if !t.is_empty() {
-                    txs_with_traces += 1;
-                    traces_found += t.len();
-                }
+            if let Some(ref t) = traces
+                && !t.is_empty()
+            {
+                txs_with_traces += 1;
+                traces_found += t.len();
             }
             preview_results.insert(txid, traces);
         }
@@ -625,14 +616,12 @@ fn write_mempool_to_db(
         if !rel.starts_with(tx_prefix) {
             break;
         }
-        if let Some(txid_str) = std::str::from_utf8(&rel[3..]).ok() {
-            if let Ok(txid) = Txid::from_str(txid_str) {
-                if let Ok(Some(raw)) = mdb.get(&rel) {
-                    if let Some(p) = decode_persisted_tx(&txid, &raw) {
-                        existing_map.insert(txid, p);
-                    }
-                }
-            }
+        if let Ok(txid_str) = std::str::from_utf8(&rel[3..])
+            && let Ok(txid) = Txid::from_str(txid_str)
+            && let Ok(Some(raw)) = mdb.get(rel)
+            && let Some(p) = decode_persisted_tx(&txid, &raw)
+        {
+            existing_map.insert(txid, p);
         }
     }
 
@@ -717,16 +706,16 @@ fn prune_oversized_mempool(current_len: usize) -> Result<()> {
             break;
         }
         let Some((first_seen, txid)) = decode_seen_key(rel) else { continue };
-        if let Some(raw) = mdb.get(&k_tx(&txid))? {
-            if let Some(persisted) = decode_persisted_tx(&txid, &raw) {
-                mdb.bulk_write(|wb| {
-                    wb.delete(&k_tx(&txid));
-                    wb.delete(&k_seen(first_seen, &txid));
-                    for addr in &persisted.addresses {
-                        wb.delete(&k_addr(addr, first_seen, &txid));
-                    }
-                })?;
-            }
+        if let Some(raw) = mdb.get(&k_tx(&txid))?
+            && let Some(persisted) = decode_persisted_tx(&txid, &raw)
+        {
+            mdb.bulk_write(|wb| {
+                wb.delete(&k_tx(&txid));
+                wb.delete(&k_seen(first_seen, &txid));
+                for addr in &persisted.addresses {
+                    wb.delete(&k_addr(addr, first_seen, &txid));
+                }
+            })?;
         }
         removed += 1;
         to_delete = to_delete.saturating_sub(1);
@@ -780,7 +769,7 @@ async fn refresh_mempool(
 
     let mut entries: Vec<(Txid, Transaction)> = Vec::with_capacity(tx_total);
     let mut low_fee_skips: usize = 0;
-    for (_idx, txid) in txids.into_iter().enumerate() {
+    for txid in txids.into_iter() {
         match rpc.get_raw_transaction_hex(&txid, None) {
             Ok(raw_hex) => {
                 let raw_bytes = match hex::decode(raw_hex.trim()) {
@@ -804,32 +793,25 @@ async fn refresh_mempool(
                                 }
                                 if let Ok(prev_raw) =
                                     rpc.get_raw_transaction_hex(&vin.previous_output.txid, None)
+                                    && let Ok(prev_bytes) = hex::decode(prev_raw.trim())
+                                    && let Ok(prev_tx) = deserialize::<Transaction>(&prev_bytes)
+                                    && let Some(prev_out) =
+                                        prev_tx.output.get(vin.previous_output.vout as usize)
                                 {
-                                    if let Ok(prev_bytes) = hex::decode(prev_raw.trim()) {
-                                        if let Ok(prev_tx) = deserialize::<Transaction>(&prev_bytes)
-                                        {
-                                            if let Some(prev_out) = prev_tx
-                                                .output
-                                                .get(vin.previous_output.vout as usize)
-                                            {
-                                                input_total = input_total.and_then(|acc| {
-                                                    acc.checked_add(prev_out.value.to_sat())
-                                                });
-                                            }
-                                        }
-                                    }
+                                    input_total = input_total
+                                        .and_then(|acc| acc.checked_add(prev_out.value.to_sat()));
                                 }
                                 if input_total.is_none() {
                                     break;
                                 }
                             }
-                            if let Some(inputs) = input_total {
-                                if let Some(fee) = inputs.checked_sub(out) {
-                                    let feerate = fee as f64 / vsize;
-                                    if feerate < MEMPOOL_MIN_FEE_RATE_SATS_VBYTE {
-                                        low_fee_skips += 1;
-                                        continue;
-                                    }
+                            if let Some(inputs) = input_total
+                                && let Some(fee) = inputs.checked_sub(out)
+                            {
+                                let feerate = fee as f64 / vsize;
+                                if feerate < MEMPOOL_MIN_FEE_RATE_SATS_VBYTE {
+                                    low_fee_skips += 1;
+                                    continue;
                                 }
                             }
                         }
@@ -898,7 +880,7 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
 
     loop {
         eprintln!("[mempool] refresh tick");
-        if let Err(e) = refresh_mempool(&rpc, &http, &preview_url, network).await {
+        if let Err(e) = refresh_mempool(rpc, &http, &preview_url, network).await {
             eprintln!("[mempool] refresh failed: {e:?}");
         }
 
@@ -996,10 +978,10 @@ pub fn purge_confirmed_from_chain() -> Result<usize> {
         }
         let Some(txid_str) = std::str::from_utf8(&rel[3..]).ok() else { continue };
         let Ok(txid) = Txid::from_str(txid_str) else { continue };
-        if let Ok(info) = rpc.get_raw_transaction_info(&txid, None) {
-            if info.blockhash.is_some() {
-                confirmed.push(txid);
-            }
+        if let Ok(info) = rpc.get_raw_transaction_info(&txid, None)
+            && info.blockhash.is_some()
+        {
+            confirmed.push(txid);
         }
     }
 
