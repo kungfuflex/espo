@@ -2459,7 +2459,7 @@ impl EssentialsProvider {
         let table = self.table();
         let total_minted = self
             .get_raw_value(GetRawValueParams {
-                blockhash: StateAt::Latest,
+                blockhash: params.blockhash,
                 key: table.total_minted_latest_key(&params.alkane),
             })
             .ok()

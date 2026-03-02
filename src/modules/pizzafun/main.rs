@@ -8,8 +8,8 @@ use crate::modules::ammdata::storage::{
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetCreationIdsInBlockParams, GetCreationRecordParams,
-    GetCreationRecordsByIdParams, GetHoldersCountParams,
-    GetIndexHeightParams as EssentialsGetIndexHeightParams, GetRawValueParams,
+    GetCreationRecordsByIdParams, GetHoldersCountParams, GetLatestTotalMintedParams,
+    GetRawValueParams,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use super::config::PizzafunConfig;
-use super::consts::PRIORITY_SERIES_ALKANES;
+use super::consts::{DEFAULT_METAPROTOCOL, PRIORITY_SERIES_ALKANES};
 use super::rpc;
 use super::server::{SnapshotHttpState, run as run_snapshot_server};
 use super::snapshot::{BondedSnapshotRowV1, PizzafunChainMetadataV1, SnapshotTokenStatus};
@@ -90,23 +90,11 @@ impl Pizzafun {
         self.config.as_ref().expect("ModuleRegistry must call set_config()")
     }
 
-    fn load_essentials_index_height(&self) -> Option<u32> {
-        let resp = self
-            .essentials_provider()
-            .get_index_height(EssentialsGetIndexHeightParams { blockhash: StateAt::Latest })
-            .ok()?;
-        resp.height
-    }
-
     fn load_index_height(&self) -> Option<u32> {
-        if let Ok(resp) = self
-            .provider()
+        self.provider()
             .get_index_height(PizzafunGetIndexHeightParams { blockhash: StateAt::Latest })
-            && resp.height.is_some()
-        {
-            return resp.height;
-        }
-        self.load_essentials_index_height()
+            .ok()
+            .and_then(|resp| resp.height)
     }
 
     fn priority_index_map() -> HashMap<SchemaAlkaneId, usize> {
@@ -139,6 +127,76 @@ impl Pizzafun {
                     .then_with(|| a.alkane_id.cmp(&b.alkane_id)),
             }
         });
+    }
+
+    fn max_supply_for_curve(cap: u128, mint_amount: u128) -> u128 {
+        cap.saturating_mul(mint_amount)
+    }
+
+    fn snapshot_status_for_alkane(
+        &self,
+        alkane: &SchemaAlkaneId,
+        blockhash: StateAt,
+        cap: u128,
+        mint_amount: u128,
+    ) -> Result<SnapshotTokenStatus> {
+        let max_supply = Self::max_supply_for_curve(cap, mint_amount);
+        if max_supply == 0 {
+            return Ok(SnapshotTokenStatus::Bonding);
+        }
+        let total_minted = self
+            .essentials_provider()
+            .get_latest_total_minted(GetLatestTotalMintedParams { blockhash, alkane: *alkane })?
+            .total_minted;
+        if total_minted >= max_supply {
+            Ok(SnapshotTokenStatus::Migrating)
+        } else {
+            Ok(SnapshotTokenStatus::Bonding)
+        }
+    }
+
+    fn token_started_migrating_this_block(
+        &self,
+        alkane: &SchemaAlkaneId,
+        block_hash: bitcoin::BlockHash,
+        previous_block_hash: Option<bitcoin::BlockHash>,
+    ) -> Result<bool> {
+        let Some(rec) = self
+            .essentials_provider()
+            .get_creation_record(GetCreationRecordParams {
+                blockhash: StateAt::Block(block_hash),
+                alkane: *alkane,
+            })?
+            .record
+        else {
+            return Ok(false);
+        };
+        let max_supply = Self::max_supply_for_curve(rec.cap, rec.mint_amount);
+        if max_supply == 0 {
+            return Ok(false);
+        }
+        let current_minted = self
+            .essentials_provider()
+            .get_latest_total_minted(GetLatestTotalMintedParams {
+                blockhash: StateAt::Block(block_hash),
+                alkane: *alkane,
+            })?
+            .total_minted;
+        if current_minted < max_supply {
+            return Ok(false);
+        }
+        let previous_minted = match previous_block_hash {
+            Some(prev_hash) => {
+                self.essentials_provider()
+                    .get_latest_total_minted(GetLatestTotalMintedParams {
+                        blockhash: StateAt::Block(prev_hash),
+                        alkane: *alkane,
+                    })?
+                    .total_minted
+            }
+            None => 0,
+        };
+        Ok(previous_minted < max_supply)
     }
 
     fn load_chain_metadata(
@@ -187,6 +245,8 @@ impl Pizzafun {
             .get_holders_count(GetHoldersCountParams { blockhash, alkane: *alkane })?
             .count;
         let metadata = self.load_chain_metadata(alkane, blockhash);
+        let status =
+            self.snapshot_status_for_alkane(alkane, blockhash, rec.cap, rec.mint_amount)?;
 
         let name = metadata
             .as_ref()
@@ -215,6 +275,7 @@ impl Pizzafun {
             .max((rec.creation_timestamp as u64).saturating_mul(1000));
 
         Ok(Some(BondedSnapshotRowV1 {
+            metaprotocol: series.metaprotocol.clone(),
             series_id: series.series_id.clone(),
             protocol_id: format!("{}:{}", alkane.block, alkane.tx),
             created_at,
@@ -222,7 +283,7 @@ impl Pizzafun {
             symbol,
             description,
             icon_url,
-            status: SnapshotTokenStatus::Bonded,
+            status,
             last_traded_at: last_traded_at_ms,
             price_usd: metrics.price_usd,
             market_cap_usd: metrics.marketcap_usd,
@@ -327,6 +388,7 @@ impl EspoModule for Pizzafun {
                 let Some(name_norm) = normalize_alkane_name(raw_name) else { continue };
                 rows_to_refresh.insert(rec.alkane);
                 by_name.entry(name_norm).or_default().push(SeriesEntry {
+                    metaprotocol: DEFAULT_METAPROTOCOL.to_string(),
                     series_id: String::new(),
                     alkane_id: rec.alkane,
                     creation_height: rec.creation_height,
@@ -340,6 +402,7 @@ impl EspoModule for Pizzafun {
                     let existing = self.provider().get_series_entries_by_name(
                         GetSeriesEntriesByNameParams {
                             blockhash: StateAt::Block(block_hash),
+                            metaprotocol: DEFAULT_METAPROTOCOL.to_string(),
                             name_norm: name.clone(),
                         },
                     )?;
@@ -364,14 +427,33 @@ impl EspoModule for Pizzafun {
                             format!("{}-{}", series_base, idx + 1)
                         };
                         updated.push(SeriesEntry {
+                            metaprotocol: DEFAULT_METAPROTOCOL.to_string(),
                             series_id,
                             alkane_id: entry.alkane_id,
                             creation_height: entry.creation_height,
                         });
                     }
 
+                    for entry in &updated {
+                        rows_to_refresh.insert(entry.alkane_id);
+                    }
                     self.provider().update_series_for_name(&existing, &updated)?;
                 }
+            }
+        }
+
+        let previous_block_hash = if block.height > 0 {
+            self.provider().mdb().blockhash_for_height(block.height - 1)?
+        } else {
+            None
+        };
+        for entry in self.provider().get_all_series_entries(StateAt::Latest)? {
+            if self.token_started_migrating_this_block(
+                &entry.alkane_id,
+                block_hash,
+                previous_block_hash,
+            )? {
+                rows_to_refresh.insert(entry.alkane_id);
             }
         }
 

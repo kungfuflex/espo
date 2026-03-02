@@ -14,9 +14,18 @@ use super::snapshot::BondedSnapshotRowV1;
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct SeriesEntry {
+    pub metaprotocol: String,
     pub series_id: String,
     pub alkane_id: SchemaAlkaneId,
     pub creation_height: u32,
+}
+
+pub fn normalize_metaprotocol(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
 }
 
 pub fn normalize_series_id(s: &str) -> Option<String> {
@@ -46,6 +55,20 @@ fn series_id_matches_name(series_id: &str, name_norm: &str) -> bool {
         return !num.is_empty() && num.chars().all(|c| c.is_ascii_digit());
     }
     false
+}
+
+fn scoped_prefix(base: &[u8], metaprotocol: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(base.len() + metaprotocol.len() + 1);
+    key.extend_from_slice(base);
+    key.extend_from_slice(metaprotocol.as_bytes());
+    key.push(b'/');
+    key
+}
+
+fn scoped_key(base: &[u8], metaprotocol: &str, series_id: &str) -> Vec<u8> {
+    let mut key = scoped_prefix(base, metaprotocol);
+    key.extend_from_slice(series_id.as_bytes());
+    key
 }
 
 fn dedupe_batch_ops(
@@ -91,17 +114,21 @@ impl<'a> PizzafunTable<'a> {
     pub fn new(mdb: &'a Mdb) -> Self {
         let root = KvPointer::root(mdb);
         Self {
-            INDEX_HEIGHT: root.keyword("/index_height"),
-            SERIES_BY_ID: root.keyword("/series/by_id/"),
-            SERIES_BY_ALKANE: root.keyword("/series/by_alkane/"),
-            SERIES_ALL: root.list_keyword("/series/all/v2/"),
-            BONDED_ROWS: root.keyword("/bonded/rows/v1/"),
+            INDEX_HEIGHT: root.keyword("/index_height/v2"),
+            SERIES_BY_ID: root.keyword("/series/by_id/v3/"),
+            SERIES_BY_ALKANE: root.keyword("/series/by_alkane/v3/"),
+            SERIES_ALL: root.list_keyword("/series/all/v3/"),
+            BONDED_ROWS: root.keyword("/snapshot/rows/v2/"),
             ROOT: root,
         }
     }
 
-    pub fn series_by_id_key(&self, series_id: &str) -> Vec<u8> {
-        self.SERIES_BY_ID.select(series_id.as_bytes()).key().to_vec()
+    pub fn series_by_id_metaprotocol_prefix(&self, metaprotocol: &str) -> Vec<u8> {
+        scoped_prefix(self.SERIES_BY_ID.key(), metaprotocol)
+    }
+
+    pub fn series_by_id_key(&self, metaprotocol: &str, series_id: &str) -> Vec<u8> {
+        scoped_key(self.SERIES_BY_ID.key(), metaprotocol, series_id)
     }
 
     pub fn series_by_id_prefix(&self) -> Vec<u8> {
@@ -129,14 +156,16 @@ impl<'a> PizzafunTable<'a> {
         key
     }
 
-    pub fn series_all_entry_key(&self, series_id: &str) -> Vec<u8> {
-        let mut key = self.series_all_entry_prefix();
-        key.extend_from_slice(series_id.as_bytes());
-        key
+    pub fn series_all_entry_metaprotocol_prefix(&self, metaprotocol: &str) -> Vec<u8> {
+        scoped_prefix(self.series_all_entry_prefix().as_slice(), metaprotocol)
     }
 
-    pub fn bonded_row_key(&self, series_id: &str) -> Vec<u8> {
-        self.BONDED_ROWS.select(series_id.as_bytes()).key().to_vec()
+    pub fn series_all_entry_key(&self, metaprotocol: &str, series_id: &str) -> Vec<u8> {
+        scoped_key(self.series_all_entry_prefix().as_slice(), metaprotocol, series_id)
+    }
+
+    pub fn bonded_row_key(&self, metaprotocol: &str, series_id: &str) -> Vec<u8> {
+        scoped_key(self.BONDED_ROWS.key(), metaprotocol, series_id)
     }
 
     pub fn bonded_row_prefix(&self) -> Vec<u8> {
@@ -160,11 +189,13 @@ pub struct SetIndexHeightParams {
 
 pub struct GetSeriesByIdParams {
     pub blockhash: StateAt,
+    pub metaprotocol: String,
     pub series_id: String,
 }
 
 pub struct GetSeriesByIdsParams {
     pub blockhash: StateAt,
+    pub metaprotocol: String,
     pub series_ids: Vec<String>,
 }
 
@@ -180,11 +211,13 @@ pub struct GetSeriesByAlkanesParams {
 
 pub struct GetSeriesEntriesByNameParams {
     pub blockhash: StateAt,
+    pub metaprotocol: String,
     pub name_norm: String,
 }
 
 pub struct GetBondedRowParams {
     pub blockhash: StateAt,
+    pub metaprotocol: String,
     pub series_id: String,
 }
 
@@ -271,23 +304,6 @@ impl PizzafunProvider {
         Ok(keys)
     }
 
-    fn read_series_ids_all(&self, blockhash: Option<BlockHash>) -> Result<Vec<String>> {
-        let table = self.table();
-        let entry_prefix = table.series_all_entry_prefix();
-        let keys = self.with_view_blockhash(blockhash).raw_scan_prefix_keys(&entry_prefix)?;
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            let Some(suffix) = key.strip_prefix(entry_prefix.as_slice()) else {
-                continue;
-            };
-            let Ok(series_id) = std::str::from_utf8(suffix) else {
-                continue;
-            };
-            out.push(series_id.to_string());
-        }
-        Ok(out)
-    }
-
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("pizzafun.get_index_height");
         let table = self.table();
@@ -315,7 +331,7 @@ impl PizzafunProvider {
 
     pub fn get_series_by_id(&self, params: GetSeriesByIdParams) -> Result<Option<SeriesEntry>> {
         let table = self.table();
-        let key = table.series_by_id_key(&params.series_id);
+        let key = table.series_by_id_key(&params.metaprotocol, &params.series_id);
         let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
         else {
             return Ok(None);
@@ -328,8 +344,11 @@ impl PizzafunProvider {
         params: GetSeriesByIdsParams,
     ) -> Result<Vec<Option<SeriesEntry>>> {
         let table = self.table();
-        let keys: Vec<Vec<u8>> =
-            params.series_ids.iter().map(|s| table.series_by_id_key(s)).collect();
+        let keys: Vec<Vec<u8>> = params
+            .series_ids
+            .iter()
+            .map(|s| table.series_by_id_key(&params.metaprotocol, s))
+            .collect();
         let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
         let mut out = Vec::with_capacity(raw.len());
         for item in raw {
@@ -377,6 +396,7 @@ impl PizzafunProvider {
         params: GetSeriesEntriesByNameParams,
     ) -> Result<Vec<SeriesEntry>> {
         let table = self.table();
+        let by_id_scope_prefix = table.series_by_id_metaprotocol_prefix(&params.metaprotocol);
         let mut lookup_names: Vec<String> = vec![params.name_norm.clone()];
         if let Some(series_base) = series_id_base_from_name(&params.name_norm)
             && series_base != params.name_norm
@@ -387,12 +407,12 @@ impl PizzafunProvider {
         let mut filtered_ids: Vec<String> = Vec::new();
         let mut seen_ids: HashSet<String> = HashSet::new();
         for name in &lookup_names {
-            let prefix = table.series_by_id_key(name);
+            let prefix = table.series_by_id_key(&params.metaprotocol, name);
             let keys = self
                 .with_view_blockhash(params.blockhash.resolve(self.view_blockhash))
                 .raw_scan_prefix_keys(&prefix)?;
             for key in keys {
-                let Some(suffix) = key.strip_prefix(table.series_by_id_prefix().as_slice()) else {
+                let Some(suffix) = key.strip_prefix(by_id_scope_prefix.as_slice()) else {
                     continue;
                 };
                 let Ok(series_id) = std::str::from_utf8(suffix) else {
@@ -409,12 +429,37 @@ impl PizzafunProvider {
             return Ok(Vec::new());
         }
 
-        let keys: Vec<Vec<u8>> = filtered_ids.iter().map(|id| table.series_by_id_key(id)).collect();
+        let keys: Vec<Vec<u8>> = filtered_ids
+            .iter()
+            .map(|id| table.series_by_id_key(&params.metaprotocol, id))
+            .collect();
         let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
         let mut out = Vec::with_capacity(raw.len());
         for bytes in raw.into_iter().flatten() {
             out.push(SeriesEntry::try_from_slice(&bytes)?);
         }
+        Ok(out)
+    }
+
+    pub fn get_all_series_entries(&self, blockhash: StateAt) -> Result<Vec<SeriesEntry>> {
+        let table = self.table();
+        let prefix = table.series_by_alkane_prefix();
+        let resolved = blockhash.resolve(self.view_blockhash);
+        let keys = self.with_view_blockhash(resolved).raw_scan_prefix_keys(&prefix)?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(bytes) = self.raw_get_at(&key, resolved)? else { continue };
+            out.push(SeriesEntry::try_from_slice(&bytes)?);
+        }
+        out.sort_by(|a, b| {
+            a.metaprotocol
+                .cmp(&b.metaprotocol)
+                .then_with(|| a.series_id.cmp(&b.series_id))
+                .then_with(|| a.alkane_id.cmp(&b.alkane_id))
+        });
         Ok(out)
     }
 
@@ -424,19 +469,26 @@ impl PizzafunProvider {
         updated: &[SeriesEntry],
     ) -> Result<()> {
         let table = self.table();
-        let mut deletes: Vec<Vec<u8>> = Vec::with_capacity(existing.len() * 3);
+        let mut deletes: Vec<Vec<u8>> = Vec::with_capacity(existing.len() * 4);
         for entry in existing {
-            deletes.push(table.series_by_id_key(&entry.series_id));
+            deletes.push(table.series_by_id_key(&entry.metaprotocol, &entry.series_id));
             deletes.push(table.series_by_alkane_key(&entry.alkane_id));
-            deletes.push(table.series_all_entry_key(&entry.series_id));
+            deletes.push(table.series_all_entry_key(&entry.metaprotocol, &entry.series_id));
+            deletes.push(table.bonded_row_key(&entry.metaprotocol, &entry.series_id));
         }
 
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(updated.len() * 3);
         for entry in updated {
             let encoded = borsh::to_vec(entry)?;
-            puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
+            puts.push((
+                table.series_by_id_key(&entry.metaprotocol, &entry.series_id),
+                encoded.clone(),
+            ));
             puts.push((table.series_by_alkane_key(&entry.alkane_id), encoded));
-            puts.push((table.series_all_entry_key(&entry.series_id), Vec::new()));
+            puts.push((
+                table.series_all_entry_key(&entry.metaprotocol, &entry.series_id),
+                Vec::new(),
+            ));
         }
         let (puts, deletes) = dedupe_batch_ops(puts, deletes);
 
@@ -457,7 +509,7 @@ impl PizzafunProvider {
         params: GetBondedRowParams,
     ) -> Result<Option<BondedSnapshotRowV1>> {
         let table = self.table();
-        let key = table.bonded_row_key(&params.series_id);
+        let key = table.bonded_row_key(&params.metaprotocol, &params.series_id);
         let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
         else {
             return Ok(None);
@@ -478,7 +530,9 @@ impl PizzafunProvider {
             let Some(bytes) = self.raw_get_at(&key, resolved)? else { continue };
             out.push(BondedSnapshotRowV1::try_from_slice(&bytes)?);
         }
-        out.sort_by(|a, b| a.series_id.cmp(&b.series_id));
+        out.sort_by(|a, b| {
+            a.metaprotocol.cmp(&b.metaprotocol).then_with(|| a.series_id.cmp(&b.series_id))
+        });
         Ok(out)
     }
 
@@ -486,28 +540,18 @@ impl PizzafunProvider {
         let table = self.table();
         let encoded = borsh::to_vec(row)?;
         self.mdb
-            .put(&table.bonded_row_key(&row.series_id), &encoded)
+            .put(&table.bonded_row_key(&row.metaprotocol, &row.series_id), &encoded)
             .map_err(|e| anyhow!("mdb.put failed: {e}"))
     }
 
     pub fn replace_series_entries(&self, entries: &[SeriesEntry], height: u32) -> Result<()> {
         let table = self.table();
-        let existing_ids = self.read_series_ids_all(None)?;
         let mut deletes: Vec<Vec<u8>> = Vec::new();
-        if !existing_ids.is_empty() {
-            let existing_rows = self.get_series_by_ids(GetSeriesByIdsParams {
-                blockhash: StateAt::Latest,
-                series_ids: existing_ids.clone(),
-            })?;
-            for (idx, maybe_entry) in existing_rows.into_iter().enumerate() {
-                let Some(entry) = maybe_entry else { continue };
-                if let Some(series_id) = existing_ids.get(idx) {
-                    deletes.push(table.series_by_id_key(series_id));
-                    deletes.push(table.series_all_entry_key(series_id));
-                } else {
-                    deletes.push(table.series_by_id_key(&entry.series_id));
-                    deletes.push(table.series_all_entry_key(&entry.series_id));
-                }
+        let existing_rows = self.get_all_series_entries(StateAt::Latest)?;
+        if !existing_rows.is_empty() {
+            for entry in existing_rows {
+                deletes.push(table.series_by_id_key(&entry.metaprotocol, &entry.series_id));
+                deletes.push(table.series_all_entry_key(&entry.metaprotocol, &entry.series_id));
                 deletes.push(table.series_by_alkane_key(&entry.alkane_id));
             }
         }
@@ -515,9 +559,15 @@ impl PizzafunProvider {
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len() * 3);
         for entry in entries {
             let encoded = borsh::to_vec(entry)?;
-            puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
+            puts.push((
+                table.series_by_id_key(&entry.metaprotocol, &entry.series_id),
+                encoded.clone(),
+            ));
             puts.push((table.series_by_alkane_key(&entry.alkane_id), encoded));
-            puts.push((table.series_all_entry_key(&entry.series_id), Vec::new()));
+            puts.push((
+                table.series_all_entry_key(&entry.metaprotocol, &entry.series_id),
+                Vec::new(),
+            ));
         }
         let (puts, deletes) = dedupe_batch_ops(puts, deletes);
 

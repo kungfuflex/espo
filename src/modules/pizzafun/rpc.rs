@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::storage::{
     GetSeriesByAlkaneParams, GetSeriesByAlkanesParams, GetSeriesByIdParams, GetSeriesByIdsParams,
-    PizzafunProvider, SeriesEntry, normalize_series_id,
+    PizzafunProvider, SeriesEntry, normalize_metaprotocol, normalize_series_id,
 };
 
 #[inline]
@@ -74,8 +74,16 @@ fn confirmations_for(creation_height: u32) -> u32 {
     get_last_safe_tip().map(|tip| tip.saturating_sub(creation_height)).unwrap_or(0)
 }
 
+fn parse_metaprotocol_payload(payload: &Value) -> Option<String> {
+    payload
+        .get("metaprotocol")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_metaprotocol)
+}
+
 fn entry_to_json(entry: &SeriesEntry) -> Value {
     json!({
+        "metaprotocol": entry.metaprotocol.clone(),
         "series_id": entry.series_id.clone(),
         "alkane_id": format!("{}:{}", entry.alkane_id.block, entry.alkane_id.tx),
         "confirmations": confirmations_for(entry.creation_height),
@@ -251,9 +259,23 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                                 });
                             }
                         };
+                        let metaprotocol = match parse_metaprotocol_payload(&payload) {
+                            Some(value) => value,
+                            None => {
+                                log_rpc(
+                                    "get_alkane_id_from_series_id",
+                                    "missing_or_invalid_metaprotocol",
+                                );
+                                return json!({
+                                    "ok": false,
+                                    "error": "missing_or_invalid_metaprotocol"
+                                });
+                            }
+                        };
 
                         let entry = match view.get_series_by_id(GetSeriesByIdParams {
                             blockhash: StateAt::Latest,
+                            metaprotocol,
                             series_id: series_id.clone(),
                         }) {
                             Ok(Some(entry)) => entry,
@@ -302,6 +324,19 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                                 });
                             }
                         };
+                        let metaprotocol = match parse_metaprotocol_payload(&payload) {
+                            Some(value) => value,
+                            None => {
+                                log_rpc(
+                                    "get_alkane_ids_from_series_ids",
+                                    "missing_or_invalid_metaprotocol",
+                                );
+                                return json!({
+                                    "ok": false,
+                                    "error": "missing_or_invalid_metaprotocol"
+                                });
+                            }
+                        };
 
                         let mut parsed: Vec<Option<String>> = Vec::with_capacity(ids.len());
                         let mut lookup: Vec<String> = Vec::new();
@@ -321,6 +356,7 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         let mut out: Vec<Value> = Vec::with_capacity(ids.len());
                         let results = match view.get_series_by_ids(GetSeriesByIdsParams {
                             blockhash: StateAt::Latest,
+                            metaprotocol,
                             series_ids: lookup.clone(),
                         }) {
                             Ok(res) => res,

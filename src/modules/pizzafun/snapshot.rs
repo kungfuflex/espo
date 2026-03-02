@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(rename_all = "lowercase")]
 pub enum SnapshotTokenStatus {
+    Bonding,
+    Migrating,
     Bonded,
 }
 
@@ -32,6 +34,7 @@ pub struct PizzafunChainMetadataV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct BondedSnapshotRowV1 {
+    pub metaprotocol: String,
     pub series_id: String,
     pub protocol_id: String,
     pub created_at: u64,

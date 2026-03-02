@@ -181,7 +181,7 @@ pub async fn alkane_page(
     let supply_f64 = circulating_supply as f64;
 
     let tv_iframe_src: Option<String> = {
-        let series_id = {
+        let series = {
             let pizzafun_mdb = crate::config::get_espo_module_mdb("pizzafun");
             let pizzafun = PizzafunProvider::new(pizzafun_mdb);
             pizzafun
@@ -191,7 +191,7 @@ pub async fn alkane_page(
                 })
                 .ok()
                 .flatten()
-                .map(|e| e.series_id)
+                .map(|e| (e.series_id, e.metaprotocol))
         };
 
         let has_market_chart = {
@@ -235,8 +235,10 @@ pub async fn alkane_page(
             }
         };
 
-        match (series_id, has_market_chart) {
-            (Some(series_id), true) => Some(pizza_tv_iframe_src(&series_id)),
+        match (series, has_market_chart) {
+            (Some((series_id, metaprotocol)), true) => {
+                Some(pizza_tv_iframe_src(&series_id, &metaprotocol))
+            }
             _ => None,
         }
     };
@@ -811,11 +813,12 @@ fn url_escape_component(raw: &str) -> String {
     out
 }
 
-fn pizza_tv_iframe_src(series_id: &str) -> String {
+fn pizza_tv_iframe_src(series_id: &str, metaprotocol: &str) -> String {
     let symbol = url_escape_component(series_id);
+    let metaprotocol = url_escape_component(metaprotocol);
     let base = crate::config::get_explorer_pizza_tv_endpoint().trim_end_matches('/');
     format!(
-        "{base}/?symbol={symbol}&timeframe=1d&type=mcap&pool=all&quote=usd&metaprotocol=alkanes&theme=espo"
+        "{base}/?symbol={symbol}&timeframe=1d&type=mcap&pool=all&quote=usd&metaprotocol={metaprotocol}&theme=espo"
     )
 }
 
