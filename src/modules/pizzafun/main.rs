@@ -1,5 +1,5 @@
 use crate::alkanes::trace::EspoBlock;
-use crate::config::{debug_enabled, get_espo_db};
+use crate::config::{debug_enabled, get_espo_module_db};
 use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
@@ -135,7 +135,7 @@ impl EspoModule for Pizzafun {
     }
 
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
-        let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
+        let essentials_mdb = Mdb::from_db(get_espo_module_db("essentials"), b"essentials:");
         let essentials_provider = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
         self.essentials_provider = Some(essentials_provider);
         self.provider = Some(Arc::new(PizzafunProvider::new(mdb)));

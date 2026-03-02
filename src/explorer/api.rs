@@ -4,7 +4,9 @@ use axum::extract::Query;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::config::{get_config, get_espo_next_height, get_metashrew_rpc_url, get_network};
+use crate::config::{
+    get_config, get_espo_module_tree, get_espo_next_height, get_metashrew_rpc_url, get_network,
+};
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
 use crate::explorer::pages::common::ALKANE_SCALE;
@@ -19,7 +21,6 @@ use crate::modules::essentials::storage::{
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
-use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
@@ -156,7 +157,8 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
     let start = center.saturating_sub(radius);
     let end = (center + radius).min(espo_tip);
 
-    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_mdb =
+        Arc::new(Mdb::from_db(crate::config::get_espo_module_db("essentials"), b"essentials:"));
     let table = EssentialsTable::new(essentials_mdb.as_ref());
     let mut blocks: Vec<CarouselBlock> = Vec::with_capacity((end - start + 1) as usize);
 
@@ -188,7 +190,8 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         return Json(SearchGuessResponse { query, groups: Vec::new() });
     }
 
-    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_mdb =
+        Arc::new(Mdb::from_db(crate::config::get_espo_module_db("essentials"), b"essentials:"));
     let essentials_provider = EssentialsProvider::new(essentials_mdb.clone());
     let table = EssentialsTable::new(essentials_mdb.as_ref());
     let mut meta_cache: AlkaneMetaCache = HashMap::new();
@@ -300,7 +303,8 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
 
         if search_index_enabled && query_len >= search_prefix_min && query_len <= search_prefix_max
         {
-            let ammdata_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"ammdata:"));
+            let ammdata_mdb =
+                Arc::new(Mdb::from_db(crate::config::get_espo_module_db("ammdata"), b"ammdata:"));
             let ammdata_provider =
                 AmmDataProvider::new(ammdata_mdb, Arc::new(essentials_provider.clone()));
             let ids = ammdata_provider
@@ -597,9 +601,11 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
         }
     };
 
-    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_mdb =
+        Arc::new(Mdb::from_db(crate::config::get_espo_module_db("essentials"), b"essentials:"));
     let essentials_provider = Arc::new(EssentialsProvider::new(essentials_mdb));
-    let ammdata_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"ammdata:"));
+    let ammdata_mdb =
+        Arc::new(Mdb::from_db(crate::config::get_espo_module_db("ammdata"), b"ammdata:"));
     let provider = AmmDataProvider::new(ammdata_mdb, essentials_provider);
 
     let mut source = q
@@ -725,7 +731,7 @@ pub async fn address_chart(Query(q): Query<AddressChartQuery>) -> Json<AddressCh
     let range = normalize_address_chart_range(q.range.as_deref());
     let (lookback_blocks, range_interval) = address_chart_range_params(&range);
     let Some((indexed_min, indexed_max)) =
-        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
+        get_espo_module_tree("essentials").and_then(|db| db.indexed_height_bounds().ok().flatten())
     else {
         return Json(AddressChartResponse {
             ok: true,
@@ -872,7 +878,7 @@ pub async fn alkane_balance_chart(
     let range = normalize_address_chart_range(q.range.as_deref());
     let (lookback_blocks, range_interval) = address_chart_range_params(&range);
     let Some((indexed_min, indexed_max)) =
-        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
+        get_espo_module_tree("essentials").and_then(|db| db.indexed_height_bounds().ok().flatten())
     else {
         return Json(AddressChartResponse {
             ok: true,
@@ -1227,7 +1233,8 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
     } else if let Some(exec) = sim.execution {
         let returns_norm = normalize_returns(req.returns.as_deref());
         let formatted = format_simulation_data(&exec.data, &returns_norm);
-        let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
+        let essentials_mdb =
+            Mdb::from_db(crate::config::get_espo_module_db("essentials"), b"essentials:");
         let mut meta_cache: AlkaneMetaCache = HashMap::new();
         let (alkanes, alkanes_overflow) = if should_decode_alkanes(&returns_norm) {
             let cards = decode_alkane_cards(&exec.data, &mut meta_cache, &essentials_mdb);

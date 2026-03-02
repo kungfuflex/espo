@@ -3,7 +3,7 @@ use bitcoin::hashes::{Hash as _, sha256};
 use borsh::{BorshDeserialize, BorshSerialize};
 use rocksdb::{DB, Direction, Error as RocksError, IteratorMode, WriteBatch};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 // Internal keyspace for the persistent Merkle B+Tree.
 const ROOT_PREFIX: &[u8] = b"__espo_bptree:";
@@ -104,10 +104,36 @@ pub struct VersionedTreeDb {
 }
 
 static TREE_DB: OnceLock<Arc<VersionedTreeDb>> = OnceLock::new();
+static TREE_DBS: OnceLock<Mutex<HashMap<usize, Arc<VersionedTreeDb>>>> = OnceLock::new();
+
+fn tree_registry() -> &'static Mutex<HashMap<usize, Arc<VersionedTreeDb>>> {
+    TREE_DBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn get_tree_db(db: &Arc<DB>) -> Option<Arc<VersionedTreeDb>> {
+    let key = Arc::as_ptr(db) as usize;
+    tree_registry().lock().ok().and_then(|registry| registry.get(&key).cloned())
+}
+
+pub fn get_or_init_tree_db(db: Arc<DB>) -> Result<Arc<VersionedTreeDb>, RocksError> {
+    if let Some(tree) = get_tree_db(&db) {
+        return Ok(tree);
+    }
+
+    let key = Arc::as_ptr(&db) as usize;
+    let mut registry = tree_registry().lock().expect("tree registry mutex poisoned");
+    if let Some(tree) = registry.get(&key) {
+        return Ok(tree.clone());
+    }
+
+    let tree = Arc::new(VersionedTreeDb::new(db)?);
+    registry.insert(key, tree.clone());
+    let _ = TREE_DB.set(tree.clone());
+    Ok(tree)
+}
 
 pub fn init_global_tree_db(db: Arc<DB>) -> Result<(), RocksError> {
-    let tree = Arc::new(VersionedTreeDb::new(db)?);
-    let _ = TREE_DB.set(tree);
+    let _ = get_or_init_tree_db(db)?;
     Ok(())
 }
 

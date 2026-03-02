@@ -14,7 +14,6 @@ use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspe
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListNonMutatePointer, ListPointer};
 use crate::runtime::state_at::StateAt;
-use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use alkanes_support::proto::alkanes::AlkanesTrace;
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -1615,7 +1614,7 @@ impl EssentialsProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
+        let Some(tree) = self.mdb.versioned_tree() else {
             return Err(anyhow!("versioned_tree_unavailable"));
         };
         let Some(blockhash) = tree
@@ -1645,7 +1644,7 @@ impl EssentialsProvider {
 
     pub fn resolved_view_blockhash(&self) -> Option<BlockHash> {
         self.view_blockhash
-            .or_else(|| get_global_tree_db().and_then(|tree| tree.active_blockhash()))
+            .or_else(|| self.mdb.versioned_tree().and_then(|tree| tree.active_blockhash()))
     }
 
     pub fn blockhash_is_ancestor(
@@ -1653,7 +1652,7 @@ impl EssentialsProvider {
         ancestor: &BlockHash,
         descendant: &BlockHash,
     ) -> Result<bool> {
-        let Some(tree) = get_global_tree_db() else {
+        let Some(tree) = self.mdb.versioned_tree() else {
             return Ok(false);
         };
         tree.is_ancestor(ancestor, descendant)
@@ -1661,7 +1660,7 @@ impl EssentialsProvider {
     }
 
     pub fn blockhash_is_on_active_chain(&self, blockhash: &BlockHash) -> Result<bool> {
-        let Some(tree) = get_global_tree_db() else {
+        let Some(tree) = self.mdb.versioned_tree() else {
             return Ok(false);
         };
         let Some(height) = tree
@@ -1680,7 +1679,7 @@ impl EssentialsProvider {
     }
 
     pub fn blockhash_for_height(&self, height: u32) -> Result<Option<BlockHash>> {
-        let Some(tree) = get_global_tree_db() else {
+        let Some(tree) = self.mdb.versioned_tree() else {
             return Ok(None);
         };
         tree.blockhash_for_height(height)

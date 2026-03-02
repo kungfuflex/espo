@@ -46,8 +46,8 @@ use crate::explorer::run_explorer;
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
     config::{
-        get_bitcoind_rpc_client, get_config, get_espo_db, get_module_config, init_config,
-        update_safe_tip,
+        get_bitcoind_rpc_client, get_config, get_espo_module_db, get_espo_module_tree,
+        get_module_config, init_config, update_safe_tip,
     },
     consts::alkanes_genesis_block,
     modules::defs::ModuleRegistry,
@@ -56,7 +56,6 @@ use crate::{
         purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service,
     },
     runtime::rpc::run_rpc,
-    runtime::tree_db::get_global_tree_db,
 };
 use bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
@@ -93,7 +92,7 @@ fn detect_first_divergence_height(
     safe_tip: u32,
     genesis_height: u32,
 ) -> Option<u32> {
-    let Some(tree) = get_global_tree_db() else { return None };
+    let Some(tree) = get_espo_module_tree("essentials") else { return None };
     let check_tip = indexed_tip.min(safe_tip);
     if check_tip < genesis_height {
         return None;
@@ -346,7 +345,7 @@ async fn run_indexer_loop(
 
                     let block_hash = espo_block.block_header.block_hash();
 
-                    if let Some(tree) = get_global_tree_db() {
+                    for tree in mods.indexing_trees(network) {
                         if let Err(e) = tree.begin_block(
                             next_height,
                             &block_hash,
@@ -392,7 +391,7 @@ async fn run_indexer_loop(
                         ),
                     }
 
-                    if let Some(tree) = get_global_tree_db() {
+                    for tree in mods.indexing_trees(network) {
                         if let Err(e) = tree.finish_block() {
                             eprintln!("[tree] failed to finish block {}: {e:?}", next_height);
                         }
@@ -487,8 +486,8 @@ async fn main() -> Result<()> {
     }
     let metashrew_sdb = get_metashrew_sdb();
 
-    // Build module registry with the global ESPO DB
-    let mut mods = ModuleRegistry::with_db(get_espo_db());
+    // Build module registry with per-module ESPO DBs
+    let mut mods = ModuleRegistry::new();
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
     mods.register_module(Pizzafun::new());
@@ -509,7 +508,7 @@ async fn main() -> Result<()> {
     }
     // mods.register_module(TracesData::new());
 
-    let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
+    let essentials_mdb = Mdb::from_db(get_espo_module_db("essentials"), b"essentials:");
     let loaded = preload_block_summary_cache(&essentials_mdb);
     if loaded > 0 {
         eprintln!("[cache] preloaded {} block summaries", loaded);

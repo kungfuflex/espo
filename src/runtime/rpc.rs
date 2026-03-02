@@ -1,6 +1,4 @@
-use crate::{
-    config::get_espo_next_height, modules::defs::RpcRegistry, runtime::tree_db::get_global_tree_db,
-};
+use crate::{config::{get_espo_module_tree, get_espo_next_height}, modules::defs::RpcRegistry};
 use axum::{
     Router,
     body::Bytes,
@@ -227,7 +225,7 @@ fn sample_heights(range_min: u32, range_max: u32, range_interval: u32) -> Vec<u3
 }
 
 fn indexed_height_bounds() -> Result<(u32, u32), String> {
-    let Some(tree) = get_global_tree_db() else {
+    let Some(tree) = get_espo_module_tree("essentials") else {
         return Err("versioned_tree_unavailable".to_string());
     };
     tree.indexed_height_bounds()

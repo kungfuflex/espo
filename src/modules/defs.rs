@@ -7,8 +7,9 @@ use tarpc::context;
 use tokio::sync::RwLock;
 
 use crate::alkanes::trace::EspoBlock;
-use crate::config::get_module_config;
+use crate::config::{get_espo_module_db, get_module_config};
 use crate::runtime::mdb::Mdb;
+use crate::runtime::tree_db::VersionedTreeDb;
 use rocksdb::{DB, Options};
 
 /// Object-safe handler: (Context, JSON) -> JSON (async)
@@ -121,20 +122,35 @@ pub trait EspoModule: Send + Sync {
     }
 }
 
-/// Registry that holds modules, the RPC router, and one shared RocksDB
+/// Registry that holds modules, the RPC router, and module-local RocksDB handles
 pub struct ModuleRegistry {
     modules: Vec<Arc<dyn EspoModule>>,
+    module_trees: Vec<Option<Arc<VersionedTreeDb>>>,
     pub router: RpcRegistry,
-    module_db: Arc<DB>,
+    legacy_shared_db: Option<Arc<DB>>,
 }
 
 impl ModuleRegistry {
-    /// Construct from an existing Arc<DB> (one global DB shared by all modules).
-    pub fn with_db(module_db: Arc<DB>) -> Self {
-        Self { modules: Vec::new(), router: RpcRegistry::default(), module_db }
+    pub fn new() -> Self {
+        Self {
+            modules: Vec::new(),
+            module_trees: Vec::new(),
+            router: RpcRegistry::default(),
+            legacy_shared_db: None,
+        }
     }
 
-    /// Convenience: open a global read-write DB at a path, create if missing.
+    /// Legacy constructor for tests that still want one shared DB across all modules.
+    pub fn with_db(module_db: Arc<DB>) -> Self {
+        Self {
+            modules: Vec::new(),
+            module_trees: Vec::new(),
+            router: RpcRegistry::default(),
+            legacy_shared_db: Some(module_db),
+        }
+    }
+
+    /// Convenience: open a shared read-write DB at a path, create if missing.
     pub fn with_db_path(path: impl AsRef<Path>) -> Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -153,7 +169,7 @@ impl ModuleRegistry {
     }
 
     /// Register a module:
-    /// - build a namespaced `Mdb` from the shared DB using `get_name()` as the prefix,
+    /// - build a namespaced `Mdb` from the module's own DB using `get_name()` as the prefix,
     /// - inject it via `set_mdb`,
     /// - provide a namespaced RPC registrar so the module can only register under "<name>.*".
     pub fn register_module<M>(&mut self, mut module: M)
@@ -187,7 +203,9 @@ impl ModuleRegistry {
         prefix_kv.extend_from_slice(name.as_bytes());
         prefix_kv.push(b':');
 
-        let mdb = Arc::new(Mdb::from_db(self.module_db.clone(), prefix_kv));
+        let db = self.legacy_shared_db.clone().unwrap_or_else(|| get_espo_module_db(name));
+        let mdb = Arc::new(Mdb::from_db(db, prefix_kv));
+        let tree = mdb.versioned_tree();
         module.set_mdb(mdb);
 
         // --- RPC prefix like "ammdata." ---
@@ -197,9 +215,34 @@ impl ModuleRegistry {
         m.register_rpc(&ns);
 
         self.modules.push(m);
+        self.module_trees.push(tree);
     }
 
     pub fn modules(&self) -> &[Arc<dyn EspoModule>] {
         &self.modules
+    }
+
+    pub fn indexing_trees(&self, network: Network) -> Vec<Arc<VersionedTreeDb>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (module, tree) in self.modules.iter().zip(self.module_trees.iter()) {
+            if module.get_genesis_block(network) == u32::MAX {
+                continue;
+            }
+            let Some(tree) = tree else {
+                continue;
+            };
+            let key = Arc::as_ptr(tree) as usize;
+            if seen.insert(key) {
+                out.push(tree.clone());
+            }
+        }
+        out
+    }
+}
+
+impl Default for ModuleRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }

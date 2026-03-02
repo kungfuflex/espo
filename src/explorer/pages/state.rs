@@ -12,7 +12,8 @@ pub struct ExplorerState {
 
 impl ExplorerState {
     pub fn new() -> Self {
-        let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
+        let essentials_mdb =
+            Mdb::from_db(crate::config::get_espo_module_db("essentials"), b"essentials:");
         let network = get_network();
         Self { essentials_mdb, network }
     }

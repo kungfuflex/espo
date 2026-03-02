@@ -5,7 +5,7 @@ use rocksdb::{
 };
 use std::{path::Path, sync::Arc};
 
-use crate::runtime::tree_db::{get_global_tree_db, is_tree_internal_key};
+use crate::runtime::tree_db::{VersionedTreeDb, get_or_init_tree_db, is_tree_internal_key};
 
 /// ===== Cache / open-time tuning =====
 /// How big you want the LRU block cache (data + index/filter when enabled).
@@ -22,6 +22,7 @@ pub struct Mdb {
     db: Arc<DB>,
     prefix: Vec<u8>,
     versioned: bool,
+    tree: Option<Arc<VersionedTreeDb>>,
 }
 
 impl Mdb {
@@ -31,7 +32,15 @@ impl Mdb {
 
     fn from_parts(db: Arc<DB>, prefix: impl AsRef<[u8]>, versioned: bool) -> Self {
         let prefix_vec = prefix.as_ref().to_vec();
-        Self { db, prefix: prefix_vec, versioned }
+        let tree = if versioned {
+            Some(
+                get_or_init_tree_db(Arc::clone(&db))
+                    .expect("failed to initialize versioned tree for RocksDB namespace"),
+            )
+        } else {
+            None
+        };
+        Self { db, prefix: prefix_vec, versioned, tree }
     }
 
     pub fn from_db(db: Arc<DB>, prefix: impl AsRef<[u8]>) -> Self {
@@ -386,11 +395,16 @@ impl Mdb {
         self.versioned_manager().is_some()
     }
 
+    #[inline]
+    pub fn versioned_tree(&self) -> Option<Arc<VersionedTreeDb>> {
+        self.tree.clone()
+    }
+
     fn versioned_manager(&self) -> Option<Arc<crate::runtime::tree_db::VersionedTreeDb>> {
         if !self.versioned {
             return None;
         }
-        get_global_tree_db()
+        self.tree.clone()
     }
 }
 

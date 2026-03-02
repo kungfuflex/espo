@@ -1,5 +1,9 @@
 use crate::alkanes::metashrew::MetashrewAdapter;
-use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB, tree_db::init_global_tree_db};
+use crate::runtime::{
+    dbpaths::get_sdb_path_for_metashrew,
+    sdb::SDB,
+    tree_db::{VersionedTreeDb, get_or_init_tree_db},
+};
 use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
 use crate::{ESPO_HEIGHT, SAFE_TIP};
 use anyhow::{Context, Result};
@@ -14,7 +18,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
     fs,
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -30,7 +34,8 @@ static ELECTRUM_CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
 static ELECTRUM_LIKE: OnceLock<Arc<dyn ElectrumLike>> = OnceLock::new();
 static BITCOIND_CLIENT: OnceLock<CoreClient> = OnceLock::new();
 static METASHREW_SDB: OnceLock<std::sync::Arc<SDB>> = OnceLock::new();
-static ESPO_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
+static ESPO_SHARED_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
+static ESPO_MODULE_DBS: OnceLock<Mutex<HashMap<String, std::sync::Arc<DB>>>> = OnceLock::new();
 static BLOCK_SOURCE: OnceLock<BlkOrRpcBlockSource> = OnceLock::new();
 
 // NEW: Global bitcoin::Network
@@ -362,6 +367,24 @@ impl AppConfig {
     }
 }
 
+fn open_espo_db_at(path: &Path) -> Result<Arc<DB>> {
+    let mut opts = Options::default();
+    opts.create_if_missing(true);
+    Ok(Arc::new(DB::open(&opts, path)?))
+}
+
+fn espo_root_dir() -> std::path::PathBuf {
+    Path::new(&get_config().db_path).join("espo")
+}
+
+fn espo_shared_db_path() -> std::path::PathBuf {
+    espo_root_dir().join("_shared")
+}
+
+fn espo_module_db_path(name: &str) -> std::path::PathBuf {
+    espo_root_dir().join(name)
+}
+
 pub fn init_config_from(cfg: AppConfig) -> Result<()> {
     let mut cfg = cfg;
 
@@ -491,16 +514,14 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("metashrew SDB already initialized"))?;
     }
 
-    // --- init ESPO RocksDB once ---
-    let mut espo_opts = Options::default();
-    espo_opts.create_if_missing(true);
-    let espo_path = Path::new(&cfg.db_path).join("espo");
-    let espo_db = std::sync::Arc::new(DB::open(&espo_opts, espo_path)?);
-    ESPO_DB
-        .set(espo_db.clone())
-        .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
-
-    init_global_tree_db(espo_db.clone())?;
+    // --- init shared ESPO RocksDB once ---
+    ESPO_MODULE_DBS
+        .set(Mutex::new(HashMap::new()))
+        .map_err(|_| anyhow::anyhow!("ESPO module DB registry already initialized"))?;
+    let shared_db = open_espo_db_at(&Path::new(&cfg.db_path).join("espo").join("_shared"))?;
+    ESPO_SHARED_DB
+        .set(shared_db)
+        .map_err(|_| anyhow::anyhow!("ESPO shared DB already initialized"))?;
 
     // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
     if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
@@ -569,14 +590,39 @@ pub fn get_metashrew_sdb() -> std::sync::Arc<SDB> {
     )
 }
 
-/// Getter for the ESPO module DB path (directory for RocksDB)
+/// Getter for the shared ESPO DB path (directory for RocksDB)
 pub fn get_espo_db_path() -> String {
-    Path::new(&get_config().db_path).join("espo").to_string_lossy().into_owned()
+    espo_shared_db_path().to_string_lossy().into_owned()
 }
 
-/// Cloneable handle to the global ESPO RocksDB
+/// Getter for a module-specific ESPO DB path (directory for RocksDB)
+pub fn get_espo_module_db_path(name: &str) -> String {
+    espo_module_db_path(name).to_string_lossy().into_owned()
+}
+
+/// Cloneable handle to the shared ESPO RocksDB
 pub fn get_espo_db() -> std::sync::Arc<DB> {
-    std::sync::Arc::clone(ESPO_DB.get().expect("init_config() must be called once at startup"))
+    std::sync::Arc::clone(
+        ESPO_SHARED_DB.get().expect("init_config() must be called once at startup"),
+    )
+}
+
+/// Cloneable handle to a module-specific ESPO RocksDB
+pub fn get_espo_module_db(name: &str) -> std::sync::Arc<DB> {
+    let registry = ESPO_MODULE_DBS.get().expect("init_config() must be called once at startup");
+    let mut guard = registry.lock().expect("ESPO module DB registry mutex poisoned");
+    if let Some(db) = guard.get(name) {
+        return db.clone();
+    }
+
+    let db = open_espo_db_at(&espo_module_db_path(name))
+        .unwrap_or_else(|e| panic!("failed to open ESPO module DB for {name}: {e}"));
+    guard.insert(name.to_string(), db.clone());
+    db
+}
+
+pub fn get_espo_module_tree(name: &str) -> Option<Arc<VersionedTreeDb>> {
+    get_or_init_tree_db(get_espo_module_db(name)).ok()
 }
 
 /// Global accessor for the block source (blk files + RPC fallback)

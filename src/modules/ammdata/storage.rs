@@ -23,7 +23,6 @@ use crate::modules::essentials::storage::EssentialsProvider;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
-use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
@@ -1491,7 +1490,7 @@ impl AmmDataProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
+        let Some(tree) = self.mdb.versioned_tree() else {
             return Err(anyhow!("versioned_tree_unavailable"));
         };
         let Some(blockhash) = tree
