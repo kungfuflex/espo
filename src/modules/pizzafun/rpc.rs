@@ -5,6 +5,7 @@ use crate::schemas::SchemaAlkaneId;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use super::consts::DEFAULT_METAPROTOCOL;
 use super::storage::{
     GetSeriesByAlkaneParams, GetSeriesByAlkanesParams, GetSeriesByIdParams, GetSeriesByIdsParams,
     PizzafunProvider, SeriesEntry, normalize_metaprotocol, normalize_series_id,
@@ -74,11 +75,12 @@ fn confirmations_for(creation_height: u32) -> u32 {
     get_last_safe_tip().map(|tip| tip.saturating_sub(creation_height)).unwrap_or(0)
 }
 
-fn parse_metaprotocol_payload(payload: &Value) -> Option<String> {
-    payload
-        .get("metaprotocol")
-        .and_then(|v| v.as_str())
-        .and_then(normalize_metaprotocol)
+fn parse_metaprotocol_payload(payload: &Value) -> Result<String, ()> {
+    match payload.get("metaprotocol") {
+        None => Ok(DEFAULT_METAPROTOCOL.to_string()),
+        Some(value) if value.is_null() => Ok(DEFAULT_METAPROTOCOL.to_string()),
+        Some(value) => value.as_str().and_then(normalize_metaprotocol).ok_or(()),
+    }
 }
 
 fn entry_to_json(entry: &SeriesEntry) -> Value {
@@ -260,15 +262,15 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                             }
                         };
                         let metaprotocol = match parse_metaprotocol_payload(&payload) {
-                            Some(value) => value,
-                            None => {
+                            Ok(value) => value,
+                            Err(()) => {
                                 log_rpc(
                                     "get_alkane_id_from_series_id",
-                                    "missing_or_invalid_metaprotocol",
+                                    "invalid_metaprotocol",
                                 );
                                 return json!({
                                     "ok": false,
-                                    "error": "missing_or_invalid_metaprotocol"
+                                    "error": "invalid_metaprotocol"
                                 });
                             }
                         };
@@ -325,15 +327,15 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                             }
                         };
                         let metaprotocol = match parse_metaprotocol_payload(&payload) {
-                            Some(value) => value,
-                            None => {
+                            Ok(value) => value,
+                            Err(()) => {
                                 log_rpc(
                                     "get_alkane_ids_from_series_ids",
-                                    "missing_or_invalid_metaprotocol",
+                                    "invalid_metaprotocol",
                                 );
                                 return json!({
                                     "ok": false,
-                                    "error": "missing_or_invalid_metaprotocol"
+                                    "error": "invalid_metaprotocol"
                                 });
                             }
                         };

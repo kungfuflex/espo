@@ -31,8 +31,7 @@ use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::essentials::storage::{
-    AddressIndexListKind, AlkaneTxSummary, get_address_index_list_len,
-    get_address_index_list_range, load_tx_pointer_blob_v3_by_id, load_tx_summary_v2,
+    AlkaneTxSummary, GetMultiValuesParams, GetRawValueParams, load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_rows_batch,
@@ -325,20 +324,31 @@ pub async fn address_page(
 
     let remaining_slots = limit.saturating_sub(tx_renders.len());
     let confirmed_offset = off.saturating_sub(pending_total);
+    let table = essentials_provider.table();
 
     let mut next_cursor: Option<Txid> = None;
     if traces_only {
         let confirmed_total_t0 = Instant::now();
-        let confirmed_total = get_address_index_list_len(
-            &essentials_provider,
-            StateAt::Latest,
-            AddressIndexListKind::AlkaneTxs,
-            &address_str,
-        )
-        .unwrap_or(0) as usize;
+        let confirmed_total = essentials_provider
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: table.alkane_address_len_key(&address_str),
+            })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|b| {
+                if b.len() == 8 {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(&b);
+                    Some(u64::from_le_bytes(arr) as usize)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
         log_address_page_perf(
             &address_str,
-            "essentials.get_address_index_list_len.alkane_txs",
+            "essentials.get_raw_value.alkane_addr_len",
             confirmed_total_t0,
             &format!("confirmed_total={}", confirmed_total),
         );
@@ -346,30 +356,42 @@ pub async fn address_page(
         let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
 
         if confirmed_slice_end > confirmed_slice_start {
-            let range_start = confirmed_total.saturating_sub(confirmed_slice_end) as u64;
-            let range_end = confirmed_total.saturating_sub(confirmed_slice_start) as u64;
             let txid_multi_get_t0 = Instant::now();
-            let ids = get_address_index_list_range(
-                &essentials_provider,
-                StateAt::Latest,
-                AddressIndexListKind::AlkaneTxs,
-                &address_str,
-                range_start,
-                range_end,
-            )
-            .unwrap_or_default();
+            let mut txid_keys: Vec<Vec<u8>> = Vec::new();
+            for idx in confirmed_slice_start..confirmed_slice_end {
+                let rev_idx = confirmed_total - 1 - idx;
+                txid_keys.push(table.alkane_address_txid_key(&address_str, rev_idx as u64));
+            }
+            let txid_vals = essentials_provider
+                .get_multi_values(GetMultiValuesParams {
+                    blockhash: StateAt::Latest,
+                    keys: txid_keys,
+                })
+                .ok()
+                .map(|resp| resp.values)
+                .unwrap_or_default();
             log_address_page_perf(
                 &address_str,
-                "essentials.get_address_index_list_range.alkane_txs",
+                "essentials.get_multi_values.alkane_addr_txids",
                 txid_multi_get_t0,
-                &format!("start={} end={} ids={}", range_start, range_end, ids.len()),
+                &format!(
+                    "start={} end={} rows={}",
+                    confirmed_slice_start,
+                    confirmed_slice_end,
+                    txid_vals.len()
+                ),
             );
             let mut txids: Vec<Txid> = Vec::new();
-            for id in ids.into_iter().rev() {
-                let Some(blob) = load_tx_pointer_blob_v3_by_id(&essentials_provider, id) else {
+            for value in txid_vals {
+                let Some(bytes) = value else {
                     continue;
                 };
-                txids.push(Txid::from_byte_array(blob.txid));
+                if bytes.len() != 32 {
+                    continue;
+                }
+                if let Ok(txid) = Txid::from_slice(&bytes) {
+                    txids.push(txid);
+                }
             }
 
             let raw_txs_t0 = Instant::now();

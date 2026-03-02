@@ -6,10 +6,11 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, GetTokenMarketUpdatedAlkanesInBlockParams, GetTokenMetricsParams,
 };
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
+use axum::Router;
 use crate::modules::essentials::storage::{
-    EssentialsProvider, GetCreationIdsInBlockParams, GetCreationRecordParams,
-    GetCreationRecordsByIdParams, GetHoldersCountParams, GetLatestTotalMintedParams,
-    GetRawValueParams,
+    EssentialsProvider, GetAlkaneStorageValueU128Params, GetCreationIdsInBlockParams,
+    GetCreationRecordParams, GetCreationRecordsByIdParams, GetHoldersCountParams,
+    GetLatestTotalMintedParams, GetRawValueParams,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
@@ -20,13 +21,12 @@ use bitcoin::Network;
 use borsh::BorshDeserialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use super::config::PizzafunConfig;
 use super::consts::{DEFAULT_METAPROTOCOL, PRIORITY_SERIES_ALKANES};
 use super::rpc;
-use super::server::{SnapshotHttpState, run as run_snapshot_server};
+use super::server::{SnapshotHttpState, router as snapshot_router};
 use super::snapshot::{BondedSnapshotRowV1, PizzafunChainMetadataV1, SnapshotTokenStatus};
 use super::storage::{
     GetIndexHeightParams as PizzafunGetIndexHeightParams, GetSeriesByAlkaneParams,
@@ -215,6 +215,18 @@ impl Pizzafun {
         PizzafunChainMetadataV1::try_from_slice(payload).ok()
     }
 
+    fn creation_is_initialized(&self, alkane: &SchemaAlkaneId, blockhash: StateAt) -> Result<bool> {
+        let value = self
+            .essentials_provider()
+            .get_alkane_storage_value_u128(GetAlkaneStorageValueU128Params {
+                blockhash,
+                alkane: *alkane,
+                key: self.config().initialization_key.clone(),
+            })?
+            .value;
+        Ok(matches!(value, Some(1)))
+    }
+
     fn build_bonded_row_for_alkane(
         &self,
         alkane: &SchemaAlkaneId,
@@ -384,6 +396,9 @@ impl EspoModule for Pizzafun {
                 if !matches_factory {
                     continue;
                 }
+                if !self.creation_is_initialized(&rec.alkane, StateAt::Block(block_hash))? {
+                    continue;
+                }
                 let Some(raw_name) = rec.names.first() else { continue };
                 let Some(name_norm) = normalize_alkane_name(raw_name) else { continue };
                 rows_to_refresh.insert(rec.alkane);
@@ -511,19 +526,14 @@ impl EspoModule for Pizzafun {
     fn register_rpc(&self, reg: &RpcNsRegistrar) {
         let provider = self.provider.as_ref().expect("ModuleRegistry must call set_mdb()");
         rpc::register_rpc(reg.clone(), Arc::clone(provider));
+    }
 
-        let Some(cfg) = self.config.clone() else {
-            return;
-        };
-        let provider = provider.clone();
-        let addr = SocketAddr::new(cfg.snapshot_http_host, cfg.snapshot_http_port);
-        let state = SnapshotHttpState { config: cfg, provider };
-        tokio::spawn(async move {
-            if let Err(err) = run_snapshot_server(addr, state).await {
-                eprintln!("[pizzafun] snapshot server error: {err:?}");
-            }
-        });
-        eprintln!("[pizzafun] snapshot transport listening on {}", addr);
+    fn http_router(&self) -> Option<Router> {
+        let cfg = self.config.clone()?;
+        let provider = self.provider.as_ref()?.clone();
+        let base_path = cfg.snapshot_http_base_path.clone();
+        eprintln!("[pizzafun] snapshot routes mounted at {}", base_path);
+        Some(snapshot_router(SnapshotHttpState { config: cfg, provider }))
     }
 
     fn config_spec(&self) -> Option<&'static str> {

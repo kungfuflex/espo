@@ -1,18 +1,16 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
+    Json,
     Router,
-    extract::{Query, State},
+    extract::Query,
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::net::TcpListener;
-
 use crate::runtime::state_at::StateAt;
 
 use super::config::PizzafunConfig;
@@ -32,31 +30,52 @@ struct PageQuery {
     limit: Option<u64>,
 }
 
-pub async fn run(addr: SocketAddr, state: SnapshotHttpState) -> Result<()> {
+#[derive(Serialize)]
+struct StatusResponse {
+    status: &'static str,
+}
+
+pub fn router(state: SnapshotHttpState) -> Router {
+    let status_path = format!("{}/status", state.config.snapshot_http_base_path);
     let meta_path = format!("{}/meta", state.config.snapshot_http_base_path);
     let page_path = format!("{}/page", state.config.snapshot_http_base_path);
 
-    let app = Router::new()
-        .route(meta_path.as_str(), get(get_meta))
-        .route(page_path.as_str(), get(get_page))
-        .with_state(state);
-
-    let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+    Router::new()
+        .route(status_path.as_str(), get(get_status))
+        .route(
+            meta_path.as_str(),
+            get({
+                let state = state.clone();
+                move || {
+                    let state = state.clone();
+                    async move { get_meta(state).await }
+                }
+            }),
+        )
+        .route(
+            page_path.as_str(),
+            get({
+                let state = state.clone();
+                move |query: Query<PageQuery>| {
+                    let state = state.clone();
+                    async move { get_page(state, query).await }
+                }
+            }),
+        )
 }
 
-async fn get_meta(State(state): State<SnapshotHttpState>) -> Response {
+async fn get_status() -> Json<StatusResponse> {
+    Json(StatusResponse { status: "OK" })
+}
+
+async fn get_meta(state: SnapshotHttpState) -> Response {
     match snapshot_meta(&state) {
         Ok(meta) => bytes_response(StatusCode::OK, &borsh::to_vec(&meta).unwrap_or_default()),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
 }
 
-async fn get_page(
-    State(state): State<SnapshotHttpState>,
-    Query(query): Query<PageQuery>,
-) -> Response {
+async fn get_page(state: SnapshotHttpState, Query(query): Query<PageQuery>) -> Response {
     let requested_hash = match parse_root_hash_hex(&query.root_hash) {
         Some(value) => value,
         None => return (StatusCode::BAD_REQUEST, "invalid_root_hash").into_response(),

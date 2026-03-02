@@ -7,8 +7,6 @@ use rocksdb::{
 };
 use std::{path::Path, sync::Arc};
 
-use crate::runtime::tree_db::{VersionedTreeDb, get_global_tree_db, is_tree_internal_key};
-
 /// ===== Cache / open-time tuning =====
 /// How big you want the LRU block cache (data + index/filter when enabled).
 pub const ROCKS_BLOCK_CACHE_BYTES: usize = 1 << 30; // 1 GiB
@@ -23,34 +21,21 @@ pub const BLOOM_BITS_PER_KEY: f64 = 10.0;
 pub struct Mdb {
     db: Arc<DB>,
     prefix: Vec<u8>,
-    tree: Option<Arc<VersionedTreeDb>>,
 }
 
 impl Mdb {
-    fn from_parts(
-        db: Arc<DB>,
-        prefix: impl AsRef<[u8]>,
-        tree: Option<Arc<VersionedTreeDb>>,
-    ) -> Self {
+    fn from_parts(db: Arc<DB>, prefix: impl AsRef<[u8]>) -> Self {
         let prefix_vec = prefix.as_ref().to_vec();
-        Self { db, prefix: prefix_vec, tree }
+        Self { db, prefix: prefix_vec }
     }
 
     pub fn from_db(db: Arc<DB>, prefix: impl AsRef<[u8]>) -> Self {
-        Self::from_parts(db, prefix, None)
-    }
-
-    pub fn from_db_with_tree(
-        db: Arc<DB>,
-        prefix: impl AsRef<[u8]>,
-        tree: Arc<VersionedTreeDb>,
-    ) -> Self {
-        Self::from_parts(db, prefix, Some(tree))
+        Self::from_parts(db, prefix)
     }
 
     /// Clone this handle onto the same underlying RocksDB with a different namespace prefix.
     pub fn clone_with_prefix(&self, prefix: impl AsRef<[u8]>) -> Self {
-        Self::from_parts(Arc::clone(&self.db), prefix, self.tree.clone())
+        Self::from_parts(Arc::clone(&self.db), prefix)
     }
 
     pub fn open(path: impl AsRef<Path>, prefix: impl AsRef<[u8]>) -> Result<Self, RocksError> {
@@ -74,7 +59,7 @@ impl Mdb {
 
         let db = DB::open(&opts, path)?;
 
-        let mdb = Self::from_parts(Arc::new(db), prefix, None);
+        let mdb = Self::from_parts(Arc::new(db), prefix);
         if WARM_CACHE_ON_OPEN {
             let _ = mdb.warm_up_namespace(); // best-effort
         }
@@ -98,7 +83,7 @@ impl Mdb {
         opts.set_block_based_table_factory(&table);
 
         let db = DB::open_for_read_only(&opts, path, error_if_log_file_exist)?;
-        let mdb = Self::from_parts(Arc::new(db), prefix, None);
+        let mdb = Self::from_parts(Arc::new(db), prefix);
         if WARM_CACHE_ON_OPEN {
             let _ = mdb.warm_up_namespace();
         }
@@ -108,9 +93,6 @@ impl Mdb {
     /// Walk the namespace once to populate the block cache.
     /// Returns the number of KV pairs touched.
     pub fn warm_up_namespace(&self) -> Result<usize, RocksError> {
-        if self.versioned_manager().is_some() {
-            return Ok(0);
-        }
         let ns = self.prefix.clone();
 
         let mut ro = ReadOptions::default();
@@ -139,14 +121,7 @@ impl Mdb {
     }
 
     pub fn get(&self, k: &[u8]) -> Result<Option<Vec<u8>>, RocksError> {
-        let full = self.prefixed(k);
-        if let Some(tree) = self.versioned_manager() {
-            if is_tree_internal_key(&full) {
-                return self.db.get(full);
-            }
-            return tree.get(&full);
-        }
-        self.db.get(full)
+        self.db.get(self.prefixed(k))
     }
 
     pub fn get_at_blockhash(
@@ -154,14 +129,8 @@ impl Mdb {
         block_hash: &BlockHash,
         k: &[u8],
     ) -> Result<Option<Vec<u8>>, RocksError> {
-        let full = self.prefixed(k);
-        if let Some(tree) = self.versioned_manager() {
-            if let Some(root) = tree.root_for_blockhash(block_hash)? {
-                return tree.get_at_root(root, &full);
-            }
-            return Ok(None);
-        }
-        self.db.get(full)
+        let _ = block_hash;
+        self.get(k)
     }
 
     pub fn scan_prefix_entries(
@@ -169,16 +138,6 @@ impl Mdb {
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
         let ns_prefix = self.prefixed(prefix);
-        if let Some(tree) = self.versioned_manager() {
-            let entries = tree.collect_prefixed_entries(&ns_prefix)?;
-            let mut out = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                if key.starts_with(&self.prefix) {
-                    out.push((key[self.prefix.len()..].to_vec(), value));
-                }
-            }
-            return Ok(out);
-        }
 
         let mut out = Vec::new();
         for res in self.db.iterator(IteratorMode::From(&ns_prefix, Direction::Forward)) {
@@ -198,35 +157,12 @@ impl Mdb {
         block_hash: &BlockHash,
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
-        let ns_prefix = self.prefixed(prefix);
-        if let Some(tree) = self.versioned_manager() {
-            let Some(root) = tree.root_for_blockhash(block_hash)? else {
-                return Ok(Vec::new());
-            };
-            let entries = tree.collect_prefixed_entries_at_root(root, &ns_prefix)?;
-            let mut out = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                if key.starts_with(&self.prefix) {
-                    out.push((key[self.prefix.len()..].to_vec(), value));
-                }
-            }
-            return Ok(out);
-        }
+        let _ = block_hash;
         self.scan_prefix_entries(prefix)
     }
 
     pub fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, RocksError> {
         let ns_prefix = self.prefixed(prefix);
-        if let Some(tree) = self.versioned_manager() {
-            let keys = tree.collect_prefixed_keys(&ns_prefix)?;
-            let mut out = Vec::with_capacity(keys.len());
-            for key in keys {
-                if key.starts_with(&self.prefix) {
-                    out.push(key[self.prefix.len()..].to_vec());
-                }
-            }
-            return Ok(out);
-        }
 
         let mut out = Vec::new();
         for res in self.db.iterator(IteratorMode::From(&ns_prefix, Direction::Forward)) {
@@ -246,28 +182,11 @@ impl Mdb {
         block_hash: &BlockHash,
         prefix: &[u8],
     ) -> Result<Vec<Vec<u8>>, RocksError> {
-        let ns_prefix = self.prefixed(prefix);
-        if let Some(tree) = self.versioned_manager() {
-            let Some(root) = tree.root_for_blockhash(block_hash)? else {
-                return Ok(Vec::new());
-            };
-            let keys = tree.collect_prefixed_keys_at_root(root, &ns_prefix)?;
-            let mut out = Vec::with_capacity(keys.len());
-            for key in keys {
-                if key.starts_with(&self.prefix) {
-                    out.push(key[self.prefix.len()..].to_vec());
-                }
-            }
-            return Ok(out);
-        }
+        let _ = block_hash;
         self.scan_prefix_keys(prefix)
     }
 
     pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, RocksError> {
-        if let Some(tree) = self.versioned_manager() {
-            let prefixed: Vec<Vec<u8>> = keys.iter().map(|k| self.prefixed(k)).collect();
-            return tree.multi_get(&prefixed);
-        }
         // Apply DB prefix to each RELATIVE key
         let prefixed: Vec<Vec<u8>> = keys.iter().map(|k| self.prefixed(k)).collect();
 
@@ -291,64 +210,25 @@ impl Mdb {
         block_hash: &BlockHash,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, RocksError> {
-        if let Some(tree) = self.versioned_manager() {
-            let Some(root) = tree.root_for_blockhash(block_hash)? else {
-                return Ok(vec![None; keys.len()]);
-            };
-            let mut out = Vec::with_capacity(keys.len());
-            for key in keys {
-                let prefixed = self.prefixed(key);
-                out.push(tree.get_at_root(root, &prefixed)?);
-            }
-            return Ok(out);
-        }
+        let _ = block_hash;
         self.multi_get(keys)
     }
 
     pub fn put(&self, k: &[u8], v: &[u8]) -> Result<(), RocksError> {
-        let prefixed = self.prefixed(k);
-        if let Some(tree) = self.versioned_manager() {
-            if is_tree_internal_key(&prefixed) {
-                return self.db.put(prefixed, v);
-            }
-            return tree.put(&prefixed, v);
-        }
-        self.db.put(&prefixed, v)
+        self.db.put(self.prefixed(k), v)
     }
 
     pub fn delete(&self, k: &[u8]) -> Result<(), RocksError> {
-        let prefixed = self.prefixed(k);
-        if let Some(tree) = self.versioned_manager() {
-            if is_tree_internal_key(&prefixed) {
-                return self.db.delete(prefixed);
-            }
-            return tree.delete(&prefixed);
-        }
-        self.db.delete(&prefixed)
+        self.db.delete(self.prefixed(k))
     }
 
     pub fn bulk_write<F>(&self, build: F) -> Result<(), RocksError>
     where
         F: FnOnce(&mut MdbBatch<'_>),
     {
-        if let Some(tree) = self.versioned_manager() {
-            let mut versioned_changes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-            {
-                let mut mb = MdbBatch {
-                    mdb: self,
-                    wb: None,
-                    versioned_changes: Some(&mut versioned_changes),
-                };
-                build(&mut mb);
-            }
-            return tree.apply_batch_owned(versioned_changes);
-        }
-
         let mut wb = WriteBatch::default();
-        {
-            let mut mb = MdbBatch { mdb: self, wb: Some(&mut wb), versioned_changes: None };
-            build(&mut mb);
-        }
+        let mut mb = MdbBatch { mdb: self, wb: &mut wb };
+        build(&mut mb);
         self.db.write(wb)
     }
 
@@ -357,13 +237,6 @@ impl Mdb {
         &self,
         start: &[u8],
     ) -> Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>), RocksError>> + '_> {
-        if let Some(tree) = self.versioned_manager() {
-            let start_full = self.prefixed(start);
-            let mut entries =
-                tree.collect_prefixed_entries(self.prefix()).unwrap_or_else(|_| Vec::new());
-            entries.retain(|(k, _)| k >= &start_full);
-            return Box::new(entries.into_iter().map(Ok));
-        }
         let ns_start = self.prefixed(start);
         Box::new(
             self.db
@@ -384,11 +257,7 @@ impl Mdb {
 
     #[inline]
     pub fn is_versioned(&self) -> bool {
-        self.versioned_manager().is_some()
-    }
-
-    pub fn tree(&self) -> Option<Arc<VersionedTreeDb>> {
-        self.versioned_manager()
+        false
     }
 
     pub fn begin_block(
@@ -397,48 +266,33 @@ impl Mdb {
         block_hash: &BlockHash,
         parent_hash: &BlockHash,
     ) -> Result<(), RocksError> {
-        let Some(tree) = self.versioned_manager() else {
-            return Ok(());
-        };
-        tree.begin_block(height, block_hash, parent_hash)
+        let _ = (height, block_hash, parent_hash);
+        Ok(())
     }
 
     pub fn finish_block(&self) -> Result<(), RocksError> {
-        let Some(tree) = self.versioned_manager() else {
-            return Ok(());
-        };
-        tree.finish_block()
+        Ok(())
     }
 
-    pub fn abort_block(&self) {
-        if let Some(tree) = self.versioned_manager() {
-            tree.abort_block();
-        }
-    }
+    pub fn abort_block(&self) {}
 
     pub fn has_blockhash(&self, block_hash: &BlockHash) -> Result<bool, RocksError> {
-        let Some(tree) = self.versioned_manager() else {
-            return Ok(false);
-        };
-        Ok(tree.root_for_blockhash(block_hash)?.is_some())
+        let _ = block_hash;
+        Ok(false)
     }
 
     pub fn blockhash_for_height(&self, height: u32) -> Result<Option<BlockHash>, RocksError> {
-        let Some(tree) = self.versioned_manager() else {
-            return Ok(None);
-        };
-        tree.blockhash_for_height(height)
+        let _ = height;
+        Ok(None)
     }
 
     pub fn active_blockhash(&self) -> Option<BlockHash> {
-        self.versioned_manager().and_then(|tree| tree.active_blockhash())
+        None
     }
 
     pub fn height_for_blockhash(&self, block_hash: &BlockHash) -> Result<Option<u32>, RocksError> {
-        let Some(tree) = self.versioned_manager() else {
-            return Ok(None);
-        };
-        tree.height_for_blockhash(block_hash)
+        let _ = block_hash;
+        Ok(None)
     }
 
     pub fn is_ancestor(
@@ -446,51 +300,29 @@ impl Mdb {
         ancestor: &BlockHash,
         descendant: &BlockHash,
     ) -> Result<bool, RocksError> {
-        let Some(tree) = self.versioned_manager() else {
-            return Ok(false);
-        };
-        tree.is_ancestor(ancestor, descendant)
+        let _ = (ancestor, descendant);
+        Ok(false)
     }
 
     pub fn indexed_height_bounds(&self) -> Result<Option<(u32, u32)>, RocksError> {
-        let Some(tree) = self.versioned_manager() else {
-            return Ok(None);
-        };
-        tree.indexed_height_bounds()
-    }
-
-    fn versioned_manager(&self) -> Option<Arc<VersionedTreeDb>> {
-        self.tree.clone().or_else(get_global_tree_db)
+        Ok(None)
     }
 }
 
 pub struct MdbBatch<'a> {
     mdb: &'a Mdb,
-    wb: Option<&'a mut WriteBatch>,
-    versioned_changes: Option<&'a mut Vec<(Vec<u8>, Option<Vec<u8>>)>>,
+    wb: &'a mut WriteBatch,
 }
 
 impl<'a> MdbBatch<'a> {
     #[inline]
     pub fn put(&mut self, k: &[u8], v: &[u8]) {
         let key = self.mdb.prefixed(k);
-        if let Some(buf) = self.versioned_changes.as_mut() {
-            buf.push((key, Some(v.to_vec())));
-            return;
-        }
-        if let Some(wb) = self.wb.as_mut() {
-            wb.put(key, v);
-        }
+        self.wb.put(key, v);
     }
     #[inline]
     pub fn delete(&mut self, k: &[u8]) {
         let key = self.mdb.prefixed(k);
-        if let Some(buf) = self.versioned_changes.as_mut() {
-            buf.push((key, None));
-            return;
-        }
-        if let Some(wb) = self.wb.as_mut() {
-            wb.delete(key);
-        }
+        self.wb.delete(key);
     }
 }

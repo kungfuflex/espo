@@ -14,9 +14,8 @@ use crate::modules::ammdata::consts::{
 };
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, EssentialsProvider,
-    GetListEntriesDescParams as EssentialsGetListEntriesDescParams, GetMultiValuesParams,
-    decode_pointer_idx_u64, load_tx_pointer_blob_v3_by_id,
+    AlkaneBalanceTxEntry, EssentialsProvider, GetMultiValuesParams,
+    GetRawValueParams as EssentialsGetRawValueParams,
 };
 use crate::modules::essentials::utils::balances::SignedU128;
 use crate::modules::essentials::utils::inspections::{
@@ -28,6 +27,7 @@ use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
 use bitcoin::{ScriptBuf, Transaction};
+use borsh::BorshDeserialize;
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use serde_json::json;
@@ -533,41 +533,17 @@ pub(crate) fn load_balance_txs_by_height(
     height: u32,
 ) -> Result<BTreeMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>> {
     let table = essentials.table();
-    let prefix = table.alkane_balance_txs_by_height_log_prefix(height);
-    let entries = essentials
-        .get_list_entries_desc(EssentialsGetListEntriesDescParams {
+    let Some(bytes) = essentials
+        .get_raw_value(EssentialsGetRawValueParams {
             blockhash: StateAt::Latest,
-            prefix: prefix.clone(),
+            key: table.alkane_balance_txs_by_height_key(height),
         })?
-        .entries;
-
-    let mut parsed_with_idx: BTreeMap<SchemaAlkaneId, Vec<(u32, AlkaneBalanceTxEntry)>> =
-        BTreeMap::new();
-    for (key, value) in entries {
-        let Some((tx_idx, owner)) = table.parse_alkane_balance_txs_by_height_log_key(height, &key)
-        else {
-            continue;
-        };
-        let Ok(entry_id) = decode_pointer_idx_u64(&value) else {
-            continue;
-        };
-        let Some(blob) = load_tx_pointer_blob_v3_by_id(essentials, entry_id) else {
-            continue;
-        };
-        let entry = AlkaneBalanceTxEntry {
-            txid: blob.txid,
-            height: blob.height,
-            outflow: blob.outflows.get(&owner).cloned().unwrap_or_default(),
-        };
-        parsed_with_idx.entry(owner).or_default().push((tx_idx, entry));
-    }
-
-    let mut parsed: BTreeMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>> = BTreeMap::new();
-    for (owner, mut entries) in parsed_with_idx {
-        entries.sort_by_key(|(tx_idx, _)| *tx_idx);
-        parsed.insert(owner, entries.into_iter().map(|(_, entry)| entry).collect());
-    }
-    Ok(parsed)
+        .value
+    else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(BTreeMap::<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>::try_from_slice(&bytes)
+        .unwrap_or_default())
 }
 
 pub struct AmmData {
@@ -654,8 +630,7 @@ impl EspoModule for AmmData {
         let search_cfg = AmmDataConfig::load_from_global_config().ok();
         let search_index_enabled =
             search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
-        let use_historical_backfill =
-            search_cfg.as_ref().map(|c| c.use_historical_backfill).unwrap_or(true);
+        let use_historical_backfill = true;
         let mut search_prefix_min =
             search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
         let mut search_prefix_max =

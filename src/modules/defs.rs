@@ -1,4 +1,5 @@
 use anyhow::Result;
+use axum::Router;
 use bitcoin::Network;
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -111,6 +112,11 @@ pub trait EspoModule: Send + Sync {
     /// For a module named "ammdata", all methods will be "ammdata.<suffix>".
     fn register_rpc(&self, reg: &RpcNsRegistrar);
 
+    /// Optional extra HTTP routes that should be merged into the shared HTTP server.
+    fn http_router(&self) -> Option<Router> {
+        None
+    }
+
     /// Return Some to declare this module expects a config section.
     /// The string should describe the expected shape (used for error messages).
     fn config_spec(&self) -> Option<&'static str> {
@@ -127,6 +133,7 @@ pub trait EspoModule: Send + Sync {
 pub struct ModuleRegistry {
     modules: Vec<Arc<dyn EspoModule>>,
     pub router: RpcRegistry,
+    pub http_router: Router,
 }
 
 impl Default for ModuleRegistry {
@@ -137,7 +144,7 @@ impl Default for ModuleRegistry {
 
 impl ModuleRegistry {
     pub fn new() -> Self {
-        Self { modules: Vec::new(), router: RpcRegistry::default() }
+        Self { modules: Vec::new(), router: RpcRegistry::default(), http_router: Router::new() }
     }
 
     /// Back-compat constructor.
@@ -199,6 +206,9 @@ impl ModuleRegistry {
 
         let m = Arc::new(module);
         m.register_rpc(&ns);
+        if let Some(router) = m.http_router() {
+            self.http_router = self.http_router.clone().merge(router);
+        }
 
         self.modules.push(m);
     }

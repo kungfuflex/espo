@@ -32,9 +32,7 @@ use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    AddressIndexListKind, AlkaneTxSummary, address_index_list_id_alkane_block_txs,
-    get_address_index_list_len, get_address_index_list_range, load_tx_pointer_blob_v3_by_id,
-    load_tx_summary_v2,
+    AlkaneTxSummary, GetMultiValuesParams, GetRawValueParams, load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_outpoint_balances_with_spent_batch,
@@ -258,35 +256,50 @@ pub async fn block_page(
     let mut last_page = 1usize;
     let traces_param = if traces_only { "1" } else { "0" };
     let hide_diesel_param = if hide_diesel_mints { "1" } else { "0" };
+    let table = essentials_provider.table();
 
     if espo_indexed {
         if traces_only {
-            let list_id = address_index_list_id_alkane_block_txs(height);
-            let total = get_address_index_list_len(
-                &essentials_provider,
-                StateAt::Latest,
-                AddressIndexListKind::AlkaneBlockTxs,
-                &list_id,
-            )
-            .unwrap_or(0) as usize;
+            let total = essentials_provider
+                .get_raw_value(GetRawValueParams {
+                    blockhash: StateAt::Latest,
+                    key: table.alkane_block_len_key(height),
+                })
+                .ok()
+                .and_then(|resp| resp.value)
+                .and_then(|b| {
+                    if b.len() == 8 {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&b);
+                        Some(u64::from_le_bytes(arr) as usize)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
             if hide_diesel_mints {
                 let mut all_txids: Vec<Txid> = Vec::new();
                 if total > 0 {
-                    let ids = get_address_index_list_range(
-                        &essentials_provider,
-                        StateAt::Latest,
-                        AddressIndexListKind::AlkaneBlockTxs,
-                        &list_id,
-                        0,
-                        total as u64,
-                    )
-                    .unwrap_or_default();
-                    for id in ids {
-                        let Some(blob) = load_tx_pointer_blob_v3_by_id(&essentials_provider, id)
-                        else {
+                    let mut txid_keys: Vec<Vec<u8>> = Vec::with_capacity(total);
+                    for idx in 0..total {
+                        txid_keys.push(table.alkane_block_txid_key(height, idx as u64));
+                    }
+                    let txid_vals = essentials_provider
+                        .get_multi_values(GetMultiValuesParams {
+                            blockhash: StateAt::Latest,
+                            keys: txid_keys,
+                        })
+                        .ok()
+                        .map(|resp| resp.values)
+                        .unwrap_or_default();
+                    for value in txid_vals {
+                        let Some(bytes) = value else { continue };
+                        if bytes.len() != 32 {
                             continue;
-                        };
-                        all_txids.push(Txid::from_byte_array(blob.txid));
+                        }
+                        if let Ok(txid) = Txid::from_slice(&bytes) {
+                            all_txids.push(txid);
+                        }
                     }
                 }
 
@@ -351,22 +364,27 @@ pub async fn block_page(
                 }
 
                 if end > off {
+                    let mut txid_keys: Vec<Vec<u8>> = Vec::with_capacity(end - off);
+                    for idx in off..end {
+                        txid_keys.push(table.alkane_block_txid_key(height, idx as u64));
+                    }
+                    let txid_vals = essentials_provider
+                        .get_multi_values(GetMultiValuesParams {
+                            blockhash: StateAt::Latest,
+                            keys: txid_keys,
+                        })
+                        .ok()
+                        .map(|resp| resp.values)
+                        .unwrap_or_default();
                     let mut txids: Vec<Txid> = Vec::new();
-                    let ids = get_address_index_list_range(
-                        &essentials_provider,
-                        StateAt::Latest,
-                        AddressIndexListKind::AlkaneBlockTxs,
-                        &list_id,
-                        off as u64,
-                        end as u64,
-                    )
-                    .unwrap_or_default();
-                    for id in ids {
-                        let Some(blob) = load_tx_pointer_blob_v3_by_id(&essentials_provider, id)
-                        else {
+                    for value in txid_vals {
+                        let Some(bytes) = value else { continue };
+                        if bytes.len() != 32 {
                             continue;
-                        };
-                        txids.push(Txid::from_byte_array(blob.txid));
+                        }
+                        if let Ok(txid) = Txid::from_slice(&bytes) {
+                            txids.push(txid);
+                        }
                     }
 
                     let raw_txs =

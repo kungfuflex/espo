@@ -1,7 +1,5 @@
 use crate::alkanes::metashrew::MetashrewAdapter;
-use crate::runtime::{
-    dbpaths::get_sdb_path_for_metashrew, mdb::Mdb, sdb::SDB, tree_db::VersionedTreeDb,
-};
+use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, mdb::Mdb, sdb::SDB};
 use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
 use crate::{ESPO_HEIGHT, SAFE_TIP};
 use anyhow::{Context, Result};
@@ -614,11 +612,7 @@ pub fn get_espo_module_mdb(name: &str) -> Arc<Mdb> {
         DB::open(&opts, &path)
             .unwrap_or_else(|e| panic!("failed to open module db {}: {e}", path.display())),
     );
-    let tree = Arc::new(
-        VersionedTreeDb::new(Arc::clone(&db))
-            .unwrap_or_else(|e| panic!("failed to init module tree {}: {e}", path.display())),
-    );
-    let mdb = Arc::new(Mdb::from_db_with_tree(db, b"", tree));
+    let mdb = Arc::new(Mdb::from_db(db, b""));
     write.insert(name.to_string(), Arc::clone(&mdb));
     mdb
 }

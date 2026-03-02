@@ -23,9 +23,15 @@ fn default_snapshot_http_base_path() -> String {
     "/pizzafun/snapshot".to_string()
 }
 
+fn default_initialization_key() -> String {
+    "/initialized".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RawPizzafunConfig {
     factory_id: String,
+    #[serde(default = "default_initialization_key")]
+    initialization_key: String,
     #[serde(default = "default_snapshot_page_limit")]
     snapshot_page_limit: u64,
     #[serde(default = "default_snapshot_page_limit_max")]
@@ -41,6 +47,7 @@ struct RawPizzafunConfig {
 #[derive(Debug, Clone)]
 pub struct PizzafunConfig {
     pub factory_id: SchemaAlkaneId,
+    pub initialization_key: Vec<u8>,
     pub snapshot_page_limit: u64,
     pub snapshot_page_limit_max: u64,
     pub snapshot_http_host: IpAddr,
@@ -50,7 +57,7 @@ pub struct PizzafunConfig {
 
 impl PizzafunConfig {
     pub fn spec() -> &'static str {
-        "{ factory_id: \"<block>:<tx>\", snapshot_page_limit?: number, snapshot_page_limit_max?: number, snapshot_http_host?: string, snapshot_http_port?: number, snapshot_http_base_path?: string }"
+        "{ factory_id: \"<block>:<tx>\", initialization_key?: string, snapshot_page_limit?: number, snapshot_page_limit_max?: number, snapshot_http_host?: string, snapshot_http_port?: number, snapshot_http_base_path?: string }"
     }
 
     pub fn from_value(value: &serde_json::Value) -> Result<Self> {
@@ -58,6 +65,10 @@ impl PizzafunConfig {
             .map_err(|e| anyhow!("invalid pizzafun config: {e}"))?;
         let factory_id = parse_alkane_id(&raw.factory_id)
             .ok_or_else(|| anyhow!("invalid factory_id, expected <block>:<tx>"))?;
+        let initialization_key = {
+            let trimmed = raw.initialization_key.trim();
+            if trimmed.is_empty() { default_initialization_key() } else { trimmed.to_string() }
+        };
         let snapshot_page_limit = raw.snapshot_page_limit.max(1);
         let snapshot_page_limit_max = raw.snapshot_page_limit_max.max(snapshot_page_limit);
         let mut snapshot_http_base_path = raw.snapshot_http_base_path.trim().to_string();
@@ -74,6 +85,7 @@ impl PizzafunConfig {
 
         Ok(Self {
             factory_id,
+            initialization_key: initialization_key.into_bytes(),
             snapshot_page_limit,
             snapshot_page_limit_max,
             snapshot_http_host: raw.snapshot_http_host,

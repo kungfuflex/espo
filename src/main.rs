@@ -54,7 +54,7 @@ use crate::{
     runtime::mempool::{
         purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service,
     },
-    runtime::rpc::run_rpc,
+    runtime::rpc::run_rpc_with_router,
 };
 use bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
@@ -91,6 +91,9 @@ fn detect_first_divergence_height(
     let tree = get_espo_module_mdb("essentials");
     let check_tip = indexed_tip.min(safe_tip);
     if check_tip < genesis_height {
+        return None;
+    }
+    if tree.blockhash_for_height(check_tip).ok().flatten().is_none() {
         return None;
     }
     let rpc = get_bitcoind_rpc_client();
@@ -337,74 +340,13 @@ async fn run_indexer_loop(
                         .iter()
                         .map(|t| t.transaction.compute_txid())
                         .collect();
-
-                    let block_hash = espo_block.block_header.block_hash();
-
                     for m in mods.modules() {
                         if next_height >= m.get_genesis_block(network) {
-                            let Some(mdb) = m.get_mdb() else {
-                                if let Err(e) = m.index_block(espo_block.clone()) {
-                                    eprintln!(
-                                        "[module:{}] height {}: {e:?}",
-                                        m.get_name(),
-                                        next_height
-                                    );
-                                }
-                                continue;
-                            };
-
-                            match mdb.has_blockhash(&block_hash) {
-                                Ok(true) => {
-                                    eprintln!(
-                                        "[module:{}] skipping already indexed block {} ({})",
-                                        m.get_name(),
-                                        next_height,
-                                        block_hash
-                                    );
-                                    continue;
-                                }
-                                Ok(false) => {}
-                                Err(e) => {
-                                    eprintln!(
-                                        "[module:{}] failed to check block {} ({}): {e:?}",
-                                        m.get_name(),
-                                        next_height,
-                                        block_hash
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            if let Err(e) = mdb.begin_block(
-                                next_height,
-                                &block_hash,
-                                &espo_block.block_header.prev_blockhash,
-                            ) {
-                                eprintln!(
-                                    "[module:{}] failed to begin block {} ({}): {e:?}",
-                                    m.get_name(),
-                                    next_height,
-                                    block_hash
-                                );
-                                continue;
-                            }
-
                             if let Err(e) = m.index_block(espo_block.clone()) {
                                 eprintln!(
                                     "[module:{}] height {}: {e:?}",
                                     m.get_name(),
                                     next_height
-                                );
-                                mdb.abort_block();
-                                continue;
-                            }
-
-                            if let Err(e) = mdb.finish_block() {
-                                eprintln!(
-                                    "[module:{}] failed to finish block {} ({}): {e:?}",
-                                    m.get_name(),
-                                    next_height,
-                                    block_hash
                                 );
                             }
                         }
@@ -555,8 +497,9 @@ async fn main() -> Result<()> {
     // Start RPC server
     let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
     let rpc_router = mods.router.clone();
+    let http_router = mods.http_router.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_rpc(rpc_router, addr).await {
+        if let Err(e) = run_rpc_with_router(rpc_router, http_router, addr).await {
             eprintln!("[rpc] server error: {e:?}");
         }
     });
