@@ -455,13 +455,14 @@ pub fn discover_new_pools(
                 }
 
                 let mut pool_balances =
-                    get_alkane_balances(StateAt::Latest, essentials, &pool_id).unwrap_or_default();
+                    get_alkane_balances(blockhash.clone(), essentials, &pool_id)
+                        .unwrap_or_default();
                 let initial_token0_amount = pool_balances.remove(&defs.base_alkane_id).unwrap_or(0);
                 let initial_token1_amount =
                     pool_balances.remove(&defs.quote_alkane_id).unwrap_or(0);
                 let initial_lp_supply = essentials
                     .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
-                        blockhash: StateAt::Latest,
+                        blockhash: blockhash.clone(),
                         alkane: pool_id,
                     })
                     .map(|res| res.supply)

@@ -613,7 +613,6 @@ pub fn get_espo_block_with_opts(
             } else {
                 None
             };
-
         txs.push(EspoAlkanesTransaction { traces: traces_opt, transaction: tx });
     }
     eprintln!(

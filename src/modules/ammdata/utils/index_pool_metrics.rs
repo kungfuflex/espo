@@ -178,14 +178,9 @@ pub fn derive_pool_metrics(
     for pool in state.pools_touched.iter() {
         let Some(defs) = state.pools_map.get(pool) else { continue };
 
-        let mut balances = crate::modules::essentials::utils::balances::get_alkane_balances(
-            StateAt::Latest,
-            essentials,
-            pool,
-        )
-        .unwrap_or_default();
-        let token0_amount = balances.remove(&defs.base_alkane_id).unwrap_or(0);
-        let token1_amount = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
+        let Some(snapshot) = state.reserves_snapshot.get(pool) else { continue };
+        let token0_amount = snapshot.base_reserve;
+        let token1_amount = snapshot.quote_reserve;
 
         let token0_price_usd = get_token_price_usd(&defs.base_alkane_id);
         let token1_price_usd = get_token_price_usd(&defs.quote_alkane_id);
@@ -234,7 +229,10 @@ pub fn derive_pool_metrics(
         let pool_tvl_sats = token0_tvl_sats.saturating_add(token1_tvl_sats);
 
         let prev_pool_metrics = provider
-            .get_pool_metrics_v2(GetPoolMetricsV2Params { blockhash: StateAt::Latest, pool: *pool })
+            .get_pool_metrics_v2(GetPoolMetricsV2Params {
+                blockhash: blockhash.clone(),
+                pool: *pool,
+            })
             .ok()
             .and_then(|res| res.metrics);
         let full_history = prev_pool_metrics.is_none();

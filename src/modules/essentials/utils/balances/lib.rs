@@ -3833,9 +3833,9 @@ pub fn bulk_update_balances_for_block(
                 }
 
                 panic!(
-                    "[balances][strict] metashrew mismatch at height {} (alkanes={} utxos={})",
+                    "[balances][strict] metashrew mismatch at height {} (alkanes={:#?} utxos={})",
                     height_u64,
-                    balance_mismatches.len(),
+                    balance_mismatches,
                     utxo_mismatches.len()
                 );
             }
