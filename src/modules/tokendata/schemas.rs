@@ -23,8 +23,14 @@ pub enum TokenActivitySource {
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SchemaTokenActivityV1 {
+    pub height: u32,
     pub timestamp: u64,
     pub txid: [u8; 32],
+    pub chain_txids: Vec<[u8; 32]>,
+    pub cpfp: bool,
+    pub mint_price_paid_sats: [u8; 32],
+    pub mint_price_pool_usd: [u8; 32],
+    pub mint_price_pool_frbtc_sats: [u8; 32],
     pub token: SchemaAlkaneId,
     pub kind: TokenActivityKind,
     pub source: TokenActivitySource,

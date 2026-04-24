@@ -4,8 +4,10 @@ use super::schemas::{
     SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
 };
 use crate::config::get_network;
+use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{
-    CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, SATS_PER_BTC, canonical_quotes,
+    CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block,
+    canonical_quotes,
 };
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
@@ -1656,6 +1658,7 @@ impl AmmDataProvider {
         params: GetLatestBtcUsdPriceParams,
     ) -> Result<Option<(u64, u128)>> {
         let table = self.table();
+        let resolved_blockhash = params.blockhash.resolve(self.view_blockhash);
         let rel_prefix = table.btc_usd_price_prefix();
         let entries = self
             .get_list_entries_desc(GetListEntriesDescParams {
@@ -1671,6 +1674,22 @@ impl AmmDataProvider {
             if let Ok(price) = decode_u128_value(&v) {
                 if price > 0 {
                     return Ok(Some((height, price)));
+                }
+            }
+        }
+        if let Some(blockhash) = resolved_blockhash {
+            if let Some(tree) = get_global_tree_db() {
+                if let Some(height) = tree
+                    .height_for_blockhash(&blockhash)
+                    .map_err(|e| anyhow!("tree height lookup failed: {e}"))?
+                {
+                    if height < ammdata_genesis_block(get_network()) {
+                        let fallback = AmmDataConfig::load_from_global_config()?
+                            .pre_ammdata_btc_usd_price;
+                        if fallback > 0 {
+                            return Ok(Some((height as u64, fallback)));
+                        }
+                    }
                 }
             }
         }

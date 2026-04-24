@@ -1,3 +1,4 @@
+use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
@@ -26,6 +27,7 @@ pub struct AmmDataConfig {
     pub eth_rpc: String,
     pub eth_call_throttle_ms: u64,
     pub use_historical_backfill: bool,
+    pub pre_ammdata_btc_usd_price: u128,
     pub search_index_enabled: bool,
     pub search_prefix_min_len: u8,
     pub search_prefix_max_len: u8,
@@ -36,7 +38,7 @@ pub struct AmmDataConfig {
 
 impl AmmDataConfig {
     pub fn spec() -> &'static str {
-        "{ \"eth_rpc\": \"<url>\", \"eth_call_throttle\": <ms>, \"use_historical_backfill\": <bool=true>, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
+        "{ \"eth_rpc\": \"<url>\", \"eth_call_throttle\": <ms>, \"use_historical_backfill\": <bool=true>, \"pre_ammdata_btc_usd_price\": <86500 or \"86500.12\">, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
@@ -65,6 +67,11 @@ impl AmmDataConfig {
         })?;
         let use_historical_backfill =
             obj.get("use_historical_backfill").and_then(|v| v.as_bool()).unwrap_or(true);
+        let pre_ammdata_btc_usd_price = obj
+            .get("pre_ammdata_btc_usd_price")
+            .map(parse_scaled_price_value)
+            .transpose()?
+            .unwrap_or(0);
 
         let search_index_enabled =
             obj.get("search_index_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -167,6 +174,7 @@ impl AmmDataConfig {
             eth_rpc,
             eth_call_throttle_ms,
             use_historical_backfill,
+            pre_ammdata_btc_usd_price,
             search_index_enabled,
             search_prefix_min_len,
             search_prefix_max_len,
@@ -193,4 +201,38 @@ fn parse_alkane_id_str(raw: &str) -> Option<SchemaAlkaneId> {
     let block = parts.next()?.parse::<u32>().ok()?;
     let tx = parts.next()?.parse::<u64>().ok()?;
     Some(SchemaAlkaneId { block, tx })
+}
+
+fn parse_scaled_price_value(value: &Value) -> Result<u128> {
+    if let Some(raw) = value.as_u64() {
+        return Ok((raw as u128).saturating_mul(PRICE_SCALE));
+    }
+    let raw = value
+        .as_str()
+        .ok_or_else(|| anyhow!("ammdata.pre_ammdata_btc_usd_price must be a number or string"))?
+        .trim();
+    if raw.is_empty() {
+        return Err(anyhow!("ammdata.pre_ammdata_btc_usd_price must not be empty"));
+    }
+    let (whole_raw, frac_raw) = raw.split_once('.').unwrap_or((raw, ""));
+    let whole = whole_raw
+        .parse::<u128>()
+        .map_err(|_| anyhow!("invalid ammdata.pre_ammdata_btc_usd_price"))?;
+    let frac_digits = frac_raw
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .take(16)
+        .collect::<String>();
+    let mut frac_scaled = frac_digits;
+    while frac_scaled.len() < 16 {
+        frac_scaled.push('0');
+    }
+    let frac = if frac_scaled.is_empty() {
+        0
+    } else {
+        frac_scaled
+            .parse::<u128>()
+            .map_err(|_| anyhow!("invalid ammdata.pre_ammdata_btc_usd_price"))?
+    };
+    Ok(whole.saturating_mul(PRICE_SCALE).saturating_add(frac))
 }

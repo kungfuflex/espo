@@ -1391,6 +1391,15 @@ a:hover {
   font-weight: 700;
   color: var(--text);
 }
+.alkane-token-activity-kind-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.alkane-token-activity-kind-row .pill.small {
+  font-weight: 700;
+}
 .alkane-token-activity-meta {
   display: flex;
   flex-direction: column;
@@ -1492,6 +1501,10 @@ a:hover {
 }
 .alkane-token-activity-flow-line.neutral {
   color: var(--muted);
+}
+.alkane-token-activity-flow-line.neutral .alkane-token-activity-price-paid {
+  color: var(--muted3);
+  font-weight: 600;
 }
 .alkane-token-activity-card td:nth-child(4) .alk-line {
   justify-content: flex-end;

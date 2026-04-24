@@ -8,9 +8,13 @@ use bitcoin::BlockHash;
 use borsh::BorshDeserialize;
 use std::sync::Arc;
 
-const INDEX_HEIGHT_KEY: &[u8] = b"/index_height";
-const TOKEN_ACTIVITY_TS_ROOT: &[u8] = b"/token_activity/v1/";
-const TOKEN_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/token_activity_amount/v1/";
+const INDEX_HEIGHT_KEY: &[u8] = b"/v2/index_height";
+const TOKEN_ACTIVITY_TS_ROOT: &[u8] = b"/token_activity/v2/";
+const TOKEN_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/token_activity_amount/v2/";
+const ADDRESS_ACTIVITY_TS_ROOT: &[u8] = b"/address_activity/v2/";
+const ADDRESS_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/address_activity_amount/v2/";
+const ADDRESS_TOKEN_ACTIVITY_TS_ROOT: &[u8] = b"/address_token_activity/v2/";
+const ADDRESS_TOKEN_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/address_token_activity_amount/v2/";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenActivityScope {
@@ -66,6 +70,35 @@ impl<'a> TokenDataTable<'a> {
         key
     }
 
+    fn address_prefix(root: &[u8], scope: TokenActivityScope, address_spk: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(root.len() + 4 + 1 + 2 + address_spk.len() + 1);
+        key.extend_from_slice(root);
+        key.extend_from_slice(scope.as_str().as_bytes());
+        key.push(b'/');
+        push_spk(&mut key, address_spk);
+        key.push(b'/');
+        key
+    }
+
+    fn address_token_prefix(
+        root: &[u8],
+        scope: TokenActivityScope,
+        address_spk: &[u8],
+        token: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut key =
+            Vec::with_capacity(root.len() + 4 + 1 + 2 + address_spk.len() + 1 + 12 + 1);
+        key.extend_from_slice(root);
+        key.extend_from_slice(scope.as_str().as_bytes());
+        key.push(b'/');
+        push_spk(&mut key, address_spk);
+        key.push(b'/');
+        key.extend_from_slice(&token.block.to_be_bytes());
+        key.extend_from_slice(&token.tx.to_be_bytes());
+        key.push(b'/');
+        key
+    }
+
     pub fn token_activity_prefix(
         &self,
         scope: TokenActivityScope,
@@ -80,6 +113,45 @@ impl<'a> TokenDataTable<'a> {
         token: &SchemaAlkaneId,
     ) -> Vec<u8> {
         Self::token_prefix(TOKEN_ACTIVITY_AMOUNT_ROOT, scope, token)
+    }
+
+    pub fn address_activity_prefix(
+        &self,
+        scope: TokenActivityScope,
+        address_spk: &[u8],
+    ) -> Vec<u8> {
+        Self::address_prefix(ADDRESS_ACTIVITY_TS_ROOT, scope, address_spk)
+    }
+
+    pub fn address_activity_amount_prefix(
+        &self,
+        scope: TokenActivityScope,
+        address_spk: &[u8],
+    ) -> Vec<u8> {
+        Self::address_prefix(ADDRESS_ACTIVITY_AMOUNT_ROOT, scope, address_spk)
+    }
+
+    pub fn address_token_activity_prefix(
+        &self,
+        scope: TokenActivityScope,
+        address_spk: &[u8],
+        token: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        Self::address_token_prefix(ADDRESS_TOKEN_ACTIVITY_TS_ROOT, scope, address_spk, token)
+    }
+
+    pub fn address_token_activity_amount_prefix(
+        &self,
+        scope: TokenActivityScope,
+        address_spk: &[u8],
+        token: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        Self::address_token_prefix(
+            ADDRESS_TOKEN_ACTIVITY_AMOUNT_ROOT,
+            scope,
+            address_spk,
+            token,
+        )
     }
 
     pub fn token_activity_key(
@@ -110,6 +182,80 @@ impl<'a> TokenDataTable<'a> {
         kind: TokenActivityKind,
     ) -> Vec<u8> {
         let mut key = self.token_activity_amount_prefix(scope, token);
+        key.extend_from_slice(&amount.to_be_bytes());
+        key.extend_from_slice(&timestamp.to_be_bytes());
+        key.extend_from_slice(txid);
+        key.extend_from_slice(&ordinal.to_be_bytes());
+        key.push(activity_kind_code(kind));
+        key
+    }
+
+    pub fn address_activity_key(
+        &self,
+        scope: TokenActivityScope,
+        address_spk: &[u8],
+        timestamp: u64,
+        txid: &[u8; 32],
+        ordinal: u32,
+        kind: TokenActivityKind,
+    ) -> Vec<u8> {
+        let mut key = self.address_activity_prefix(scope, address_spk);
+        key.extend_from_slice(&timestamp.to_be_bytes());
+        key.extend_from_slice(txid);
+        key.extend_from_slice(&ordinal.to_be_bytes());
+        key.push(activity_kind_code(kind));
+        key
+    }
+
+    pub fn address_activity_amount_key(
+        &self,
+        scope: TokenActivityScope,
+        address_spk: &[u8],
+        amount: u128,
+        timestamp: u64,
+        txid: &[u8; 32],
+        ordinal: u32,
+        kind: TokenActivityKind,
+    ) -> Vec<u8> {
+        let mut key = self.address_activity_amount_prefix(scope, address_spk);
+        key.extend_from_slice(&amount.to_be_bytes());
+        key.extend_from_slice(&timestamp.to_be_bytes());
+        key.extend_from_slice(txid);
+        key.extend_from_slice(&ordinal.to_be_bytes());
+        key.push(activity_kind_code(kind));
+        key
+    }
+
+    pub fn address_token_activity_key(
+        &self,
+        scope: TokenActivityScope,
+        address_spk: &[u8],
+        token: &SchemaAlkaneId,
+        timestamp: u64,
+        txid: &[u8; 32],
+        ordinal: u32,
+        kind: TokenActivityKind,
+    ) -> Vec<u8> {
+        let mut key = self.address_token_activity_prefix(scope, address_spk, token);
+        key.extend_from_slice(&timestamp.to_be_bytes());
+        key.extend_from_slice(txid);
+        key.extend_from_slice(&ordinal.to_be_bytes());
+        key.push(activity_kind_code(kind));
+        key
+    }
+
+    pub fn address_token_activity_amount_key(
+        &self,
+        scope: TokenActivityScope,
+        address_spk: &[u8],
+        token: &SchemaAlkaneId,
+        amount: u128,
+        timestamp: u64,
+        txid: &[u8; 32],
+        ordinal: u32,
+        kind: TokenActivityKind,
+    ) -> Vec<u8> {
+        let mut key = self.address_token_activity_amount_prefix(scope, address_spk, token);
         key.extend_from_slice(&amount.to_be_bytes());
         key.extend_from_slice(&timestamp.to_be_bytes());
         key.extend_from_slice(txid);
@@ -279,21 +425,86 @@ impl TokenDataProvider {
         params: GetTokenActivityPageParams,
     ) -> Result<GetTokenActivityPageResult> {
         let table = self.table();
-        let prefix = match params.sort_by {
-            TokenActivitySortField::Timestamp => {
-                table.token_activity_prefix(params.scope, &params.token)
+        let source_sort = if params.start_time.is_some() || params.end_time.is_some() {
+            TokenActivitySortField::Timestamp
+        } else {
+            params.sort_by
+        };
+        let prefix = match source_sort {
+            TokenActivitySortField::Timestamp => table.token_activity_prefix(params.scope, &params.token),
+            TokenActivitySortField::Amount => table.token_activity_amount_prefix(params.scope, &params.token),
+        };
+        self.get_activity_page_from_prefix(
+            prefix,
+            params.blockhash,
+            params.kind,
+            source_sort,
+            params.sort_by,
+            params.dir,
+            params.offset,
+            params.limit,
+            params.start_time,
+            params.end_time,
+        )
+    }
+
+    pub fn get_address_activity_page(
+        &self,
+        params: GetAddressActivityPageParams,
+    ) -> Result<GetTokenActivityPageResult> {
+        let table = self.table();
+        let source_sort = if params.start_time.is_some() || params.end_time.is_some() {
+            TokenActivitySortField::Timestamp
+        } else {
+            params.sort_by
+        };
+        let prefix = match (params.token, source_sort) {
+            (Some(token), TokenActivitySortField::Timestamp) => {
+                table.address_token_activity_prefix(params.scope, &params.address_spk, &token)
             }
-            TokenActivitySortField::Amount => {
-                table.token_activity_amount_prefix(params.scope, &params.token)
+            (Some(token), TokenActivitySortField::Amount) => table
+                .address_token_activity_amount_prefix(params.scope, &params.address_spk, &token),
+            (None, TokenActivitySortField::Timestamp) => {
+                table.address_activity_prefix(params.scope, &params.address_spk)
+            }
+            (None, TokenActivitySortField::Amount) => {
+                table.address_activity_amount_prefix(params.scope, &params.address_spk)
             }
         };
-        let blockhash = params.blockhash.resolve(self.view_blockhash);
+        self.get_activity_page_from_prefix(
+            prefix,
+            params.blockhash,
+            params.kind,
+            source_sort,
+            params.sort_by,
+            params.dir,
+            params.offset,
+            params.limit,
+            params.start_time,
+            params.end_time,
+        )
+    }
+
+    fn get_activity_page_from_prefix(
+        &self,
+        prefix: Vec<u8>,
+        blockhash: StateAt,
+        kind: Option<TokenActivityKind>,
+        source_sort: TokenActivitySortField,
+        requested_sort: TokenActivitySortField,
+        dir: SortDir,
+        offset: usize,
+        limit: usize,
+        start_time: Option<u64>,
+        end_time: Option<u64>,
+    ) -> Result<GetTokenActivityPageResult> {
+        let blockhash = blockhash.resolve(self.view_blockhash);
         let mut entries: Vec<(SchemaTokenActivityV1, (u128, u64, u32, [u8; 32]))> = self
             .raw_scan_prefix_entries(&prefix, blockhash)?
             .into_iter()
             .filter_map(|(k, v)| {
                 let row = SchemaTokenActivityV1::try_from_slice(&v).ok()?;
-                let sort_meta = match params.sort_by {
+                let sort_meta = match source_sort {
                     TokenActivitySortField::Timestamp => self
                         .parse_timestamp_sort_key(&prefix, &k)
                         .map(|(ts, ordinal, txid)| (0, ts, ordinal, txid))
@@ -304,17 +515,48 @@ impl TokenDataProvider {
                 };
                 Some((row, sort_meta))
             })
-            .filter(|(entry, _)| params.kind.map(|k| entry.kind == k).unwrap_or(true))
             .collect();
-        entries.sort_by(|a, b| a.1.cmp(&b.1));
-        if matches!(params.dir, SortDir::Desc) {
+
+        if matches!(source_sort, TokenActivitySortField::Timestamp)
+            && (start_time.is_some() || end_time.is_some())
+        {
+            entries.sort_by(|a, b| a.1.cmp(&b.1));
+            let start_idx = start_time
+                .map(|target| entries.partition_point(|(_, meta)| meta.1 < target))
+                .unwrap_or(0);
+            let end_idx = end_time
+                .map(|target| entries.partition_point(|(_, meta)| meta.1 <= target))
+                .unwrap_or(entries.len());
+            entries = entries
+                .into_iter()
+                .skip(start_idx)
+                .take(end_idx.saturating_sub(start_idx))
+                .collect();
+        }
+
+        entries = entries
+            .into_iter()
+            .filter(|(entry, _)| kind.map(|k| entry.kind == k).unwrap_or(true))
+            .filter(|(entry, _)| start_time.map(|s| entry.timestamp >= s).unwrap_or(true))
+            .filter(|(entry, _)| end_time.map(|e| entry.timestamp <= e).unwrap_or(true))
+            .collect();
+
+        match requested_sort {
+            TokenActivitySortField::Timestamp => {
+                entries.sort_by(|a, b| timestamp_sort_tuple(&a.0).cmp(&timestamp_sort_tuple(&b.0)));
+            }
+            TokenActivitySortField::Amount => {
+                entries.sort_by(|a, b| amount_sort_tuple(&a.0).cmp(&amount_sort_tuple(&b.0)));
+            }
+        }
+        if matches!(dir, SortDir::Desc) {
             entries.reverse();
         }
         let total = entries.len();
         let page = entries
             .into_iter()
-            .skip(params.offset)
-            .take(params.limit)
+            .skip(offset)
+            .take(limit)
             .map(|(entry, _)| entry)
             .collect();
         Ok(GetTokenActivityPageResult { entries: page, total })
@@ -349,6 +591,22 @@ pub struct GetTokenActivityPageParams {
     pub scope: TokenActivityScope,
     pub sort_by: TokenActivitySortField,
     pub dir: SortDir,
+    pub start_time: Option<u64>,
+    pub end_time: Option<u64>,
+}
+
+pub struct GetAddressActivityPageParams {
+    pub blockhash: StateAt,
+    pub address_spk: Vec<u8>,
+    pub token: Option<SchemaAlkaneId>,
+    pub offset: usize,
+    pub limit: usize,
+    pub kind: Option<TokenActivityKind>,
+    pub scope: TokenActivityScope,
+    pub sort_by: TokenActivitySortField,
+    pub dir: SortDir,
+    pub start_time: Option<u64>,
+    pub end_time: Option<u64>,
 }
 
 pub struct GetTokenActivityPageResult {
@@ -371,9 +629,23 @@ pub fn amount_from_row(row: &SchemaTokenActivityV1) -> u128 {
     row.token_delta.unsigned_abs()
 }
 
+fn timestamp_sort_tuple(row: &SchemaTokenActivityV1) -> (u64, u32, [u8; 32]) {
+    (row.timestamp, 0, row.txid)
+}
+
+fn amount_sort_tuple(row: &SchemaTokenActivityV1) -> (u128, u64, u32, [u8; 32]) {
+    (amount_from_row(row), row.timestamp, 0, row.txid)
+}
+
 pub fn scopes_for_source(source: TokenActivitySource) -> [TokenActivityScope; 2] {
     match source {
         TokenActivitySource::Market => [TokenActivityScope::All, TokenActivityScope::Market],
         TokenActivitySource::Mint => [TokenActivityScope::All, TokenActivityScope::Mint],
     }
+}
+
+fn push_spk(dst: &mut Vec<u8>, spk: &[u8]) {
+    let len = spk.len().min(u16::MAX as usize) as u16;
+    dst.extend_from_slice(&len.to_be_bytes());
+    dst.extend_from_slice(&spk[..len as usize]);
 }

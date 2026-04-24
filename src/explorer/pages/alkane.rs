@@ -24,9 +24,10 @@ use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::ammdata::config::AmmDataConfig;
+use crate::modules::ammdata::consts::{PRICE_SCALE, SATS_PER_BTC};
 use crate::modules::ammdata::schemas::Timeframe;
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, AmmDataTable, GetListKeysByPrefixParams,
+    AmmDataProvider, AmmDataTable, GetLatestBtcUsdPriceParams, GetListKeysByPrefixParams,
 };
 use crate::modules::essentials::storage::{
     BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
@@ -45,9 +46,10 @@ use crate::modules::tokendata::storage::{
 };
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
+use alloy_primitives::U256;
 use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Txid};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 const ADDR_SUFFIX_LEN: usize = 8;
@@ -257,6 +259,8 @@ struct TokenActivityRenderEntry {
     timestamp: u64,
     txid: String,
     kind_key: &'static str,
+    cpfp: bool,
+    mint_price_paid_usd: Option<String>,
     pool: Option<SchemaAlkaneId>,
     actor_address: Option<String>,
     token_delta: i128,
@@ -336,6 +340,8 @@ pub async fn alkane_page(
             scope: TokenActivityScope::All,
             sort_by: TokenActivitySortField::Timestamp,
             dir: TokenActivitySortDir::Desc,
+            start_time: None,
+            end_time: None,
         })
         .map(|res| res.total > 0)
         .unwrap_or(false);
@@ -648,14 +654,24 @@ pub async fn alkane_page(
                 scope: activity_filter.storage_scope(),
                 sort_by: activity_order.storage_sort(),
                 dir: activity_dir.storage_dir(),
+                start_time: None,
+                end_time: None,
             })
             .ok();
         let total = page_result.as_ref().map(|res| res.total).unwrap_or(0);
         let entries = page_result
             .map(|res| {
+                let mut btc_price_cache: HashMap<u32, Option<u128>> = HashMap::new();
                 res.entries
                     .into_iter()
-                    .map(|entry| build_token_activity_render_entry(entry, state.network))
+                    .map(|entry| {
+                        build_token_activity_render_entry(
+                            entry,
+                            state.network,
+                            &amm_provider,
+                            &mut btc_price_cache,
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -781,7 +797,12 @@ pub async fn alkane_page(
                                 (activity_icon)
                             }
                             div class="alkane-token-activity-summary-copy" {
-                                span class="alkane-token-activity-kind-label" { (activity_label) }
+                                div class="alkane-token-activity-kind-row" {
+                                    span class="alkane-token-activity-kind-label" { (activity_label) }
+                                    @if entry.kind_key == "mint" && entry.cpfp {
+                                        span class="pill small" { "CPFP Chain" }
+                                    }
+                                }
                                 div class="alkane-token-activity-meta" {
                                     div class="alkane-token-activity-time" data-ts-group="" {
                                         span hidden data-header-ts=(entry.timestamp) { (entry.timestamp) }
@@ -809,6 +830,11 @@ pub async fn alkane_page(
                             }
                             span class="alk-amt mono" { (fmt_signed_alkane_amount(entry.token_delta)) }
                             a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk_str}"))) { (coin_label.clone()) }
+                        }
+                        @if let Some(price_paid_usd) = entry.mint_price_paid_usd.as_ref() {
+                            div class="alkane-token-activity-flow-line neutral" {
+                                span class="alkane-token-activity-price-paid" { "Price paid: $" (price_paid_usd) " / " (coin_label.clone()) }
+                            }
                         }
                         @if entry.kind_key == "pool_create" {
                             div class="alkane-token-activity-flow-line neutral" {
@@ -1387,6 +1413,8 @@ fn token_short_label(
 fn build_token_activity_render_entry(
     activity: SchemaTokenActivityV1,
     network: bitcoin::Network,
+    amm_provider: &AmmDataProvider,
+    btc_price_cache: &mut HashMap<u32, Option<u128>>,
 ) -> TokenActivityRenderEntry {
     let kind_key = match activity.kind {
         TokenActivityKind::Buy => "trade_buy",
@@ -1402,16 +1430,58 @@ fn build_token_activity_render_entry(
         let spk = ScriptBuf::from_bytes(activity.address_spk.clone());
         spk_to_address_str(&spk, network)
     };
+    let mint_price_paid_usd = if matches!(activity.kind, TokenActivityKind::Mint) {
+        let btc_price_usd = *btc_price_cache.entry(activity.height).or_insert_with(|| {
+            amm_provider
+                .with_height(Some(activity.height as u64), true)
+                .ok()
+                .and_then(|view| {
+                    view.get_latest_btc_usd_price(GetLatestBtcUsdPriceParams {
+                        blockhash: StateAt::Latest,
+                    })
+                    .ok()
+                    .flatten()
+                })
+        });
+        format_mint_price_paid_usd(activity.mint_price_paid_sats, btc_price_usd)
+    } else {
+        None
+    };
 
     TokenActivityRenderEntry {
         timestamp: activity.timestamp,
         txid: Txid::from_byte_array(activity.txid).to_string(),
         kind_key,
+        cpfp: activity.cpfp,
+        mint_price_paid_usd,
         pool: activity.pool,
         actor_address,
         token_delta: activity.token_delta,
         counter: activity.counter_token.map(|counter_token| (counter_token, activity.counter_delta)),
     }
+}
+
+fn format_mint_price_paid_usd(
+    mint_price_paid_sats: [u8; 32],
+    btc_price_usd_scaled: Option<u128>,
+) -> Option<String> {
+    let btc_price_usd_scaled = btc_price_usd_scaled?;
+    let sats_scaled = U256::from_be_bytes(mint_price_paid_sats);
+    if sats_scaled.is_zero() {
+        return None;
+    }
+    let scale = U256::from(PRICE_SCALE);
+    let usd_scaled = sats_scaled.saturating_mul(U256::from(btc_price_usd_scaled))
+        / U256::from(PRICE_SCALE.saturating_mul(SATS_PER_BTC));
+    if usd_scaled.is_zero() {
+        return None;
+    }
+    let micros =
+        (usd_scaled.saturating_mul(U256::from(1_000_000u32)).saturating_add(scale / U256::from(2u8)))
+        / scale;
+    let whole = micros / U256::from(1_000_000u32);
+    let frac = (micros % U256::from(1_000_000u32)).to::<u32>();
+    Some(format!("{whole}.{:06}", frac))
 }
 
 fn token_activity_label(kind: &str) -> &'static str {
