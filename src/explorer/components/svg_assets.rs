@@ -1,4 +1,4 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 pub fn icon_left() -> Markup {
     html! {
@@ -122,6 +122,62 @@ pub fn icon_arrow_up_right() -> Markup {
     html! {
         svg class="icon" width="16" height="16" viewBox="0 0 256 256" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {
             path d="M204,64V168a12,12,0,0,1-24,0V93L72.49,200.49a12,12,0,0,1-17-17L163,76H88a12,12,0,0,1,0-24H192A12,12,0,0,1,204,64Z" {}
+        }
+    }
+}
+pub fn icon_activity() -> Markup {
+    html! {
+        svg class="icon" width="16" height="16" viewBox="0 0 256 256" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {
+            path d="M230,128a10,10,0,0,1-10,10H183.72l-24.84,62.09a10,10,0,0,1-18.77-.86L116.28,122.8,87.61,179.1A10,10,0,0,1,78.7,184H36a10,10,0,0,1,0-20H72.58l35.51-69.76a10,10,0,0,1,18.57,1.61l23.56,75.41,15.49-38.73A10,10,0,0,1,175,126h45A10,10,0,0,1,230,128Z" {}
+        }
+    }
+}
+pub fn icon_activity_trade_buy() -> Markup {
+    html! {
+        svg class="icon" width="16" height="16" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {
+            line x1="64" y1="192" x2="192" y2="64" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+            polyline points="88 64 192 64 192 168" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+        }
+    }
+}
+pub fn icon_activity_trade_sell() -> Markup {
+    html! {
+        svg class="icon" width="16" height="16" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {
+            line x1="64" y1="64" x2="192" y2="192" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+            polyline points="88 192 192 192 192 88" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+        }
+    }
+}
+pub fn icon_activity_add_liquidity() -> Markup {
+    html! {
+        svg class="icon" width="16" height="16" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {
+            circle cx="128" cy="128" r="96" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+            line x1="88" y1="128" x2="168" y2="128" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+            line x1="128" y1="88" x2="128" y2="168" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+        }
+    }
+}
+pub fn icon_activity_remove_liquidity() -> Markup {
+    html! {
+        svg class="icon" width="16" height="16" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {
+            line x1="88" y1="128" x2="168" y2="128" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+            circle cx="128" cy="128" r="96" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+        }
+    }
+}
+pub fn icon_activity_pool_create() -> Markup {
+    html! {
+        svg class="icon" width="16" height="16" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {
+            polyline points="32.7 76.92 128 129.08 223.3 76.92" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+            path d="M131.84,25l88,48.18a8,8,0,0,1,4.16,7v95.64a8,8,0,0,1-4.16,7l-88,48.18a8,8,0,0,1-7.68,0l-88-48.18a8,8,0,0,1-4.16-7V80.18a8,8,0,0,1,4.16-7l88-48.18A8,8,0,0,1,131.84,25Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+            line x1="128" y1="129.09" x2="128" y2="232" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+        }
+    }
+}
+pub fn icon_activity_mint() -> Markup {
+    html! {
+        svg class="icon" width="16" height="16" viewBox="0 0 256 256" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {
+            path d="M240,128a15.79,15.79,0,0,1-10.5,15l-63.44,23.07L143,229.5a16,16,0,0,1-30,0L89.94,166.06,26.5,143a16,16,0,0,1,0-30L89.94,89.94,113,26.5a16,16,0,0,1,30,0l23.07,63.44L229.5,113A15.79,15.79,0,0,1,240,128Z" {}
         }
     }
 }

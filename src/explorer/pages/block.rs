@@ -13,30 +13,32 @@ use maud::html;
 use serde::Deserialize;
 
 use crate::alkanes::trace::{
-    get_espo_block_with_opts, traces_for_block_as_prost, EspoSandshrewLikeTrace,
-    EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoTrace, GetEspoBlockOpts,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoTrace,
+    GetEspoBlockOpts, get_espo_block_with_opts,
 };
 use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_network,
 };
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::header::{
-    header, header_scripts, HeaderPillTone, HeaderProps, HeaderSummaryItem,
+    HeaderPillTone, HeaderProps, HeaderSummaryItem, header, header_scripts,
 };
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
     icon_arrow_up_right, icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
-use crate::explorer::components::tx_view::{render_tx, TxPill, TxPillTone};
+use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
+use crate::explorer::pages::common::format_fee_rate;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    address_index_list_id_alkane_block_txs, get_address_index_list_len, get_address_index_list_range,
-    load_tx_pointer_blob_v3_by_id, load_tx_summary_v2, AddressIndexListKind, AlkaneTxSummary,
+    AddressIndexListKind, AlkaneTxSummary, address_index_list_id_alkane_block_txs,
+    get_address_index_list_len, get_address_index_list_range, load_tx_pointer_blob_v3_by_id,
+    load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
-    get_outpoint_balances_with_spent_batch, OutpointLookup,
+    OutpointLookup, get_outpoint_balances_with_spent_batch,
 };
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
@@ -49,10 +51,6 @@ fn format_with_commas(n: u64) -> String {
         i -= 3;
     }
     s
-}
-
-fn format_sats_short(n: u64) -> String {
-    format!("{} sats", format_with_commas(n))
 }
 
 fn mempool_block_url(network: bitcoin::Network, block_hash: &BlockHash) -> Option<String> {
@@ -218,9 +216,14 @@ pub async fn block_page(
                 .into_response();
         }
     };
-    let hdr = rpc.get_block_header_info(&block_hash).ok();
     let block_hash_hex = block_hash.to_string();
-    let block_stats = rpc.get_block_stats(height).ok();
+    let block_summary = essentials_provider
+        .get_block_summary(crate::modules::essentials::storage::GetBlockSummaryParams {
+            blockhash: StateAt::Latest,
+            height: height as u32,
+        })
+        .ok()
+        .and_then(|resp| resp.summary);
 
     let _tab = q.tab.unwrap_or_else(|| "txs".to_string());
     let page = q.page.unwrap_or(1).max(1);
@@ -475,31 +478,18 @@ pub async fn block_page(
         }
     }
 
-    let block_time: Option<u64> = hdr
+    let block_time: Option<u64> = block_summary
         .as_ref()
-        .map(|h| h.time as u64)
-        .or_else(|| block_stats.as_ref().map(|s| s.time));
-    let confirmations = hdr
+        .and_then(|summary| deserialize::<bitcoin::blockdata::block::Header>(&summary.header).ok())
+        .map(|header| header.time as u64);
+    let confirmations = (tip >= height).then_some(tip - height + 1);
+    let traces_count: Option<usize> =
+        block_summary.as_ref().map(|summary| summary.trace_count as usize);
+    let tx_count: Option<u64> = block_summary
         .as_ref()
-        .and_then(|h| (h.confirmations >= 0).then_some(h.confirmations as u64))
-        .or_else(|| (tip >= height).then_some(tip - height + 1));
-    let traces_count: Option<usize> = if espo_indexed {
-        match traces_for_block_as_prost(height) {
-            Ok(v) => Some(v.len()),
-            Err(e) => {
-                eprintln!("[block_page] failed to fetch traces for block {height}: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let tx_count: Option<u64> = hdr
-        .as_ref()
-        .map(|h| h.n_tx as u64)
-        .or_else(|| block_stats.as_ref().map(|s| s.txs as u64))
+        .and_then(|summary| (summary.tx_count > 0).then_some(summary.tx_count as u64))
         .or_else(|| espo_block.as_ref().map(|b| b.tx_count as u64));
-    let avg_fee_sat: Option<u64> = block_stats.as_ref().map(|s| s.avg_fee.to_sat());
+    let median_fee_rate: Option<f64> = block_summary.as_ref().map(|summary| summary.fee_median);
 
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
     summary_items.push(HeaderSummaryItem {
@@ -529,9 +519,9 @@ pub async fn block_page(
         },
     });
     summary_items.push(HeaderSummaryItem {
-        label: "Avg fee".to_string(),
-        value: match avg_fee_sat {
-            Some(fee) => html! { span class="summary-value" { (format_sats_short(fee)) } },
+        label: "Median feerate".to_string(),
+        value: match median_fee_rate {
+            Some(fee_rate) => html! { span class="summary-value" { (format_fee_rate(fee_rate)) } },
             None => html! { span class="summary-value muted" { "—" } },
         },
     });

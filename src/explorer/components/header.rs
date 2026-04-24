@@ -1,4 +1,4 @@
-use maud::{html, Markup, PreEscaped};
+use maud::{Markup, PreEscaped, html};
 
 use crate::explorer::components::svg_assets::{icon_check, icon_copy};
 
@@ -156,10 +156,14 @@ pub fn header_scripts() -> Markup {
     if (!Number.isFinite(raw)) return;
     const date = new Date(raw * 1000);
     const formatter = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-    tsNode.textContent = formatter.format(date);
+    const formattedDate = formatter.format(date);
+    tsNode.textContent = formattedDate;
     const relNode = group.querySelector('[data-header-ts-rel]');
     if (relNode) {
-      relNode.textContent = `(${formatRel(raw)})`;
+      relNode.textContent = relNode.hasAttribute('data-rel-only')
+        ? formatRel(raw)
+        : `(${formatRel(raw)})`;
+      relNode.title = formattedDate;
     }
   });
 })();

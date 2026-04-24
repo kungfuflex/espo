@@ -39,6 +39,7 @@ use crate::modules::essentials::storage::preload_block_summary_cache;
 use crate::modules::oylapi::main::OylApi;
 use crate::modules::pizzafun::main::Pizzafun;
 use crate::modules::subfrost::main::Subfrost;
+use crate::modules::tokendata::main::TokenData;
 use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
 
@@ -64,6 +65,100 @@ pub use espo::{ESPO_HEIGHT, SAFE_TIP};
 use tokio::runtime::Builder as TokioBuilder;
 
 const NO_REWIND: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetashrewCanonicalityWaitKind {
+    TipBehind,
+    MissingHash,
+    HashMismatch,
+}
+
+impl MetashrewCanonicalityWaitKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            MetashrewCanonicalityWaitKind::TipBehind => "metashrew_tip_behind",
+            MetashrewCanonicalityWaitKind::MissingHash => "metashrew_missing_height_hash",
+            MetashrewCanonicalityWaitKind::HashMismatch => "metashrew_hash_mismatch",
+        }
+    }
+}
+
+#[derive(Default)]
+struct CanonicalityWaitTracker {
+    last_height: Option<u32>,
+    last_kind: Option<MetashrewCanonicalityWaitKind>,
+    attempts: u32,
+}
+
+impl CanonicalityWaitTracker {
+    fn bump(&mut self, height: u32, kind: MetashrewCanonicalityWaitKind) -> u32 {
+        if self.last_height == Some(height) && self.last_kind == Some(kind) {
+            self.attempts = self.attempts.saturating_add(1);
+        } else {
+            self.last_height = Some(height);
+            self.last_kind = Some(kind);
+            self.attempts = 1;
+        }
+        self.attempts
+    }
+
+    fn reset(&mut self) {
+        self.last_height = None;
+        self.last_kind = None;
+        self.attempts = 0;
+    }
+}
+
+fn classify_metashrew_canonicality_wait(
+    err: &anyhow::Error,
+) -> Option<MetashrewCanonicalityWaitKind> {
+    for cause in err.chain() {
+        let message = cause.to_string();
+        if message.contains("metashrew tip ") && message.contains(" is behind required height ") {
+            return Some(MetashrewCanonicalityWaitKind::TipBehind);
+        }
+        if message.contains("metashrew missing stored block hash at height ") {
+            return Some(MetashrewCanonicalityWaitKind::MissingHash);
+        }
+        if message.contains("metashrew hash mismatch at height ") {
+            return Some(MetashrewCanonicalityWaitKind::HashMismatch);
+        }
+    }
+    None
+}
+
+fn canonicality_retry_delay(attempt: u32) -> Duration {
+    if attempt >= 8 {
+        Duration::from_secs(15)
+    } else if attempt >= 4 {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
+fn should_log_canonicality_wait(attempt: u32) -> bool {
+    attempt <= 3 || attempt.is_power_of_two()
+}
+
+fn log_canonicality_wait(
+    stage: &str,
+    height: u32,
+    kind: MetashrewCanonicalityWaitKind,
+    attempt: u32,
+    retry_delay: Duration,
+    err: &anyhow::Error,
+) {
+    eprintln!(
+        "[reorg_wait] stage={} height={} reason={} attempt={} retry_in={} detail={}",
+        stage,
+        height,
+        kind.as_str(),
+        attempt,
+        fmt_duration(retry_delay),
+        err
+    );
+}
 
 fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> std::io::Result<()> {
     let db_root = Path::new(db_path);
@@ -240,7 +335,8 @@ async fn run_indexer_loop(
     let mut mempool_started = false;
     let mut logged_start = false;
     let mut safe_tip_hook_ran = false;
-    let mut reorg_poller_started = false;
+    let mut safe_tip_waits = CanonicalityWaitTracker::default();
+    let mut block_waits = CanonicalityWaitTracker::default();
     if cfg.reset_mempool_on_startup {
         if let Err(e) = reset_mempool_store() {
             eprintln!("[mempool] failed to reset store on startup: {e:?}");
@@ -257,6 +353,15 @@ async fn run_indexer_loop(
         .as_ref()
         .map(|backup| backup.blocks.iter().copied().collect())
         .unwrap_or_default();
+
+    {
+        let shutdown_for_poller = shutdown_requested.clone();
+        let rewind_target_for_poller = rewind_target.clone();
+        tokio::spawn(async move {
+            eprintln!("[reorg] poller started (10s cadence)");
+            run_reorg_poller(rewind_target_for_poller, shutdown_for_poller, genesis_height).await;
+        });
+    }
 
     loop {
         if shutdown_requested.load(Ordering::Relaxed) {
@@ -282,11 +387,29 @@ async fn run_indexer_loop(
         let tip = match get_safe_tip() {
             Ok(h) => h,
             Err(e) => {
+                if let Some(kind) = classify_metashrew_canonicality_wait(&e) {
+                    let attempt = safe_tip_waits.bump(next_height, kind);
+                    let retry_delay = canonicality_retry_delay(attempt);
+                    if should_log_canonicality_wait(attempt) {
+                        log_canonicality_wait(
+                            "safe_tip",
+                            next_height,
+                            kind,
+                            attempt,
+                            retry_delay,
+                            &e,
+                        );
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+                safe_tip_waits.reset();
                 eprintln!("[indexer] failed to fetch safe tip: {e:?}");
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
         };
+        safe_tip_waits.reset();
         update_safe_tip(tip);
         if let Some(prev_tip) = last_tip {
             if tip > prev_tip {
@@ -337,6 +460,7 @@ async fn run_indexer_loop(
                 .with_context(|| format!("failed to load espo block {next_height}"))
             {
                 Ok(espo_block) => {
+                    block_waits.reset();
                     // (Optional) include hash or tx count here as you like
                     let block_txids: Vec<Txid> = espo_block
                         .transactions
@@ -421,6 +545,23 @@ async fn run_indexer_loop(
                     }
                 }
                 Err(e) => {
+                    if let Some(kind) = classify_metashrew_canonicality_wait(&e) {
+                        let attempt = block_waits.bump(next_height, kind);
+                        let retry_delay = canonicality_retry_delay(attempt);
+                        if should_log_canonicality_wait(attempt) {
+                            log_canonicality_wait(
+                                "block_load",
+                                next_height,
+                                kind,
+                                attempt,
+                                retry_delay,
+                                &e,
+                            );
+                        }
+                        tokio::time::sleep(retry_delay).await;
+                        continue;
+                    }
+                    block_waits.reset();
                     eprintln!("[indexer] error at height {}: {e:?}", next_height);
                     // Don’t update EMA on failure; just wait and retry
                     tokio::time::sleep(POLL_INTERVAL).await;
@@ -432,16 +573,6 @@ async fn run_indexer_loop(
                     safe_tip_hook_ran = true;
                     run_safe_tip_hook(script, next_height, tip);
                 }
-            }
-            if !reorg_poller_started {
-                reorg_poller_started = true;
-                let shutdown_for_poller = shutdown_requested.clone();
-                let rewind_target_for_poller = rewind_target.clone();
-                tokio::spawn(async move {
-                    eprintln!("[reorg] poller started (10s cadence) after reaching safe tip");
-                    run_reorg_poller(rewind_target_for_poller, shutdown_for_poller, genesis_height)
-                        .await;
-                });
             }
             // Caught up; chill then poll again
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -497,6 +628,7 @@ async fn main() -> Result<()> {
     } else {
         eprintln!("[modules] ammdata disabled (missing config)");
     }
+    mods.register_module(TokenData::new());
     if get_module_config("subfrost").is_some() {
         mods.register_module(Subfrost::new());
     } else {

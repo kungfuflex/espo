@@ -239,11 +239,7 @@ pub fn bootstrap_pools_from_creation_records(
     if debug_enabled() || load_elapsed_ms >= 250 {
         eprintln!(
             "[debug] module=ammdata fn=bootstrap_pools_from_creation_records stage=load_creation_records blockhash={:?} height={} scanned={} inserted={} elapsed_ms={}",
-            blockhash,
-            height,
-            scanned,
-            inserted,
-            load_elapsed_ms
+            blockhash, height, scanned, inserted, load_elapsed_ms
         );
     }
 
@@ -504,6 +500,50 @@ pub fn discover_new_pools(
 
                 if let Ok(seq) = state.activity_acc.push(pool_id, block_ts, activity.clone()) {
                     state.index_acc.add(&pool_id, block_ts, seq, &activity);
+                    state.token_activity_writes.push((
+                        table.token_activity_key(
+                            &defs.base_alkane_id,
+                            block_ts,
+                            seq,
+                            activity.kind,
+                            &pool_id,
+                        ),
+                        Vec::new(),
+                    ));
+                    state.token_activity_amount_writes.push((
+                        table.token_activity_amount_key(
+                            &defs.base_alkane_id,
+                            0,
+                            block_ts,
+                            seq,
+                            activity.kind,
+                            &pool_id,
+                        ),
+                        Vec::new(),
+                    ));
+                    if defs.quote_alkane_id != defs.base_alkane_id {
+                        state.token_activity_writes.push((
+                            table.token_activity_key(
+                                &defs.quote_alkane_id,
+                                block_ts,
+                                seq,
+                                activity.kind,
+                                &pool_id,
+                            ),
+                            Vec::new(),
+                        ));
+                        state.token_activity_amount_writes.push((
+                            table.token_activity_amount_key(
+                                &defs.quote_alkane_id,
+                                0,
+                                block_ts,
+                                seq,
+                                activity.kind,
+                                &pool_id,
+                            ),
+                            Vec::new(),
+                        ));
+                    }
                     state
                         .pool_creations_writes
                         .push((table.pool_creations_key(block_ts, seq, &pool_id), Vec::new()));

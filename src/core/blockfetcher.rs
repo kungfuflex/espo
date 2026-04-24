@@ -3,18 +3,26 @@ use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use anyhow::{Context, Result, anyhow};
 use bitcoincore_rpc::RpcApi;
 use bitcoincore_rpc::bitcoin::hashes::Hash; // for to_byte_array()
-use bitcoincore_rpc::bitcoin::{Block, BlockHash, Network, consensus};
+use bitcoincore_rpc::bitcoin::{
+    Block, BlockHash, CompactTarget, Network, Transaction, TxMerkleNode, block, consensus,
+};
 use borsh::{BorshDeserialize, BorshSerialize};
+use serde::Deserialize;
+use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::config::{get_bitcoind_rpc_client, get_espo_db};
 use crate::consts::alkanes_genesis_block;
 use crate::runtime::mdb::Mdb;
+use crate::utils::fee_rates::{
+    BlockFeeRateSummary, compute_fee_rate_summary, fee_rate_entry_from_weight_and_btc_fee,
+};
 
 /// === Tuning ==================================================================
 /// Max expected payload size from blk header (sanity).
@@ -27,6 +35,33 @@ const NEAR_TIP_RPC_THRESHOLD: u32 = 6_000;
 pub trait BlockSource {
     /// Returns the full block for `height`. `tip` is used to optionally route near-tip to RPC.
     fn get_block_by_height(&self, height: u32, tip: u32) -> Result<Block>;
+
+    fn get_block_result_by_height(&self, height: u32, tip: u32) -> Result<BlockFetchResult> {
+        Ok(BlockFetchResult { block: self.get_block_by_height(height, tip)?, fee_summary: None })
+    }
+}
+
+pub struct BlockFetchResult {
+    pub block: Block,
+    pub fee_summary: Option<BlockFeeRateSummary>,
+}
+
+#[derive(Deserialize)]
+struct VerboseRpcBlock {
+    version: i32,
+    previousblockhash: Option<String>,
+    merkleroot: String,
+    time: u32,
+    bits: String,
+    nonce: u32,
+    tx: Vec<VerboseRpcTx>,
+}
+
+#[derive(Deserialize)]
+struct VerboseRpcTx {
+    hex: String,
+    weight: u64,
+    fee: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -660,10 +695,79 @@ impl BlkOrRpcBlockSource {
         self.decoded_cache.lock().unwrap().blocks.insert(*hash, blk.clone());
         Ok(blk)
     }
+
+    fn get_block_result_from_rpc(&self, hash: &BlockHash) -> Result<BlockFetchResult> {
+        let verbose: VerboseRpcBlock = match self
+            .rpc
+            .call("getblock", &[json!(hash.to_string()), json!(3)])
+        {
+            Ok(block) => block,
+            Err(err) => {
+                eprintln!(
+                    "[BLOCKFETCHER] verbose getblock({hash}, 3) failed; falling back to raw block without fee range: {err:?}"
+                );
+                let block = self
+                    .rpc
+                    .get_block(hash)
+                    .with_context(|| format!("bitcoind: getblock({hash})"))?;
+                return Ok(BlockFetchResult { block, fee_summary: None });
+            }
+        };
+
+        let previousblockhash = verbose
+            .previousblockhash
+            .as_deref()
+            .map(BlockHash::from_str)
+            .transpose()
+            .context("parse previousblockhash")?
+            .unwrap_or_else(BlockHash::all_zeros);
+        let merkle_root = TxMerkleNode::from_str(&verbose.merkleroot)
+            .context("parse verbose block merkleroot")?;
+        let bits = u32::from_str_radix(verbose.bits.trim_start_matches("0x"), 16)
+            .context("parse verbose block bits")?;
+
+        let mut transactions = Vec::with_capacity(verbose.tx.len());
+        let mut fee_entries = Vec::new();
+        for tx in verbose.tx {
+            let raw = hex::decode(&tx.hex).context("decode verbose tx hex")?;
+            let transaction: Transaction =
+                consensus::encode::deserialize(&raw).context("decode verbose tx")?;
+            if let Some(entry) = fee_rate_entry_from_weight_and_btc_fee(tx.weight, tx.fee) {
+                fee_entries.push(entry);
+            }
+            transactions.push(transaction);
+        }
+
+        let block = Block {
+            header: block::Header {
+                version: block::Version::from_consensus(verbose.version),
+                prev_blockhash: previousblockhash,
+                merkle_root,
+                time: verbose.time,
+                bits: CompactTarget::from_consensus(bits),
+                nonce: verbose.nonce,
+            },
+            txdata: transactions,
+        };
+
+        if block.block_hash() != *hash {
+            return Err(anyhow!(
+                "verbose getblock reconstructed hash mismatch: expected {} got {}",
+                hash,
+                block.block_hash()
+            ));
+        }
+
+        Ok(BlockFetchResult { block, fee_summary: Some(compute_fee_rate_summary(fee_entries)) })
+    }
 }
 
 impl BlockSource for BlkOrRpcBlockSource {
     fn get_block_by_height(&self, height: u32, tip: u32) -> Result<Block> {
+        Ok(self.get_block_result_by_height(height, tip)?.block)
+    }
+
+    fn get_block_result_by_height(&self, height: u32, tip: u32) -> Result<BlockFetchResult> {
         let t0 = Instant::now();
         eprintln!(
             "[BLOCKFETCHER] request height={} (tip={}, Δ={}) mode={:?}",
@@ -679,12 +783,9 @@ impl BlockSource for BlkOrRpcBlockSource {
                 .rpc
                 .get_block_hash(height as u64)
                 .with_context(|| format!("bitcoind: getblockhash({height})"))?;
-            let blk = self
-                .rpc
-                .get_block(&hash)
-                .with_context(|| format!("bitcoind: getblock({hash})"))?;
+            let result = self.get_block_result_from_rpc(&hash)?;
             eprintln!("[BLOCKFETCHER] height={} RPC-only ok in {:.2?}", height, t0.elapsed());
-            return Ok(blk);
+            return Ok(result);
         }
 
         // 0) First: consult the preloaded height→hash map (already filtered to active chain)
@@ -696,7 +797,7 @@ impl BlockSource for BlkOrRpcBlockSource {
                 );
                 let blk = self.read_block_from_loc(&h, &loc)?;
                 eprintln!("[BLOCKFETCHER] height={} BLK ok in {:.2?}", height, t0.elapsed());
-                return Ok(blk);
+                return Ok(BlockFetchResult { block: blk, fee_summary: None });
             }
             // If the map has the hash but location is missing (shouldn't happen), fall through.
         }
@@ -714,12 +815,9 @@ impl BlockSource for BlkOrRpcBlockSource {
             && tip.saturating_sub(height) <= NEAR_TIP_RPC_THRESHOLD
         {
             eprintln!("[BLOCKFETCHER] height={} using RPC (near tip)", height);
-            let blk = self
-                .rpc
-                .get_block(&hash)
-                .with_context(|| format!("bitcoind: getblock({hash})"))?;
+            let result = self.get_block_result_from_rpc(&hash)?;
             eprintln!("[BLOCKFETCHER] height={} RPC ok in {:.2?}", height, t0.elapsed());
-            return Ok(blk);
+            return Ok(result);
         }
 
         // 2) Try local index → blk file
@@ -730,7 +828,7 @@ impl BlockSource for BlkOrRpcBlockSource {
             );
             let blk = self.read_block_from_loc(&hash, &loc)?;
             eprintln!("[BLOCKFETCHER] height={} BLK ok in {:.2?}", height, t0.elapsed());
-            return Ok(blk);
+            return Ok(BlockFetchResult { block: blk, fee_summary: None });
         }
 
         // 3) Lazily index files until found (but stop once stop-hash is present)
@@ -743,7 +841,7 @@ impl BlockSource for BlkOrRpcBlockSource {
                 );
                 let blk = self.read_block_from_loc(&hash, &loc)?;
                 eprintln!("[BLOCKFETCHER] height={} BLK ok in {:.2?}", height, t0.elapsed());
-                return Ok(blk);
+                return Ok(BlockFetchResult { block: blk, fee_summary: None });
             }
         }
 
@@ -756,12 +854,9 @@ impl BlockSource for BlkOrRpcBlockSource {
         }
 
         eprintln!("[BLOCKFETCHER] height={} fallback to RPC (not in local blk files)", height);
-        let blk = self
-            .rpc
-            .get_block(&hash)
-            .with_context(|| format!("bitcoind: getblock({hash})"))?;
+        let result = self.get_block_result_from_rpc(&hash)?;
         eprintln!("[BLOCKFETCHER] height={} RPC ok in {:.2?}", height, t0.elapsed());
-        Ok(blk)
+        Ok(result)
     }
 }
 

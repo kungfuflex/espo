@@ -19,8 +19,11 @@ use std::sync::{Arc, RwLock};
 use super::consts::PRIORITY_SERIES_ALKANES;
 use super::rpc;
 use super::storage::{
-    GetIndexHeightParams as PizzafunGetIndexHeightParams, GetSeriesEntriesByNameParams,
-    PizzafunProvider, SeriesEntry, series_id_base_from_name,
+    GetIndexHeightParams as PizzafunGetIndexHeightParams,
+    GetSeriesEntriesByNameParams,
+    PizzafunProvider,
+    SeriesEntry,
+    series_id_base_from_name,
 };
 
 fn parse_alkane_id_str(s: &str) -> Option<SchemaAlkaneId> {
@@ -92,12 +95,85 @@ impl Pizzafun {
 
     fn priority_index_map() -> HashMap<SchemaAlkaneId, usize> {
         let mut priority_index: HashMap<SchemaAlkaneId, usize> = HashMap::new();
-        for (idx, raw) in PRIORITY_SERIES_ALKANES.iter().enumerate() {
+        for (idx, (raw, _name)) in PRIORITY_SERIES_ALKANES.iter().enumerate() {
             if let Some(id) = parse_alkane_id_str(raw) {
                 priority_index.entry(id).or_insert(idx);
             }
         }
         priority_index
+    }
+
+    fn rebuild_series_for_name(
+        &self,
+        name: &str,
+        new_entries: Vec<SeriesEntry>,
+        blockhash: StateAt,
+    ) -> Result<()> {
+        if new_entries.is_empty() {
+            return Ok(());
+        }
+        let Some(series_base) = series_id_base_from_name(name) else { return Ok(()) };
+        let existing = self.provider().get_series_entries_by_name(GetSeriesEntriesByNameParams {
+            blockhash,
+            name_norm: name.to_string(),
+        })?;
+
+        let mut combined = existing.clone();
+        let mut existing_ids: HashSet<SchemaAlkaneId> = existing.iter().map(|e| e.alkane_id).collect();
+        for entry in new_entries {
+            if existing_ids.insert(entry.alkane_id) {
+                combined.push(entry);
+            }
+        }
+        if combined.len() == existing.len() {
+            return Ok(());
+        }
+
+        let priority_index = Self::priority_index_map();
+        Self::sort_series_entries(&mut combined, &priority_index);
+
+        let mut updated: Vec<SeriesEntry> = Vec::with_capacity(combined.len());
+        for (idx, entry) in combined.into_iter().enumerate() {
+            let series_id = if idx == 0 {
+                series_base.clone()
+            } else {
+                format!("{}-{}", series_base, idx + 1)
+            };
+            updated.push(SeriesEntry {
+                series_id,
+                alkane_id: entry.alkane_id,
+                creation_height: entry.creation_height,
+            });
+        }
+
+        self.provider().update_series_for_name(&existing, &updated)
+    }
+
+    fn seed_priority_series_entries(&self) -> Result<()> {
+        let mut by_name: HashMap<String, Vec<SeriesEntry>> = HashMap::new();
+
+        for (raw_id, raw_name) in PRIORITY_SERIES_ALKANES {
+            let Some(alkane_id) = parse_alkane_id_str(raw_id) else { continue };
+            let Some(name_norm) = normalize_alkane_name(raw_name) else { continue };
+            if self
+                .provider()
+                .priority_family_seeded(&name_norm, alkane_id, StateAt::Latest)?
+            {
+                continue;
+            }
+            by_name.entry(name_norm).or_default().push(SeriesEntry {
+                series_id: String::new(),
+                alkane_id,
+                // Alkane ids are block:tx, so the block component is the creation height.
+                creation_height: alkane_id.block,
+            });
+        }
+
+        for (name, entries) in by_name {
+            self.rebuild_series_for_name(&name, entries, StateAt::Latest)?;
+        }
+
+        Ok(())
     }
 
     fn sort_series_entries(
@@ -139,6 +215,9 @@ impl EspoModule for Pizzafun {
         let essentials_provider = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
         self.essentials_provider = Some(essentials_provider);
         self.provider = Some(Arc::new(PizzafunProvider::new(mdb)));
+        if let Err(err) = self.seed_priority_series_entries() {
+            eprintln!("[pizzafun] failed to seed priority series entries: {err:#}");
+        }
         *self.index_height.write().unwrap() = self.load_index_height();
     }
 
@@ -186,43 +265,8 @@ impl EspoModule for Pizzafun {
             }
 
             if !by_name.is_empty() {
-                let priority_index = Self::priority_index_map();
-                for (name, mut new_entries) in by_name {
-                    let Some(series_base) = series_id_base_from_name(&name) else { continue };
-                    let existing = self.provider().get_series_entries_by_name(
-                        GetSeriesEntriesByNameParams {
-                            blockhash: StateAt::Block(block_hash),
-                            name_norm: name.clone(),
-                        },
-                    )?;
-                    if !existing.is_empty() {
-                        let mut existing_ids: HashSet<SchemaAlkaneId> =
-                            existing.iter().map(|e| e.alkane_id).collect();
-                        new_entries.retain(|e| existing_ids.insert(e.alkane_id));
-                    }
-                    if new_entries.is_empty() {
-                        continue;
-                    }
-
-                    let mut combined = existing.clone();
-                    combined.extend(new_entries);
-                    Self::sort_series_entries(&mut combined, &priority_index);
-
-                    let mut updated: Vec<SeriesEntry> = Vec::with_capacity(combined.len());
-                    for (idx, entry) in combined.into_iter().enumerate() {
-                        let series_id = if idx == 0 {
-                            series_base.clone()
-                        } else {
-                            format!("{}-{}", series_base, idx + 1)
-                        };
-                        updated.push(SeriesEntry {
-                            series_id,
-                            alkane_id: entry.alkane_id,
-                            creation_height: entry.creation_height,
-                        });
-                    }
-
-                    self.provider().update_series_for_name(&existing, &updated)?;
+                for (name, new_entries) in by_name {
+                    self.rebuild_series_for_name(&name, new_entries, StateAt::Block(block_hash))?;
                 }
             }
         }

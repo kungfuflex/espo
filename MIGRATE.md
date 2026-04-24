@@ -1,0 +1,1 @@
+ ./scripts/migrate_token_activity_amount.sh ./config.json --batch-size 5000 --log-every-pools 50

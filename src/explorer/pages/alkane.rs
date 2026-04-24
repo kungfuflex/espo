@@ -3,36 +3,50 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use hex;
-use maud::{html, Markup, PreEscaped};
+use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 
 use crate::explorer::components::alk_balances::render_alkane_balance_cards;
+use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
 use crate::explorer::components::header::header_scripts;
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
-    icon_caret_right, icon_dropdown_caret, icon_left, icon_right, icon_skip_left, icon_skip_right,
+    icon_activity, icon_activity_add_liquidity, icon_activity_pool_create,
+    icon_activity_remove_liquidity, icon_activity_trade_buy, icon_activity_trade_sell,
+    icon_activity_mint, icon_caret_right, icon_dropdown_caret, icon_left, icon_right,
+    icon_skip_left, icon_skip_right,
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
-    alkane_icon_url_unfiltered, alkane_meta, icon_bg_style, AlkaneMetaCache,
+    AlkaneMetaCache, alkane_icon_url_unfiltered, alkane_meta, icon_bg_style,
 };
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::schemas::Timeframe;
-use crate::modules::ammdata::storage::{AmmDataProvider, AmmDataTable, GetListKeysByPrefixParams};
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, AmmDataTable, GetListKeysByPrefixParams,
+};
 use crate::modules::essentials::storage::{
-    load_creation_record, BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId,
+    BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
+    spk_to_address_str,
 };
 use crate::modules::essentials::utils::balances::{
     get_alkane_balances, get_holders_for_alkane, get_total_received_for_alkane,
     get_transfer_volume_for_alkane,
 };
-use crate::modules::essentials::utils::inspections::{load_inspection, StoredInspectionMethod};
+use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
 use crate::modules::pizzafun::storage::{GetSeriesByAlkaneParams, PizzafunProvider};
+use crate::modules::tokendata::schemas::{SchemaTokenActivityV1, TokenActivityKind};
+use crate::modules::tokendata::storage::{
+    GetTokenActivityPageParams, SortDir as TokenActivitySortDir, TokenActivityScope,
+    TokenActivitySortField, TokenDataProvider,
+};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
+use bitcoin::hashes::Hash;
+use bitcoin::{ScriptBuf, Txid};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -44,6 +58,10 @@ const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward
 #[derive(Deserialize)]
 pub struct PageQuery {
     pub tab: Option<String>,
+    pub volume: Option<String>,
+    pub order: Option<String>,
+    pub dir: Option<String>,
+    pub filter: Option<String>,
     pub page: Option<usize>,
     pub limit: Option<usize>,
 }
@@ -51,18 +69,176 @@ pub struct PageQuery {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AlkaneTab {
     Holders,
+    Volume,
+    Activity,
     Inspect,
-    TransferVolume,
-    TotalReceived,
 }
 
 impl AlkaneTab {
     fn from_query(raw: Option<&str>) -> Self {
         match raw {
+            Some("activity") => AlkaneTab::Activity,
             Some("inspect") => AlkaneTab::Inspect,
-            Some("transfer_volume") => AlkaneTab::TransferVolume,
-            Some("total_received") => AlkaneTab::TotalReceived,
+            Some("volume") | Some("transfer_volume") | Some("total_received") => AlkaneTab::Volume,
             _ => AlkaneTab::Holders,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VolumeKind {
+    TransferVolume,
+    TotalReceived,
+}
+
+impl VolumeKind {
+    fn from_query(tab: Option<&str>, volume: Option<&str>) -> Self {
+        match (tab, volume) {
+            (Some("total_received"), _) | (_, Some("total_received")) => Self::TotalReceived,
+            _ => Self::TransferVolume,
+        }
+    }
+
+    fn query_value(self) -> &'static str {
+        match self {
+            Self::TransferVolume => "transfer_volume",
+            Self::TotalReceived => "total_received",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::TransferVolume => "Transfer Volume",
+            Self::TotalReceived => "Total Received",
+        }
+    }
+}
+
+fn activity_tab_url(
+    alk_str: &str,
+    page: usize,
+    limit: usize,
+    order: ActivityOrder,
+    dir: ActivityDir,
+    filter: ActivityFilter,
+) -> String {
+    explorer_path(&format!(
+        "/alkane/{alk_str}?tab=activity&order={}&dir={}&filter={}&page={page}&limit={limit}",
+        order.as_query(),
+        dir.as_query(),
+        filter.as_query(),
+    ))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivityOrder {
+    Timestamp,
+    Volume,
+}
+
+impl ActivityOrder {
+    fn from_query(raw: Option<&str>) -> Self {
+        match raw {
+            Some("volume") | Some("amount") => Self::Volume,
+            _ => Self::Timestamp,
+        }
+    }
+
+    fn as_query(self) -> &'static str {
+        match self {
+            Self::Timestamp => "timestamp",
+            Self::Volume => "volume",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Timestamp => "Timestamp",
+            Self::Volume => "Volume",
+        }
+    }
+
+    fn storage_sort(self) -> TokenActivitySortField {
+        match self {
+            Self::Timestamp => TokenActivitySortField::Timestamp,
+            Self::Volume => TokenActivitySortField::Amount,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivityDir {
+    Desc,
+    Asc,
+}
+
+impl ActivityDir {
+    fn from_query(raw: Option<&str>) -> Self {
+        match raw {
+            Some("asc") => Self::Asc,
+            _ => Self::Desc,
+        }
+    }
+
+    fn as_query(self) -> &'static str {
+        match self {
+            Self::Desc => "desc",
+            Self::Asc => "asc",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Desc => "Descending",
+            Self::Asc => "Ascending",
+        }
+    }
+
+    fn storage_dir(self) -> TokenActivitySortDir {
+        match self {
+            Self::Desc => TokenActivitySortDir::Desc,
+            Self::Asc => TokenActivitySortDir::Asc,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivityFilter {
+    All,
+    Market,
+    Mint,
+}
+
+impl ActivityFilter {
+    fn from_query(raw: Option<&str>) -> Self {
+        match raw {
+            Some("market") => Self::Market,
+            Some("mint") | Some("mints") => Self::Mint,
+            _ => Self::All,
+        }
+    }
+
+    fn as_query(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Market => "market",
+            Self::Mint => "mint",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All activity",
+            Self::Market => "Only market data",
+            Self::Mint => "Only mints",
+        }
+    }
+
+    fn storage_scope(self) -> TokenActivityScope {
+        match self {
+            Self::All => TokenActivityScope::All,
+            Self::Market => TokenActivityScope::Market,
+            Self::Mint => TokenActivityScope::Mint,
         }
     }
 }
@@ -75,6 +251,16 @@ struct AlkaneBalanceChartToken {
     symbol: String,
     icon_url: String,
     fallback_letter: String,
+}
+
+struct TokenActivityRenderEntry {
+    timestamp: u64,
+    txid: String,
+    kind_key: &'static str,
+    pool: Option<SchemaAlkaneId>,
+    actor_address: Option<String>,
+    token_delta: i128,
+    counter: Option<(SchemaAlkaneId, i128)>,
 }
 
 fn token_fallback_letter(label: &str, fallback: &str) -> String {
@@ -114,7 +300,11 @@ pub async fn alkane_page(
             .into_response();
     };
 
-    let tab = AlkaneTab::from_query(q.tab.as_deref());
+    let requested_tab = AlkaneTab::from_query(q.tab.as_deref());
+    let volume_kind = VolumeKind::from_query(q.tab.as_deref(), q.volume.as_deref());
+    let activity_order = ActivityOrder::from_query(q.order.as_deref());
+    let activity_dir = ActivityDir::from_query(q.dir.as_deref());
+    let activity_filter = ActivityFilter::from_query(q.filter.as_deref());
     let all_range_label = if current_language().is_chinese() { "全部" } else { "All" };
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
@@ -128,6 +318,31 @@ pub async fn alkane_page(
         format!("Alkane {display_name} ({alk_str})")
     } else {
         format!("Alkane {alk_str}")
+    };
+    let db = crate::config::get_espo_db();
+    let amm_mdb = Mdb::from_db(Arc::clone(&db), b"ammdata:");
+    let tokendata_mdb = Mdb::from_db(Arc::clone(&db), b"tokendata:");
+    let amm_table = AmmDataTable::new(&amm_mdb);
+    let amm_provider =
+        AmmDataProvider::new(Arc::new(amm_mdb.clone()), Arc::new(state.essentials_provider()));
+    let tokendata_provider = TokenDataProvider::new(Arc::new(tokendata_mdb));
+    let has_token_activity = tokendata_provider
+        .get_token_activity_page(GetTokenActivityPageParams {
+            blockhash: StateAt::Latest,
+            token: alk,
+            offset: 0,
+            limit: 1,
+            kind: None,
+            scope: TokenActivityScope::All,
+            sort_by: TokenActivitySortField::Timestamp,
+            dir: TokenActivitySortDir::Desc,
+        })
+        .map(|res| res.total > 0)
+        .unwrap_or(false);
+    let tab = if requested_tab == AlkaneTab::Activity && !has_token_activity {
+        AlkaneTab::Holders
+    } else {
+        requested_tab
     };
 
     let creation_record = load_creation_record(&state.essentials_mdb, &alk).ok().flatten();
@@ -182,8 +397,6 @@ pub async fn alkane_page(
     let supply_f64 = circulating_supply as f64;
 
     let tv_iframe_src: Option<String> = {
-        let db = crate::config::get_espo_db();
-
         let series_id = {
             let pizzafun_mdb = Arc::new(Mdb::from_db(Arc::clone(&db), b"pizzafun:"));
             let pizzafun = PizzafunProvider::new(pizzafun_mdb);
@@ -208,13 +421,6 @@ pub async fn alkane_page(
                 .map(|dl| dl.derived_quotes.into_iter().map(|q| q.alkane).collect())
                 .unwrap_or_default();
 
-            let amm_mdb = Mdb::from_db(Arc::clone(&db), b"ammdata:");
-            let table = AmmDataTable::new(&amm_mdb);
-            let amm_provider = AmmDataProvider::new(
-                Arc::new(amm_mdb.clone()),
-                Arc::new(state.essentials_provider()),
-            );
-
             let has_prefix = |rel_prefix: Vec<u8>| -> bool {
                 amm_provider
                     .get_list_keys_by_prefix(GetListKeysByPrefixParams {
@@ -226,12 +432,12 @@ pub async fn alkane_page(
             };
 
             if is_derived_quote_token {
-                has_prefix(table.token_usd_candle_ns_prefix(&alk, Timeframe::D1))
+                has_prefix(amm_table.token_usd_candle_ns_prefix(&alk, Timeframe::D1))
             } else if derived_quotes.is_empty() {
                 false
             } else {
                 derived_quotes.iter().any(|quote| {
-                    has_prefix(table.token_derived_mcusd_candle_ns_prefix(
+                    has_prefix(amm_table.token_derived_mcusd_candle_ns_prefix(
                         &alk,
                         quote,
                         Timeframe::D1,
@@ -333,8 +539,8 @@ pub async fn alkane_page(
         }
     };
 
-    let (activity_total, activity_entries, activity_label) = match tab {
-        AlkaneTab::TransferVolume => {
+    let (activity_total, activity_entries, activity_label) = match volume_kind {
+        VolumeKind::TransferVolume => {
             let (total, entries) = get_transfer_volume_for_alkane(
                 StateAt::Latest,
                 &state.essentials_provider(),
@@ -345,7 +551,7 @@ pub async fn alkane_page(
             .unwrap_or((0, Vec::new()));
             (total, entries, "Transfer volume")
         }
-        AlkaneTab::TotalReceived => {
+        VolumeKind::TotalReceived => {
             let (total, entries) = get_total_received_for_alkane(
                 StateAt::Latest,
                 &state.essentials_provider(),
@@ -356,8 +562,31 @@ pub async fn alkane_page(
             .unwrap_or((0, Vec::new()));
             (total, entries, "Total received")
         }
-        _ => (0, Vec::new(), "Transfer volume"),
     };
+    let volume_query = volume_kind.query_value();
+    let volume_dropdown = dropdown(DropdownProps {
+        label: Some(volume_kind.label().to_string()),
+        selected_icon: None,
+        aria_label: Some("Select volume metric".to_string()),
+        items: vec![
+            DropdownItem {
+                label: "Transfer Volume".to_string(),
+                href: explorer_path(&format!(
+                    "/alkane/{alk_str}?tab=volume&volume=transfer_volume&page=1&limit={limit}"
+                )),
+                icon: None,
+                selected: volume_kind == VolumeKind::TransferVolume,
+            },
+            DropdownItem {
+                label: "Total Received".to_string(),
+                href: explorer_path(&format!(
+                    "/alkane/{alk_str}?tab=volume&volume=total_received&page=1&limit={limit}"
+                )),
+                icon: None,
+                selected: volume_kind == VolumeKind::TotalReceived,
+            },
+        ],
+    });
     let activity_off = limit.saturating_mul(page.saturating_sub(1));
     let activity_len = activity_entries.len();
     let activity_has_prev = page > 1;
@@ -402,6 +631,226 @@ pub async fn alkane_page(
         html! {
             div class="alkane-panel alkane-holders-card alkane-activity-card" {
                 (holders_table(&["Address", activity_label], activity_rows))
+            }
+        }
+    };
+
+    let (token_activity_total, token_activity_entries) = if has_token_activity && tab == AlkaneTab::Activity
+    {
+        let offset = limit.saturating_mul(page.saturating_sub(1));
+        let page_result = tokendata_provider
+            .get_token_activity_page(GetTokenActivityPageParams {
+                blockhash: StateAt::Latest,
+                token: alk,
+                offset,
+                limit,
+                kind: None,
+                scope: activity_filter.storage_scope(),
+                sort_by: activity_order.storage_sort(),
+                dir: activity_dir.storage_dir(),
+            })
+            .ok();
+        let total = page_result.as_ref().map(|res| res.total).unwrap_or(0);
+        let entries = page_result
+            .map(|res| {
+                res.entries
+                    .into_iter()
+                    .map(|entry| build_token_activity_render_entry(entry, state.network))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (total, entries)
+    } else {
+        (0, Vec::new())
+    };
+    let token_activity_off = limit.saturating_mul(page.saturating_sub(1));
+    let token_activity_len = token_activity_entries.len();
+    let token_activity_has_prev = page > 1;
+    let token_activity_has_next = token_activity_off + token_activity_len < token_activity_total;
+    let token_activity_display_start = if token_activity_total > 0 && token_activity_off < token_activity_total
+    {
+        token_activity_off + 1
+    } else {
+        0
+    };
+    let token_activity_display_end =
+        (token_activity_off + token_activity_len).min(token_activity_total);
+    let token_activity_last_page = if token_activity_total > 0 {
+        (token_activity_total + limit - 1) / limit
+    } else {
+        1
+    };
+    let activity_sort_dropdown = dropdown(DropdownProps {
+        label: Some(activity_order.label().to_string()),
+        selected_icon: None,
+        aria_label: Some("Sort token activity".to_string()),
+        items: [ActivityOrder::Timestamp, ActivityOrder::Volume]
+            .iter()
+            .map(|opt| DropdownItem {
+                label: opt.label().to_string(),
+                href: activity_tab_url(&alk_str, 1, limit, *opt, activity_dir, activity_filter),
+                icon: None,
+                selected: *opt == activity_order,
+            })
+            .collect(),
+    });
+    let activity_dir_dropdown = dropdown(DropdownProps {
+        label: Some(activity_dir.label().to_string()),
+        selected_icon: None,
+        aria_label: Some("Token activity sort direction".to_string()),
+        items: [ActivityDir::Asc, ActivityDir::Desc]
+            .iter()
+            .map(|opt| DropdownItem {
+                label: opt.label().to_string(),
+                href: activity_tab_url(&alk_str, 1, limit, activity_order, *opt, activity_filter),
+                icon: None,
+                selected: *opt == activity_dir,
+            })
+            .collect(),
+    });
+    let activity_filter_dropdown = dropdown(DropdownProps {
+        label: Some(activity_filter.label().to_string()),
+        selected_icon: None,
+        aria_label: Some("Token activity filter".to_string()),
+        items: [ActivityFilter::All, ActivityFilter::Market, ActivityFilter::Mint]
+            .iter()
+            .map(|opt| DropdownItem {
+                label: opt.label().to_string(),
+                href: activity_tab_url(&alk_str, 1, limit, activity_order, activity_dir, *opt),
+                icon: None,
+                selected: *opt == activity_filter,
+            })
+            .collect(),
+    });
+
+    let token_activity_rows: Vec<Vec<Markup>> = token_activity_entries
+        .into_iter()
+        .map(|entry| {
+            let activity_icon = token_activity_icon(entry.kind_key);
+            let activity_label = token_activity_label(entry.kind_key);
+            let pool_markup = if let Some(pool) = entry.pool {
+                let pool_id = format!("{}:{}", pool.block, pool.tx);
+                let pool_meta = alkane_meta(&pool, &mut kv_cache, &state.essentials_mdb);
+                let pool_label = if pool_meta.name.known && pool_meta.name.value != pool_id {
+                    pool_meta.name.value.clone()
+                } else {
+                    "Pool".to_string()
+                };
+                html! {
+                    div class="alkane-token-activity-pool" {
+                        a class="link" href=(explorer_path(&format!("/alkane/{pool_id}"))) { (pool_label) }
+                    }
+                }
+            } else {
+                html! {
+                    div class="alkane-token-activity-pool" {
+                        span class="muted" { "—" }
+                    }
+                }
+            };
+            let account_markup = if let Some(address) = entry.actor_address.as_ref() {
+                html! {
+                    a class="link mono alkane-token-activity-account" href=(explorer_path(&format!("/address/{address}"))) {
+                        (short_hex(address))
+                    }
+                }
+            } else {
+                html! { span class="muted mono alkane-token-activity-account" { "Unknown" } }
+            };
+            let (tx_prefix, tx_suffix) = addr_prefix_suffix(&entry.txid);
+            let mobile_tx_markup = html! {
+                div class="alkane-meta alkane-token-activity-mobile-head" {
+                    a class="link mono alkane-id alkane-token-activity-mobile-tx" href=(explorer_path(&format!("/tx/{}", entry.txid))) {
+                        (&entry.txid)
+                    }
+                }
+            };
+            let token_line_class = if entry.token_delta < 0 {
+                "alkane-token-activity-flow-line out"
+            } else if entry.token_delta > 0 {
+                "alkane-token-activity-flow-line in"
+            } else {
+                "alkane-token-activity-flow-line neutral"
+            };
+            vec![
+                html! {
+                    div {
+                        (mobile_tx_markup)
+                        div class="alkane-token-activity-summary" {
+                            span class=(format!("alkane-token-activity-icon {}", entry.kind_key)) aria-hidden="true" {
+                                (activity_icon)
+                            }
+                            div class="alkane-token-activity-summary-copy" {
+                                span class="alkane-token-activity-kind-label" { (activity_label) }
+                                div class="alkane-token-activity-meta" {
+                                    div class="alkane-token-activity-time" data-ts-group="" {
+                                        span hidden data-header-ts=(entry.timestamp) { (entry.timestamp) }
+                                        span class="muted" data-header-ts-rel data-rel-only title="" { "" }
+                                    }
+                                    (account_markup)
+                                }
+                            }
+                        }
+                    }
+                },
+                pool_markup,
+                html! {
+                    a class="link mono addr-inline alkane-token-activity-tx" href=(explorer_path(&format!("/tx/{}", entry.txid))) {
+                        span class="addr-prefix" { (tx_prefix) }
+                        span class="addr-suffix" { (tx_suffix) }
+                    }
+                },
+                html! {
+                    div class="alkane-token-activity-flow" {
+                        div class=(format!("{token_line_class} alk-line")) {
+                            div class="alk-icon-wrap" aria-hidden="true" {
+                                span class="alk-icon-img" style=(icon_bg_style(&icon_url)) {}
+                                span class="alk-icon-letter" { (fallback_letter) }
+                            }
+                            span class="alk-amt mono" { (fmt_signed_alkane_amount(entry.token_delta)) }
+                            a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk_str}"))) { (coin_label.clone()) }
+                        }
+                        @if entry.kind_key == "pool_create" {
+                            div class="alkane-token-activity-flow-line neutral" {
+                                span class="muted" { "Created raw pool" }
+                            }
+                        } @else if let Some((counter_token, counter_delta)) = entry.counter {
+                            @let counter_id = format!("{}:{}", counter_token.block, counter_token.tx);
+                            @let counter_meta = alkane_meta(&counter_token, &mut kv_cache, &state.essentials_mdb);
+                            @let counter_label = if counter_meta.symbol.trim().is_empty() || counter_meta.symbol == "?" {
+                                token_short_label(&counter_token, &mut kv_cache, &state.essentials_mdb)
+                            } else {
+                                counter_meta.symbol.clone()
+                            };
+                            @let counter_fallback = token_fallback_letter(&counter_meta.name.value, &counter_id);
+                            @let counter_line_class = if counter_delta < 0 {
+                                "alkane-token-activity-flow-line out"
+                            } else if counter_delta > 0 {
+                                "alkane-token-activity-flow-line in"
+                            } else {
+                                "alkane-token-activity-flow-line neutral"
+                            };
+                            div class=(format!("{counter_line_class} alk-line")) {
+                                div class="alk-icon-wrap" aria-hidden="true" {
+                                    span class="alk-icon-img" style=(icon_bg_style(&counter_meta.icon_url)) {}
+                                    span class="alk-icon-letter" { (counter_fallback) }
+                                }
+                                span class="alk-amt mono" { (fmt_signed_alkane_amount(counter_delta)) }
+                                a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{counter_id}"))) { (counter_label) }
+                            }
+                        }
+                    }
+                },
+            ]
+        })
+        .collect();
+
+    let token_activity_table_markup = if token_activity_rows.is_empty() {
+        html! { div class="alkane-panel" { p class="muted" { "No token activity yet." } } }
+    } else {
+        html! {
+            div class="alkane-panel alkane-token-activity-card" {
+                (holders_table(&["Activity", "Pool", "Tx", "Flow"], token_activity_rows))
             }
         }
     };
@@ -591,12 +1040,16 @@ pub async fn alkane_page(
                         div class="alkane-tab-list" {
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Holders { " active" } else { "" }))
                                 href=(explorer_path(&format!("/alkane/{alk_str}?page={page}&limit={limit}"))) { "Holders" }
-                            a class=(format!("alkane-tab{}", if tab == AlkaneTab::TransferVolume { " active" } else { "" }))
-                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=transfer_volume&page={page}&limit={limit}"))) { "Transfer Volume" }
-                            a class=(format!("alkane-tab{}", if tab == AlkaneTab::TotalReceived { " active" } else { "" }))
-                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=total_received&page={page}&limit={limit}"))) { "Total Received" }
+                            @if has_token_activity {
+                                a class=(format!("alkane-tab{}", if tab == AlkaneTab::Activity { " active" } else { "" }))
+                                    href=(activity_tab_url(&alk_str, page, limit, activity_order, activity_dir, activity_filter)) {
+                                    "Activity"
+                                }
+                            }
+                            a class=(format!("alkane-tab{}", if tab == AlkaneTab::Volume { " active" } else { "" }))
+                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page={page}&limit={limit}"))) { "Volume" }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Inspect { " active" } else { "" }))
-                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=inspect&page={page}&limit={limit}"))) { "Inspect contract" }
+                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=inspect&page={page}&limit={limit}"))) { "Inspect Contract" }
                         }
                         div class="alkane-tab-panel" {
                             @if tab == AlkaneTab::Holders {
@@ -640,18 +1093,21 @@ pub async fn alkane_page(
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
                                     }
                                 }
-                            } @else if tab == AlkaneTab::TransferVolume || tab == AlkaneTab::TotalReceived {
+                            } @else if tab == AlkaneTab::Volume {
+                                div class="alkane-volume-toolbar" {
+                                    (volume_dropdown)
+                                }
                                 (activity_table_markup)
                                 div class="pager" {
                                     @if activity_has_prev {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page=1&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }))) aria-label="First page" {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page=1&limit={limit}"))) aria-label="First page" {
                                             (icon_skip_left())
                                         }
                                     } @else {
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
                                     }
                                     @if activity_has_prev {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page={}&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }, page - 1))) aria-label="Previous page" {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page={}&limit={limit}", page - 1))) aria-label="Previous page" {
                                             (icon_left())
                                         }
                                     } @else {
@@ -667,14 +1123,61 @@ pub async fn alkane_page(
                                         (activity_total)
                                     }
                                     @if activity_has_next {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page={}&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }, page + 1))) aria-label="Next page" {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page={}&limit={limit}", page + 1))) aria-label="Next page" {
                                             (icon_right())
                                         }
                                     } @else {
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
                                     }
                                     @if activity_has_next {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page={}&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }, activity_last_page))) aria-label="Last page" {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page={activity_last_page}&limit={limit}"))) aria-label="Last page" {
+                                            (icon_skip_right())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
+                                    }
+                                }
+                            } @else if tab == AlkaneTab::Activity {
+                                div class="order-control" {
+                                    span class="muted" { "Sort by:" }
+                                    (activity_sort_dropdown)
+                                    (activity_dir_dropdown)
+                                    (activity_filter_dropdown)
+                                }
+                                (token_activity_table_markup)
+                                div class="pager" {
+                                    @if token_activity_has_prev {
+                                        a class="pill iconbtn" href=(activity_tab_url(&alk_str, 1, limit, activity_order, activity_dir, activity_filter)) aria-label="First page" {
+                                            (icon_skip_left())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                                    }
+                                    @if token_activity_has_prev {
+                                        a class="pill iconbtn" href=(activity_tab_url(&alk_str, page - 1, limit, activity_order, activity_dir, activity_filter)) aria-label="Previous page" {
+                                            (icon_left())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                                    }
+                                    span class="pager-meta muted" { "Showing "
+                                        (if token_activity_total > 0 { token_activity_display_start } else { 0 })
+                                        @if token_activity_total > 0 {
+                                            "-"
+                                            (token_activity_display_end)
+                                        }
+                                        " / "
+                                        (token_activity_total)
+                                    }
+                                    @if token_activity_has_next {
+                                        a class="pill iconbtn" href=(activity_tab_url(&alk_str, page + 1, limit, activity_order, activity_dir, activity_filter)) aria-label="Next page" {
+                                            (icon_right())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                                    }
+                                    @if token_activity_has_next {
+                                        a class="pill iconbtn" href=(activity_tab_url(&alk_str, token_activity_last_page, limit, activity_order, activity_dir, activity_filter)) aria-label="Last page" {
                                             (icon_skip_right())
                                         }
                                     } @else {
@@ -849,10 +1352,89 @@ fn fmt_activity_amount(raw: u128) -> String {
     let whole = units / unit;
     let rem = units % unit;
     let dec = (rem * 10) / unit;
-    if dec == 0 {
-        format!("{whole}{suffix}")
+    if dec == 0 { format!("{whole}{suffix}") } else { format!("{whole}.{dec}{suffix}") }
+}
+
+fn fmt_signed_alkane_amount(raw: i128) -> String {
+    let sign = if raw > 0 {
+        "+"
+    } else if raw < 0 {
+        "-"
     } else {
-        format!("{whole}.{dec}{suffix}")
+        ""
+    };
+    format!("{sign}{}", fmt_alkane_amount(raw.unsigned_abs()))
+}
+
+fn token_short_label(
+    alk: &SchemaAlkaneId,
+    kv_cache: &mut AlkaneMetaCache,
+    essentials_mdb: &Mdb,
+) -> String {
+    let id = format!("{}:{}", alk.block, alk.tx);
+    let meta = alkane_meta(alk, kv_cache, essentials_mdb);
+    if meta.symbol.trim().is_empty() || meta.symbol == "?" {
+        if meta.name.known && meta.name.value != id {
+            meta.name.value
+        } else {
+            id
+        }
+    } else {
+        meta.symbol
+    }
+}
+
+fn build_token_activity_render_entry(
+    activity: SchemaTokenActivityV1,
+    network: bitcoin::Network,
+) -> TokenActivityRenderEntry {
+    let kind_key = match activity.kind {
+        TokenActivityKind::Buy => "trade_buy",
+        TokenActivityKind::Sell => "trade_sell",
+        TokenActivityKind::LiquidityAdd => "liquidity_add",
+        TokenActivityKind::LiquidityRemove => "liquidity_remove",
+        TokenActivityKind::PoolCreate => "pool_create",
+        TokenActivityKind::Mint => "mint",
+    };
+    let actor_address = if activity.address_spk.is_empty() {
+        None
+    } else {
+        let spk = ScriptBuf::from_bytes(activity.address_spk.clone());
+        spk_to_address_str(&spk, network)
+    };
+
+    TokenActivityRenderEntry {
+        timestamp: activity.timestamp,
+        txid: Txid::from_byte_array(activity.txid).to_string(),
+        kind_key,
+        pool: activity.pool,
+        actor_address,
+        token_delta: activity.token_delta,
+        counter: activity.counter_token.map(|counter_token| (counter_token, activity.counter_delta)),
+    }
+}
+
+fn token_activity_label(kind: &str) -> &'static str {
+    match kind {
+        "trade_buy" => "Buy",
+        "trade_sell" => "Sell",
+        "liquidity_add" => "Liquidity Add",
+        "liquidity_remove" => "Liquidity Remove",
+        "pool_create" => "Pool Create",
+        "mint" => "Mint",
+        _ => "Activity",
+    }
+}
+
+fn token_activity_icon(kind: &str) -> Markup {
+    match kind {
+        "trade_buy" => icon_activity_trade_buy(),
+        "trade_sell" => icon_activity_trade_sell(),
+        "liquidity_add" => icon_activity_add_liquidity(),
+        "liquidity_remove" => icon_activity_remove_liquidity(),
+        "pool_create" => icon_activity_pool_create(),
+        "mint" => icon_activity_mint(),
+        _ => icon_activity(),
     }
 }
 

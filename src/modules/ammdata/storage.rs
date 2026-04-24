@@ -9,8 +9,8 @@ use crate::modules::ammdata::consts::{
 };
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
-    ActivityFilter, ActivityPage, ActivitySideFilter, ActivitySortKey, SortDir, decode_activity_v1,
-    read_activity_for_pool, read_activity_for_pool_sorted,
+    ActivityFilter, ActivityPage, ActivityRow, ActivitySideFilter, ActivitySortKey, SortDir,
+    decode_activity_v1, read_activity_for_pool, read_activity_for_pool_sorted,
 };
 use crate::modules::ammdata::utils::candles::{CandleSlice, PriceSide, read_candles_v1};
 use crate::modules::ammdata::utils::live_reserves::fetch_all_pools;
@@ -108,6 +108,8 @@ pub struct AmmDataTable<'a> {
     pub POOL_LP_SUPPLY: KvPointer<'a>,
     pub POOL_DETAILS_SNAPSHOT: KvPointer<'a>,
     pub TVL_VERSIONED: KvPointer<'a>,
+    pub TOKEN_ACTIVITY: ListPointer<'a>,
+    pub TOKEN_ACTIVITY_AMOUNT: ListPointer<'a>,
     pub TOKEN_SWAPS: ListPointer<'a>,
     pub POOL_CREATIONS: ListPointer<'a>,
     pub ADDRESS_POOL_SWAPS: ListPointer<'a>,
@@ -163,6 +165,8 @@ impl<'a> AmmDataTable<'a> {
             POOL_LP_SUPPLY: root.keyword("/pool_lp_supply/latest/"),
             POOL_DETAILS_SNAPSHOT: root.keyword("/pool_details/v2/"),
             TVL_VERSIONED: root.keyword("/tvlVersioned/"),
+            TOKEN_ACTIVITY: root.list_keyword("/token_activity/v1/"),
+            TOKEN_ACTIVITY_AMOUNT: root.list_keyword("/token_activity_amount/v1/"),
             TOKEN_SWAPS: root.list_keyword("/token_swaps/v1/"),
             POOL_CREATIONS: root.list_keyword("/pool_creations/v1/"),
             ADDRESS_POOL_SWAPS: root.list_keyword("/address_pool_swaps/v1/"),
@@ -1082,6 +1086,56 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
+    pub fn token_activity_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.TOKEN_ACTIVITY.key().to_vec();
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k
+    }
+
+    pub fn token_activity_amount_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.TOKEN_ACTIVITY_AMOUNT.key().to_vec();
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k
+    }
+
+    pub fn token_activity_key(
+        &self,
+        token: &SchemaAlkaneId,
+        ts: u64,
+        seq: u32,
+        kind: ActivityKind,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.token_activity_prefix(token);
+        k.extend_from_slice(&ts.to_be_bytes());
+        k.extend_from_slice(&seq.to_be_bytes());
+        k.push(activity_kind_code(kind));
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn token_activity_amount_key(
+        &self,
+        token: &SchemaAlkaneId,
+        amount: u128,
+        ts: u64,
+        seq: u32,
+        kind: ActivityKind,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.token_activity_amount_prefix(token);
+        k.extend_from_slice(&amount.to_be_bytes());
+        k.extend_from_slice(&ts.to_be_bytes());
+        k.extend_from_slice(&seq.to_be_bytes());
+        k.push(activity_kind_code(kind));
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
     pub fn token_swaps_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {
         let mut suffix = Vec::with_capacity(12 + 1);
         suffix.extend_from_slice(&token.block.to_be_bytes());
@@ -1461,6 +1515,94 @@ fn read_amm_history(
     }
 
     Ok(GetAmmHistoryPageResult { entries: out, total })
+}
+
+fn activity_matches_filter(kind: ActivityKind, filter: ActivityFilter) -> bool {
+    match filter {
+        ActivityFilter::All => true,
+        ActivityFilter::Trades => matches!(kind, ActivityKind::TradeBuy | ActivityKind::TradeSell),
+        ActivityFilter::Events => matches!(
+            kind,
+            ActivityKind::LiquidityAdd | ActivityKind::LiquidityRemove | ActivityKind::PoolCreate
+        ),
+    }
+}
+
+fn read_token_activity(
+    provider: &AmmDataProvider,
+    blockhash: StateAt,
+    prefix: Vec<u8>,
+    offset: usize,
+    limit: usize,
+    kind_filter: Option<ActivityKind>,
+    activity_type: ActivityFilter,
+    sort_by: TokenActivitySortField,
+    dir: SortDir,
+) -> Result<GetTokenActivityPageResult> {
+    let mut entries = match provider.get_list_entries_desc(GetListEntriesDescParams {
+        blockhash,
+        prefix: prefix.clone(),
+    }) {
+        Ok(v) => v.entries,
+        Err(_) => Vec::new(),
+    };
+    if matches!(dir, SortDir::Asc) {
+        entries.reverse();
+    }
+
+    let mut total = 0usize;
+    let mut out = Vec::new();
+    let mut seen = 0usize;
+    for (k, _v) in entries {
+        if !k.starts_with(&prefix) {
+            continue;
+        }
+        let rest = &k[prefix.len()..];
+        let (ts, seq, kind, pool) = match sort_by {
+            TokenActivitySortField::Timestamp => {
+                if rest.len() < 25 {
+                    continue;
+                }
+                let mut ts_arr = [0u8; 8];
+                let mut seq_arr = [0u8; 4];
+                ts_arr.copy_from_slice(&rest[0..8]);
+                seq_arr.copy_from_slice(&rest[8..12]);
+                let Some(kind) = activity_kind_from_code(rest[12]) else { continue };
+                let Some(pool) = decode_alkane_id_be(&rest[13..25]) else { continue };
+                (u64::from_be_bytes(ts_arr), u32::from_be_bytes(seq_arr), kind, pool)
+            }
+            TokenActivitySortField::Amount => {
+                if rest.len() < 41 {
+                    continue;
+                }
+                let mut ts_arr = [0u8; 8];
+                let mut seq_arr = [0u8; 4];
+                ts_arr.copy_from_slice(&rest[16..24]);
+                seq_arr.copy_from_slice(&rest[24..28]);
+                let Some(kind) = activity_kind_from_code(rest[28]) else { continue };
+                let Some(pool) = decode_alkane_id_be(&rest[29..41]) else { continue };
+                (u64::from_be_bytes(ts_arr), u32::from_be_bytes(seq_arr), kind, pool)
+            }
+        };
+        if let Some(want) = kind_filter {
+            if want != kind {
+                continue;
+            }
+        }
+        if !activity_matches_filter(kind, activity_type) {
+            continue;
+        }
+        total += 1;
+        if seen < offset {
+            seen += 1;
+            continue;
+        }
+        if out.len() < limit {
+            out.push(TokenActivityEntry { ts, seq, pool, kind });
+        }
+    }
+
+    Ok(GetTokenActivityPageResult { entries: out, total })
 }
 
 #[derive(Clone)]
@@ -2406,10 +2548,33 @@ impl AmmDataProvider {
         let table = self.table();
         let key = table.activity_key(&params.pool, params.ts, params.seq);
         let entry = self
-            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+            .get_raw_value(GetRawValueParams { blockhash: params.blockhash, key })?
             .value
             .and_then(|raw| decode_activity_v1(&raw).ok());
         Ok(GetActivityEntryResult { entry })
+    }
+
+    pub fn get_token_activity_page(
+        &self,
+        params: GetTokenActivityPageParams,
+    ) -> Result<GetTokenActivityPageResult> {
+        crate::debug_timer_log!("get_token_activity_page");
+        let table = self.table();
+        let prefix = match params.sort_by {
+            TokenActivitySortField::Timestamp => table.token_activity_prefix(&params.token),
+            TokenActivitySortField::Amount => table.token_activity_amount_prefix(&params.token),
+        };
+        read_token_activity(
+            self,
+            params.blockhash,
+            prefix,
+            params.offset,
+            params.limit,
+            params.kind,
+            params.activity_type,
+            params.sort_by,
+            params.dir,
+        )
     }
 
     pub fn get_token_swaps_page(
@@ -3291,6 +3456,106 @@ impl AmmDataProvider {
         }
     }
 
+    pub fn rpc_get_token_activity(
+        &self,
+        params: RpcGetTokenActivityParams,
+    ) -> Result<RpcGetTokenActivityResult> {
+        let limit = params.limit.map(|n| n as usize).unwrap_or(50).clamp(1, 500);
+        let page = params.page.map(|n| n as usize).unwrap_or(1).max(1);
+        let offset = limit.saturating_mul(page.saturating_sub(1));
+        let fallback_side =
+            params.side.as_deref().and_then(parse_price_side).unwrap_or(PriceSide::Base);
+        let activity_type = parse_activity_type_str(params.activity_type.as_deref());
+        let kind = parse_activity_kind_str(params.kind.as_deref());
+        let sort_by = parse_token_activity_sort_str(params.sort.as_deref());
+        let dir = parse_sort_dir_str(params.dir.as_deref());
+
+        let token = match params.token.as_deref().and_then(parse_id_from_str) {
+            Some(t) => t,
+            None => {
+                return Ok(RpcGetTokenActivityResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "missing_or_invalid_token",
+                        "hint": "token should be a string like \"2:68441\""
+                    }),
+                });
+            }
+        };
+
+        let page_result = self.get_token_activity_page(GetTokenActivityPageParams {
+            blockhash: StateAt::Latest,
+            token,
+            offset,
+            limit,
+            kind,
+            activity_type,
+            sort_by,
+            dir,
+        })?;
+
+        let mut activity = Vec::with_capacity(page_result.entries.len());
+        for entry in page_result.entries.iter() {
+            let stored = self.get_activity_entry(GetActivityEntryParams {
+                blockhash: StateAt::Latest,
+                pool: entry.pool,
+                ts: entry.ts,
+                seq: entry.seq,
+            })?;
+            let Some(stored) = stored.entry else { continue };
+            let defs = self
+                .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool: entry.pool })
+                .ok()
+                .and_then(|res| res.defs);
+            let side = defs
+                .map(|defs| {
+                    if defs.quote_alkane_id == token {
+                        PriceSide::Quote
+                    } else {
+                        PriceSide::Base
+                    }
+                })
+                .unwrap_or(fallback_side);
+            let mut row = serde_json::to_value(ActivityRow::from_storage(&stored, side))
+                .unwrap_or_else(|_| json!({}));
+            if let Value::Object(ref mut obj) = row {
+                obj.insert("pool".to_string(), json!(id_str(&entry.pool)));
+                obj.insert("pool_id".to_string(), json!(id_str(&entry.pool)));
+                obj.insert("token".to_string(), json!(id_str(&token)));
+                obj.insert("seq".to_string(), json!(entry.seq));
+                obj.insert("index_kind".to_string(), json!(activity_kind_str(entry.kind)));
+                if let Some(defs) = defs {
+                    obj.insert("base".to_string(), json!(id_str(&defs.base_alkane_id)));
+                    obj.insert("quote".to_string(), json!(id_str(&defs.quote_alkane_id)));
+                }
+            }
+            activity.push(row);
+        }
+
+        Ok(RpcGetTokenActivityResult {
+            value: json!({
+                "ok": true,
+                "token": id_str(&token),
+                "activity_type": match activity_type {
+                    ActivityFilter::All => "all",
+                    ActivityFilter::Trades => "trades",
+                    ActivityFilter::Events => "events",
+                },
+                "kind": kind.map(activity_kind_str),
+                "sort": match sort_by {
+                    TokenActivitySortField::Timestamp => "timestamp",
+                    TokenActivitySortField::Amount => "amount",
+                },
+                "dir": match dir { SortDir::Asc => "asc", SortDir::Desc => "desc" },
+                "page": page,
+                "limit": limit,
+                "total": page_result.total,
+                "has_more": page.saturating_mul(limit) < page_result.total,
+                "activity": activity
+            }),
+        })
+    }
+
     pub fn rpc_get_pools(&self, params: RpcGetPoolsParams) -> Result<RpcGetPoolsResult> {
         let live_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = match fetch_all_pools(self) {
             Ok(m) => m,
@@ -4072,6 +4337,37 @@ pub struct TokenSwapEntry {
     pub pool: SchemaAlkaneId,
 }
 
+#[derive(Clone, Debug)]
+pub struct TokenActivityEntry {
+    pub ts: u64,
+    pub seq: u32,
+    pub pool: SchemaAlkaneId,
+    pub kind: ActivityKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenActivitySortField {
+    Timestamp,
+    Amount,
+}
+
+pub struct GetTokenActivityPageParams {
+    pub blockhash: StateAt,
+
+    pub token: SchemaAlkaneId,
+    pub offset: usize,
+    pub limit: usize,
+    pub kind: Option<ActivityKind>,
+    pub activity_type: ActivityFilter,
+    pub sort_by: TokenActivitySortField,
+    pub dir: SortDir,
+}
+
+pub struct GetTokenActivityPageResult {
+    pub entries: Vec<TokenActivityEntry>,
+    pub total: usize,
+}
+
 pub struct GetTokenSwapsPageParams {
     pub blockhash: StateAt,
 
@@ -4293,6 +4589,21 @@ pub struct RpcGetActivityParams {
 }
 
 pub struct RpcGetActivityResult {
+    pub value: Value,
+}
+
+pub struct RpcGetTokenActivityParams {
+    pub token: Option<String>,
+    pub limit: Option<u64>,
+    pub page: Option<u64>,
+    pub side: Option<String>,
+    pub activity_type: Option<String>,
+    pub kind: Option<String>,
+    pub sort: Option<String>,
+    pub dir: Option<String>,
+}
+
+pub struct RpcGetTokenActivityResult {
     pub value: Value,
 }
 
@@ -5069,6 +5380,28 @@ fn parse_activity_type_str(s: Option<&str>) -> ActivityFilter {
     ActivityFilter::All
 }
 
+fn parse_activity_kind_str(s: Option<&str>) -> Option<ActivityKind> {
+    let s = s?.to_ascii_lowercase();
+    match s.as_str() {
+        "trade_buy" | "buy" => Some(ActivityKind::TradeBuy),
+        "trade_sell" | "sell" => Some(ActivityKind::TradeSell),
+        "liquidity_add" | "add" | "mint" => Some(ActivityKind::LiquidityAdd),
+        "liquidity_remove" | "remove" | "burn" => Some(ActivityKind::LiquidityRemove),
+        "pool_create" | "create" => Some(ActivityKind::PoolCreate),
+        _ => None,
+    }
+}
+
+fn activity_kind_str(kind: ActivityKind) -> &'static str {
+    match kind {
+        ActivityKind::TradeBuy => "trade_buy",
+        ActivityKind::TradeSell => "trade_sell",
+        ActivityKind::LiquidityAdd => "liquidity_add",
+        ActivityKind::LiquidityRemove => "liquidity_remove",
+        ActivityKind::PoolCreate => "pool_create",
+    }
+}
+
 fn parse_sort_dir_str(s: Option<&str>) -> SortDir {
     if let Some(s) = s {
         match s.to_ascii_lowercase().as_str() {
@@ -5078,6 +5411,15 @@ fn parse_sort_dir_str(s: Option<&str>) -> SortDir {
         }
     }
     SortDir::Desc
+}
+
+fn parse_token_activity_sort_str(s: Option<&str>) -> TokenActivitySortField {
+    match s.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "amount" | "volume" | "amt") => {
+            TokenActivitySortField::Amount
+        }
+        _ => TokenActivitySortField::Timestamp,
+    }
 }
 
 fn norm_token(s: &str) -> Option<&'static str> {

@@ -1,10 +1,12 @@
 use crate::config::{
     get_block_source, // NEW: use BlockSource for full blocks
     get_metashrew,
+    get_metashrew_sdb,
 };
 use crate::core::blockfetcher::BlockSource;
 use crate::schemas::EspoOutpoint;
 use crate::schemas::SchemaAlkaneId;
+use crate::utils::fee_rates::BlockFeeRateSummary;
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId;
@@ -136,6 +138,7 @@ pub struct EspoBlock {
     pub height: u32,
     pub block_header: Header,
     pub host_function_values: EspoHostFunctionValues,
+    pub fee_summary: Option<BlockFeeRateSummary>,
     pub tx_count: usize,
     pub transactions: Vec<EspoAlkanesTransaction>,
 }
@@ -378,6 +381,16 @@ fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
     format!("{}:{}", hex::encode(txid_be), vout)
 }
 
+fn tx_has_alkanes_protocol(tx: &Transaction) -> bool {
+    let Some(Artifact::Runestone(ref runestone)) = Runestone::decipher(tx) else {
+        return false;
+    };
+    let Ok(protostones) = Protostone::from_runestone(runestone) else {
+        return false;
+    };
+    protostones.iter().any(|protostone| protostone.protocol_tag == 1)
+}
+
 // parse possibly-tailed trace (strip trailing u32 if needed)
 pub fn traces_for_block_as_prost(block: u64) -> Result<Vec<PartialEspoTrace>> {
     get_metashrew().traces_for_block_as_prost(block)
@@ -404,13 +417,10 @@ pub fn traces_for_block_as_json_str(block: u64) -> Result<String> {
 }
 
 /// Build a map { txid_be_hex => Vec<(vout, PartialEspoTrace)> } for quick attach later.
-fn traces_for_block_indexed(
-    block: u64,
+fn partial_traces_indexed(
+    partials: Vec<PartialEspoTrace>,
     allow_txids: Option<&HashSet<String>>,
 ) -> Result<HashMap<String, Vec<(u32, PartialEspoTrace)>>> {
-    let partials = traces_for_block_as_prost(block)
-        .with_context(|| format!("failed traces_for_block_as_prost({block})"))?;
-
     let mut map: HashMap<String, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
     for p in partials {
         if p.outpoint.len() < 36 {
@@ -445,6 +455,90 @@ fn traces_for_block_indexed(
     Ok(map)
 }
 
+#[derive(Debug, Default)]
+struct CanonicalTraceSelection {
+    traces_by_txid: HashMap<String, Vec<(u32, PartialEspoTrace)>>,
+    recovered_txids: Vec<String>,
+    missing_candidate_txids: Vec<String>,
+    unexpected_height_trace_txids: Vec<String>,
+}
+
+fn select_canonical_traces(
+    block: u64,
+    selected: &[(Txid, Transaction)],
+) -> Result<CanonicalTraceSelection> {
+    let canonical_txids: HashSet<String> =
+        selected.iter().map(|(txid, _)| txid.to_string()).collect();
+    let metashrew = get_metashrew();
+    let metashrew_sdb = get_metashrew_sdb();
+    metashrew_sdb
+        .catch_up_now()
+        .with_context(|| format!("metashrew catch_up before validating block {block}"))?;
+    let block_u32: u32 = block
+        .try_into()
+        .context("block height does not fit into u32 for canonical trace selection")?;
+    metashrew
+        .ensure_canonical_height_with_db(metashrew_sdb.as_ref(), block_u32)
+        .with_context(|| format!("metashrew not canonical at block {block}"))?;
+
+    let height_partials = metashrew
+        .traces_for_block_as_prost_with_db_uncaught(metashrew_sdb.as_ref(), block)
+        .with_context(|| format!("failed traces_for_block_as_prost_with_db_uncaught({block})"))?;
+    let height_index = partial_traces_indexed(height_partials, None)?;
+
+    let mut traces_by_txid: HashMap<String, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
+    let mut recovered_txids: Vec<String> = Vec::new();
+    let mut missing_candidate_txids: Vec<String> = Vec::new();
+
+    for (txid, tx) in selected {
+        let txid_hex = txid.to_string();
+        if let Some(vouts_partials) = height_index.get(&txid_hex) {
+            traces_by_txid.insert(txid_hex, vouts_partials.clone());
+            continue;
+        }
+
+        if !tx_has_alkanes_protocol(tx) {
+            continue;
+        }
+
+        let fallback_partials = metashrew
+            .traces_for_tx_with_db_uncaught(metashrew_sdb.as_ref(), txid)
+            .with_context(|| format!("failed traces_for_tx_with_db_uncaught({txid})"))?;
+        let allow = HashSet::from([txid_hex.clone()]);
+        let fallback_index = partial_traces_indexed(fallback_partials, Some(&allow))?;
+        if let Some(vouts_partials) = fallback_index.get(&txid_hex) {
+            traces_by_txid.insert(txid_hex.clone(), vouts_partials.clone());
+            recovered_txids.push(txid_hex);
+        } else {
+            missing_candidate_txids.push(txid_hex);
+        }
+    }
+
+    if !missing_candidate_txids.is_empty()
+        && std::env::var_os("ESPO_STRICT_CANONICAL_TRACES").is_some()
+    {
+        let listed = missing_candidate_txids.join(", ");
+        anyhow::bail!(
+            "canonical trace set incomplete at block {}: missing traces for canonical txids [{}]",
+            block,
+            listed
+        );
+    }
+
+    let unexpected_height_trace_txids: Vec<String> = height_index
+        .keys()
+        .filter(|txid| !canonical_txids.contains(*txid))
+        .cloned()
+        .collect();
+
+    Ok(CanonicalTraceSelection {
+        traces_by_txid,
+        recovered_txids,
+        missing_candidate_txids,
+        unexpected_height_trace_txids,
+    })
+}
+
 /// Use the BlockSource for the block (header + transactions), Electrum for prevouts.
 /// Traces are now **multiple per transaction** and are stitched in per outpoint (vout).
 pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
@@ -469,9 +563,11 @@ pub fn get_espo_block_with_opts(
     eprintln!("[TRACE::get_espo_block] converted block heights h32={h32}, tip32={tip32}");
 
     // Fetch block
-    let full_block = block_source
-        .get_block_by_height(h32, tip32)
-        .context("BlockSource: get_block_by_height")?;
+    let block_result = block_source
+        .get_block_result_by_height(h32, tip32)
+        .context("BlockSource: get_block_result_by_height")?;
+    let fee_summary = block_result.fee_summary;
+    let full_block = block_result.block;
     let total_txs = full_block.txdata.len();
     eprintln!("[TRACE::get_espo_block] got block at height={}, txs={}", h32, total_txs);
 
@@ -568,14 +664,23 @@ pub fn get_espo_block_with_opts(
         selected.push((txid, tx));
     }
 
-    let allow_txids: HashSet<String> = selected.iter().map(|(txid, _)| txid.to_string()).collect();
-
-    // Index traces only for the selected txids
-    let traces_index = traces_for_block_indexed(block, Some(&allow_txids))?;
+    let canonical_traces = select_canonical_traces(block, &selected)?;
+    if !canonical_traces.recovered_txids.is_empty()
+        || !canonical_traces.missing_candidate_txids.is_empty()
+        || !canonical_traces.unexpected_height_trace_txids.is_empty()
+    {
+        eprintln!(
+            "[reorg] metashrew trace mismatch at block {}: recovered_missing_txids={} missing_candidate_txids={} unexpected_height_trace_txids={}",
+            block,
+            canonical_traces.recovered_txids.join(","),
+            canonical_traces.missing_candidate_txids.join(","),
+            canonical_traces.unexpected_height_trace_txids.join(",")
+        );
+    }
     eprintln!(
-        "[TRACE::get_espo_block] built traces_index for block={} ({} txs with traces)",
+        "[TRACE::get_espo_block] built canonical traces_index for block={} ({} txs with traces)",
         block,
-        traces_index.len()
+        canonical_traces.traces_by_txid.len()
     );
 
     // Build transactions
@@ -584,7 +689,7 @@ pub fn get_espo_block_with_opts(
         let txid_hex = txid.to_string();
 
         let traces_opt: Option<Vec<EspoTrace>> =
-            if let Some(vouts_partials) = traces_index.get(&txid_hex) {
+            if let Some(vouts_partials) = canonical_traces.traces_by_txid.get(&txid_hex) {
                 let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
                 for (vout, partial) in vouts_partials.iter() {
                     let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
@@ -628,9 +733,58 @@ pub fn get_espo_block_with_opts(
         tx_count: total_txs,
         transactions: txs,
         host_function_values,
+        fee_summary,
         height: block
             .try_into()
             .context("block height does not fit into u32 for EspoBlock::height")?,
         is_latest: block == tip,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute};
+
+    fn sample_tx(lock_time: u32) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version(2),
+            lock_time: absolute::LockTime::from_consensus(lock_time),
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    fn sample_partial(txid: &Txid, vout: u32) -> PartialEspoTrace {
+        let mut outpoint = txid.as_byte_array().to_vec();
+        outpoint.reverse();
+        outpoint.extend_from_slice(&vout.to_le_bytes());
+        PartialEspoTrace { protobuf_trace: AlkanesTrace { events: Vec::new() }, outpoint }
+    }
+
+    #[test]
+    fn partial_traces_indexed_accepts_le_outpoints_with_be_allow_list() {
+        let tx = sample_tx(1);
+        let txid = tx.compute_txid();
+        let allow = HashSet::from([txid.to_string()]);
+        let indexed = partial_traces_indexed(vec![sample_partial(&txid, 2)], Some(&allow))
+            .expect("index partial traces");
+        let entries = indexed.get(&txid.to_string()).expect("entry for txid");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, 2);
+    }
+
+    #[test]
+    fn tx_has_alkanes_protocol_returns_false_for_plain_tx() {
+        let tx = sample_tx(2);
+        assert!(!tx_has_alkanes_protocol(&tx));
+    }
 }

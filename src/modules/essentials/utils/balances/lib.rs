@@ -1,7 +1,7 @@
 use super::defs::{EspoTraceType, SignedU128, SignedU128MapExt};
 use super::utils::{
-    compute_nets, is_op_return, parse_protostones, parse_short_id, schema_id_from_parts,
-    transfers_to_sheet, tx_has_op_return, u128_to_u32, Unallocated,
+    Unallocated, compute_nets, is_op_return, parse_protostones, parse_short_id,
+    schema_id_from_parts, transfers_to_sheet, tx_has_op_return, u128_to_u32,
 };
 use crate::alkanes::trace::{
     EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
@@ -16,6 +16,8 @@ use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
+    AddressActivityEntry, AddressAmountEntry, AddressIndexListKind, AlkaneBalanceTxEntry,
+    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
     address_index_list_id_alkane_balance_txs_by_token, address_index_list_id_alkane_block_txs,
     append_address_index_values, build_outpoint_pos_versioned_puts,
     build_outpoint_spent_versioned_puts, build_tx_pos_versioned_puts, decode_balances_vec,
@@ -24,8 +26,6 @@ use crate::modules::essentials::storage::{
     encode_u128_value, encode_vec, get_holders_count_encoded, mk_outpoint, resolve_outpoint_id_v2,
     resolve_outpoint_ids_batch_v2, resolve_outpoint_spent_by_id_v2,
     resolve_outpoint_spent_by_ids_batch_v2, resolve_tx_pointer_ids_batch_v2, spk_to_address_str,
-    AddressActivityEntry, AddressAmountEntry, AddressIndexListKind, AlkaneBalanceTxEntry,
-    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
 };
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetMultiValuesParams, GetRawValueParams, SetBatchParams,
@@ -33,7 +33,7 @@ use crate::modules::essentials::storage::{
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
@@ -269,7 +269,7 @@ fn parse_u128_from_str(input: &str) -> Option<u128> {
     }
 }
 
-fn mint_deltas_from_trace(
+pub(crate) fn mint_deltas_from_trace(
     trace: &EspoSandshrewLikeTrace,
     host_function_values: &EspoHostFunctionValues,
 ) -> Option<BTreeMap<SchemaAlkaneId, u128>> {
@@ -446,11 +446,7 @@ pub(crate) fn accumulate_alkane_balance_deltas(
     // Find the nearest NORMAL frame in the current stack (delegates/statics are skipped).
     fn nearest_normal_owner(stack: &[Frame]) -> Option<SchemaAlkaneId> {
         stack.iter().rev().find_map(|frame| {
-            if matches!(frame.kind, FrameKind::Normal) {
-                Some(frame.owner)
-            } else {
-                None
-            }
+            if matches!(frame.kind, FrameKind::Normal) { Some(frame.owner) } else { None }
         })
     }
 
@@ -3439,9 +3435,9 @@ pub fn bulk_update_balances_for_block(
                         Ok(None) => 0,
                         Err(e) => {
                             panic!(
-                            "[balances][strict] metashrew lookup failed (owner={}:{}, token={}:{}, height={}): {e:?}",
-                            owner.block, owner.tx, token.block, token.tx, height_u64
-                        );
+                                "[balances][strict] metashrew lookup failed (owner={}:{}, token={}:{}, height={}): {e:?}",
+                                owner.block, owner.tx, token.block, token.tx, height_u64
+                            );
                         }
                     };
 
@@ -3667,11 +3663,7 @@ pub fn bulk_update_balances_for_block(
                                 let (start, balance) = snapshots[idx];
                                 let end = if idx + 1 < snapshots.len() {
                                     let next_start = snapshots[idx + 1].0;
-                                    if next_start == 0 {
-                                        0
-                                    } else {
-                                        next_start.saturating_sub(1)
-                                    }
+                                    if next_start == 0 { 0 } else { next_start.saturating_sub(1) }
                                 } else {
                                     current_height
                                 };
@@ -3701,9 +3693,13 @@ pub fn bulk_update_balances_for_block(
                                     Ok(None) => 0,
                                     Err(e) => {
                                         panic!(
-                                    "[balances][strict] metashrew lookup failed (owner={}:{}, token={}:{}, height={}): {e:?}",
-                                    owner.block, owner.tx, token.block, token.tx, height_u64
-                                );
+                                            "[balances][strict] metashrew lookup failed (owner={}:{}, token={}:{}, height={}): {e:?}",
+                                            owner.block,
+                                            owner.tx,
+                                            token.block,
+                                            token.tx,
+                                            height_u64
+                                        );
                                     }
                                 };
                                 meta_cache.insert(height, value);
@@ -3746,15 +3742,15 @@ pub fn bulk_update_balances_for_block(
 
                     for (owner, token, local_balance, metashrew_balance) in &balance_mismatches {
                         eprintln!(
-                        "[balances][strict] mismatch height={} owner={}:{} token={}:{} local={} metashrew={}",
-                        height_u64,
-                        owner.block,
-                        owner.tx,
-                        token.block,
-                        token.tx,
-                        local_balance,
-                        metashrew_balance
-                    );
+                            "[balances][strict] mismatch height={} owner={}:{} token={}:{} local={} metashrew={}",
+                            height_u64,
+                            owner.block,
+                            owner.tx,
+                            token.block,
+                            token.tx,
+                            local_balance,
+                            metashrew_balance
+                        );
 
                         let mut txids: Vec<String> = alkane_balance_tx_entries_by_token
                             .get(&(*owner, *token))
@@ -3770,9 +3766,9 @@ pub fn bulk_update_balances_for_block(
 
                         if txids.is_empty() {
                             eprintln!(
-                            "[balances][strict] balance-change txids: none (owner={}:{}, token={}:{})",
-                            owner.block, owner.tx, token.block, token.tx
-                        );
+                                "[balances][strict] balance-change txids: none (owner={}:{}, token={}:{})",
+                                owner.block, owner.tx, token.block, token.tx
+                            );
                         } else {
                             eprintln!(
                                 "[balances][strict] balance-change txids: {}",
@@ -3785,26 +3781,26 @@ pub fn bulk_update_balances_for_block(
                         {
                             if exact {
                                 eprintln!(
-                                "[balances][strict] mismatch origin height={} owner={}:{} token={}:{} local={} metashrew={}",
-                                first_height,
-                                owner.block,
-                                owner.tx,
-                                token.block,
-                                token.tx,
-                                local_at,
-                                meta_at
-                            );
+                                    "[balances][strict] mismatch origin height={} owner={}:{} token={}:{} local={} metashrew={}",
+                                    first_height,
+                                    owner.block,
+                                    owner.tx,
+                                    token.block,
+                                    token.tx,
+                                    local_at,
+                                    meta_at
+                                );
                             } else {
                                 eprintln!(
-                                "[balances][strict] mismatch origin at or before height={} owner={}:{} token={}:{} local={} metashrew={}",
-                                first_height,
-                                owner.block,
-                                owner.tx,
-                                token.block,
-                                token.tx,
-                                local_at,
-                                meta_at
-                            );
+                                    "[balances][strict] mismatch origin at or before height={} owner={}:{} token={}:{} local={} metashrew={}",
+                                    first_height,
+                                    owner.block,
+                                    owner.tx,
+                                    token.block,
+                                    token.tx,
+                                    local_at,
+                                    meta_at
+                                );
                             }
                         }
                     }
@@ -3823,12 +3819,12 @@ pub fn bulk_update_balances_for_block(
                     };
                     for mismatch in &utxo_mismatches {
                         eprintln!(
-                        "[balances][strict] utxo mismatch outpoint={} addr={} local=[{}] metashrew=[{}]",
-                        mismatch.outpoint.as_outpoint_string(),
-                        mismatch.addr,
-                        fmt_sheet(&mismatch.local),
-                        fmt_sheet(&mismatch.metashrew)
-                    );
+                            "[balances][strict] utxo mismatch outpoint={} addr={} local=[{}] metashrew=[{}]",
+                            mismatch.outpoint.as_outpoint_string(),
+                            mismatch.addr,
+                            fmt_sheet(&mismatch.local),
+                            fmt_sheet(&mismatch.metashrew)
+                        );
                     }
                 }
 
@@ -4346,13 +4342,9 @@ pub fn get_outpoint_balances_with_spent(
     let row = load_outpoint_row_v2(provider, txid, vout, blockhash)?;
     let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
     let address = row.as_ref().map(|r| r.address.clone()).filter(|s| !s.is_empty());
-    let spk = row.as_ref().and_then(|r| {
-        if r.spk.is_empty() {
-            None
-        } else {
-            Some(ScriptBuf::from(r.spk.clone()))
-        }
-    });
+    let spk = row
+        .as_ref()
+        .and_then(|r| if r.spk.is_empty() { None } else { Some(ScriptBuf::from(r.spk.clone())) });
     Ok(OutpointLookup { balances, spent_by, address, spk })
 }
 
@@ -4396,11 +4388,7 @@ pub fn get_outpoint_rows_batch(
         let balances = row.map(|r| r.balances.clone()).unwrap_or_default();
         let address = row.map(|r| r.address.clone()).filter(|s| !s.is_empty());
         let spk = row.and_then(|r| {
-            if r.spk.is_empty() {
-                None
-            } else {
-                Some(ScriptBuf::from(r.spk.clone()))
-            }
+            if r.spk.is_empty() { None } else { Some(ScriptBuf::from(r.spk.clone())) }
         });
         out.insert((*txid, *vout), OutpointLookup { balances, spent_by: None, address, spk });
     }
@@ -4457,11 +4445,7 @@ pub fn get_outpoint_balances_with_spent_batch(
         let balances = row.map(|r| r.balances.clone()).unwrap_or_default();
         let address = row.map(|r| r.address.clone()).filter(|s| !s.is_empty());
         let spk = row.and_then(|r| {
-            if r.spk.is_empty() {
-                None
-            } else {
-                Some(ScriptBuf::from(r.spk.clone()))
-            }
+            if r.spk.is_empty() { None } else { Some(ScriptBuf::from(r.spk.clone())) }
         });
         out.insert((*txid, *vout), OutpointLookup { balances, spent_by, address, spk });
     }

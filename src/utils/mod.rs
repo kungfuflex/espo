@@ -1,5 +1,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod electrum_like;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod fee_rates;
 
 use crate::schemas::SchemaAlkaneId;
 use std::time::{Duration, Instant};

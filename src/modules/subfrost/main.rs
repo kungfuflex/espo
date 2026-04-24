@@ -288,11 +288,7 @@ impl EspoModule for Subfrost {
             debug::log_elapsed(module, "update_totals", timer);
             let timer = debug::start_if(debug);
             provider
-                .set_batch(SetBatchParams {
-                    blockhash: StateAt::Latest,
-                    puts,
-                    deletes: Vec::new(),
-                })
+                .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
                 .map_err(|e| anyhow!("[SUBFROST] set_batch failed at height {}: {e}", height))?;
             debug::log_elapsed(module, "write_batch", timer);
         }

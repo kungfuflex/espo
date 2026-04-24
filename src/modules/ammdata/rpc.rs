@@ -1,7 +1,8 @@
 use crate::modules::ammdata::storage::{
     AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
     RpcGetBestMevSwapParams, RpcGetBtcUsdPriceParams, RpcGetCandlesParams,
-    RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams, RpcGetPoolsParams, RpcPingParams,
+    RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams, RpcGetPoolsParams, RpcGetTokenActivityParams,
+    RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -159,6 +160,56 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         }
                     };
                     view.rpc_get_activity(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_token_activity = reg.clone();
+    let mdb_ptr_token_activity: Arc<AmmDataProvider> = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_token_activity
+            .register("get_token_activity", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_ptr_token_activity);
+                async move {
+                    let params = RpcGetTokenActivityParams {
+                        token: payload
+                            .get("token")
+                            .or_else(|| payload.get("alkane"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        page: payload.get("page").and_then(|v| v.as_u64()),
+                        side: payload.get("side").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        activity_type: payload
+                            .get("activity_type")
+                            .or_else(|| payload.get("type"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        kind: payload.get("kind").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        sort: payload
+                            .get("sort")
+                            .or_else(|| payload.get("sort_by"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        dir: payload.get("dir").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    };
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_token_activity(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }

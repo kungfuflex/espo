@@ -1,12 +1,15 @@
 use crate::runtime::state_at::StateAt;
-use axum::extract::Query;
 use axum::Json;
+use axum::extract::Query;
 use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::{get_config, get_espo_next_height, get_metashrew_rpc_url, get_network};
-use crate::explorer::components::tx_view::{alkane_meta, AlkaneMetaCache};
+use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
+use crate::explorer::mining_pools::{
+    MiningPoolDisplay, resolve_block_mining_pool, resolve_block_mining_pool_with_tx_count,
+};
 use crate::explorer::pages::common::ALKANE_SCALE;
 use crate::explorer::paths::explorer_path;
 use crate::modules::ammdata::config::AmmDataConfig;
@@ -14,9 +17,8 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
 };
 use crate::modules::essentials::storage::{
-    get_cached_block_summary, load_creation_record, BlockSummary, EssentialsProvider,
-    EssentialsTable, GetAlkaneIdsByNamePrefixPageParams, GetListEntriesDescParams,
-    HoldersCountEntry,
+    EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
+    GetListEntriesDescParams, HoldersCountEntry, get_cached_block_summary, load_creation_record,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
@@ -29,8 +31,8 @@ use alkanes_support::proto::alkanes::{
 };
 use anyhow::Context;
 use bitcoin::blockdata::block::Header;
-use bitcoin::consensus::encode::deserialize;
 use bitcoin::consensus::Encodable;
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use bitcoin::transaction::Version;
@@ -41,7 +43,7 @@ use ordinals::Runestone;
 use prost::Message;
 use protorune_support::protostone::{Protostone, Protostones};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
@@ -57,7 +59,17 @@ pub struct CarouselQuery {
 pub struct CarouselBlock {
     pub height: u64,
     pub traces: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub median_fee_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_fee_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fee_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_count: Option<u32>,
     pub time: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<MiningPoolDisplay>,
 }
 
 #[derive(Serialize)]
@@ -158,26 +170,53 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
     let end = (center + radius).min(espo_tip);
 
     let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
-    let table = EssentialsTable::new(essentials_mdb.as_ref());
+    let essentials_provider = EssentialsProvider::new(essentials_mdb.clone());
+    let heights: Vec<u32> = (start..=end).map(|h| h as u32).collect();
+    let summaries =
+        essentials_provider
+            .get_block_summaries_by_heights(&heights)
+            .unwrap_or_else(|err| {
+                eprintln!("[carousel] failed to load block summaries: {err}");
+                vec![None; heights.len()]
+            });
     let mut blocks: Vec<CarouselBlock> = Vec::with_capacity((end - start + 1) as usize);
 
-    for h in start..=end {
-        let summary = get_cached_block_summary(h as u32).or_else(|| {
-            essentials_mdb
-                .get(&table.block_summary_key(h as u32))
-                .ok()
-                .flatten()
-                .and_then(|b| BlockSummary::try_from_slice(&b).ok())
+    for (h, summary) in (start..=end).zip(summaries.into_iter()) {
+        let summary = summary.or_else(|| get_cached_block_summary(h as u32));
+        let (traces, time, summary_tx_count, median_fee_rate, min_fee_rate, max_fee_rate) =
+            if let Some(summary) = summary {
+                let time = deserialize::<Header>(&summary.header).ok().map(|hdr| hdr.time as u32);
+                let tx_count = if summary.tx_count > 0 { Some(summary.tx_count) } else { None };
+                let min_fee_rate = summary.fee_range.first().copied();
+                let max_fee_rate = summary.fee_range.last().copied();
+                (
+                    summary.trace_count as usize,
+                    time,
+                    tx_count,
+                    Some(summary.fee_median),
+                    min_fee_rate,
+                    max_fee_rate,
+                )
+            } else {
+                (0, None, None, None, None, None)
+            };
+        let resolved_pool = resolve_block_mining_pool_with_tx_count(h).ok();
+        let tx_count = summary_tx_count
+            .or_else(|| resolved_pool.as_ref().map(|result| result.tx_count as u32));
+        let pool = resolved_pool
+            .map(|result| result.pool)
+            .or_else(|| resolve_block_mining_pool(h).ok().map(|result| result.pool));
+
+        blocks.push(CarouselBlock {
+            height: h,
+            traces,
+            median_fee_rate,
+            min_fee_rate,
+            max_fee_rate,
+            tx_count,
+            time,
+            pool,
         });
-
-        let (traces, time) = if let Some(summary) = summary {
-            let time = deserialize::<Header>(&summary.header).ok().map(|hdr| hdr.time as u32);
-            (summary.trace_count as usize, time)
-        } else {
-            (0, None)
-        };
-
-        blocks.push(CarouselBlock { height: h, traces, time });
     }
 
     Json(CarouselResponse { espo_tip, blocks })
@@ -1476,11 +1515,7 @@ fn decode_support_alkane_ids_prefixed(bytes: &[u8], total: usize) -> Option<Alka
         let schema = schema_from_support_id(parsed)?;
         ids.push(schema);
     }
-    if ids.is_empty() {
-        None
-    } else {
-        Some(AlkaneDecodeResult { ids, total })
-    }
+    if ids.is_empty() { None } else { Some(AlkaneDecodeResult { ids, total }) }
 }
 
 fn decode_support_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
@@ -1501,11 +1536,7 @@ fn decode_support_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
             ids.push(schema);
         }
     }
-    if ids.is_empty() {
-        None
-    } else {
-        Some(AlkaneDecodeResult { ids, total })
-    }
+    if ids.is_empty() { None } else { Some(AlkaneDecodeResult { ids, total }) }
 }
 
 fn decode_proto_alkane_id(bytes: &[u8]) -> Option<SchemaAlkaneId> {
@@ -1524,11 +1555,7 @@ fn schema_from_support_id(id: SupportAlkaneId) -> Option<SchemaAlkaneId> {
 }
 
 fn validate_schema_alkane(id: SchemaAlkaneId) -> Option<SchemaAlkaneId> {
-    if (id.block as u128) <= MAX_ALKANE_BLOCK {
-        Some(id)
-    } else {
-        None
-    }
+    if (id.block as u128) <= MAX_ALKANE_BLOCK { Some(id) } else { None }
 }
 
 fn decode_utf8(bytes: &[u8]) -> Option<String> {

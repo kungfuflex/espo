@@ -1,4 +1,4 @@
-use maud::{html, Markup, PreEscaped};
+use maud::{Markup, PreEscaped, html};
 
 use crate::explorer::paths::{current_language, explorer_path};
 
@@ -81,6 +81,68 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     return isChinese ? `${{amount}} 条跟踪` : `${{amount}} traces`;
   }}
 
+  function formatTxCount(count) {{
+    if (!Number.isFinite(Number(count))) return '';
+    const amount = new Intl.NumberFormat('en-US', {{ maximumFractionDigits: 0 }}).format(Number(count));
+    return isChinese ? `${{amount}} 笔交易` : `${{amount}} transactions`;
+  }}
+
+  function formatFeeRate(rate, includeUnit = true) {{
+    const numeric = Number(rate);
+    if (!Number.isFinite(numeric)) return '';
+    const compact = Math.abs(numeric) >= 1000;
+    const displayValue = compact ? numeric / 1000 : numeric;
+    const amount = new Intl.NumberFormat('en-US', {{
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 2
+    }}).format(displayValue) + (compact ? 'k' : '');
+    if (!includeUnit) return amount;
+    return isChinese ? `${{amount}} sat/vB` : `${{amount}} sat/vB`;
+  }}
+
+  function renderFeeStats(block) {{
+    const median = formatFeeRate(block.median_fee_rate, true);
+    const min = formatFeeRate(block.min_fee_rate, false);
+    const max = formatFeeRate(block.max_fee_rate, true);
+    if (!median && !min && !max) return '';
+    const medianMarkup = median ? `<div class="bc-fees">~${{median}}</div>` : '';
+    const rangeMarkup = min && max ? `<div class="bc-fee-span">${{min}} - ${{max}}</div>` : '';
+    return `${{medianMarkup}}${{rangeMarkup}}`;
+  }}
+
+  function escapeHtml(value) {{
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }}
+
+  function renderPoolTag(pool) {{
+    if (!pool || !pool.name) return '';
+    const icon = pool.icon_url
+      ? `<img class="bc-pool-icon" src="${{escapeHtml(pool.icon_url)}}" alt="${{escapeHtml(pool.name)}} pool icon" loading="lazy">`
+      : '';
+    const unknownClass = pool.matched ? '' : ' unknown';
+    const content = `
+      ${{icon}}
+      <span class="bc-pool-name">${{escapeHtml(pool.name)}}</span>
+    `;
+    if (pool.mempool_url) {{
+      return `
+        <a class="bc-pool-tag${{unknownClass}}" href="${{escapeHtml(pool.mempool_url)}}" target="_blank" rel="noopener noreferrer">
+          ${{content}}
+        </a>
+      `;
+    }}
+    return `
+      <div class="bc-pool-tag${{unknownClass}}">
+        ${{content}}
+      </div>
+    `;
+  }}
+
   function ensureIndicator() {{
     if (indicator) return indicator;
     indicator = root.querySelector('[data-bc-indicator]');
@@ -147,10 +209,13 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
         </div>
         <a class="bc-card${{b.height === current ? ' current' : ''}}" href="${{basePrefix}}/block/${{b.height}}">
           <div class="bc-face">
+            ${{renderFeeStats(b)}}
             <div class="bc-traces">${{formatTraces(b.traces)}}</div>
+            <div class="bc-tx-count">${{formatTxCount(b.tx_count)}}</div>
             <div class="bc-time">${{formatAgo(b.time)}}</div>
           </div>
         </a>
+        ${{renderPoolTag(b.pool)}}
       `;
       container.appendChild(slide);
     }}

@@ -1,15 +1,17 @@
 use crate::alkanes::defs::AlkaneMessageContext;
 use crate::alkanes::trace::PartialEspoTrace;
-use crate::config::{get_metashrew_sdb, strict_check_trace_mismatches};
+use crate::config::{get_bitcoind_rpc_client, get_metashrew_sdb, strict_check_trace_mismatches};
 use crate::runtime::sdb::SDB;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_cli_common::alkanes_pb::{AlkanesTrace, AlkanesTraceEvent};
 use alkanes_support::gz;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
 use anyhow::{Context, Result, anyhow};
+use bitcoin::BlockHash;
 use bitcoin::OutPoint;
 use bitcoin::Txid;
 use bitcoin::hashes::Hash;
+use bitcoincore_rpc::RpcApi;
 use metashrew_support::index_pointer::KeyValuePointer;
 use prost::Message;
 use protorune::message::MessageContext;
@@ -20,6 +22,35 @@ use rocksdb::{Direction, IteratorMode};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+const CANONICAL_TIP_SCAN_BUFFER: u32 = 288;
+
+static LAST_CANONICAL_METASHREW_TIP: AtomicU32 = AtomicU32::new(0);
+
+fn block_hash_variants(raw: [u8; 32]) -> [BlockHash; 2] {
+    let direct = BlockHash::from_byte_array(raw);
+    let mut reversed = raw;
+    reversed.reverse();
+    let reversed = BlockHash::from_byte_array(reversed);
+    [direct, reversed]
+}
+
+fn block_hash_display_score(hash: &BlockHash) -> usize {
+    hash.to_string().chars().take_while(|ch| *ch == '0').count()
+}
+
+fn preferred_block_hash_variant(raw: [u8; 32]) -> BlockHash {
+    let [direct, reversed] = block_hash_variants(raw);
+    if block_hash_display_score(&reversed) > block_hash_display_score(&direct) {
+        reversed
+    } else {
+        direct
+    }
+}
+
+fn block_hash_matching_chain(raw: [u8; 32], chain_hash: &BlockHash) -> Option<BlockHash> {
+    block_hash_variants(raw).into_iter().find(|candidate| candidate == chain_hash)
+}
 
 fn try_decode_trace_prost(raw: &[u8]) -> Option<AlkanesTrace> {
     AlkanesTrace::decode(raw).ok().or_else(|| {
@@ -457,11 +488,16 @@ impl MetashrewAdapter {
         self.get_alkane_wasm_bytes_with_db(db.as_ref(), alkane)
     }
 
+    fn get_alkanes_tip_height_with_db(&self, db: &SDB) -> Result<u32> {
+        let height_ptr = self.root.from_bytes(db, b"__INTERNAL/height".to_vec());
+        let height = height_ptr.get_value::<u32>();
+        Ok(height)
+    }
+
     pub fn get_alkanes_tip_height(&self) -> Result<u32> {
         static LAST_LOGGED_HEIGHT: AtomicU32 = AtomicU32::new(u32::MAX);
         let db = get_metashrew_sdb();
-        let height_ptr = self.root.from_bytes(db.as_ref(), b"__INTERNAL/height".to_vec());
-        let height = height_ptr.get_value::<u32>();
+        let height = self.get_alkanes_tip_height_with_db(db.as_ref())?;
         let prev = LAST_LOGGED_HEIGHT.load(Ordering::Relaxed);
         if prev != height {
             eprintln!("[metashrew] indexed height: {}", height);
@@ -470,15 +506,141 @@ impl MetashrewAdapter {
         Ok(height)
     }
 
+    pub fn get_indexed_block_hash_with_db(
+        &self,
+        db: &SDB,
+        height: u32,
+    ) -> Result<Option<BlockHash>> {
+        let Some(raw) = self.get_indexed_block_hash_raw_with_db(db, height)? else {
+            return Ok(None);
+        };
+        Ok(Some(preferred_block_hash_variant(raw)))
+    }
+
+    fn get_indexed_block_hash_raw_with_db(
+        &self,
+        db: &SDB,
+        height: u32,
+    ) -> Result<Option<[u8; 32]>> {
+        let key = format!("/__INTERNAL/height-to-hash/{height}").into_bytes();
+        let Some(raw) = self.root.from_bytes(db, key).get_raw() else {
+            return Ok(None);
+        };
+        if raw.len() != 32 {
+            anyhow::bail!("decode metashrew block hash at height {} ({} bytes)", height, raw.len());
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&raw);
+        Ok(Some(arr))
+    }
+
+    pub fn ensure_canonical_height_with_db(&self, db: &SDB, height: u32) -> Result<BlockHash> {
+        let indexed_tip = self.get_alkanes_tip_height_with_db(db)?;
+        if indexed_tip < height {
+            anyhow::bail!("metashrew tip {} is behind required height {}", indexed_tip, height);
+        }
+
+        let Some(raw) = self.get_indexed_block_hash_raw_with_db(db, height)? else {
+            anyhow::bail!(
+                "metashrew missing stored block hash at height {} (indexed_tip={})",
+                height,
+                indexed_tip
+            );
+        };
+
+        let chain_hash = get_bitcoind_rpc_client()
+            .get_block_hash(height as u64)
+            .with_context(|| format!("bitcoind get_block_hash({height})"))?;
+        let metashrew_hash = block_hash_matching_chain(raw, &chain_hash)
+            .unwrap_or_else(|| preferred_block_hash_variant(raw));
+
+        if metashrew_hash != chain_hash {
+            anyhow::bail!(
+                "metashrew hash mismatch at height {}: core={} metashrew={} indexed_tip={}",
+                height,
+                chain_hash,
+                metashrew_hash,
+                indexed_tip
+            );
+        }
+
+        Ok(chain_hash)
+    }
+
+    fn find_canonical_tip_in_range(&self, db: &SDB, from: u32, to: u32) -> Result<Option<u32>> {
+        if from < to {
+            return Ok(None);
+        }
+
+        let rpc = get_bitcoind_rpc_client();
+        for height in (to..=from).rev() {
+            let Some(raw) = self.get_indexed_block_hash_raw_with_db(db, height)? else {
+                continue;
+            };
+            let chain_hash = match rpc.get_block_hash(height as u64) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    return Err(anyhow!("bitcoind get_block_hash({height}): {e}"));
+                }
+            };
+            let metashrew_hash = block_hash_matching_chain(raw, &chain_hash)
+                .unwrap_or_else(|| preferred_block_hash_variant(raw));
+            if metashrew_hash == chain_hash {
+                return Ok(Some(height));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn get_canonical_tip_height_with_db(&self, db: &SDB) -> Result<u32> {
+        let indexed_tip = self.get_alkanes_tip_height_with_db(db)?;
+        if indexed_tip == 0 {
+            return Ok(0);
+        }
+
+        let last_known = LAST_CANONICAL_METASHREW_TIP.load(Ordering::Relaxed).min(indexed_tip);
+        let buffered_floor = if last_known == 0 {
+            indexed_tip.saturating_sub(CANONICAL_TIP_SCAN_BUFFER)
+        } else {
+            last_known.saturating_sub(CANONICAL_TIP_SCAN_BUFFER)
+        };
+
+        if let Some(height) = self.find_canonical_tip_in_range(db, indexed_tip, buffered_floor)? {
+            LAST_CANONICAL_METASHREW_TIP.store(height, Ordering::Relaxed);
+            return Ok(height);
+        }
+
+        if buffered_floor > 0 {
+            if let Some(height) = self.find_canonical_tip_in_range(db, buffered_floor - 1, 0)? {
+                LAST_CANONICAL_METASHREW_TIP.store(height, Ordering::Relaxed);
+                return Ok(height);
+            }
+        }
+
+        anyhow::bail!(
+            "unable to find canonical metashrew tip at or below indexed tip {}",
+            indexed_tip
+        );
+    }
+
+    pub fn get_canonical_tip_height(&self) -> Result<u32> {
+        let db = get_metashrew_sdb();
+        db.catch_up_now().context("metashrew catch_up before computing canonical tip")?;
+        self.get_canonical_tip_height_with_db(db.as_ref())
+    }
+
     /// Fetch all traces for a txid directly from the secondary DB, without needing block height.
     pub fn traces_for_tx(&self, txid: &Txid) -> Result<Vec<PartialEspoTrace>> {
         let db = get_metashrew_sdb();
         self.traces_for_tx_with_db(db.as_ref(), txid)
     }
 
-    pub fn traces_for_tx_with_db(&self, db: &SDB, txid: &Txid) -> Result<Vec<PartialEspoTrace>> {
-        db.catch_up_now().context("metashrew catch_up before scanning traces_for_tx")?;
-
+    pub(crate) fn traces_for_tx_with_db_uncaught(
+        &self,
+        db: &SDB,
+        txid: &Txid,
+    ) -> Result<Vec<PartialEspoTrace>> {
         let root = self.root_ptr(db);
         let traces = TraceTablesNative::new(&root);
 
@@ -541,6 +703,11 @@ impl MetashrewAdapter {
         }
 
         Ok(out)
+    }
+
+    pub fn traces_for_tx_with_db(&self, db: &SDB, txid: &Txid) -> Result<Vec<PartialEspoTrace>> {
+        db.catch_up_now().context("metashrew catch_up before scanning traces_for_tx")?;
+        self.traces_for_tx_with_db_uncaught(db, txid)
     }
 
     pub fn get_reserves_for_alkane_with_db(
@@ -735,13 +902,11 @@ impl MetashrewAdapter {
         self.traces_for_block_as_prost_with_db(db.as_ref(), block)
     }
 
-    pub fn traces_for_block_as_prost_with_db(
+    pub(crate) fn traces_for_block_as_prost_with_db_uncaught(
         &self,
         db: &SDB,
         block: u64,
     ) -> Result<Vec<PartialEspoTrace>> {
-        // Ensure the secondary view is fresh before scanning traces.
-        db.catch_up_now().context("metashrew catch_up before scanning traces")?;
         let root = self.root_ptr(db);
         let traces = TraceTablesNative::new(&root);
         let outpoints = traces.TRACES_BY_HEIGHT_NATIVE.select_value(block).get_list();
@@ -804,5 +969,18 @@ impl MetashrewAdapter {
         }
 
         Ok(final_traces)
+    }
+
+    pub fn traces_for_block_as_prost_with_db(
+        &self,
+        db: &SDB,
+        block: u64,
+    ) -> Result<Vec<PartialEspoTrace>> {
+        // Ensure the secondary view is fresh before scanning traces.
+        db.catch_up_now().context("metashrew catch_up before scanning traces")?;
+        let block_u32: u32 =
+            block.try_into().context("block height does not fit into u32 for trace scan")?;
+        self.ensure_canonical_height_with_db(db, block_u32)?;
+        self.traces_for_block_as_prost_with_db_uncaught(db, block)
     }
 }

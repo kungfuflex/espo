@@ -3,6 +3,7 @@ use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
+use super::consts::PRIORITY_SERIES_ALKANES;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -43,6 +44,69 @@ fn series_id_matches_name(series_id: &str, name_norm: &str) -> bool {
         }
     }
     false
+}
+
+fn parse_alkane_id_str(s: &str) -> Option<SchemaAlkaneId> {
+    let (block_raw, tx_raw) = s.split_once(':')?;
+    let parse_u32 = |v: &str| {
+        if let Some(hex) = v.strip_prefix("0x") {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            v.parse::<u32>().ok()
+        }
+    };
+    let parse_u64 = |v: &str| {
+        if let Some(hex) = v.strip_prefix("0x") {
+            u64::from_str_radix(hex, 16).ok()
+        } else {
+            v.parse::<u64>().ok()
+        }
+    };
+    Some(SchemaAlkaneId { block: parse_u32(block_raw)?, tx: parse_u64(tx_raw)? })
+}
+
+fn priority_family_for_alkane(alkane: &SchemaAlkaneId) -> Option<(&'static str, SchemaAlkaneId)> {
+    for (raw_alkane, base_name) in PRIORITY_SERIES_ALKANES {
+        let priority_alkane = parse_alkane_id_str(raw_alkane)?;
+        if &priority_alkane == alkane {
+            return Some((base_name, priority_alkane));
+        }
+    }
+    None
+}
+
+fn parse_priority_series_query(series_id: &str) -> Option<(&'static str, SchemaAlkaneId, Option<u32>)> {
+    for (raw_alkane, base_name) in PRIORITY_SERIES_ALKANES {
+        let priority_alkane = parse_alkane_id_str(raw_alkane)?;
+        if series_id == *base_name {
+            return Some((base_name, priority_alkane, None));
+        }
+        if let Some(rest) = series_id.strip_prefix(base_name).and_then(|s| s.strip_prefix('-')) {
+            let suffix = rest.parse::<u32>().ok()?;
+            return Some((base_name, priority_alkane, Some(suffix)));
+        }
+    }
+    None
+}
+
+fn shift_stored_series_id_for_priority_family(stored_series_id: &str, base_name: &str) -> Option<String> {
+    if stored_series_id == base_name {
+        return Some(format!("{base_name}-2"));
+    }
+    let rest = stored_series_id
+        .strip_prefix(base_name)
+        .and_then(|s| s.strip_prefix('-'))?;
+    let suffix = rest.parse::<u32>().ok()?;
+    Some(format!("{base_name}-{}", suffix.saturating_add(1)))
+}
+
+fn map_priority_public_query_to_stored(base_name: &str, suffix: Option<u32>) -> Option<String> {
+    match suffix {
+        None => Some(base_name.to_string()),
+        Some(0) | Some(1) => None,
+        Some(2) => Some(base_name.to_string()),
+        Some(n) => Some(format!("{base_name}-{}", n - 1)),
+    }
 }
 
 fn dedupe_batch_ops(
@@ -272,6 +336,45 @@ impl PizzafunProvider {
         Ok(out)
     }
 
+    pub(crate) fn get_series_by_id_raw(
+        &self,
+        params: GetSeriesByIdParams,
+    ) -> Result<Option<SeriesEntry>> {
+        let table = self.table();
+        let key = table.series_by_id_key(&params.series_id);
+        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SeriesEntry::try_from_slice(&bytes)?))
+    }
+
+    pub(crate) fn get_series_by_alkane_raw(
+        &self,
+        params: GetSeriesByAlkaneParams,
+    ) -> Result<Option<SeriesEntry>> {
+        let table = self.table();
+        let key = table.series_by_alkane_key(&params.alkane);
+        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SeriesEntry::try_from_slice(&bytes)?))
+    }
+
+    pub(crate) fn priority_family_seeded(
+        &self,
+        base_name: &str,
+        priority_alkane: SchemaAlkaneId,
+        blockhash: StateAt,
+    ) -> Result<bool> {
+        let raw = self.get_series_by_id_raw(GetSeriesByIdParams {
+            blockhash,
+            series_id: base_name.to_string(),
+        })?;
+        Ok(matches!(raw, Some(entry) if entry.alkane_id == priority_alkane))
+    }
+
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("pizzafun.get_index_height");
         let table = self.table();
@@ -298,29 +401,47 @@ impl PizzafunProvider {
     }
 
     pub fn get_series_by_id(&self, params: GetSeriesByIdParams) -> Result<Option<SeriesEntry>> {
-        let table = self.table();
-        let key = table.series_by_id_key(&params.series_id);
-        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(SeriesEntry::try_from_slice(&bytes)?))
+        if let Some((base_name, priority_alkane, suffix)) =
+            parse_priority_series_query(&params.series_id)
+        {
+            if !self.priority_family_seeded(base_name, priority_alkane, params.blockhash)? {
+                if suffix.is_none() {
+                    return Ok(Some(SeriesEntry {
+                        series_id: base_name.to_string(),
+                        alkane_id: priority_alkane,
+                        creation_height: priority_alkane.block,
+                    }));
+                }
+                let Some(stored_series_id) =
+                    map_priority_public_query_to_stored(base_name, suffix)
+                else {
+                    return Ok(None);
+                };
+                let raw = self.get_series_by_id_raw(GetSeriesByIdParams {
+                    blockhash: params.blockhash,
+                    series_id: stored_series_id,
+                })?;
+                return Ok(raw.map(|mut entry| {
+                    entry.series_id =
+                        shift_stored_series_id_for_priority_family(&entry.series_id, base_name)
+                            .unwrap_or(entry.series_id.clone());
+                    entry
+                }));
+            }
+        }
+        self.get_series_by_id_raw(params)
     }
 
     pub fn get_series_by_ids(
         &self,
         params: GetSeriesByIdsParams,
     ) -> Result<Vec<Option<SeriesEntry>>> {
-        let table = self.table();
-        let keys: Vec<Vec<u8>> =
-            params.series_ids.iter().map(|s| table.series_by_id_key(s)).collect();
-        let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
-        let mut out = Vec::with_capacity(raw.len());
-        for item in raw {
-            match item {
-                Some(bytes) => out.push(Some(SeriesEntry::try_from_slice(&bytes)?)),
-                None => out.push(None),
-            }
+        let mut out = Vec::with_capacity(params.series_ids.len());
+        for series_id in params.series_ids {
+            out.push(self.get_series_by_id(GetSeriesByIdParams {
+                blockhash: params.blockhash,
+                series_id,
+            })?);
         }
         Ok(out)
     }
@@ -329,29 +450,51 @@ impl PizzafunProvider {
         &self,
         params: GetSeriesByAlkaneParams,
     ) -> Result<Option<SeriesEntry>> {
-        let table = self.table();
-        let key = table.series_by_alkane_key(&params.alkane);
-        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
-        else {
+        if let Some((base_name, priority_alkane)) = priority_family_for_alkane(&params.alkane) {
+            if !self.priority_family_seeded(base_name, priority_alkane, params.blockhash)? {
+                return Ok(Some(SeriesEntry {
+                    series_id: base_name.to_string(),
+                    alkane_id: priority_alkane,
+                    creation_height: priority_alkane.block,
+                }));
+            }
+        }
+
+        let raw = self.get_series_by_alkane_raw(GetSeriesByAlkaneParams {
+            blockhash: params.blockhash,
+            alkane: params.alkane,
+        })?;
+        let Some(mut entry) = raw else {
             return Ok(None);
         };
-        Ok(Some(SeriesEntry::try_from_slice(&bytes)?))
+
+        if let Some((base_name, priority_alkane, _suffix)) =
+            parse_priority_series_query(&entry.series_id)
+        {
+            if entry.alkane_id != priority_alkane
+                && !self.priority_family_seeded(base_name, priority_alkane, params.blockhash)?
+            {
+                if let Some(shifted) =
+                    shift_stored_series_id_for_priority_family(&entry.series_id, base_name)
+                {
+                    entry.series_id = shifted;
+                }
+            }
+        }
+
+        Ok(Some(entry))
     }
 
     pub fn get_series_by_alkanes(
         &self,
         params: GetSeriesByAlkanesParams,
     ) -> Result<Vec<Option<SeriesEntry>>> {
-        let table = self.table();
-        let keys: Vec<Vec<u8>> =
-            params.alkanes.iter().map(|a| table.series_by_alkane_key(a)).collect();
-        let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
-        let mut out = Vec::with_capacity(raw.len());
-        for item in raw {
-            match item {
-                Some(bytes) => out.push(Some(SeriesEntry::try_from_slice(&bytes)?)),
-                None => out.push(None),
-            }
+        let mut out = Vec::with_capacity(params.alkanes.len());
+        for alkane in params.alkanes {
+            out.push(self.get_series_by_alkane(GetSeriesByAlkaneParams {
+                blockhash: params.blockhash,
+                alkane,
+            })?);
         }
         Ok(out)
     }
@@ -382,7 +525,8 @@ impl PizzafunProvider {
                 let Ok(series_id) = std::str::from_utf8(suffix) else {
                     continue;
                 };
-                if series_id_matches_name(series_id, name) && seen_ids.insert(series_id.to_string()) {
+                if series_id_matches_name(series_id, name) && seen_ids.insert(series_id.to_string())
+                {
                     filtered_ids.push(series_id.to_string());
                 }
             }
@@ -416,8 +560,7 @@ impl PizzafunProvider {
             deletes.push(table.series_all_entry_key(&entry.series_id));
         }
 
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(updated.len() * 3);
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(updated.len() * 3);
         for entry in updated {
             let encoded = borsh::to_vec(entry)?;
             puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
@@ -460,8 +603,7 @@ impl PizzafunProvider {
             }
         }
 
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(entries.len() * 3);
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len() * 3);
         for entry in entries {
             let encoded = borsh::to_vec(entry)?;
             puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));

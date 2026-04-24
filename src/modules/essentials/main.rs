@@ -8,7 +8,7 @@ use crate::modules::essentials::consts::{
 use crate::modules::essentials::rpc;
 use crate::modules::essentials::storage::{
     BlockSummary, EssentialsProvider, GetRawValueParams, cache_block_summary,
-    encode_creation_record,
+    compute_block_fee_rate_summary, encode_creation_record,
 };
 use crate::modules::essentials::utils::creation_meta::{get_cap, get_value_per_mint};
 use crate::modules::essentials::utils::inspections::{
@@ -221,16 +221,30 @@ impl EspoModule for Essentials {
                     rows.insert(table.alkane_symbol_index_key(&norm, alk), Vec::new());
                 }
             };
-        // block summary row (trace count + header)
+        // block summary rows (by blockhash plus append-only height->hash versions)
         let trace_count = block
             .transactions
             .iter()
             .map(|tx| tx.traces.as_ref().map(|t| t.len()).unwrap_or(0))
             .sum::<usize>() as u32;
+        let tx_count = block.transactions.len() as u32;
         let mut header_bytes = Vec::new();
         block.block_header.consensus_encode(&mut header_bytes)?;
-        let block_summary = BlockSummary { trace_count, header: header_bytes };
-        let block_summary_bytes = borsh::to_vec(&block_summary)?;
+        let blockhash = block.block_header.block_hash();
+        let fee_summary = match block.fee_summary {
+            Some(summary) => summary,
+            None => compute_block_fee_rate_summary(&blockhash)?,
+        };
+        let block_summary = BlockSummary {
+            height: block.height,
+            blockhash: blockhash.to_byte_array(),
+            trace_count,
+            tx_count,
+            header: header_bytes,
+            fee_avg: fee_summary.avg,
+            fee_median: fee_summary.median,
+            fee_range: fee_summary.range.to_vec(),
+        };
 
         let mut total_pairs_dedup = 0usize;
 
@@ -646,10 +660,8 @@ impl EspoModule for Essentials {
                 let mut alkane_id_bytes = Vec::with_capacity(12);
                 alkane_id_bytes.extend_from_slice(&rec.alkane.block.to_be_bytes());
                 alkane_id_bytes.extend_from_slice(&rec.alkane.tx.to_be_bytes());
-                creation_rows_seq.insert(
-                    table.alkane_creation_seq_key(next_creation_seq),
-                    alkane_id_bytes,
-                );
+                creation_rows_seq
+                    .insert(table.alkane_creation_seq_key(next_creation_seq), alkane_id_bytes);
                 next_creation_seq = next_creation_seq.saturating_add(1);
                 holders_index_rows.insert(table.alkane_holders_ordered_key(0, &rec.alkane));
             }
@@ -777,7 +789,6 @@ impl EspoModule for Essentials {
         for k in &holders_index_keys {
             puts.push((k.clone(), Vec::new()));
         }
-        puts.push((table.block_summary_key(block.height), block_summary_bytes));
         if let Some(count_bytes) = creation_count_row {
             puts.push((table.alkane_creation_count_key(), count_bytes.to_vec()));
         }
@@ -796,6 +807,13 @@ impl EspoModule for Essentials {
             deletes: Vec::new(),
         }) {
             eprintln!("[ESSENTIALS] bulk_write failed at block #{}: {e}", block.height);
+            return Err(e.into());
+        }
+        if let Err(e) = provider.put_block_summary_indexes(&block_summary) {
+            eprintln!(
+                "[ESSENTIALS] block summary index write failed at block #{}: {e}",
+                block.height
+            );
             return Err(e.into());
         }
         cache_block_summary(block.height, block_summary);

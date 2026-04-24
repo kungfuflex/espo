@@ -1351,6 +1351,151 @@ a:hover {
   flex-wrap: wrap;
   max-width: 100%;
 }
+.alkane-token-activity-card .holders_table td,
+.alkane-token-activity-card .holders_table th {
+  vertical-align: top;
+}
+.alkane-token-activity-card col:nth-child(1) {
+  width: 240px !important;
+}
+.alkane-token-activity-card col:nth-child(2) {
+  width: 168px !important;
+}
+.alkane-token-activity-card col:nth-child(4) {
+  width: 340px !important;
+}
+.alkane-token-activity-card td:nth-child(3),
+.alkane-token-activity-card th:nth-child(3) {
+  text-align: left;
+  min-width: 0;
+  overflow: hidden;
+}
+.alkane-token-activity-card td:nth-child(4),
+.alkane-token-activity-card th:nth-child(4) {
+  text-align: right;
+}
+.alkane-token-activity-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+.alkane-token-activity-summary-copy {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.alkane-token-activity-kind-label {
+  font-weight: 700;
+  color: var(--text);
+}
+.alkane-token-activity-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+.alkane-token-activity-mobile-head {
+  display: none;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+.alkane-token-activity-mobile-tx {
+  display: block;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+}
+.alkane-token-activity-time {
+  color: var(--muted);
+}
+.alkane-token-activity-tx {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+.alkane-token-activity-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--link);
+}
+.alkane-token-activity-icon .icon {
+  width: 16px;
+  height: 16px;
+}
+.alkane-token-activity-icon.trade_buy,
+.alkane-token-activity-flow-line.in {
+  color: var(--success);
+}
+.alkane-token-activity-flow-line.in .alk-amt {
+  color: var(--success);
+}
+.alkane-token-activity-icon.trade_buy {
+  background: rgba(83, 214, 163, 0.14);
+}
+.alkane-token-activity-icon.trade_sell,
+.alkane-token-activity-flow-line.out {
+  color: #f18585;
+}
+.alkane-token-activity-flow-line.out .alk-amt {
+  color: #f18585;
+}
+.alkane-token-activity-icon.trade_sell {
+  background: rgba(241, 133, 133, 0.14);
+}
+.alkane-token-activity-icon.liquidity_add {
+  background: rgba(81, 200, 227, 0.12);
+  color: #7de7f7;
+}
+.alkane-token-activity-icon.liquidity_remove {
+  background: rgba(255, 189, 92, 0.12);
+  color: #ffc36a;
+}
+.alkane-token-activity-icon.pool_create {
+  background: rgba(116, 121, 255, 0.14);
+  color: #a4a9ff;
+}
+.alkane-token-activity-icon.mint {
+  background: rgba(98, 184, 255, 0.14);
+  color: #7cc8ff;
+}
+.alkane-token-activity-pool {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.alkane-token-activity-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-end;
+}
+.alkane-token-activity-flow-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.alkane-token-activity-flow-line.neutral {
+  color: var(--muted);
+}
+.alkane-token-activity-card td:nth-child(4) .alk-line {
+  justify-content: flex-end;
+}
 
 .io-amount {
   color: var(--muted3);
@@ -2079,6 +2224,9 @@ a:hover {
   flex-wrap: wrap;
 }
 .alkane-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   border-radius: 6px;
   color: var(--muted2);
   font-weight: 700;
@@ -2096,11 +2244,19 @@ a:hover {
   color: var(--text);
   background: var(--link-dark);
 }
+.alkane-tab .icon {
+  width: 14px;
+  height: 14px;
+}
 .alkane-tab-panel {
   padding: 14px;
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+.alkane-volume-toolbar {
+  display: flex;
+  justify-content: flex-start;
 }
 .alkane-tab-panel .pager {
   margin-top: 12px;
@@ -2233,6 +2389,62 @@ button:hover {
   }
   .alkane-tab-list {
     overflow-x: auto;
+  }
+}
+@media (max-width: 580px) {
+  .alkane-token-activity-card .holders_table tbody tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "summary"
+      "flow";
+    gap: 10px;
+    align-items: start;
+  }
+  .alkane-token-activity-card .holders_table td {
+    width: auto;
+  }
+  .alkane-token-activity-card .holders_table td:nth-child(1) {
+    grid-area: summary;
+  }
+  .alkane-token-activity-card .holders_table td:nth-child(2) {
+    display: none;
+  }
+  .alkane-token-activity-card .holders_table td:nth-child(3) {
+    display: none;
+  }
+  .alkane-token-activity-card .holders_table td:nth-child(4) {
+    grid-area: flow;
+    justify-self: start;
+  }
+  .alkane-token-activity-summary {
+    justify-content: flex-start;
+    margin-top: 22px;
+    margin-bottom: 5px;
+  }
+  .alkane-token-activity-summary-copy {
+    align-items: flex-start;
+    text-align: left;
+  }
+  .alkane-token-activity-meta {
+    align-items: flex-start;
+    text-align: left;
+  }
+  .alkane-token-activity-account {
+    display: none;
+  }
+  .alkane-token-activity-mobile-head {
+    display: flex;
+    margin-bottom: 6px;
+  }
+  .alkane-token-activity-mobile-tx {
+    display: block;
+  }
+  .alkane-token-activity-flow {
+    align-items: flex-start;
+  }
+  .alkane-token-activity-flow-line {
+    justify-content: flex-start;
   }
 }
 .trace-contract-name {
@@ -2778,7 +2990,7 @@ button:hover {
   left: 50%;
   width: var(--bc-indicator-width, 22px);
   height: var(--bc-indicator-height, 12px);
-  transform: translate(-50%, 12px) rotate(180deg);
+  transform: translate(-50%, 16px) rotate(180deg);
   color: var(--link);
   pointer-events: none;
   opacity: 0;
@@ -2790,7 +3002,7 @@ button:hover {
 
 .bc-card.current .bc-indicator {
   opacity: 1;
-  transform: translate(-50%, 42px) scale(2) rotate(180deg);
+  transform: translate(-50%, 46px) scale(2) rotate(180deg);
 }
 .bc-indicator-svg {
   display: block;
@@ -2829,11 +3041,11 @@ button:hover {
   flex-direction: column;
   gap: 8px;
   align-items: center;
+  transform: translateY(-4px);
 }
 .bc-top {
   z-index: 10;
   transform: translateY(-18px);
-
   margin-left: -20px;
 }
 .bc-height-tag {
@@ -2842,6 +3054,39 @@ button:hover {
 }
 .bc-slide:hover .bc-height-tag {
   color: var(--link);
+}
+.bc-pool-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 154px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: rgba(31, 34, 40, 0.92);
+  color: var(--text);
+  text-decoration: none;
+}
+.bc-pool-tag:hover {
+  text-decoration: none;
+  color: var(--text);
+}
+.bc-pool-tag.unknown {
+  color: var(--muted);
+}
+.bc-pool-icon {
+  width: 16px;
+  height: 16px;
+  display: block;
+  flex: 0 0 auto;
+}
+.bc-pool-name {
+  max-width: 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
 }
 .bc-card {
   --bc-size: 125px;
@@ -2883,10 +3128,8 @@ button:hover {
   transform-origin: top;
 }
 .bc-face {
-  margin-top: 55px;
   position: relative;
   z-index: 1;
-  padding: 6px 4px;
   border-radius: 0;
   text-align: center;
 }
@@ -2948,14 +3191,34 @@ button:hover {
   font-weight: 700;
   font-size: 15px;
 }
+.bc-fees {
+  font-size: 12px;
+  margin-bottom: 2px;
+  color: #ffffff;
+  font-weight: 600;
+}
+.bc-fee-span {
+  font-size: 10px;
+  margin-bottom: 10px;
+  color: #98fffaf0;
+}
 .bc-traces {
   font-size: 15px;
   color: #fff;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.bc-tx-count {
+  font-size: 10px;
+  color: #fff;
+  line-height: 0;
+  margin-top: 0;
 }
 .bc-time {
   font-size: 13px;
   color: #fff;
-  font-weight: 700;
+  font-weight: 400;
+  margin-top: 12px;
 }
 
 .site-footer {

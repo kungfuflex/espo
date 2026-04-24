@@ -80,6 +80,54 @@ pub fn process_balance_deltas(
 
             if let Ok(seq) = state.activity_acc.push(owner, block_ts, activity.clone()) {
                 state.index_acc.add(&owner, block_ts, seq, &activity);
+                let base_amount = activity.base_delta.unsigned_abs();
+                let quote_amount = activity.quote_delta.unsigned_abs();
+                // This path only processes concrete pool defs from pools_map; synthetic
+                // chart ids such as "-usd" and "-derived_*" never enter this index.
+                state.token_activity_writes.push((
+                    table.token_activity_key(
+                        &defs.base_alkane_id,
+                        block_ts,
+                        seq,
+                        kind,
+                        &owner,
+                    ),
+                    Vec::new(),
+                ));
+                state.token_activity_amount_writes.push((
+                    table.token_activity_amount_key(
+                        &defs.base_alkane_id,
+                        base_amount,
+                        block_ts,
+                        seq,
+                        kind,
+                        &owner,
+                    ),
+                    Vec::new(),
+                ));
+                if defs.quote_alkane_id != defs.base_alkane_id {
+                    state.token_activity_writes.push((
+                        table.token_activity_key(
+                            &defs.quote_alkane_id,
+                            block_ts,
+                            seq,
+                            kind,
+                            &owner,
+                        ),
+                        Vec::new(),
+                    ));
+                    state.token_activity_amount_writes.push((
+                        table.token_activity_amount_key(
+                            &defs.quote_alkane_id,
+                            quote_amount,
+                            block_ts,
+                            seq,
+                            kind,
+                            &owner,
+                        ),
+                        Vec::new(),
+                    ));
+                }
                 if matches!(kind, ActivityKind::TradeBuy | ActivityKind::TradeSell) {
                     state.token_swaps_writes.push((
                         table.token_swaps_key(&defs.base_alkane_id, block_ts, seq, &owner),

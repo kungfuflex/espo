@@ -36,6 +36,8 @@ pub struct FinalizeStats {
     pub pool_lp_supply: usize,
     pub pool_details_snapshot: usize,
     pub tvl_versioned: usize,
+    pub token_activity: usize,
+    pub token_activity_amount: usize,
     pub token_swaps: usize,
     pub address_pool_swaps: usize,
     pub address_token_swaps: usize,
@@ -216,6 +218,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     let pls_cnt = state.pool_lp_supply_writes.len();
     let pds_cnt = state.pool_details_snapshot_writes.len();
     let tvl_cnt = state.tvl_versioned_writes.len();
+    let ta_cnt = state.token_activity_writes.len();
+    let taa_cnt = state.token_activity_amount_writes.len();
     let ts_cnt = state.token_swaps_writes.len();
     let a_cnt = activity_writes.len();
     let i_cnt = index_writes.len();
@@ -253,6 +257,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         || !state.pool_lp_supply_writes.is_empty()
         || !state.pool_details_snapshot_writes.is_empty()
         || !state.tvl_versioned_writes.is_empty()
+        || !state.token_activity_writes.is_empty()
+        || !state.token_activity_amount_writes.is_empty()
         || !state.token_swaps_writes.is_empty()
         || !state.address_pool_swaps_writes.is_empty()
         || !state.address_token_swaps_writes.is_empty()
@@ -294,6 +300,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     puts.extend(std::mem::take(&mut state.pool_lp_supply_writes));
     puts.extend(std::mem::take(&mut state.pool_details_snapshot_writes));
     puts.extend(std::mem::take(&mut state.tvl_versioned_writes));
+    puts.extend(std::mem::take(&mut state.token_activity_writes));
+    puts.extend(std::mem::take(&mut state.token_activity_amount_writes));
     puts.extend(std::mem::take(&mut state.token_swaps_writes));
     puts.extend(std::mem::take(&mut state.address_pool_swaps_writes));
     puts.extend(std::mem::take(&mut state.address_token_swaps_writes));
@@ -346,6 +354,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         pool_lp_supply: pls_cnt,
         pool_details_snapshot: pds_cnt,
         tvl_versioned: tvl_cnt,
+        token_activity: ta_cnt,
+        token_activity_amount: taa_cnt,
         token_swaps: ts_cnt,
         address_pool_swaps: aps_cnt,
         address_token_swaps: ats_cnt,

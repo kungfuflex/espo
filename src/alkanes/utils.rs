@@ -7,7 +7,7 @@ fn get_electrum_tip() -> Result<u32> {
 }
 
 pub fn get_safe_tip() -> Result<u32> {
-    let alkanes_tip = get_metashrew().get_alkanes_tip_height()?;
+    let alkanes_tip = get_metashrew().get_canonical_tip_height()?;
     let electrum_tip = match get_electrum_tip() {
         Ok(tip) => Some(tip),
         Err(e) => {

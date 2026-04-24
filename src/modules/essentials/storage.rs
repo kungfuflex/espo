@@ -1,16 +1,16 @@
 use crate::alkanes::trace::{
-    prettyify_protobuf_trace_json, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
 };
 use crate::config::{
     get_address_index_chunk_size, get_bitcoind_rpc_client, get_electrum_like, get_metashrew,
     get_network,
 };
 use crate::modules::essentials::utils::balances::{
-    get_address_activity_for_address, get_alkane_balances, get_alkane_balances_at_or_before,
-    get_balance_for_address, get_holders_for_alkane, get_outpoint_address,
-    get_total_received_for_alkane, get_transfer_volume_for_alkane, SignedU128,
+    SignedU128, get_address_activity_for_address, get_alkane_balances,
+    get_alkane_balances_at_or_before, get_balance_for_address, get_holders_for_alkane,
+    get_outpoint_address, get_total_received_for_alkane, get_transfer_volume_for_alkane,
 };
-use crate::modules::essentials::utils::inspections::{inspection_to_json, AlkaneCreationRecord};
+use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListNonMutatePointer, ListPointer};
 use crate::runtime::state_at::StateAt;
@@ -24,13 +24,14 @@ use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
-use serde_json::{json, map::Map, Value};
+use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address, MempoolEntry,
+    MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
 };
 use crate::utils::electrum_like::AddressHistoryEntry;
-use anyhow::{anyhow, Result};
+pub use crate::utils::fee_rates::{BlockFeeRateSummary, compute_block_fee_rate_summary};
+use anyhow::{Result, anyhow};
 use hex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -301,6 +302,7 @@ pub struct EssentialsTable<'a> {
     pub ALKANE_LATEST_TRACES: KvPointer<'a>,
     // Block summaries.
     pub BLOCK_SUMMARY: KvPointer<'a>,
+    pub HEIGHT_TO_HASH: KvPointer<'a>,
 }
 
 impl<'a> EssentialsTable<'a> {
@@ -341,6 +343,7 @@ impl<'a> EssentialsTable<'a> {
             ALKANE_ADDR: root.list_keyword("/alkane_addr/"),
             ALKANE_LATEST_TRACES: root.keyword("/alkane_latest_traces"),
             BLOCK_SUMMARY: root.keyword("/block_summary/"),
+            HEIGHT_TO_HASH: root.keyword("/height_to_hash/"),
         }
     }
 }
@@ -1577,6 +1580,21 @@ impl<'a> EssentialsTable<'a> {
         self.BLOCK_SUMMARY.select(&height.to_be_bytes()).key().to_vec()
     }
 
+    pub fn block_summary_by_hash_key(&self, blockhash: &BlockHash) -> Vec<u8> {
+        self.BLOCK_SUMMARY.select(blockhash.to_string().as_bytes()).key().to_vec()
+    }
+
+    pub fn height_to_hash_length_key(&self, height: u32) -> Vec<u8> {
+        self.HEIGHT_TO_HASH.select(format!("{height}/length").as_bytes()).key().to_vec()
+    }
+
+    pub fn height_to_hash_version_key(&self, height: u32, version: u32) -> Vec<u8> {
+        self.HEIGHT_TO_HASH
+            .select(format!("{height}/{version}").as_bytes())
+            .key()
+            .to_vec()
+    }
+
     pub fn block_summary_prefix(&self) -> Vec<u8> {
         self.BLOCK_SUMMARY.key().to_vec()
     }
@@ -1689,16 +1707,6 @@ impl EssentialsProvider {
 
     pub fn non_mutating_pointer(&self) -> ListNonMutatePointer<'_> {
         ListNonMutatePointer::root(self.mdb.as_ref(), self.blob_mdb.as_ref())
-    }
-
-    fn raw_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.view_blockhash {
-            Some(blockhash) => self
-                .mdb
-                .get_at_blockhash(&blockhash, key)
-                .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}")),
-            None => self.mdb.get(key).map_err(|e| anyhow!("mdb.get failed: {e}")),
-        }
     }
 
     fn raw_get_at(&self, key: &[u8], blockhash: Option<BlockHash>) -> Result<Option<Vec<u8>>> {
@@ -2513,10 +2521,129 @@ impl EssentialsProvider {
         params: GetBlockSummaryParams,
     ) -> Result<GetBlockSummaryResult> {
         crate::debug_timer_log!("get_block_summary");
-        let table = self.table();
-        let key = table.block_summary_key(params.height);
-        let summary = self.raw_get(&key)?.and_then(|b| BlockSummary::try_from_slice(&b).ok());
+        let summary = match params.blockhash {
+            StateAt::Block(blockhash) => self.get_block_summary_by_hash(&blockhash)?,
+            StateAt::Latest => self.get_latest_block_summary_by_height(params.height)?,
+        };
         Ok(GetBlockSummaryResult { summary })
+    }
+
+    pub fn get_block_summaries_by_heights(
+        &self,
+        heights: &[u32],
+    ) -> Result<Vec<Option<BlockSummary>>> {
+        crate::debug_timer_log!("get_block_summaries_by_heights");
+        if heights.is_empty() {
+            return Ok(Vec::new());
+        }
+        let table = self.table();
+
+        let length_keys: Vec<Vec<u8>> =
+            heights.iter().map(|height| table.height_to_hash_length_key(*height)).collect();
+        let length_values = self.raw_blob_multi_get(&length_keys)?;
+
+        let mut hash_keys: Vec<Vec<u8>> = Vec::new();
+        let mut hash_key_positions: Vec<usize> = Vec::new();
+        let mut out: Vec<Option<BlockSummary>> = vec![None; heights.len()];
+        for (idx, raw) in length_values.iter().enumerate() {
+            let Some(length) = raw.as_ref().and_then(|bytes| decode_u32_le(bytes)) else {
+                continue;
+            };
+            if length == 0 {
+                continue;
+            }
+            hash_keys.push(table.height_to_hash_version_key(heights[idx], length - 1));
+            hash_key_positions.push(idx);
+        }
+
+        if hash_keys.is_empty() {
+            return self.get_legacy_block_summaries_by_heights(heights);
+        }
+
+        let hash_values = self.raw_blob_multi_get(&hash_keys)?;
+        let mut summary_keys: Vec<Vec<u8>> = Vec::new();
+        let mut summary_key_positions: Vec<usize> = Vec::new();
+        for (raw, idx) in hash_values.iter().zip(hash_key_positions.iter().copied()) {
+            let Some(blockhash) = raw.as_ref().and_then(|bytes| decode_blockhash(bytes)) else {
+                continue;
+            };
+            summary_keys.push(table.block_summary_by_hash_key(&blockhash));
+            summary_key_positions.push(idx);
+        }
+
+        if !summary_keys.is_empty() {
+            let summary_values = self.raw_blob_multi_get(&summary_keys)?;
+            for (raw, idx) in summary_values.iter().zip(summary_key_positions.iter().copied()) {
+                if let Some(summary) = raw.as_ref().and_then(|bytes| BlockSummary::decode(bytes)) {
+                    out[idx] = Some(summary);
+                }
+            }
+        }
+
+        if out.iter().any(|summary| summary.is_none()) {
+            let legacy = self.get_legacy_block_summaries_by_heights(heights)?;
+            for (slot, legacy_summary) in out.iter_mut().zip(legacy.into_iter()) {
+                if slot.is_none() {
+                    *slot = legacy_summary;
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn get_latest_block_summary_by_height(&self, height: u32) -> Result<Option<BlockSummary>> {
+        let summaries = self.get_block_summaries_by_heights(&[height])?;
+        Ok(summaries.into_iter().next().flatten())
+    }
+
+    fn get_block_summary_by_hash(&self, blockhash: &BlockHash) -> Result<Option<BlockSummary>> {
+        let table = self.table();
+        let key = table.block_summary_by_hash_key(blockhash);
+        Ok(self.raw_blob_get(&key)?.and_then(|bytes| BlockSummary::decode(&bytes)))
+    }
+
+    fn get_legacy_block_summaries_by_heights(
+        &self,
+        heights: &[u32],
+    ) -> Result<Vec<Option<BlockSummary>>> {
+        let table = self.table();
+        let keys: Vec<Vec<u8>> =
+            heights.iter().map(|height| table.block_summary_key(*height)).collect();
+        let values = self.raw_multi_get(&keys)?;
+        Ok(values
+            .into_iter()
+            .map(|raw| raw.and_then(|bytes| BlockSummary::decode(&bytes)))
+            .collect())
+    }
+
+    pub fn put_block_summary_indexes(&self, summary: &BlockSummary) -> Result<()> {
+        let Some(blockhash) = summary.block_hash() else {
+            return Err(anyhow!("block summary missing blockhash"));
+        };
+        let table = self.table();
+        let summary_key = table.block_summary_by_hash_key(&blockhash);
+        let length_key = table.height_to_hash_length_key(summary.height);
+        let length = self
+            .raw_blob_get(&length_key)?
+            .as_ref()
+            .and_then(|raw| decode_u32_le(raw))
+            .unwrap_or(0);
+        let version_key = table.height_to_hash_version_key(summary.height, length);
+        let summary_bytes = borsh::to_vec(summary)?;
+        let blockhash_bytes = encode_blockhash(&blockhash);
+        let next_length = length.checked_add(1).ok_or_else(|| {
+            anyhow!("height_to_hash length overflow for height {}", summary.height)
+        })?;
+
+        self.blob_mdb
+            .bulk_write(|wb: &mut MdbBatch<'_>| {
+                wb.put(&summary_key, &summary_bytes);
+                wb.put(&version_key, &blockhash_bytes);
+                wb.put(&length_key, &next_length.to_le_bytes());
+            })
+            .map_err(|e| anyhow!("blob_mdb.bulk_write block summary indexes failed: {e}"))?;
+        Ok(())
     }
 
     pub fn get_mempool_seen_page(
@@ -2707,11 +2834,7 @@ impl EssentialsProvider {
             let key_str_val = utf8_or_null(k);
 
             let top_key = if try_decode_utf8 {
-                if let Value::String(s) = &key_str_val {
-                    s.clone()
-                } else {
-                    key_hex.clone()
-                }
+                if let Value::String(s) = &key_str_val { s.clone() } else { key_hex.clone() }
             } else {
                 key_hex.clone()
             };
@@ -2899,11 +3022,22 @@ impl EssentialsProvider {
             .ok()
             .and_then(|resp| resp.summary);
 
-        let (trace_count, header_hex, found) = if let Some(summary) = summary {
-            (summary.trace_count, Some(hex::encode(summary.header)), true)
-        } else {
-            (0, None, false)
-        };
+        let (trace_count, tx_count, header_hex, blockhash, fee_avg, fee_median, fee_range, found) =
+            if let Some(summary) = summary {
+                let blockhash = summary.block_hash().map(|h| h.to_string());
+                (
+                    summary.trace_count,
+                    summary.tx_count,
+                    Some(hex::encode(summary.header)),
+                    blockhash,
+                    summary.fee_avg,
+                    summary.fee_median,
+                    summary.fee_range,
+                    true,
+                )
+            } else {
+                (0, 0, None, None, 0.0, 0.0, Vec::new(), false)
+            };
 
         Ok(RpcGetBlockSummaryResult {
             value: json!({
@@ -2911,7 +3045,12 @@ impl EssentialsProvider {
                 "height": height,
                 "found": found,
                 "trace_count": trace_count,
+                "tx_count": tx_count,
+                "blockhash": blockhash,
                 "header_hex": header_hex,
+                "fee_avg": fee_avg,
+                "fee_median": fee_median,
+                "fee_range": fee_range,
             }),
         })
     }
@@ -4254,11 +4393,7 @@ impl EssentialsProvider {
                                         return None;
                                     }
                                     chain_tip.and_then(|tip| {
-                                        if tip >= h {
-                                            Some(tip - h + 1)
-                                        } else {
-                                            None
-                                        }
+                                        if tip >= h { Some(tip - h + 1) } else { None }
                                     })
                                 });
                             let traces = summary
@@ -4316,11 +4451,7 @@ impl EssentialsProvider {
                                 let summary = load_tx_summary_v2(self, txid);
                                 let confirmations = entries_for_page[idx].height.and_then(|h| {
                                     chain_tip.and_then(|tip| {
-                                        if tip >= h {
-                                            Some(tip - h + 1)
-                                        } else {
-                                            None
-                                        }
+                                        if tip >= h { Some(tip - h + 1) } else { None }
                                     })
                                 });
                                 let traces = summary
@@ -5075,8 +5206,73 @@ pub struct HoldersCountEntry {
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct BlockSummary {
+    pub height: u32,
+    pub blockhash: [u8; 32],
+    pub trace_count: u32,
+    pub tx_count: u32,
+    pub header: Vec<u8>,
+    pub fee_avg: f64,
+    pub fee_median: f64,
+    pub fee_range: Vec<f64>,
+}
+
+#[derive(Clone, Debug, BorshDeserialize)]
+struct LegacyBlockSummaryV1 {
+    pub trace_count: u32,
+    pub tx_count: u32,
+    pub header: Vec<u8>,
+}
+
+#[derive(Clone, Debug, BorshDeserialize)]
+struct LegacyBlockSummaryV0 {
     pub trace_count: u32,
     pub header: Vec<u8>,
+}
+
+impl BlockSummary {
+    pub fn decode(raw: &[u8]) -> Option<Self> {
+        Self::try_from_slice(raw)
+            .ok()
+            .or_else(|| {
+                LegacyBlockSummaryV1::try_from_slice(raw).ok().map(|legacy| Self {
+                    height: 0,
+                    blockhash: [0; 32],
+                    trace_count: legacy.trace_count,
+                    tx_count: legacy.tx_count,
+                    header: legacy.header,
+                    fee_avg: 0.0,
+                    fee_median: 0.0,
+                    fee_range: Vec::new(),
+                })
+            })
+            .or_else(|| {
+                LegacyBlockSummaryV0::try_from_slice(raw).ok().map(|legacy| Self {
+                    height: 0,
+                    blockhash: [0; 32],
+                    trace_count: legacy.trace_count,
+                    tx_count: 0,
+                    header: legacy.header,
+                    fee_avg: 0.0,
+                    fee_median: 0.0,
+                    fee_range: Vec::new(),
+                })
+            })
+    }
+
+    pub fn block_hash(&self) -> Option<BlockHash> {
+        if self.blockhash == [0; 32] {
+            return None;
+        }
+        Some(BlockHash::from_byte_array(self.blockhash))
+    }
+}
+
+fn decode_blockhash(bytes: &[u8]) -> Option<BlockHash> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+fn encode_blockhash(blockhash: &BlockHash) -> Vec<u8> {
+    blockhash.to_string().into_bytes()
 }
 
 const BLOCK_SUMMARY_CACHE_CAP: usize = 100;
@@ -5136,17 +5332,16 @@ pub fn preload_block_summary_cache(mdb: &Mdb) -> usize {
         return 0;
     }
 
+    let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
     let mut loaded = 0usize;
     let mut height = index_height;
     loop {
         if loaded >= BLOCK_SUMMARY_CACHE_CAP {
             break;
         }
-        if let Ok(Some(raw)) = mdb.get(&table.block_summary_key(height)) {
-            if let Ok(summary) = BlockSummary::try_from_slice(&raw) {
-                cache_block_summary(height, summary);
-                loaded += 1;
-            }
+        if let Ok(Some(summary)) = provider.get_latest_block_summary_by_height(height) {
+            cache_block_summary(height, summary);
+            loaded += 1;
         }
         if height == 0 {
             break;
@@ -6351,11 +6546,7 @@ fn enriched_transaction_json(
     let has_protostones = !protostones.is_empty();
     let alkanes_traces = render.traces.as_ref().and_then(|traces| {
         let vals = traces.iter().map(enriched_trace_to_value).collect::<Vec<_>>();
-        if vals.is_empty() {
-            None
-        } else {
-            Some(Value::Array(vals))
-        }
+        if vals.is_empty() { None } else { Some(Value::Array(vals)) }
     });
 
     let mut out = Map::new();
@@ -6612,7 +6803,7 @@ mod tests {
     use super::*;
     use crate::runtime::tree_db::{get_global_tree_db, init_global_tree_db};
     use bitcoin::BlockHash;
-    use rocksdb::{Options, DB};
+    use rocksdb::{DB, Options};
     use std::sync::Arc;
     use tempfile::TempDir;
 

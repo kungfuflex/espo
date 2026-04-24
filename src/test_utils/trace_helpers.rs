@@ -53,6 +53,7 @@ pub fn build_espo_block(
         height,
         block_header: block.header,
         host_function_values,
+        fee_summary: None,
         tx_count: block.txdata.len(),
         transactions,
     })

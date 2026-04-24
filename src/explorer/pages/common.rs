@@ -40,6 +40,21 @@ pub fn fmt_alkane_amount(raw: u128) -> String {
     format!("{}.{}", with_commas(whole), frac)
 }
 
+pub fn format_fee_rate_value(rate: f64) -> String {
+    let mut s = format!("{rate:.2}");
+    while s.contains('.') && s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    if s == "-0" { "0".to_string() } else { s }
+}
+
+pub fn format_fee_rate(rate: f64) -> String {
+    format!("{} sat/vB", format_fee_rate_value(rate))
+}
+
 fn trim_fraction(mut s: String) -> String {
     while s.ends_with('0') {
         s.pop();
