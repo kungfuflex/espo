@@ -2,12 +2,10 @@ use maud::{Markup, PreEscaped, html};
 
 use crate::explorer::paths::{current_language, explorer_path};
 
-/// Carousel of blocks around the current height. Uses Embla (CDN) for smooth drag/scroll.
 pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     let current_height = current_height.unwrap_or(espo_tip);
     let base_path_js = format!("{:?}", explorer_path("/"));
     let is_chinese = current_language().is_chinese();
-    let loading_label = if is_chinese { "区块加载中…" } else { "Loading blocks…" };
 
     let script = PreEscaped(format!(
         r#"
@@ -17,40 +15,88 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   const basePrefix = basePath === '/' ? '' : basePath;
   const root = document.querySelector('[data-block-carousel]');
   if (!root) return;
-  const viewport = root.querySelector('[data-bc-viewport]');
-  const container = root.querySelector('[data-bc-container]');
+
+  const scroller = root.querySelector('[data-bc-scroll]');
+  const track = root.querySelector('[data-bc-track]');
   const current = Number(root.dataset.current);
   const espoTip = Number(root.dataset.espoTip);
-  if (!viewport || !container || !Number.isFinite(current) || !Number.isFinite(espoTip)) return;
+  if (!scroller || !track || !Number.isFinite(current) || !Number.isFinite(espoTip)) return;
 
-  let minH = current;
-  let maxH = current;
+  const RADIUS = 8;
+  const SKELETON_BATCH = RADIUS * 2;
+  const EDGE_THRESHOLD = 320;
+  const RETRY_MS = 1500;
+
   const seen = new Set();
   const blocks = [];
-  let fetching = false;
-  let embla = null;
+  let minH = current;
+  let maxH = current;
+  let selectedHeight = current;
+  let pendingLeft = 0;
+  let pendingRight = 0;
+  let loadingInitial = false;
   let loadingLeft = false;
   let loadingRight = false;
-  let selectedHeight = current;
-  let pendingEdge = false;
+  let initialRetryTimer = null;
+  let leftRetryTimer = null;
+  let rightRetryTimer = null;
   let leftDepleted = false;
   let rightDepleted = false;
-  let suppressSelectUpdate = false;
+  let initialCentered = false;
   let scrollRaf = null;
-  let hasCentered = false;
-  const isLatest = current === espoTip;
-  const isRtl = root.dataset.bcRtl === '1';
-  let indicator = null;
 
-  const setLoading = (side, val) => {{
-    if (side === 'left') {{
-      loadingLeft = val;
-      root.dataset.loadingleft = val ? '1' : '0';
-    }} else {{
-      loadingRight = val;
-      root.dataset.loadingright = val ? '1' : '0';
+  let isDragging = false;
+  let dragStartX = 0;
+  let dragStartScrollLeft = 0;
+  let lastPointerX = 0;
+  let lastVelocityTs = 0;
+  let velocity = 0;
+  let momentumRaf = null;
+  let dragMoved = false;
+  let suppressClickUntil = 0;
+
+  function stopMomentum() {{
+    if (momentumRaf) {{
+      cancelAnimationFrame(momentumRaf);
+      momentumRaf = null;
     }}
-  }};
+  }}
+
+  function resetMomentum(x) {{
+    lastPointerX = x;
+    lastVelocityTs = performance.now();
+    velocity = 0;
+    dragMoved = false;
+    stopMomentum();
+  }}
+
+  function updateVelocity(x) {{
+    const now = performance.now();
+    const dt = now - lastVelocityTs;
+    if (dt <= 0) return;
+    const inst = (x - lastPointerX) / dt;
+    velocity = (velocity * 0.8) + (inst * 0.2);
+    lastPointerX = x;
+    lastVelocityTs = now;
+  }}
+
+  function animateMomentum() {{
+    stopMomentum();
+    if (Math.abs(velocity) < 0.01) return;
+    let last = performance.now();
+    const step = (now) => {{
+      const dt = now - last;
+      last = now;
+      if (Math.abs(velocity) < 0.01) {{
+        momentumRaf = null;
+        return;
+      }}
+      scroller.scrollLeft -= velocity * dt;
+      velocity *= Math.pow(0.94, dt / 16);
+      momentumRaf = requestAnimationFrame(step);
+    }};
+    momentumRaf = requestAnimationFrame(step);
+  }}
 
   function formatAgo(ts) {{
     if (!ts) return '';
@@ -59,15 +105,15 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     const hrs = Math.floor(mins / 60);
     const days = Math.floor(hrs / 24);
     if (isChinese) {{
-      if (days > 365) return `${{Math.floor(days/365)}}年前`;
-      if (days > 30) return `${{Math.floor(days/30)}}个月前`;
+      if (days > 365) return `${{Math.floor(days / 365)}}年前`;
+      if (days > 30) return `${{Math.floor(days / 30)}}个月前`;
       if (days > 0) return `${{days}}天前`;
       if (hrs > 0) return `${{hrs}}小时前`;
       if (mins > 0) return `${{mins}}分钟前`;
       return '刚刚';
     }}
-    if (days > 365) return `${{Math.floor(days/365)}}y ago`;
-    if (days > 30) return `${{Math.floor(days/30)}}mo ago`;
+    if (days > 365) return `${{Math.floor(days / 365)}}y ago`;
+    if (days > 30) return `${{Math.floor(days / 30)}}mo ago`;
     if (days > 0) return `${{days}}d ago`;
     if (hrs > 0) return `${{hrs}}h ago`;
     if (mins > 0) return `${{mins}}m ago`;
@@ -97,7 +143,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
       maximumFractionDigits: 2
     }}).format(displayValue) + (compact ? 'k' : '');
     if (!includeUnit) return amount;
-    return isChinese ? `${{amount}} sat/vB` : `${{amount}} sat/vB`;
+    return `${{amount}} sat/vB`;
   }}
 
   function renderFeeStats(block) {{
@@ -120,7 +166,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   }}
 
   function renderPoolTag(pool) {{
-    if (!pool || !pool.name) return '';
+    if (!pool || !pool.name) return '<div class="bc-pool-slot"></div>';
     const icon = pool.icon_url
       ? `<img class="bc-pool-icon" src="${{escapeHtml(pool.icon_url)}}" alt="${{escapeHtml(pool.name)}} pool icon" loading="lazy">`
       : '';
@@ -130,265 +176,286 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
       <span class="bc-pool-name">${{escapeHtml(pool.name)}}</span>
     `;
     if (pool.mempool_url) {{
-      return `
-        <a class="bc-pool-tag${{unknownClass}}" href="${{escapeHtml(pool.mempool_url)}}" target="_blank" rel="noopener noreferrer">
-          ${{content}}
-        </a>
-      `;
+      return `<a class="bc-pool-tag${{unknownClass}}" href="${{escapeHtml(pool.mempool_url)}}" target="_blank" rel="noopener noreferrer">${{content}}</a>`;
     }}
+    return `<div class="bc-pool-tag${{unknownClass}}">${{content}}</div>`;
+  }}
+
+  function renderSkeleton(side, index) {{
     return `
-      <div class="bc-pool-tag${{unknownClass}}">
-        ${{content}}
+      <div class="bc-slide bc-skeleton" data-bc-skeleton="${{side}}-${{index}}">
+        <div class="bc-top" aria-hidden="true"></div>
+        <div class="bc-card bc-card-skeleton" aria-hidden="true"></div>
+        <div class="bc-pool-slot" aria-hidden="true"></div>
       </div>
     `;
   }}
 
-  function ensureIndicator() {{
-    if (indicator) return indicator;
-    indicator = root.querySelector('[data-bc-indicator]');
-    if (!indicator) {{
-      indicator = document.createElement('div');
-      indicator.className = 'bc-indicator';
-      indicator.dataset.bcIndicator = '1';
-      indicator.setAttribute('aria-hidden', 'true');
-      indicator.innerHTML = '<svg class="bc-indicator-svg" viewBox="0 0 24 14" aria-hidden="true" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg>';
-    }}
-    return indicator;
-  }}
-
-  function getIndexByHeight(height) {{
-    return blocks.findIndex((b) => b.height === height);
-  }}
-
-  function snapToHeight(height, jump = false) {{
-    if (!embla) return;
-    const idx = getIndexByHeight(height);
-    if (idx < 0) return;
-    embla.scrollTo(idx, jump);
-  }}
-
-  function updateIndicator() {{
-    if (!embla) return;
-    const node = ensureIndicator();
-    if (!node) return;
-    const currentCard = container.querySelector('.bc-card.current');
-    if (!currentCard) {{
-      node.style.opacity = '0';
-      return;
-    }}
-    node.style.opacity = '1';
-    currentCard.appendChild(node);
-  }}
-
-  function snapBackIfLatest() {{
-    if (!isLatest || !embla || isRtl) return;
-    const currentCard = container.querySelector('.bc-card.current');
-    if (!currentCard) return;
-    const viewportRect = viewport.getBoundingClientRect();
-    const cardRect = currentCard.getBoundingClientRect();
-    const viewportCenter = viewportRect.left + viewportRect.width / 2;
-    const cardCenter = cardRect.left + cardRect.width / 2;
-    if (cardCenter < viewportCenter - 1) {{
-      snapToHeight(current, false);
-    }}
+  function renderBlock(block) {{
+    return `
+      <div class="bc-slide" data-height="${{block.height}}">
+        <div class="bc-top">
+          <span class="bc-height-tag">${{block.height}}</span>
+        </div>
+        <a class="bc-card${{block.height === current ? ' current' : ''}}" href="${{basePrefix}}/block/${{block.height}}" draggable="false">
+          <div class="bc-face">
+            ${{renderFeeStats(block)}}
+            <div class="bc-traces">${{formatTraces(block.traces)}}</div>
+            <div class="bc-tx-count">${{formatTxCount(block.tx_count)}}</div>
+            <div class="bc-time">${{formatAgo(block.time)}}</div>
+          </div>
+          ${{block.height === current ? '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>' : ''}}
+        </a>
+        ${{renderPoolTag(block.pool)}}
+      </div>
+    `;
   }}
 
   function render() {{
-    if (embla) {{
-      updateSelectedHeightFromCenter();
-    }}
-    blocks.sort((a,b) => a.height - b.height);
-    container.innerHTML = '';
-    for (const b of blocks) {{
-      const slide = document.createElement('div');
-      slide.className = 'bc-slide';
-      slide.dataset.height = String(b.height);
-      slide.innerHTML = `
-        <div class="bc-top">
-          <span class="bc-height-tag">${{b.height}}</span>
-        </div>
-        <a class="bc-card${{b.height === current ? ' current' : ''}}" href="${{basePrefix}}/block/${{b.height}}">
-          <div class="bc-face">
-            ${{renderFeeStats(b)}}
-            <div class="bc-traces">${{formatTraces(b.traces)}}</div>
-            <div class="bc-tx-count">${{formatTxCount(b.tx_count)}}</div>
-            <div class="bc-time">${{formatAgo(b.time)}}</div>
-          </div>
-        </a>
-        ${{renderPoolTag(b.pool)}}
-      `;
-      container.appendChild(slide);
-    }}
-
-    let targetIdx = getIndexByHeight(hasCentered ? selectedHeight : current);
-    if (targetIdx < 0) {{
-      targetIdx = blocks.findIndex((b) => b.height === current);
-    }}
-    if (targetIdx < 0) targetIdx = 0;
-
-    const opts = {{
-      align: 'center',
-      dragFree: true,
-      containScroll: false,
-      startIndex: targetIdx,
-      direction: isRtl ? 'rtl' : 'ltr'
-    }};
-
-    const ensureSelectedHeight = () => {{
-      if (suppressSelectUpdate) return;
-      if (!embla) return;
-      const idx = embla.selectedScrollSnap();
-      const slide = embla.slideNodes()[idx];
-      if (slide && slide.dataset.height) {{
-        selectedHeight = Number(slide.dataset.height);
-      }}
-    }};
-
-    suppressSelectUpdate = true;
-    if (!embla && window.EmblaCarousel) {{
-      embla = window.EmblaCarousel(viewport, opts);
-      embla.on('select', () => {{
-        ensureSelectedHeight();
-        updateIndicator();
-        maybeLoadMore();
-      }});
-      embla.on('scroll', throttleMaybeLoad);
-      embla.on('settle', snapBackIfLatest);
-      embla.on('pointerUp', snapBackIfLatest);
-    }} else if (embla) {{
-      embla.reInit(opts);
-    }}
-
-    if (embla) {{
-      window.requestAnimationFrame(() => {{
-        hasCentered = true;
-        suppressSelectUpdate = false;
-        ensureSelectedHeight();
-        updateIndicator();
-        snapBackIfLatest();
-      }});
-    }}
-    suppressSelectUpdate = false;
-    maybeLoadMore();
+    blocks.sort((a, b) => b.height - a.height);
+    const html = [];
+    for (let i = 0; i < pendingLeft; i++) html.push(renderSkeleton('left', i));
+    for (const block of blocks) html.push(renderBlock(block));
+    for (let i = 0; i < pendingRight; i++) html.push(renderSkeleton('right', i));
+    track.innerHTML = html.join('');
   }}
 
-  async function fetchAround(center, dir = 0) {{
-    if (fetching) {{
-      pendingEdge = true;
+  function centerHeight(height, smooth) {{
+    const slide = track.querySelector(`[data-height="${{height}}"]`);
+    if (!slide) return;
+    const target = slide.offsetLeft + (slide.offsetWidth / 2) - (scroller.clientWidth / 2);
+    scroller.scrollTo({{ left: Math.max(0, target), behavior: smooth ? 'smooth' : 'auto' }});
+  }}
+
+  function withStablePrepend(renderFn) {{
+    const beforeWidth = scroller.scrollWidth;
+    const beforeLeft = scroller.scrollLeft;
+    renderFn();
+    const afterWidth = scroller.scrollWidth;
+    if (afterWidth !== beforeWidth) {{
+      scroller.scrollLeft = Math.max(0, beforeLeft + (afterWidth - beforeWidth));
+    }}
+  }}
+
+  function scheduleRetry(side, fn) {{
+    const existing = side === 'initial'
+      ? initialRetryTimer
+      : side === 'left'
+        ? leftRetryTimer
+        : rightRetryTimer;
+    if (existing) return;
+
+    const timer = setTimeout(() => {{
+      if (side === 'initial') initialRetryTimer = null;
+      if (side === 'left') leftRetryTimer = null;
+      if (side === 'right') rightRetryTimer = null;
+      fn();
+    }}, RETRY_MS);
+
+    if (side === 'initial') initialRetryTimer = timer;
+    if (side === 'left') leftRetryTimer = timer;
+    if (side === 'right') rightRetryTimer = timer;
+  }}
+
+  function applyBlocks(batch) {{
+    let added = 0;
+    for (const block of batch) {{
+      if (block.height > espoTip) continue;
+      if (seen.has(block.height)) continue;
+      seen.add(block.height);
+      blocks.push(block);
+      minH = Math.min(minH, block.height);
+      maxH = Math.max(maxH, block.height);
+      added += 1;
+    }}
+    return added;
+  }}
+
+  async function fetchWindow(center) {{
+    try {{
+      const res = await fetch(`${{basePrefix}}/api/blocks/carousel?center=${{center}}&radius=${{RADIUS}}`, {{
+        headers: {{ Accept: 'application/json' }}
+      }});
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data && Array.isArray(data.blocks) ? data.blocks : null;
+    }} catch (_) {{
+      return null;
+    }}
+  }}
+
+  async function fetchInitial() {{
+    if (loadingInitial || initialRetryTimer) return;
+    loadingInitial = true;
+    pendingLeft = current < espoTip ? RADIUS : 0;
+    pendingRight = RADIUS + 1;
+    render();
+    const batch = await fetchWindow(current);
+    if (!batch) {{
+      loadingInitial = false;
+      scheduleRetry('initial', fetchInitial);
       return;
     }}
-    if (center < 0 || center > espoTip) return;
-    fetching = true;
-    if (dir < 0) setLoading('left', true);
-    if (dir > 0) setLoading('right', true);
+    applyBlocks(batch);
+    pendingLeft = 0;
+    pendingRight = 0;
+    render();
+    loadingInitial = false;
+    if (!initialCentered) {{
+      initialCentered = true;
+      requestAnimationFrame(() => centerHeight(current, false));
+    }}
+    queueEdgeCheck();
+  }}
+
+  async function fetchLeft() {{
+    if (loadingLeft || leftRetryTimer || leftDepleted || maxH >= espoTip) return;
+    loadingLeft = true;
+    const end = Math.min(espoTip, maxH + SKELETON_BATCH);
+    const expected = end - maxH;
+    if (expected <= 0) {{
+      leftDepleted = true;
+      loadingLeft = false;
+      return;
+    }}
+
+    const hasPending = pendingLeft > 0;
+    if (!hasPending) {{
+      pendingLeft += expected;
+      withStablePrepend(() => render());
+    }}
+
+    let loaded = false;
     try {{
-      const res = await fetch(`${{basePrefix}}/api/blocks/carousel?center=${{center}}&radius=8`);
-      if (!res.ok) return;
-      const data = await res.json();
-      if (!data || !Array.isArray(data.blocks)) return;
-      let added = false;
-      for (const b of data.blocks) {{
-        if (b.height > espoTip) continue;
-        if (seen.has(b.height)) continue;
-        seen.add(b.height);
-        blocks.push(b);
-        minH = Math.min(minH, b.height);
-        maxH = Math.max(maxH, b.height);
-        added = true;
+      const center = Math.min(espoTip, maxH + RADIUS);
+      const batch = await fetchWindow(center);
+      if (!batch) {{
+        scheduleRetry('left', fetchLeft);
+        return;
       }}
-      if (!added) {{
-        if (dir < 0) {{
-          minH = 0;
-          leftDepleted = true;
-        }} else if (dir > 0) {{
-          maxH = espoTip;
-          rightDepleted = true;
-        }}
-      }} else {{
-        if (dir < 0) leftDepleted = false;
-        if (dir > 0) rightDepleted = false;
-      }}
-      render();
+      loaded = true;
+      const added = batch ? applyBlocks(batch) : 0;
+      if (added < expected || end === espoTip) leftDepleted = end === espoTip;
     }} finally {{
-      fetching = false;
-      if (dir < 0) setLoading('left', false);
-      if (dir > 0) setLoading('right', false);
-      if (pendingEdge) {{
-        pendingEdge = false;
-        maybeLoadMore();
+      if (loaded) {{
+        pendingLeft = Math.max(0, pendingLeft - expected);
+        withStablePrepend(() => render());
       }}
+      loadingLeft = false;
+      if (loaded) queueEdgeCheck();
     }}
   }}
 
-  function maybeLoadMore() {{
-    if (!embla || blocks.length === 0) return;
-    const inView = embla.slidesInView(false);
-    let minIdx = embla.selectedScrollSnap();
-    let maxIdx = minIdx;
-    if (inView && inView.length) {{
-      minIdx = Math.min(...inView);
-      maxIdx = Math.max(...inView);
+  async function fetchRight() {{
+    if (loadingRight || rightRetryTimer || rightDepleted || minH <= 0) return;
+    loadingRight = true;
+    const start = Math.max(0, minH - SKELETON_BATCH);
+    const expected = minH - start;
+    if (expected <= 0) {{
+      rightDepleted = true;
+      loadingRight = false;
+      return;
     }}
-    const nearLeft = minIdx <= 2;
-    const nearRight = maxIdx >= blocks.length - 3;
-    if (nearLeft && minH > 0 && !leftDepleted) {{
-      fetchAround(Math.max(0, minH - 8), -1);
+
+    const hasPending = pendingRight > 0;
+    if (!hasPending) {{
+      pendingRight += expected;
+      render();
     }}
-    if (nearRight && maxH < espoTip && !rightDepleted) {{
-      fetchAround(Math.min(espoTip, maxH + 8), 1);
+
+    let loaded = false;
+    try {{
+      const center = Math.max(0, minH - RADIUS);
+      const batch = await fetchWindow(center);
+      if (!batch) {{
+        scheduleRetry('right', fetchRight);
+        return;
+      }}
+      loaded = true;
+      const added = batch ? applyBlocks(batch) : 0;
+      if (added < expected || start === 0) rightDepleted = start === 0;
+    }} finally {{
+      if (loaded) {{
+        pendingRight = Math.max(0, pendingRight - expected);
+        render();
+      }}
+      loadingRight = false;
+      if (loaded) queueEdgeCheck();
     }}
   }}
 
-  function updateSelectedHeightFromCenter() {{
-    if (!embla) return;
-    const inView = embla.slidesInView(false);
-    if (!inView || inView.length === 0) return;
-    const slides = embla.slideNodes();
-    const viewportRect = viewport.getBoundingClientRect();
-    const viewportCenter = viewportRect.left + viewportRect.width / 2;
-    let bestIdx = inView[0];
+  function updateSelectedHeight() {{
+    const slides = Array.from(track.querySelectorAll('[data-height]'));
+    if (!slides.length) return;
+    const viewportRect = scroller.getBoundingClientRect();
+    const viewportCenter = viewportRect.left + (viewportRect.width / 2);
+    let bestHeight = selectedHeight;
     let bestDist = Infinity;
-    for (const idx of inView) {{
-      const slide = slides[idx];
-      if (!slide) continue;
+    for (const slide of slides) {{
       const rect = slide.getBoundingClientRect();
-      const center = rect.left + rect.width / 2;
+      const center = rect.left + (rect.width / 2);
       const dist = Math.abs(center - viewportCenter);
       if (dist < bestDist) {{
         bestDist = dist;
-        bestIdx = idx;
+        bestHeight = Number(slide.dataset.height);
       }}
     }}
-    const bestSlide = slides[bestIdx];
-    if (bestSlide && bestSlide.dataset.height) {{
-      selectedHeight = Number(bestSlide.dataset.height);
-    }}
+    selectedHeight = bestHeight;
   }}
 
-  function throttleMaybeLoad() {{
+  function checkEdges() {{
+    updateSelectedHeight();
+    if (scroller.scrollLeft <= EDGE_THRESHOLD) fetchLeft();
+    if (scroller.scrollLeft + scroller.clientWidth >= scroller.scrollWidth - EDGE_THRESHOLD) fetchRight();
+  }}
+
+  function queueEdgeCheck() {{
     if (scrollRaf) return;
-    scrollRaf = window.requestAnimationFrame(() => {{
+    scrollRaf = requestAnimationFrame(() => {{
       scrollRaf = null;
-      updateSelectedHeightFromCenter();
-      maybeLoadMore();
-      updateIndicator();
+      checkEdges();
     }});
   }}
 
-  function ensureEmbla(cb) {{
-    if (window.EmblaCarousel) return cb();
-    let script = document.getElementById('embla-cdn');
-    if (!script) {{
-      script = document.createElement('script');
-      script.id = 'embla-cdn';
-      script.src = 'https://unpkg.com/embla-carousel/embla-carousel.umd.js';
-      script.async = true;
-      document.head.appendChild(script);
-    }}
-    script.addEventListener('load', cb, {{ once: true }});
-  }}
+  scroller.addEventListener('scroll', queueEdgeCheck, {{ passive: true }});
 
-  ensureEmbla(() => fetchAround(current));
+  scroller.addEventListener('mousedown', (event) => {{
+    if (event.button !== 0) return;
+    isDragging = true;
+    dragStartX = event.clientX;
+    dragStartScrollLeft = scroller.scrollLeft;
+    resetMomentum(event.clientX);
+    root.dataset.dragging = '1';
+    event.preventDefault();
+  }});
+
+  document.addEventListener('mousemove', (event) => {{
+    if (!isDragging) return;
+    if (Math.abs(event.clientX - dragStartX) > 4) dragMoved = true;
+    updateVelocity(event.clientX);
+    scroller.scrollLeft = dragStartScrollLeft - (event.clientX - dragStartX);
+  }});
+
+  document.addEventListener('mouseup', () => {{
+    if (!isDragging) return;
+    isDragging = false;
+    root.dataset.dragging = '0';
+    if (dragMoved) suppressClickUntil = performance.now() + 450;
+    animateMomentum();
+  }});
+
+  scroller.addEventListener('dragstart', (event) => event.preventDefault());
+  scroller.addEventListener('click', (event) => {{
+    if (dragMoved || performance.now() < suppressClickUntil) {{
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+    }}
+    dragMoved = false;
+  }}, true);
+
+  render();
+  fetchInitial();
 }})();
 "#,
         base_path_js = base_path_js,
@@ -396,17 +463,10 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     ));
 
     html! {
-        div class="block-carousel card full-bleed" data-block-carousel data-bc-rtl="1" data-current=(current_height) data-espo-tip=(espo_tip) {
-            div class="bc-inner" {
-
-                div class="bc-embla-wrap" {
-                    div class="bc-embla" data-bc-viewport {
-                        div class="bc-embla__container" data-bc-container {
-                            div class="muted" { (loading_label) }
-                        }
-                    }
-                    div class="bc-loader left" aria-hidden="true" { div class="spinner" {} }
-                    div class="bc-loader right" aria-hidden="true" { div class="spinner" {} }
+        div class="block-carousel card full-bleed" data-block-carousel data-current=(current_height) data-espo-tip=(espo_tip) data-dragging="0" {
+            div class="bc-native-wrap" {
+                div class="bc-native-scroll" data-bc-scroll {
+                    div class="bc-native-track" data-bc-track {}
                 }
             }
         }
