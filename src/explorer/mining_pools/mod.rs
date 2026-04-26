@@ -213,6 +213,26 @@ pub fn pool_icon_url(slug: &str) -> Option<String> {
     Some(explorer_path(&format!("/static/mining-pools/{icon_slug}")))
 }
 
+pub(crate) fn bundled_pool_icon_svgs_json() -> String {
+    serde_json::json!({
+        "antpool": ANTPOOL_SVG,
+        "binancepool": BINANCEPOOL_SVG,
+        "braiinspool": BRAIINSPOOL_SVG,
+        "default": DEFAULT_SVG,
+        "f2pool": F2POOL_SVG,
+        "foundryusa": FOUNDRYUSA_SVG,
+        "luxor": LUXOR_SVG,
+        "marapool": MARAPOOL_SVG,
+        "ocean": OCEAN_SVG,
+        "sbicrypto": SBICRYPTO_SVG,
+        "secpool": SECPOOL_SVG,
+        "spiderpool": SPIDERPOOL_SVG,
+        "unknown": DEFAULT_SVG,
+        "viabtc": VIABTC_SVG,
+    })
+    .to_string()
+}
+
 fn mempool_pool_url(network: Network, slug: &str) -> Option<String> {
     let base = match network {
         Network::Bitcoin => "https://mempool.space",

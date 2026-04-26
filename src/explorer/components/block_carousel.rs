@@ -1,23 +1,28 @@
 use maud::{Markup, PreEscaped, html};
 
+use crate::explorer::mining_pools::bundled_pool_icon_svgs_json;
 use crate::explorer::paths::{current_language, explorer_path};
 
 pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     let current_height = current_height.unwrap_or(espo_tip);
     let base_path_js = format!("{:?}", explorer_path("/"));
+    let pool_icons_js = bundled_pool_icon_svgs_json();
     let is_chinese = current_language().is_chinese();
+    let reset_label = if is_chinese { "返回最新区块" } else { "Back to latest block" };
 
     let script = PreEscaped(format!(
         r#"
 (function() {{
   const basePath = {base_path_js};
   const isChinese = {is_chinese};
+  const POOL_ICONS = {pool_icons_js};
   const basePrefix = basePath === '/' ? '' : basePath;
   const root = document.querySelector('[data-block-carousel]');
   if (!root) return;
 
   const scroller = root.querySelector('[data-bc-scroll]');
   const track = root.querySelector('[data-bc-track]');
+  const resetButton = root.querySelector('[data-bc-reset]');
   const current = Number(root.dataset.current);
   const espoTip = Number(root.dataset.espoTip);
   if (!scroller || !track || !Number.isFinite(current) || !Number.isFinite(espoTip)) return;
@@ -25,6 +30,10 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   const RADIUS = 8;
   const SKELETON_BATCH = RADIUS * 2;
   const EDGE_THRESHOLD = 320;
+  const RIGHT_BUFFER_VIEWPORTS = 3;
+  const WINDOW_VIEWPORTS_LEFT = 2;
+  const WINDOW_VIEWPORTS_RIGHT = 3;
+  const MIN_WINDOW_BLOCKS = 64;
   const RETRY_MS = 1500;
 
   const seen = new Set();
@@ -34,6 +43,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   let selectedHeight = current;
   let pendingLeft = 0;
   let pendingRight = 0;
+  let bufferRight = 0;
   let loadingInitial = false;
   let loadingLeft = false;
   let loadingRight = false;
@@ -167,9 +177,8 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
 
   function renderPoolTag(pool) {{
     if (!pool || !pool.name) return '<div class="bc-pool-slot"></div>';
-    const icon = pool.icon_url
-      ? `<img class="bc-pool-icon" src="${{escapeHtml(pool.icon_url)}}" alt="${{escapeHtml(pool.name)}} pool icon" loading="lazy">`
-      : '';
+    const iconSvg = POOL_ICONS[pool.slug] || POOL_ICONS.default || '';
+    const icon = iconSvg ? `<span class="bc-pool-icon" aria-hidden="true">${{iconSvg}}</span>` : '';
     const unknownClass = pool.matched ? '' : ' unknown';
     const content = `
       ${{icon}}
@@ -216,8 +225,95 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     const html = [];
     for (let i = 0; i < pendingLeft; i++) html.push(renderSkeleton('left', i));
     for (const block of blocks) html.push(renderBlock(block));
-    for (let i = 0; i < pendingRight; i++) html.push(renderSkeleton('right', i));
+    for (let i = 0; i < pendingRight + bufferRight; i++) html.push(renderSkeleton('right', i));
     track.innerHTML = html.join('');
+  }}
+
+  function slideSpan() {{
+    const slide = track.querySelector('.bc-slide');
+    if (!slide) return 162;
+    const styles = getComputedStyle(track);
+    const gap = parseFloat(styles.columnGap || styles.gap || '12') || 12;
+    return slide.offsetWidth + gap;
+  }}
+
+  function rightBufferCount() {{
+    return Math.max(
+      SKELETON_BATCH * 2,
+      Math.ceil((scroller.clientWidth * RIGHT_BUFFER_VIEWPORTS) / slideSpan())
+    );
+  }}
+
+  function viewportBlockCount() {{
+    return Math.max(1, Math.ceil(scroller.clientWidth / slideSpan()));
+  }}
+
+  function pruneBlocksAroundViewport() {{
+    if (!blocks.length) return;
+    const maxBlocks = Math.max(MIN_WINDOW_BLOCKS, viewportBlockCount() * (WINDOW_VIEWPORTS_LEFT + WINDOW_VIEWPORTS_RIGHT + 1));
+    if (blocks.length <= maxBlocks) return;
+
+    blocks.sort((a, b) => b.height - a.height);
+    let selectedIndex = blocks.findIndex((block) => block.height === selectedHeight);
+    if (selectedIndex < 0) {{
+      selectedIndex = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < blocks.length; i++) {{
+        const dist = Math.abs(blocks[i].height - selectedHeight);
+        if (dist < bestDist) {{
+          bestDist = dist;
+          selectedIndex = i;
+        }}
+      }}
+    }}
+
+    const keepLeft = Math.max(RADIUS, viewportBlockCount() * WINDOW_VIEWPORTS_LEFT);
+    const keepRight = Math.max(RADIUS, viewportBlockCount() * WINDOW_VIEWPORTS_RIGHT);
+    let removeLeft = Math.max(0, selectedIndex - keepLeft);
+    let removeRight = Math.max(0, blocks.length - (selectedIndex + keepRight + 1));
+
+    if (!removeLeft && !removeRight) return;
+
+    const span = slideSpan();
+    if (removeLeft) {{
+      const removed = blocks.splice(0, removeLeft);
+      for (const block of removed) seen.delete(block.height);
+      const delta = removeLeft * span;
+      scroller.scrollLeft = Math.max(0, scroller.scrollLeft - delta);
+      dragStartScrollLeft = Math.max(0, dragStartScrollLeft - delta);
+    }}
+    if (removeRight) {{
+      const removed = blocks.splice(blocks.length - removeRight, removeRight);
+      for (const block of removed) seen.delete(block.height);
+    }}
+
+    minH = blocks.reduce((min, block) => Math.min(min, block.height), blocks[0].height);
+    maxH = blocks.reduce((max, block) => Math.max(max, block.height), blocks[0].height);
+    leftDepleted = maxH >= espoTip;
+    rightDepleted = minH <= 0;
+    render();
+  }}
+
+  function realRightEdge() {{
+    const realSlides = track.querySelectorAll('[data-height]');
+    const lastReal = realSlides.length ? realSlides[realSlides.length - 1] : null;
+    return lastReal ? lastReal.offsetLeft + lastReal.offsetWidth : 0;
+  }}
+
+  function ensureRightBuffer(count = rightBufferCount()) {{
+    if (rightDepleted) return false;
+    if (bufferRight >= count) return false;
+    bufferRight = count;
+    render();
+    return true;
+  }}
+
+  function ensureRightBufferAhead() {{
+    if (rightDepleted) return;
+    const visibleRight = scroller.scrollLeft + scroller.clientWidth;
+    const wantedRight = visibleRight + (scroller.clientWidth * RIGHT_BUFFER_VIEWPORTS);
+    const needed = Math.ceil(Math.max(0, wantedRight - realRightEdge()) / slideSpan());
+    ensureRightBuffer(Math.max(rightBufferCount(), needed));
   }}
 
   function centerHeight(height, smooth) {{
@@ -225,6 +321,24 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     if (!slide) return;
     const target = slide.offsetLeft + (slide.offsetWidth / 2) - (scroller.clientWidth / 2);
     scroller.scrollTo({{ left: Math.max(0, target), behavior: smooth ? 'smooth' : 'auto' }});
+  }}
+
+  async function scrollToLatest() {{
+    stopMomentum();
+    if (!seen.has(espoTip)) {{
+      const batch = await fetchWindow(espoTip);
+      if (batch) {{
+        applyBlocks(batch);
+        render();
+      }}
+    }}
+    centerHeight(espoTip, true);
+    updateResetButton();
+  }}
+
+  function updateResetButton() {{
+    if (!resetButton) return;
+    root.dataset.canReset = scroller.scrollLeft > 80 ? '1' : '0';
   }}
 
   function withStablePrepend(renderFn) {{
@@ -288,7 +402,8 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     if (loadingInitial || initialRetryTimer) return;
     loadingInitial = true;
     pendingLeft = current < espoTip ? RADIUS : 0;
-    pendingRight = RADIUS + 1;
+    pendingRight = rightBufferCount();
+    bufferRight = 0;
     render();
     const batch = await fetchWindow(current);
     if (!batch) {{
@@ -299,12 +414,14 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     applyBlocks(batch);
     pendingLeft = 0;
     pendingRight = 0;
+    bufferRight = rightDepleted ? 0 : rightBufferCount();
     render();
     loadingInitial = false;
     if (!initialCentered) {{
       initialCentered = true;
       requestAnimationFrame(() => centerHeight(current, false));
     }}
+    updateResetButton();
     queueEdgeCheck();
   }}
 
@@ -357,13 +474,14 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
       return;
     }}
 
-    const hasPending = pendingRight > 0;
-    if (!hasPending) {{
+    const hasVisualBuffer = pendingRight + bufferRight > 0;
+    if (!hasVisualBuffer) {{
       pendingRight += expected;
       render();
     }}
 
     let loaded = false;
+    let added = 0;
     try {{
       const center = Math.max(0, minH - RADIUS);
       const batch = await fetchWindow(center);
@@ -372,11 +490,12 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
         return;
       }}
       loaded = true;
-      const added = batch ? applyBlocks(batch) : 0;
+      added = batch ? applyBlocks(batch) : 0;
       if (added < expected || start === 0) rightDepleted = start === 0;
     }} finally {{
       if (loaded) {{
         pendingRight = Math.max(0, pendingRight - expected);
+        bufferRight = rightDepleted ? 0 : Math.max(rightBufferCount(), bufferRight - added);
         render();
       }}
       loadingRight = false;
@@ -405,8 +524,14 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
 
   function checkEdges() {{
     updateSelectedHeight();
+    pruneBlocksAroundViewport();
+    updateResetButton();
     if (scroller.scrollLeft <= EDGE_THRESHOLD) fetchLeft();
-    if (scroller.scrollLeft + scroller.clientWidth >= scroller.scrollWidth - EDGE_THRESHOLD) fetchRight();
+    const realRemainingRight = realRightEdge() - (scroller.scrollLeft + scroller.clientWidth);
+    if (realRemainingRight <= scroller.clientWidth) {{
+      ensureRightBufferAhead();
+    }}
+    if (realRemainingRight <= Math.max(EDGE_THRESHOLD, scroller.clientWidth * 1.5)) fetchRight();
   }}
 
   function queueEdgeCheck() {{
@@ -418,6 +543,13 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   }}
 
   scroller.addEventListener('scroll', queueEdgeCheck, {{ passive: true }});
+  if (resetButton) {{
+    resetButton.addEventListener('click', (event) => {{
+      event.preventDefault();
+      event.stopPropagation();
+      scrollToLatest();
+    }});
+  }}
 
   scroller.addEventListener('mousedown', (event) => {{
     if (event.button !== 0) return;
@@ -434,6 +566,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     if (Math.abs(event.clientX - dragStartX) > 4) dragMoved = true;
     updateVelocity(event.clientX);
     scroller.scrollLeft = dragStartScrollLeft - (event.clientX - dragStartX);
+    queueEdgeCheck();
   }});
 
   document.addEventListener('mouseup', () => {{
@@ -459,6 +592,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
 }})();
 "#,
         base_path_js = base_path_js,
+        pool_icons_js = pool_icons_js,
         is_chinese = is_chinese
     ));
 
@@ -467,6 +601,11 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
             div class="bc-native-wrap" {
                 div class="bc-native-scroll" data-bc-scroll {
                     div class="bc-native-track" data-bc-track {}
+                }
+                button class="bc-reset-scroll" type="button" data-bc-reset aria-label=(reset_label) title=(reset_label) {
+                    svg viewBox="0 0 512 512" aria-hidden="true" focusable="false" {
+                        path d="M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM135 239l80-80c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9L209.9 232H368c13.3 0 24 10.7 24 24s-10.7 24-24 24H209.9l39 39c9.4 9.4 9.4 24.6 0 33.9s-24.6 9.4-33.9 0l-80-80c-9.4-9.3-9.4-24.5 0-33.9z" {}
+                    }
                 }
             }
         }
