@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, StrictModeConfig};
+use crate::config::{AppConfig, MiscConfig, StrictModeConfig};
 use crate::core::blockfetcher::BlockFetchMode;
 use bitcoin::Network;
 use std::collections::HashMap;
@@ -51,6 +51,7 @@ impl TestConfigBuilder {
             address_index_chunk_size: 512,
             explorer_networks: None,
             google_analytics_tag: None,
+            misc: MiscConfig::default(),
             modules: HashMap::new(),
         };
 

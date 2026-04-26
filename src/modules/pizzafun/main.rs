@@ -19,11 +19,8 @@ use std::sync::{Arc, RwLock};
 use super::consts::PRIORITY_SERIES_ALKANES;
 use super::rpc;
 use super::storage::{
-    GetIndexHeightParams as PizzafunGetIndexHeightParams,
-    GetSeriesEntriesByNameParams,
-    PizzafunProvider,
-    SeriesEntry,
-    series_id_base_from_name,
+    GetIndexHeightParams as PizzafunGetIndexHeightParams, GetSeriesEntriesByNameParams,
+    PizzafunProvider, SeriesEntry, series_id_base_from_name,
 };
 
 fn parse_alkane_id_str(s: &str) -> Option<SchemaAlkaneId> {
@@ -113,13 +110,15 @@ impl Pizzafun {
             return Ok(());
         }
         let Some(series_base) = series_id_base_from_name(name) else { return Ok(()) };
-        let existing = self.provider().get_series_entries_by_name(GetSeriesEntriesByNameParams {
-            blockhash,
-            name_norm: name.to_string(),
-        })?;
+        let existing =
+            self.provider().get_series_entries_by_name(GetSeriesEntriesByNameParams {
+                blockhash,
+                name_norm: name.to_string(),
+            })?;
 
         let mut combined = existing.clone();
-        let mut existing_ids: HashSet<SchemaAlkaneId> = existing.iter().map(|e| e.alkane_id).collect();
+        let mut existing_ids: HashSet<SchemaAlkaneId> =
+            existing.iter().map(|e| e.alkane_id).collect();
         for entry in new_entries {
             if existing_ids.insert(entry.alkane_id) {
                 combined.push(entry);
@@ -134,11 +133,8 @@ impl Pizzafun {
 
         let mut updated: Vec<SeriesEntry> = Vec::with_capacity(combined.len());
         for (idx, entry) in combined.into_iter().enumerate() {
-            let series_id = if idx == 0 {
-                series_base.clone()
-            } else {
-                format!("{}-{}", series_base, idx + 1)
-            };
+            let series_id =
+                if idx == 0 { series_base.clone() } else { format!("{}-{}", series_base, idx + 1) };
             updated.push(SeriesEntry {
                 series_id,
                 alkane_id: entry.alkane_id,
@@ -155,10 +151,7 @@ impl Pizzafun {
         for (raw_id, raw_name) in PRIORITY_SERIES_ALKANES {
             let Some(alkane_id) = parse_alkane_id_str(raw_id) else { continue };
             let Some(name_norm) = normalize_alkane_name(raw_name) else { continue };
-            if self
-                .provider()
-                .priority_family_seeded(&name_norm, alkane_id, StateAt::Latest)?
-            {
+            if self.provider().priority_family_seeded(&name_norm, alkane_id, StateAt::Latest)? {
                 continue;
             }
             by_name.entry(name_norm).or_default().push(SeriesEntry {

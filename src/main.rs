@@ -62,6 +62,7 @@ use crate::{
 use bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
 pub use espo::{ESPO_HEIGHT, SAFE_TIP};
+use rocksdb::checkpoint::Checkpoint;
 use tokio::runtime::Builder as TokioBuilder;
 
 const NO_REWIND: u32 = u32::MAX;
@@ -171,15 +172,74 @@ fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> st
     }
     std::fs::create_dir_all(backup_root)?;
     let dest_dir = backup_root.join(format!("bkp-{block}"));
-    eprintln!("[debug_backup] starting copy: '{}' -> '{}'", db_root.display(), dest_dir.display());
-    let status = Command::new("cp").arg("-r").arg(db_root).arg(&dest_dir).status()?;
-    if !status.success() {
+    if dest_dir.exists() {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("cp exited with status {status}"),
+            std::io::ErrorKind::AlreadyExists,
+            format!("backup destination already exists: {}", dest_dir.display()),
         ));
     }
+    eprintln!("[debug_backup] starting copy: '{}' -> '{}'", db_root.display(), dest_dir.display());
+    copy_debug_backup_tree(db_root, &dest_dir)?;
     eprintln!("[debug_backup] finished copy to '{}'", dest_dir.display());
+    Ok(())
+}
+
+fn copy_debug_backup_tree(src_root: &Path, dest_root: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest_root)?;
+    for entry in std::fs::read_dir(src_root)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = dest_root.join(entry.file_name());
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            if entry.file_name() == "espo" {
+                checkpoint_espo_db(&dest_path)?;
+            } else if entry.file_name() == "tmp" {
+                // Secondary RocksDB state is derived from the primary metashrew DB.
+                // Recreate the directory structure instead of copying a live secondary.
+                std::fs::create_dir_all(&dest_path)?;
+            } else {
+                copy_dir_recursive(&src_path, &dest_path)?;
+            }
+        } else if file_type.is_file() {
+            std::fs::copy(&src_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src_dir: &Path, dest_dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest_dir)?;
+    for entry in std::fs::read_dir(src_dir)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = dest_dir.join(entry.file_name());
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&src_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_espo_db(dest_dir: &Path) -> std::io::Result<()> {
+    let espo_db = get_espo_db();
+    espo_db
+        .flush_wal(true)
+        .map_err(|e| std::io::Error::other(format!("failed to flush espo WAL: {e}")))?;
+    espo_db
+        .flush()
+        .map_err(|e| std::io::Error::other(format!("failed to flush espo memtables: {e}")))?;
+
+    let checkpoint = Checkpoint::new(espo_db.as_ref())
+        .map_err(|e| std::io::Error::other(format!("failed to create espo checkpoint: {e}")))?;
+    checkpoint
+        .create_checkpoint(dest_dir)
+        .map_err(|e| std::io::Error::other(format!("failed to write espo checkpoint: {e}")))?;
     Ok(())
 }
 

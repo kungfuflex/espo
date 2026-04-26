@@ -11,10 +11,9 @@ use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdow
 use crate::explorer::components::header::header_scripts;
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
-    icon_activity, icon_activity_add_liquidity, icon_activity_pool_create,
+    icon_activity, icon_activity_add_liquidity, icon_activity_mint, icon_activity_pool_create,
     icon_activity_remove_liquidity, icon_activity_trade_buy, icon_activity_trade_sell,
-    icon_activity_mint, icon_caret_right, icon_dropdown_caret, icon_left, icon_right,
-    icon_skip_left, icon_skip_right,
+    icon_caret_right, icon_dropdown_caret, icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
@@ -641,61 +640,58 @@ pub async fn alkane_page(
         }
     };
 
-    let (token_activity_total, token_activity_entries) = if has_token_activity && tab == AlkaneTab::Activity
-    {
-        let offset = limit.saturating_mul(page.saturating_sub(1));
-        let page_result = tokendata_provider
-            .get_token_activity_page(GetTokenActivityPageParams {
-                blockhash: StateAt::Latest,
-                token: alk,
-                offset,
-                limit,
-                kind: None,
-                scope: activity_filter.storage_scope(),
-                sort_by: activity_order.storage_sort(),
-                dir: activity_dir.storage_dir(),
-                start_time: None,
-                end_time: None,
-            })
-            .ok();
-        let total = page_result.as_ref().map(|res| res.total).unwrap_or(0);
-        let entries = page_result
-            .map(|res| {
-                let mut btc_price_cache: HashMap<u32, Option<u128>> = HashMap::new();
-                res.entries
-                    .into_iter()
-                    .map(|entry| {
-                        build_token_activity_render_entry(
-                            entry,
-                            state.network,
-                            &amm_provider,
-                            &mut btc_price_cache,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        (total, entries)
-    } else {
-        (0, Vec::new())
-    };
+    let (token_activity_total, token_activity_entries) =
+        if has_token_activity && tab == AlkaneTab::Activity {
+            let offset = limit.saturating_mul(page.saturating_sub(1));
+            let page_result = tokendata_provider
+                .get_token_activity_page(GetTokenActivityPageParams {
+                    blockhash: StateAt::Latest,
+                    token: alk,
+                    offset,
+                    limit,
+                    kind: None,
+                    scope: activity_filter.storage_scope(),
+                    sort_by: activity_order.storage_sort(),
+                    dir: activity_dir.storage_dir(),
+                    start_time: None,
+                    end_time: None,
+                })
+                .ok();
+            let total = page_result.as_ref().map(|res| res.total).unwrap_or(0);
+            let entries = page_result
+                .map(|res| {
+                    let mut btc_price_cache: HashMap<u32, Option<u128>> = HashMap::new();
+                    res.entries
+                        .into_iter()
+                        .map(|entry| {
+                            build_token_activity_render_entry(
+                                entry,
+                                state.network,
+                                &amm_provider,
+                                &mut btc_price_cache,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (total, entries)
+        } else {
+            (0, Vec::new())
+        };
     let token_activity_off = limit.saturating_mul(page.saturating_sub(1));
     let token_activity_len = token_activity_entries.len();
     let token_activity_has_prev = page > 1;
     let token_activity_has_next = token_activity_off + token_activity_len < token_activity_total;
-    let token_activity_display_start = if token_activity_total > 0 && token_activity_off < token_activity_total
-    {
-        token_activity_off + 1
-    } else {
-        0
-    };
+    let token_activity_display_start =
+        if token_activity_total > 0 && token_activity_off < token_activity_total {
+            token_activity_off + 1
+        } else {
+            0
+        };
     let token_activity_display_end =
         (token_activity_off + token_activity_len).min(token_activity_total);
-    let token_activity_last_page = if token_activity_total > 0 {
-        (token_activity_total + limit - 1) / limit
-    } else {
-        1
-    };
+    let token_activity_last_page =
+        if token_activity_total > 0 { (token_activity_total + limit - 1) / limit } else { 1 };
     let activity_sort_dropdown = dropdown(DropdownProps {
         label: Some(activity_order.label().to_string()),
         selected_icon: None,
@@ -836,11 +832,7 @@ pub async fn alkane_page(
                                 span class="alkane-token-activity-price-paid" { "Price paid: $" (price_paid_usd) " / " (coin_label.clone()) }
                             }
                         }
-                        @if entry.kind_key == "pool_create" {
-                            div class="alkane-token-activity-flow-line neutral" {
-                                span class="muted" { "Created raw pool" }
-                            }
-                        } @else if let Some((counter_token, counter_delta)) = entry.counter {
+                        @if let Some((counter_token, counter_delta)) = entry.counter {
                             @let counter_id = format!("{}:{}", counter_token.block, counter_token.tx);
                             @let counter_meta = alkane_meta(&counter_token, &mut kv_cache, &state.essentials_mdb);
                             @let counter_label = if counter_meta.symbol.trim().is_empty() || counter_meta.symbol == "?" {
@@ -1400,11 +1392,7 @@ fn token_short_label(
     let id = format!("{}:{}", alk.block, alk.tx);
     let meta = alkane_meta(alk, kv_cache, essentials_mdb);
     if meta.symbol.trim().is_empty() || meta.symbol == "?" {
-        if meta.name.known && meta.name.value != id {
-            meta.name.value
-        } else {
-            id
-        }
+        if meta.name.known && meta.name.value != id { meta.name.value } else { id }
     } else {
         meta.symbol
     }
@@ -1457,7 +1445,9 @@ fn build_token_activity_render_entry(
         pool: activity.pool,
         actor_address,
         token_delta: activity.token_delta,
-        counter: activity.counter_token.map(|counter_token| (counter_token, activity.counter_delta)),
+        counter: activity
+            .counter_token
+            .map(|counter_token| (counter_token, activity.counter_delta)),
     }
 }
 
@@ -1476,8 +1466,9 @@ fn format_mint_price_paid_usd(
     if usd_scaled.is_zero() {
         return None;
     }
-    let micros =
-        (usd_scaled.saturating_mul(U256::from(1_000_000u32)).saturating_add(scale / U256::from(2u8)))
+    let micros = (usd_scaled
+        .saturating_mul(U256::from(1_000_000u32))
+        .saturating_add(scale / U256::from(2u8)))
         / scale;
     let whole = micros / U256::from(1_000_000u32);
     let frac = (micros % U256::from(1_000_000u32)).to::<u32>();

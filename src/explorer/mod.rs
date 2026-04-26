@@ -34,7 +34,7 @@ use tokio::net::TcpListener;
 use crate::config::{
     get_espo_next_height, get_explorer_base_path, get_explorer_networks, get_network,
 };
-use components::layout::{favicon, style};
+use components::layout::{favicon, style, waves_light};
 use paths::with_language;
 
 pub fn explorer_router(state: ExplorerState) -> Router {
@@ -58,6 +58,7 @@ pub fn explorer_router(state: ExplorerState) -> Router {
 
     let assets = Router::new()
         .route("/static/style.css", get(style))
+        .route("/static/waves-light.svg", get(waves_light))
         .route("/static/mining-pools/{slug}", get(mining_pool_icon))
         .route("/favicon.svg", get(favicon));
     let seo = Router::new()

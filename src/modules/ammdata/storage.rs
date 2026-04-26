@@ -1541,10 +1541,9 @@ fn read_token_activity(
     sort_by: TokenActivitySortField,
     dir: SortDir,
 ) -> Result<GetTokenActivityPageResult> {
-    let mut entries = match provider.get_list_entries_desc(GetListEntriesDescParams {
-        blockhash,
-        prefix: prefix.clone(),
-    }) {
+    let mut entries = match provider
+        .get_list_entries_desc(GetListEntriesDescParams { blockhash, prefix: prefix.clone() })
+    {
         Ok(v) => v.entries,
         Err(_) => Vec::new(),
     };
@@ -1684,8 +1683,8 @@ impl AmmDataProvider {
                     .map_err(|e| anyhow!("tree height lookup failed: {e}"))?
                 {
                     if height < ammdata_genesis_block(get_network()) {
-                        let fallback = AmmDataConfig::load_from_global_config()?
-                            .pre_ammdata_btc_usd_price;
+                        let fallback =
+                            AmmDataConfig::load_from_global_config()?.pre_ammdata_btc_usd_price;
                         if fallback > 0 {
                             return Ok(Some((height as u64, fallback)));
                         }
@@ -2358,7 +2357,7 @@ impl AmmDataProvider {
         let table = self.table();
         let defs = self
             .get_raw_value(GetRawValueParams {
-                blockhash: StateAt::Latest,
+                blockhash: params.blockhash,
                 key: table.pools_key(&params.pool),
             })
             .ok()
@@ -3526,13 +3525,9 @@ impl AmmDataProvider {
                 .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool: entry.pool })
                 .ok()
                 .and_then(|res| res.defs);
-            let side = defs
-                .map(|defs| {
-                    if defs.quote_alkane_id == token {
-                        PriceSide::Quote
-                    } else {
-                        PriceSide::Base
-                    }
+            let side =
+                defs.map(|defs| {
+                    if defs.quote_alkane_id == token { PriceSide::Quote } else { PriceSide::Base }
                 })
                 .unwrap_or(fallback_side);
             let mut row = serde_json::to_value(ActivityRow::from_storage(&stored, side))

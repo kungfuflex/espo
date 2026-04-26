@@ -644,21 +644,16 @@ impl MetashrewAdapter {
         let root = self.root_ptr(db);
         let traces = TraceTablesNative::new(&root);
 
-        let tx_be = txid.to_byte_array().to_vec();
-        let mut tx_le = tx_be.clone();
-        tx_le.reverse();
+        let txid_le = txid.to_byte_array().to_vec();
+        let mut txid_display_bytes = txid_le.clone();
+        txid_display_bytes.reverse();
 
         let mut traces_by_outpoint: HashMap<Vec<u8>, Option<AlkanesTrace>> = HashMap::new();
 
-        let mut walk_prefix = |tx_bytes: &[u8], tx_bytes_are_be: bool| -> Result<()> {
+        let mut walk_prefix = |tx_key_bytes: &[u8], outpoint_txid_le: &[u8]| -> Result<()> {
             let mut prefix = b"/trace/".to_vec();
-            prefix.extend_from_slice(tx_bytes);
+            prefix.extend_from_slice(tx_key_bytes);
             let prefix = self.root.apply_label(&prefix);
-
-            let mut tx_outpoint = tx_bytes.to_vec();
-            if tx_bytes_are_be {
-                tx_outpoint.reverse();
-            }
 
             let mut it = db.iterator(IteratorMode::From(&prefix, Direction::Forward));
             while let Some(Ok((k, v))) = it.next() {
@@ -672,8 +667,8 @@ impl MetashrewAdapter {
                 }
                 let vout_le = &suffix[..4];
 
-                let mut outpoint = Vec::with_capacity(tx_outpoint.len() + 4);
-                outpoint.extend_from_slice(&tx_outpoint);
+                let mut outpoint = Vec::with_capacity(outpoint_txid_le.len() + 4);
+                outpoint.extend_from_slice(outpoint_txid_le);
                 outpoint.extend_from_slice(vout_le);
 
                 let entry = traces_by_outpoint.entry(outpoint).or_insert(None);
@@ -687,9 +682,9 @@ impl MetashrewAdapter {
             Ok(())
         };
 
-        walk_prefix(&tx_be, true)?;
-        if tx_le != tx_be {
-            walk_prefix(&tx_le, false)?;
+        walk_prefix(&txid_le, &txid_le)?;
+        if txid_display_bytes != txid_le {
+            walk_prefix(&txid_display_bytes, &txid_le)?;
         }
 
         let mut out: Vec<PartialEspoTrace> = Vec::new();

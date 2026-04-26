@@ -1,9 +1,9 @@
+use super::consts::PRIORITY_SERIES_ALKANES;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
-use super::consts::PRIORITY_SERIES_ALKANES;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -75,7 +75,9 @@ fn priority_family_for_alkane(alkane: &SchemaAlkaneId) -> Option<(&'static str, 
     None
 }
 
-fn parse_priority_series_query(series_id: &str) -> Option<(&'static str, SchemaAlkaneId, Option<u32>)> {
+fn parse_priority_series_query(
+    series_id: &str,
+) -> Option<(&'static str, SchemaAlkaneId, Option<u32>)> {
     for (raw_alkane, base_name) in PRIORITY_SERIES_ALKANES {
         let priority_alkane = parse_alkane_id_str(raw_alkane)?;
         if series_id == *base_name {
@@ -89,13 +91,14 @@ fn parse_priority_series_query(series_id: &str) -> Option<(&'static str, SchemaA
     None
 }
 
-fn shift_stored_series_id_for_priority_family(stored_series_id: &str, base_name: &str) -> Option<String> {
+fn shift_stored_series_id_for_priority_family(
+    stored_series_id: &str,
+    base_name: &str,
+) -> Option<String> {
     if stored_series_id == base_name {
         return Some(format!("{base_name}-2"));
     }
-    let rest = stored_series_id
-        .strip_prefix(base_name)
-        .and_then(|s| s.strip_prefix('-'))?;
+    let rest = stored_series_id.strip_prefix(base_name).and_then(|s| s.strip_prefix('-'))?;
     let suffix = rest.parse::<u32>().ok()?;
     Some(format!("{base_name}-{}", suffix.saturating_add(1)))
 }
@@ -412,8 +415,7 @@ impl PizzafunProvider {
                         creation_height: priority_alkane.block,
                     }));
                 }
-                let Some(stored_series_id) =
-                    map_priority_public_query_to_stored(base_name, suffix)
+                let Some(stored_series_id) = map_priority_public_query_to_stored(base_name, suffix)
                 else {
                     return Ok(None);
                 };

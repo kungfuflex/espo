@@ -110,6 +110,7 @@ mod tests {
             address_index_chunk_size: 512,
             explorer_networks: None,
             google_analytics_tag: None,
+            misc: espo::config::MiscConfig::default(),
             modules: std::collections::HashMap::new(),
         };
 

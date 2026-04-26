@@ -1,7 +1,7 @@
 use super::defs::SignedU128;
 use super::lib::accumulate_alkane_balance_deltas;
 use crate::alkanes::trace::{EspoHostFunctionValues, EspoSandshrewLikeTrace, get_espo_block};
-use crate::config::{AppConfig, init_config_from};
+use crate::config::{AppConfig, MiscConfig, init_config_from};
 use crate::core::blockfetcher::BlockFetchMode;
 use crate::schemas::SchemaAlkaneId;
 use bitcoin::{Txid, hashes::Hash};
@@ -38,6 +38,7 @@ fn init_test_config_from_run_sh() {
         address_index_chunk_size: 512,
         explorer_networks: None,
         google_analytics_tag: None,
+        misc: MiscConfig::default(),
         modules: HashMap::new(),
     };
     if let Err(err) = init_config_from(cfg) {

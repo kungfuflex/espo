@@ -218,11 +218,7 @@ fn parse_scaled_price_value(value: &Value) -> Result<u128> {
     let whole = whole_raw
         .parse::<u128>()
         .map_err(|_| anyhow!("invalid ammdata.pre_ammdata_btc_usd_price"))?;
-    let frac_digits = frac_raw
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .take(16)
-        .collect::<String>();
+    let frac_digits = frac_raw.chars().filter(|c| c.is_ascii_digit()).take(16).collect::<String>();
     let mut frac_scaled = frac_digits;
     while frac_scaled.len() < 16 {
         frac_scaled.push('0');

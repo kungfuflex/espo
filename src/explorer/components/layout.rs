@@ -14,6 +14,7 @@ use crate::explorer::paths::{current_language, explorer_base_path, explorer_path
 
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 const FAVICON_SVG: &str = include_str!("../assets/favicon.svg");
+const WAVES_LIGHT_SVG: &str = include_str!("../assets/waves-light.svg");
 const SEARCH_DEBOUNCE_MS: u64 = 300;
 const DEFAULT_DESCRIPTION: &str =
     "Explore blocks, transactions, addresses, and Alkanes on Espo Explorer.";
@@ -97,6 +98,10 @@ pub async fn style() -> impl IntoResponse {
 
 pub async fn favicon() -> impl IntoResponse {
     (StatusCode::OK, [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")], FAVICON_SVG)
+}
+
+pub async fn waves_light() -> impl IntoResponse {
+    (StatusCode::OK, [(CONTENT_TYPE, "image/svg+xml; charset=utf-8")], WAVES_LIGHT_SVG)
 }
 
 pub fn layout(_title: &str, content: Markup) -> Html<String> {

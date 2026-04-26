@@ -64,7 +64,7 @@ a:hover {
   z-index: 10;
   backdrop-filter: blur(10px);
   background: rgba(40, 43, 50, 0.95);
-  box-shadow: 0 0px 4px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 0px 4px rgba(0, 0, 0, 0.32);
 }
 .nav {
   padding: 6px 10px;
@@ -807,6 +807,70 @@ a:hover {
   justify-content: center;
   display: none;
 }
+.terminal-ad {
+  position: relative;
+  margin: 0 0 32px;
+  padding: 28px 32px;
+  border-radius: 8px;
+  border: none;
+  background: var(--panel3);
+  overflow: hidden;
+}
+.terminal-ad-copy {
+  position: relative;
+  z-index: 1;
+  max-width: 720px;
+}
+.terminal-ad::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: url("waves-light.svg") center center / 600px 600px repeat;
+  opacity: 0.5;
+  pointer-events: none;
+}
+.terminal-ad-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 28px;
+  line-height: 1.02;
+  letter-spacing: -0.03em;
+}
+.terminal-ad-title-accent {
+  color: #53a7ff;
+}
+.terminal-ad-text {
+  margin: 14px 0 0;
+  max-width: 760px;
+  color: #d0d5df;
+  font-size: 15px;
+  line-height: 1.45;
+}
+.terminal-ad-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 14px;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--link-dark);
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  text-decoration: none;
+  box-shadow: none;
+}
+.terminal-ad-button:hover {
+  background: var(--link-dark2);
+  color: var(--text);
+  text-decoration: none;
+}
+.terminal-ad-button .icon {
+  width: 16px;
+  height: 16px;
+}
 .home-table-title {
   margin: 0;
   font-size: 38px;
@@ -959,6 +1023,13 @@ a:hover {
 }
 
 @media (max-width: 580px) {
+  .terminal-ad {
+    padding: 24px 18px;
+    border-radius: 8px;
+  }
+  .terminal-ad-title {
+    font-size: 28px;
+  }
   .holders_table {
     border-collapse: separate;
     border-spacing: 0;
@@ -2822,10 +2893,20 @@ button:hover {
   overflow: hidden;
   padding-top: 60px;
 }
+.block-hero.full-bleed::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: url("waves-light.svg") center center / 600px 600px repeat;
+  opacity: 0.5;
+  pointer-events: none;
+}
 .block-hero .block-carousel {
   margin-top: 0;
 }
 .block-hero-inner {
+  position: relative;
+  z-index: 1;
   max-width: 1120px;
   width: 100%;
   margin: 0 auto;
@@ -3075,7 +3156,6 @@ button:hover {
   max-width: 154px;
   padding: 4px 9px;
   border-radius: 999px;
-  background: rgba(31, 34, 40, 0.92);
   color: var(--text);
   text-decoration: none;
 }
@@ -3127,7 +3207,7 @@ button:hover {
   left: calc(-0.16 * var(--bc-size));
   width: calc(0.16 * var(--bc-size));
   height: 100%;
-  background: rgb(55 85 128 / 40%);
+  background: #29364b;
   transform: skewY(50deg);
   transform-origin: top;
 }
@@ -3136,7 +3216,7 @@ button:hover {
   left: calc(-0.16 * var(--bc-size));
   width: 100%;
   height: calc(0.192 * var(--bc-size));
-  background: rgb(55 70 128 / 20%);
+  background: #24293a;
   transform: skewX(40deg);
   transform-origin: top;
 }
@@ -3198,7 +3278,7 @@ button:hover {
   text-decoration: none;
 }
 .bc-card.current {
-  outline: 2px solid var(--link);
+  outline: none;
 }
 .bc-height {
   font-weight: 700;

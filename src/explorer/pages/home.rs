@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
-use crate::config::{get_bitcoind_rpc_client, get_espo_next_height};
+use crate::config::{get_bitcoind_rpc_client, get_espo_next_height, show_terminal_ad};
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::icon_right;
@@ -184,6 +184,7 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
     let alkanes_link = explorer_path("/alkanes");
     let recent_block_heights: Vec<u64> =
         (latest_height.saturating_sub(9)..=latest_height).rev().collect();
+    let show_terminal_ad = show_terminal_ad();
 
     let top_alkanes_table: Markup = if top_alkanes.is_empty() {
         html! { p class="muted" { "No alkanes found." } }
@@ -235,6 +236,25 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
                     "Explore "
                     span class="home-table-accent" { "programmable" }
                     " Bitcoin"
+                }
+            }
+            @if show_terminal_ad {
+                section class="terminal-ad" {
+                    div class="terminal-ad-copy" {
+                        h2 class="terminal-ad-title" {
+                            "Earn BTC minting "
+                            span class="terminal-ad-title-accent" { "Diesel" }
+                        }
+                        p class="terminal-ad-text" {
+                            "Mint diesel for free with the Espo Terminal, our bot that mints Diesel "
+                            "for you automatically at profitable sats/vbyte ranges so you can acquire "
+                            "Diesel below marketplace."
+                        }
+                        a class="terminal-ad-button" href="https://terminal.espo.sh" {
+                            "Create a Bot"
+                            (icon_right())
+                        }
+                    }
                 }
             }
             div class="grid2 home-table-grid" {

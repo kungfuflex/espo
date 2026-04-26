@@ -1,19 +1,19 @@
 use super::rpc::register_rpc;
 use super::schemas::{SchemaTokenActivityV1, TokenActivityKind, TokenActivitySource};
 use super::storage::{
-    GetIndexHeightParams, SetBatchParams, SetIndexHeightParams, TokenDataProvider,
-    amount_from_row, scopes_for_source,
+    GetIndexHeightParams, SetBatchParams, SetBlobBatchParams, SetIndexHeightParams,
+    TokenDataProvider, encode_u64_value, scopes_for_source,
 };
 use crate::alkanes::trace::EspoBlock;
-use crate::config::{debug_enabled, get_electrum_like, get_espo_db};
+use crate::config::{debug_enabled, get_electrum_like, get_espo_db, get_network};
 use crate::debug;
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, PRICE_SCALE};
-use crate::modules::ammdata::main::{load_balance_txs_by_height, pool_creator_spk_from_protostone};
+use crate::modules::ammdata::main::pool_creator_spk_from_protostone;
+use crate::modules::ammdata::schemas::{ActivityKind, SchemaActivityV1, Timeframe};
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetCanonicalPoolPricesParams, GetLatestTokenUsdCloseParams, GetPoolDefsParams,
+    AmmDataProvider, GetActivityEntryParams, GetCanonicalPoolPricesParams,
+    GetLatestTokenUsdCloseParams, GetListEntriesDescParams, GetPoolDefsParams,
 };
-use crate::modules::ammdata::schemas::Timeframe;
-use crate::modules::ammdata::utils::reserves::{NewPoolInfo, extract_new_pools_from_espo_transaction};
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::modules::essentials::utils::balances::mint_deltas_from_trace;
@@ -22,10 +22,10 @@ use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use alloy_primitives::U256;
 use anyhow::{Result, anyhow};
-use bitcoin::hashes::Hash;
 use bitcoin::consensus::encode::deserialize;
+use bitcoin::hashes::Hash;
 use bitcoin::{Network, Transaction, Txid};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 pub struct TokenData {
@@ -43,14 +43,6 @@ impl TokenData {
             provider: None,
             index_height: Arc::new(RwLock::new(None)),
         }
-    }
-
-    #[inline]
-    fn essentials_provider(&self) -> &EssentialsProvider {
-        self.essentials_provider
-            .as_ref()
-            .expect("ModuleRegistry must call set_mdb()")
-            .as_ref()
     }
 
     #[inline]
@@ -79,7 +71,10 @@ impl TokenData {
     fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
         if let Some(prev) = *self.index_height.read().unwrap() {
             if new_height < prev {
-                eprintln!("[TOKENDATA] index height rollback detected ({} -> {})", prev, new_height);
+                eprintln!(
+                    "[TOKENDATA] index height rollback detected ({} -> {})",
+                    prev, new_height
+                );
             }
         }
         self.persist_index_height(new_height, blockhash)?;
@@ -101,8 +96,10 @@ impl EspoModule for TokenData {
 
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
         let db = get_espo_db();
-        let essentials_provider =
-            Arc::new(EssentialsProvider::new(Arc::new(Mdb::from_db(Arc::clone(&db), b"essentials:"))));
+        let essentials_provider = Arc::new(EssentialsProvider::new(Arc::new(Mdb::from_db(
+            Arc::clone(&db),
+            b"essentials:",
+        ))));
         let amm_provider = Arc::new(AmmDataProvider::new(
             Arc::new(Mdb::from_db(db, b"ammdata:")),
             Arc::clone(&essentials_provider),
@@ -122,8 +119,15 @@ impl EspoModule for TokenData {
         let debug = debug_enabled();
         let module = self.get_name();
         let height = block.height;
+        let genesis_height = self.get_genesis_block(get_network());
         if let Some(prev) = *self.index_height.read().unwrap() {
-            if height <= prev {
+            if height == genesis_height && prev >= genesis_height {
+                eprintln!(
+                    "[TOKENDATA] genesis reindex detected at block #{height}; clearing existing tokendata state (last={prev})"
+                );
+                self.provider().reset_all_data()?;
+                *self.index_height.write().unwrap() = None;
+            } else if height <= prev {
                 eprintln!("[TOKENDATA] skipping already indexed block #{height} (last={prev})");
                 return Ok(());
             }
@@ -136,6 +140,10 @@ impl EspoModule for TokenData {
         let block_ts = block.block_header.time as u64;
         let tx_meta = build_tx_meta(&block);
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut blob_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut timestamp_index_appends: HashMap<Vec<u8>, Vec<u64>> = HashMap::new();
+        let mut next_activity_row_id = provider.get_activity_row_counter()?;
+        let mut next_activity_index_chunk_id = provider.get_activity_index_chunk_counter()?;
         let mut ordinal: u32 = 0;
         let mut market_rows = 0usize;
         let mut mint_rows = 0usize;
@@ -144,22 +152,14 @@ impl EspoModule for TokenData {
         let timer = debug::start_if(debug);
         index_market_activity(
             self.amm_provider(),
-            self.essentials_provider(),
-            &table,
-            height,
-            block_ts,
-            &tx_meta,
-            &mut ordinal,
-            &mut puts,
-            &mut market_rows,
-        )?;
-        index_pool_creations(
             &block,
             &table,
+            blockhash,
             block_ts,
-            &tx_meta,
-            &mut ordinal,
             &mut puts,
+            &mut timestamp_index_appends,
+            &mut next_activity_row_id,
+            &mut blob_puts,
             &mut market_rows,
         )?;
         debug::log_elapsed(module, "index_market_activity", timer);
@@ -173,11 +173,38 @@ impl EspoModule for TokenData {
             &tx_meta,
             &mut ordinal,
             &mut puts,
+            &mut timestamp_index_appends,
+            &mut next_activity_row_id,
+            &mut blob_puts,
             &mut mint_rows,
         )?;
         debug::log_elapsed(module, "index_mints", timer);
 
         let timer = debug::start_if(debug);
+        if !timestamp_index_appends.is_empty() {
+            let mut keys = timestamp_index_appends.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                let Some(values) = timestamp_index_appends.get(&key) else {
+                    continue;
+                };
+                provider.append_activity_index_values(
+                    key,
+                    values,
+                    &mut next_activity_index_chunk_id,
+                    &mut puts,
+                    &mut blob_puts,
+                )?;
+            }
+            blob_puts.push((
+                table.activity_index_chunk_counter_key(),
+                encode_u64_value(next_activity_index_chunk_id),
+            ));
+        }
+        blob_puts.push((table.activity_row_counter_key(), encode_u64_value(next_activity_row_id)));
+        if !blob_puts.is_empty() {
+            provider.set_blob_batch(SetBlobBatchParams { puts: blob_puts })?;
+        }
         if !puts.is_empty() {
             provider.set_batch(SetBatchParams {
                 blockhash: StateAt::Latest,
@@ -235,138 +262,136 @@ fn build_tx_meta(block: &EspoBlock) -> HashMap<Txid, (Vec<u8>, bool)> {
 
 fn index_market_activity(
     amm_provider: &AmmDataProvider,
-    essentials: &EssentialsProvider,
+    block: &EspoBlock,
     table: &super::storage::TokenDataTable<'_>,
-    height: u32,
+    blockhash: bitcoin::BlockHash,
     block_ts: u64,
-    tx_meta: &HashMap<Txid, (Vec<u8>, bool)>,
-    ordinal: &mut u32,
     puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    timestamp_index_appends: &mut HashMap<Vec<u8>, Vec<u64>>,
+    next_activity_row_id: &mut u64,
+    blob_puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
     market_rows: &mut usize,
 ) -> Result<()> {
-    let balance_txs = load_balance_txs_by_height(essentials, height).unwrap_or_else(|e| {
-        eprintln!("[TOKENDATA] failed to load balance txs for height {height}: {e:?}");
-        BTreeMap::new()
-    });
+    let block_txids: HashSet<[u8; 32]> = block
+        .transactions
+        .iter()
+        .map(|tx| tx.transaction.compute_txid().to_byte_array())
+        .collect();
+    if block_txids.is_empty() {
+        return Ok(());
+    }
 
-    for (pool, entries) in balance_txs {
+    let amm_table = amm_provider.table();
+    let mut prefix = amm_table.amm_history_all_prefix();
+    prefix.extend_from_slice(&block_ts.to_be_bytes());
+    let mut entries = amm_provider
+        .get_list_entries_desc(GetListEntriesDescParams {
+            // During tokendata indexing the current block's ammdata writes live on the
+            // in-progress block root, not the previously committed Latest root.
+            blockhash: StateAt::Block(blockhash),
+            prefix: prefix.clone(),
+        })
+        .map(|resp| resp.entries)
+        .unwrap_or_default();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (key, _value) in entries {
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() < 17 {
+            continue;
+        }
+        let mut seq_bytes = [0u8; 4];
+        seq_bytes.copy_from_slice(&rest[..4]);
+        let seq = u32::from_be_bytes(seq_bytes);
+        let Some(pool) = decode_alkane_id_be(&rest[5..17]) else {
+            continue;
+        };
+        let Some(activity) = amm_provider
+            .get_activity_entry(GetActivityEntryParams {
+                blockhash: StateAt::Block(blockhash),
+                pool,
+                ts: block_ts,
+                seq,
+            })
+            .ok()
+            .and_then(|resp| resp.entry)
+        else {
+            continue;
+        };
+        let Some(row_txid) = normalize_activity_txid_for_block(activity.txid, &block_txids) else {
+            continue;
+        };
         let Some(defs) = amm_provider
-            .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool })
+            .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Block(blockhash), pool })
             .ok()
             .and_then(|resp| resp.defs)
         else {
             continue;
         };
-        for entry in entries {
-            let base_delta =
-                crate::modules::ammdata::signed_from_delta(entry.outflow.get(&defs.base_alkane_id));
-            let quote_delta =
-                crate::modules::ammdata::signed_from_delta(entry.outflow.get(&defs.quote_alkane_id));
-            let pool_kind = match (base_delta.signum(), quote_delta.signum()) {
-                (1, -1) => Some(crate::modules::ammdata::schemas::ActivityKind::TradeSell),
-                (-1, 1) => Some(crate::modules::ammdata::schemas::ActivityKind::TradeBuy),
-                (1, 1) => Some(crate::modules::ammdata::schemas::ActivityKind::LiquidityAdd),
-                (-1, -1) => Some(crate::modules::ammdata::schemas::ActivityKind::LiquidityRemove),
-                _ => None,
-            };
-            let Some(pool_kind) = pool_kind else { continue };
-            let txid = entry.txid;
-            let txid_obj = Txid::from_byte_array(txid);
-            let (address_spk, success) =
-                tx_meta.get(&txid_obj).cloned().unwrap_or_else(|| (Vec::new(), true));
-            let address_index_spks = unique_non_empty_spks(std::slice::from_ref(&address_spk));
-            let base_row = market_row_for_token(
-                height,
-                defs.base_alkane_id,
-                defs.quote_alkane_id,
-                pool,
-                pool_kind,
-                base_delta,
-                quote_delta,
-                txid,
-                block_ts,
-                address_spk.clone(),
-                success,
-            );
-            write_row(table, base_row, &address_index_spks, *ordinal, puts)?;
-            *ordinal = ordinal.saturating_add(1);
-            *market_rows = market_rows.saturating_add(1);
+        let address_index_spks = unique_non_empty_spks(std::slice::from_ref(&activity.address_spk));
+        let base_row = market_row_for_token(
+            block.height,
+            defs.base_alkane_id,
+            defs.quote_alkane_id,
+            pool,
+            &activity,
+            row_txid,
+            activity.base_delta,
+            activity.quote_delta,
+        );
+        write_row(
+            table,
+            base_row,
+            &address_index_spks,
+            puts,
+            timestamp_index_appends,
+            next_activity_row_id,
+            blob_puts,
+        )?;
+        *market_rows = market_rows.saturating_add(1);
 
-            if defs.quote_alkane_id != defs.base_alkane_id {
-                let quote_row = market_row_for_token(
-                    height,
-                    defs.quote_alkane_id,
-                    defs.base_alkane_id,
-                    pool,
-                    pool_kind,
-                    quote_delta,
-                    base_delta,
-                    txid,
-                    block_ts,
-                    address_spk,
-                    success,
-                );
-                write_row(table, quote_row, &address_index_spks, *ordinal, puts)?;
-                *ordinal = ordinal.saturating_add(1);
-                *market_rows = market_rows.saturating_add(1);
-            }
+        if defs.quote_alkane_id != defs.base_alkane_id {
+            let quote_row = market_row_for_token(
+                block.height,
+                defs.quote_alkane_id,
+                defs.base_alkane_id,
+                pool,
+                &activity,
+                row_txid,
+                activity.quote_delta,
+                activity.base_delta,
+            );
+            write_row(
+                table,
+                quote_row,
+                &address_index_spks,
+                puts,
+                timestamp_index_appends,
+                next_activity_row_id,
+                blob_puts,
+            )?;
+            *market_rows = market_rows.saturating_add(1);
         }
     }
     Ok(())
 }
 
-fn index_pool_creations(
-    block: &EspoBlock,
-    table: &super::storage::TokenDataTable<'_>,
-    block_ts: u64,
-    tx_meta: &HashMap<Txid, (Vec<u8>, bool)>,
-    ordinal: &mut u32,
-    puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    market_rows: &mut usize,
-) -> Result<()> {
-    for transaction in &block.transactions {
-        let new_pools = extract_new_pools_from_espo_transaction(transaction, &block.host_function_values)
-            .unwrap_or_default();
-        if new_pools.is_empty() {
-            continue;
-        }
-        let txid = transaction.transaction.compute_txid();
-        let txid_bytes = txid.to_byte_array();
-        let (address_spk, success) =
-            tx_meta.get(&txid).cloned().unwrap_or_else(|| (Vec::new(), true));
-        let address_index_spks = unique_non_empty_spks(std::slice::from_ref(&address_spk));
-        for NewPoolInfo { pool_id, defs, .. } in new_pools {
-            let base_row = pool_create_row(
-                block.height,
-                defs.base_alkane_id,
-                defs.quote_alkane_id,
-                pool_id,
-                txid_bytes,
-                block_ts,
-                address_spk.clone(),
-                success,
-            );
-            write_row(table, base_row, &address_index_spks, *ordinal, puts)?;
-            *ordinal = ordinal.saturating_add(1);
-            *market_rows = market_rows.saturating_add(1);
-            if defs.quote_alkane_id != defs.base_alkane_id {
-                let quote_row = pool_create_row(
-                    block.height,
-                    defs.quote_alkane_id,
-                    defs.base_alkane_id,
-                    pool_id,
-                    txid_bytes,
-                    block_ts,
-                    address_spk.clone(),
-                    success,
-                );
-                write_row(table, quote_row, &address_index_spks, *ordinal, puts)?;
-                *ordinal = ordinal.saturating_add(1);
-                *market_rows = market_rows.saturating_add(1);
-            }
-        }
+fn normalize_activity_txid_for_block(
+    txid: [u8; 32],
+    block_txids: &HashSet<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    if block_txids.contains(&txid) {
+        return Some(txid);
     }
-    Ok(())
+    let mut reversed = txid;
+    reversed.reverse();
+    if block_txids.contains(&reversed) {
+        return Some(reversed);
+    }
+    None
 }
 
 fn index_mints(
@@ -377,6 +402,9 @@ fn index_mints(
     tx_meta: &HashMap<Txid, (Vec<u8>, bool)>,
     ordinal: &mut u32,
     puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    timestamp_index_appends: &mut HashMap<Vec<u8>, Vec<u64>>,
+    next_activity_row_id: &mut u64,
+    blob_puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
     mint_rows: &mut usize,
 ) -> Result<()> {
     let mut price_cache: HashMap<SchemaAlkaneId, MintPoolPriceSnapshot> = HashMap::new();
@@ -404,7 +432,15 @@ fn index_mints(
                 address_spk: chain.display_address_spk.clone(),
                 success: chain.success,
             };
-            write_row(table, row, &chain.address_index_spks, *ordinal, puts)?;
+            write_row(
+                table,
+                row,
+                &chain.address_index_spks,
+                puts,
+                timestamp_index_appends,
+                next_activity_row_id,
+                blob_puts,
+            )?;
             *ordinal = ordinal.saturating_add(1);
             *mint_rows = mint_rows.saturating_add(1);
         }
@@ -523,7 +559,9 @@ fn collect_mint_txs(
         let Some(traces) = &atx.traces else { continue };
         let mut tx_mint_deltas: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
         for trace in traces {
-            if let Some(mints) = mint_deltas_from_trace(&trace.sandshrew_trace, &block.host_function_values) {
+            if let Some(mints) =
+                mint_deltas_from_trace(&trace.sandshrew_trace, &block.host_function_values)
+            {
                 for (token, delta) in mints {
                     if delta == 0 {
                         continue;
@@ -605,7 +643,8 @@ fn load_external_prev_txs_for_mints(block: &EspoBlock) -> HashMap<Txid, Transact
             continue;
         }
         for input in &atx.transaction.input {
-            if input.previous_output.is_null() || block_txids.contains(&input.previous_output.txid) {
+            if input.previous_output.is_null() || block_txids.contains(&input.previous_output.txid)
+            {
                 continue;
             }
             if seen.insert(input.previous_output.txid) {
@@ -644,7 +683,9 @@ fn compute_tx_fee_sats(
             .copied()
             .or_else(|| external_prev_map.get(&input.previous_output.txid));
         let Some(prev_tx) = prev_tx else { return 0 };
-        let Some(prev_out) = prev_tx.output.get(input.previous_output.vout as usize) else { return 0 };
+        let Some(prev_out) = prev_tx.output.get(input.previous_output.vout as usize) else {
+            return 0;
+        };
         input_total = input_total.saturating_add(prev_out.value.to_sat() as u128);
     }
     let output_total = tx
@@ -706,33 +747,44 @@ fn u256_to_be(value: U256) -> [u8; 32] {
     value.to_be_bytes::<32>()
 }
 
+fn decode_alkane_id_be(bytes: &[u8]) -> Option<SchemaAlkaneId> {
+    if bytes.len() != 12 {
+        return None;
+    }
+    let mut block = [0u8; 4];
+    let mut tx = [0u8; 8];
+    block.copy_from_slice(&bytes[..4]);
+    tx.copy_from_slice(&bytes[4..12]);
+    Some(SchemaAlkaneId { block: u32::from_be_bytes(block), tx: u64::from_be_bytes(tx) })
+}
+
 fn market_row_for_token(
     height: u32,
     token: SchemaAlkaneId,
     counter_token: SchemaAlkaneId,
     pool: SchemaAlkaneId,
-    pool_kind: crate::modules::ammdata::schemas::ActivityKind,
+    activity: &SchemaActivityV1,
+    txid: [u8; 32],
     pool_token_delta: i128,
     pool_counter_delta: i128,
-    txid: [u8; 32],
-    timestamp: u64,
-    address_spk: Vec<u8>,
-    success: bool,
 ) -> SchemaTokenActivityV1 {
     let token_delta = -pool_token_delta;
     let counter_delta = -pool_counter_delta;
-    let kind = match pool_kind {
-        crate::modules::ammdata::schemas::ActivityKind::TradeBuy
-        | crate::modules::ammdata::schemas::ActivityKind::TradeSell => {
-            if token_delta >= 0 { TokenActivityKind::Buy } else { TokenActivityKind::Sell }
+    let kind = match activity.kind {
+        ActivityKind::TradeBuy | ActivityKind::TradeSell => {
+            if token_delta >= 0 {
+                TokenActivityKind::Buy
+            } else {
+                TokenActivityKind::Sell
+            }
         }
-        crate::modules::ammdata::schemas::ActivityKind::LiquidityAdd => TokenActivityKind::LiquidityAdd,
-        crate::modules::ammdata::schemas::ActivityKind::LiquidityRemove => TokenActivityKind::LiquidityRemove,
-        crate::modules::ammdata::schemas::ActivityKind::PoolCreate => TokenActivityKind::PoolCreate,
+        ActivityKind::LiquidityAdd => TokenActivityKind::LiquidityAdd,
+        ActivityKind::LiquidityRemove => TokenActivityKind::LiquidityRemove,
+        ActivityKind::PoolCreate => TokenActivityKind::PoolCreate,
     };
     SchemaTokenActivityV1 {
         height,
-        timestamp,
+        timestamp: activity.timestamp,
         txid,
         chain_txids: vec![txid],
         cpfp: false,
@@ -746,39 +798,8 @@ fn market_row_for_token(
         counter_token: Some(counter_token),
         token_delta,
         counter_delta,
-        address_spk,
-        success,
-    }
-}
-
-fn pool_create_row(
-    height: u32,
-    token: SchemaAlkaneId,
-    counter_token: SchemaAlkaneId,
-    pool: SchemaAlkaneId,
-    txid: [u8; 32],
-    timestamp: u64,
-    address_spk: Vec<u8>,
-    success: bool,
-) -> SchemaTokenActivityV1 {
-    SchemaTokenActivityV1 {
-        height,
-        timestamp,
-        txid,
-        chain_txids: vec![txid],
-        cpfp: false,
-        mint_price_paid_sats: [0u8; 32],
-        mint_price_pool_usd: [0u8; 32],
-        mint_price_pool_frbtc_sats: [0u8; 32],
-        token,
-        kind: TokenActivityKind::PoolCreate,
-        source: TokenActivitySource::Market,
-        pool: Some(pool),
-        counter_token: Some(counter_token),
-        token_delta: 0,
-        counter_delta: 0,
-        address_spk,
-        success,
+        address_spk: activity.address_spk.clone(),
+        success: activity.success,
     }
 }
 
@@ -786,27 +807,26 @@ fn write_row(
     table: &super::storage::TokenDataTable<'_>,
     row: SchemaTokenActivityV1,
     address_index_spks: &[Vec<u8>],
-    ordinal: u32,
     puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    timestamp_index_appends: &mut HashMap<Vec<u8>, Vec<u64>>,
+    next_activity_row_id: &mut u64,
+    blob_puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<()> {
     let encoded = borsh::to_vec(&row)?;
-    let amount = amount_from_row(&row);
+    let row_id = *next_activity_row_id;
+    *next_activity_row_id = next_activity_row_id.saturating_add(1);
+    blob_puts.push((table.activity_row_blob_key(row_id), encoded));
+    let row_id_value = encode_u64_value(row_id);
+    let amount = super::storage::amount_from_row(&row);
     for scope in scopes_for_source(row.source) {
+        let token_activity_prefix = table.token_activity_prefix(scope, &row.token);
+        timestamp_index_appends
+            .entry(table.activity_index_meta_key(&token_activity_prefix))
+            .or_default()
+            .push(row_id);
         puts.push((
-            table.token_activity_key(scope, &row.token, row.timestamp, &row.txid, ordinal, row.kind),
-            encoded.clone(),
-        ));
-        puts.push((
-            table.token_activity_amount_key(
-                scope,
-                &row.token,
-                amount,
-                row.timestamp,
-                &row.txid,
-                ordinal,
-                row.kind,
-            ),
-            encoded.clone(),
+            table.token_activity_amount_key(scope, &row.token, amount, row_id),
+            row_id_value.clone(),
         ));
     }
     for address_spk in address_index_spks {
@@ -814,53 +834,30 @@ fn write_row(
             continue;
         }
         for scope in scopes_for_source(row.source) {
+            let address_activity_prefix = table.address_activity_prefix(scope, address_spk);
+            timestamp_index_appends
+                .entry(table.activity_index_meta_key(&address_activity_prefix))
+                .or_default()
+                .push(row_id);
             puts.push((
-                table.address_activity_key(
-                    scope,
-                    address_spk,
-                    row.timestamp,
-                    &row.txid,
-                    ordinal,
-                    row.kind,
-                ),
-                encoded.clone(),
+                table.address_activity_amount_key(scope, address_spk, amount, row_id),
+                row_id_value.clone(),
             ));
-            puts.push((
-                table.address_activity_amount_key(
-                    scope,
-                    address_spk,
-                    amount,
-                    row.timestamp,
-                    &row.txid,
-                    ordinal,
-                    row.kind,
-                ),
-                encoded.clone(),
-            ));
-            puts.push((
-                table.address_token_activity_key(
-                    scope,
-                    address_spk,
-                    &row.token,
-                    row.timestamp,
-                    &row.txid,
-                    ordinal,
-                    row.kind,
-                ),
-                encoded.clone(),
-            ));
+            let address_token_activity_prefix =
+                table.address_token_activity_prefix(scope, address_spk, &row.token);
+            timestamp_index_appends
+                .entry(table.activity_index_meta_key(&address_token_activity_prefix))
+                .or_default()
+                .push(row_id);
             puts.push((
                 table.address_token_activity_amount_key(
                     scope,
                     address_spk,
                     &row.token,
                     amount,
-                    row.timestamp,
-                    &row.txid,
-                    ordinal,
-                    row.kind,
+                    row_id,
                 ),
-                encoded.clone(),
+                row_id_value.clone(),
             ));
         }
     }

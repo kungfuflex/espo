@@ -388,7 +388,9 @@ fn tx_has_alkanes_protocol(tx: &Transaction) -> bool {
     let Ok(protostones) = Protostone::from_runestone(runestone) else {
         return false;
     };
-    protostones.iter().any(|protostone| protostone.protocol_tag == 1)
+    protostones
+        .iter()
+        .any(|protostone| protostone.protocol_tag == 1 && !protostone.message.is_empty())
 }
 
 // parse possibly-tailed trace (strip trailing u32 if needed)
@@ -416,7 +418,7 @@ pub fn traces_for_block_as_json_str(block: u64) -> Result<String> {
     Ok(final_json)
 }
 
-/// Build a map { txid_be_hex => Vec<(vout, PartialEspoTrace)> } for quick attach later.
+/// Build a map { txid_display_hex => Vec<(vout, PartialEspoTrace)> } for quick attach later.
 fn partial_traces_indexed(
     partials: Vec<PartialEspoTrace>,
     allow_txids: Option<&HashSet<String>>,
@@ -426,24 +428,24 @@ fn partial_traces_indexed(
         if p.outpoint.len() < 36 {
             continue;
         }
-        let (tx_bytes, vout_le) = p.outpoint.split_at(32);
+        let (txid_le, vout_le) = p.outpoint.split_at(32);
         let vout = u32::from_le_bytes(vout_le[..4].try_into().expect("vout 4 bytes"));
 
-        let txid_hex_be = hex::encode(tx_bytes);
-        let mut tx_bytes_rev = tx_bytes.to_vec();
-        tx_bytes_rev.reverse();
-        let txid_hex_le = hex::encode(&tx_bytes_rev);
+        let txid_native_hex = hex::encode(txid_le);
+        let mut txid_display_bytes = txid_le.to_vec();
+        txid_display_bytes.reverse();
+        let txid_display_hex = hex::encode(&txid_display_bytes);
 
         let txid_hex = if let Some(allow) = allow_txids {
-            if allow.contains(&txid_hex_be) {
-                txid_hex_be
-            } else if allow.contains(&txid_hex_le) {
-                txid_hex_le
+            if allow.contains(&txid_display_hex) {
+                txid_display_hex
+            } else if allow.contains(&txid_native_hex) {
+                txid_native_hex
             } else {
                 continue;
             }
         } else {
-            txid_hex_le
+            txid_display_hex
         };
 
         map.entry(txid_hex).or_default().push((vout, p));
@@ -465,10 +467,9 @@ struct CanonicalTraceSelection {
 
 fn select_canonical_traces(
     block: u64,
+    canonical_txids: &HashSet<String>,
     selected: &[(Txid, Transaction)],
 ) -> Result<CanonicalTraceSelection> {
-    let canonical_txids: HashSet<String> =
-        selected.iter().map(|(txid, _)| txid.to_string()).collect();
     let metashrew = get_metashrew();
     let metashrew_sdb = get_metashrew_sdb();
     metashrew_sdb
@@ -488,7 +489,7 @@ fn select_canonical_traces(
 
     let mut traces_by_txid: HashMap<String, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
     let mut recovered_txids: Vec<String> = Vec::new();
-    let mut missing_candidate_txids: Vec<String> = Vec::new();
+    let missing_candidate_txids: Vec<String> = Vec::new();
 
     for (txid, tx) in selected {
         let txid_hex = txid.to_string();
@@ -509,8 +510,6 @@ fn select_canonical_traces(
         if let Some(vouts_partials) = fallback_index.get(&txid_hex) {
             traces_by_txid.insert(txid_hex.clone(), vouts_partials.clone());
             recovered_txids.push(txid_hex);
-        } else {
-            missing_candidate_txids.push(txid_hex);
         }
     }
 
@@ -654,17 +653,19 @@ pub fn get_espo_block_with_opts(
         opts.as_ref().map(|o| o.page_range(total_txs)).unwrap_or((0, total_txs));
 
     // Select only the requested page of transactions
+    let mut canonical_txids: HashSet<String> = HashSet::with_capacity(total_txs);
     let mut selected: Vec<(Txid, Transaction)> =
         Vec::with_capacity(page_end.saturating_sub(page_start));
     for (idx, tx) in full_block.txdata.into_iter().enumerate() {
+        let txid = tx.compute_txid();
+        canonical_txids.insert(txid.to_string());
         if idx < page_start || idx >= page_end {
             continue;
         }
-        let txid = tx.compute_txid();
         selected.push((txid, tx));
     }
 
-    let canonical_traces = select_canonical_traces(block, &selected)?;
+    let canonical_traces = select_canonical_traces(block, &canonical_txids, &selected)?;
     if !canonical_traces.recovered_txids.is_empty()
         || !canonical_traces.missing_candidate_txids.is_empty()
         || !canonical_traces.unexpected_height_trace_txids.is_empty()

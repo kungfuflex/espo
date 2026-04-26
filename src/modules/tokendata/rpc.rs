@@ -1,8 +1,7 @@
 use super::schemas::{SchemaTokenActivityV1, TokenActivityKind};
 use super::storage::{
     GetAddressActivityPageParams, GetTokenActivityPageParams, SortDir, TokenActivityScope,
-    TokenActivitySortField,
-    TokenDataProvider,
+    TokenActivitySortField, TokenDataProvider,
 };
 use crate::config::get_network;
 use crate::modules::ammdata::consts::{PRICE_SCALE, SATS_PER_BTC};
@@ -11,8 +10,8 @@ use crate::modules::defs::RpcNsRegistrar;
 use crate::schemas::SchemaAlkaneId;
 use alloy_primitives::U256;
 use bitcoin::Address;
-use bitcoin::hashes::Hash;
 use bitcoin::Txid;
+use bitcoin::hashes::Hash;
 use serde_json::json;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -111,10 +110,7 @@ fn scaled_u256_bytes(bytes: [u8; 32]) -> U256 {
     U256::from_be_bytes(bytes)
 }
 
-fn row_json(
-    row: &SchemaTokenActivityV1,
-    btc_price_usd_scaled: Option<u128>,
-) -> serde_json::Value {
+fn row_json(row: &SchemaTokenActivityV1, btc_price_usd_scaled: Option<u128>) -> serde_json::Value {
     let mint_price_paid_usd = btc_price_usd_scaled.and_then(|btc_usd| {
         let paid_sats = scaled_u256_bytes(row.mint_price_paid_sats);
         if paid_sats.is_zero() {

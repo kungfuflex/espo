@@ -28,12 +28,7 @@ impl Mdb {
     fn should_enable_versioned_namespace(prefix: &[u8]) -> bool {
         matches!(
             prefix,
-            b"essentials:"
-                | b"ammdata:"
-                | b"tokendata:"
-                | b"subfrost:"
-                | b"pizzafun:"
-                | b"oylapi:"
+            b"essentials:" | b"ammdata:" | b"tokendata:" | b"subfrost:" | b"pizzafun:" | b"oylapi:"
         )
     }
 
@@ -220,6 +215,63 @@ impl Mdb {
             return Ok(out);
         }
         self.scan_prefix_entries(prefix)
+    }
+
+    pub fn scan_range_entries(
+        &self,
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        let ns_start = self.prefixed(start_inclusive);
+        let ns_end = end_exclusive.map(|end| self.prefixed(end));
+        if let Some(tree) = self.versioned_manager() {
+            let entries = tree.range_entries(&ns_start, ns_end.as_deref())?;
+            let mut out = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                if key.starts_with(&self.prefix) {
+                    out.push((key[self.prefix.len()..].to_vec(), value));
+                }
+            }
+            return Ok(out);
+        }
+
+        let mut out = Vec::new();
+        for res in self.db.iterator(IteratorMode::From(&ns_start, Direction::Forward)) {
+            let (key, value) = res?;
+            if let Some(end) = &ns_end {
+                if key.as_ref() >= end.as_slice() {
+                    break;
+                }
+            }
+            if key.starts_with(&self.prefix) {
+                out.push((key[self.prefix.len()..].to_vec(), value.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn scan_range_entries_at_blockhash(
+        &self,
+        block_hash: &BlockHash,
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        let ns_start = self.prefixed(start_inclusive);
+        let ns_end = end_exclusive.map(|end| self.prefixed(end));
+        if let Some(tree) = self.versioned_manager() {
+            let Some(root) = tree.root_for_blockhash(block_hash)? else {
+                return Ok(Vec::new());
+            };
+            let entries = tree.range_entries_at_root(root, &ns_start, ns_end.as_deref())?;
+            let mut out = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                if key.starts_with(&self.prefix) {
+                    out.push((key[self.prefix.len()..].to_vec(), value));
+                }
+            }
+            return Ok(out);
+        }
+        self.scan_range_entries(start_inclusive, end_exclusive)
     }
 
     pub fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, RocksError> {

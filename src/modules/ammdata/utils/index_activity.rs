@@ -85,13 +85,7 @@ pub fn process_balance_deltas(
                 // This path only processes concrete pool defs from pools_map; synthetic
                 // chart ids such as "-usd" and "-derived_*" never enter this index.
                 state.token_activity_writes.push((
-                    table.token_activity_key(
-                        &defs.base_alkane_id,
-                        block_ts,
-                        seq,
-                        kind,
-                        &owner,
-                    ),
+                    table.token_activity_key(&defs.base_alkane_id, block_ts, seq, kind, &owner),
                     Vec::new(),
                 ));
                 state.token_activity_amount_writes.push((

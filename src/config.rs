@@ -165,6 +165,12 @@ pub struct StrictModeConfig {
     pub check_trace_mismatches: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MiscConfig {
+    #[serde(default)]
+    pub show_terminal_ad: bool,
+}
+
 impl<'de> Deserialize<'de> for DebugBackupConfig {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -259,6 +265,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub google_analytics_tag: Option<String>,
     #[serde(default)]
+    pub misc: MiscConfig,
+    #[serde(default)]
     pub modules: HashMap<String, serde_json::Value>,
 }
 
@@ -293,6 +301,7 @@ pub struct AppConfig {
     pub address_index_chunk_size: u32,
     pub explorer_networks: Option<ExplorerNetworks>,
     pub google_analytics_tag: Option<String>,
+    pub misc: MiscConfig,
     pub modules: HashMap<String, serde_json::Value>,
 }
 
@@ -357,12 +366,21 @@ impl AppConfig {
             address_index_chunk_size: file.address_index_chunk_size,
             explorer_networks,
             google_analytics_tag,
+            misc: file.misc,
             modules: file.modules,
         })
     }
 }
 
 pub fn init_config_from(cfg: AppConfig) -> Result<()> {
+    init_config_from_inner(cfg, false)
+}
+
+pub fn init_config_from_read_only(cfg: AppConfig) -> Result<()> {
+    init_config_from_inner(cfg, true)
+}
+
+fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
     let mut cfg = cfg;
 
     // --- validations ---
@@ -493,9 +511,15 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
 
     // --- init ESPO RocksDB once ---
     let mut espo_opts = Options::default();
-    espo_opts.create_if_missing(true);
+    if !espo_read_only {
+        espo_opts.create_if_missing(true);
+    }
     let espo_path = Path::new(&cfg.db_path).join("espo");
-    let espo_db = std::sync::Arc::new(DB::open(&espo_opts, espo_path)?);
+    let espo_db = if espo_read_only {
+        std::sync::Arc::new(DB::open_for_read_only(&espo_opts, espo_path, false)?)
+    } else {
+        std::sync::Arc::new(DB::open(&espo_opts, espo_path)?)
+    };
     ESPO_DB
         .set(espo_db.clone())
         .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
@@ -659,6 +683,10 @@ pub fn get_explorer_networks() -> Option<&'static ExplorerNetworks> {
 
 pub fn get_google_analytics_tag() -> Option<&'static str> {
     get_config().google_analytics_tag.as_deref()
+}
+
+pub fn show_terminal_ad() -> bool {
+    get_config().misc.show_terminal_ad
 }
 
 pub fn get_espo_next_height() -> u32 {

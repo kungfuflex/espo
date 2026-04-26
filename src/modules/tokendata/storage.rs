@@ -1,20 +1,25 @@
 use super::schemas::{SchemaTokenActivityV1, TokenActivityKind, TokenActivitySource};
+use crate::config::get_address_index_chunk_size;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::state_at::StateAt;
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
-use borsh::BorshDeserialize;
+use borsh::{BorshDeserialize, BorshSerialize};
 use std::sync::Arc;
 
-const INDEX_HEIGHT_KEY: &[u8] = b"/v2/index_height";
-const TOKEN_ACTIVITY_TS_ROOT: &[u8] = b"/token_activity/v2/";
-const TOKEN_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/token_activity_amount/v2/";
-const ADDRESS_ACTIVITY_TS_ROOT: &[u8] = b"/address_activity/v2/";
-const ADDRESS_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/address_activity_amount/v2/";
-const ADDRESS_TOKEN_ACTIVITY_TS_ROOT: &[u8] = b"/address_token_activity/v2/";
-const ADDRESS_TOKEN_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/address_token_activity_amount/v2/";
+const INDEX_HEIGHT_KEY: &[u8] = b"/v3/index_height";
+const TOKEN_ACTIVITY_TS_ROOT: &[u8] = b"/token_activity/v3/";
+const TOKEN_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/token_activity_amount/v3/";
+const ADDRESS_ACTIVITY_TS_ROOT: &[u8] = b"/address_activity/v3/";
+const ADDRESS_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/address_activity_amount/v3/";
+const ADDRESS_TOKEN_ACTIVITY_TS_ROOT: &[u8] = b"/address_token_activity/v3/";
+const ADDRESS_TOKEN_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/address_token_activity_amount/v3/";
+const PTR_V1_PREFIX: &[u8] = b"/ptr/v1/";
+const PTR_ENTITY_ACTIVITY_ROW: &[u8] = b"activity_row";
+const PTR_ENTITY_ACTIVITY_INDEX_CHUNK: &[u8] = b"activity_index_chunk";
+const ACTIVITY_INDEX_INLINE_CAP: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenActivityScope {
@@ -86,8 +91,7 @@ impl<'a> TokenDataTable<'a> {
         address_spk: &[u8],
         token: &SchemaAlkaneId,
     ) -> Vec<u8> {
-        let mut key =
-            Vec::with_capacity(root.len() + 4 + 1 + 2 + address_spk.len() + 1 + 12 + 1);
+        let mut key = Vec::with_capacity(root.len() + 4 + 1 + 2 + address_spk.len() + 1 + 12 + 1);
         key.extend_from_slice(root);
         key.extend_from_slice(scope.as_str().as_bytes());
         key.push(b'/');
@@ -146,12 +150,7 @@ impl<'a> TokenDataTable<'a> {
         address_spk: &[u8],
         token: &SchemaAlkaneId,
     ) -> Vec<u8> {
-        Self::address_token_prefix(
-            ADDRESS_TOKEN_ACTIVITY_AMOUNT_ROOT,
-            scope,
-            address_spk,
-            token,
-        )
+        Self::address_token_prefix(ADDRESS_TOKEN_ACTIVITY_AMOUNT_ROOT, scope, address_spk, token)
     }
 
     pub fn token_activity_key(
@@ -176,17 +175,11 @@ impl<'a> TokenDataTable<'a> {
         scope: TokenActivityScope,
         token: &SchemaAlkaneId,
         amount: u128,
-        timestamp: u64,
-        txid: &[u8; 32],
-        ordinal: u32,
-        kind: TokenActivityKind,
+        row_id: u64,
     ) -> Vec<u8> {
         let mut key = self.token_activity_amount_prefix(scope, token);
         key.extend_from_slice(&amount.to_be_bytes());
-        key.extend_from_slice(&timestamp.to_be_bytes());
-        key.extend_from_slice(txid);
-        key.extend_from_slice(&ordinal.to_be_bytes());
-        key.push(activity_kind_code(kind));
+        key.extend_from_slice(&row_id.to_be_bytes());
         key
     }
 
@@ -212,17 +205,11 @@ impl<'a> TokenDataTable<'a> {
         scope: TokenActivityScope,
         address_spk: &[u8],
         amount: u128,
-        timestamp: u64,
-        txid: &[u8; 32],
-        ordinal: u32,
-        kind: TokenActivityKind,
+        row_id: u64,
     ) -> Vec<u8> {
         let mut key = self.address_activity_amount_prefix(scope, address_spk);
         key.extend_from_slice(&amount.to_be_bytes());
-        key.extend_from_slice(&timestamp.to_be_bytes());
-        key.extend_from_slice(txid);
-        key.extend_from_slice(&ordinal.to_be_bytes());
-        key.push(activity_kind_code(kind));
+        key.extend_from_slice(&row_id.to_be_bytes());
         key
     }
 
@@ -250,38 +237,72 @@ impl<'a> TokenDataTable<'a> {
         address_spk: &[u8],
         token: &SchemaAlkaneId,
         amount: u128,
-        timestamp: u64,
-        txid: &[u8; 32],
-        ordinal: u32,
-        kind: TokenActivityKind,
+        row_id: u64,
     ) -> Vec<u8> {
         let mut key = self.address_token_activity_amount_prefix(scope, address_spk, token);
         key.extend_from_slice(&amount.to_be_bytes());
-        key.extend_from_slice(&timestamp.to_be_bytes());
-        key.extend_from_slice(txid);
-        key.extend_from_slice(&ordinal.to_be_bytes());
-        key.push(activity_kind_code(kind));
+        key.extend_from_slice(&row_id.to_be_bytes());
         key
     }
 
     pub fn mdb(&self) -> &Mdb {
         self.mdb
     }
+
+    pub fn activity_row_counter_key(&self) -> Vec<u8> {
+        pointer_counter_key(PTR_ENTITY_ACTIVITY_ROW)
+    }
+
+    pub fn activity_row_blob_key(&self, id: u64) -> Vec<u8> {
+        pointer_blob_key(PTR_ENTITY_ACTIVITY_ROW, id)
+    }
+
+    pub fn activity_index_meta_key(&self, prefix: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(prefix.len() + 4);
+        key.extend_from_slice(prefix);
+        key.extend_from_slice(b"meta");
+        key
+    }
+
+    pub fn activity_index_chunk_counter_key(&self) -> Vec<u8> {
+        pointer_counter_key(PTR_ENTITY_ACTIVITY_INDEX_CHUNK)
+    }
+
+    pub fn activity_index_chunk_blob_key(&self, id: u64) -> Vec<u8> {
+        pointer_blob_key(PTR_ENTITY_ACTIVITY_INDEX_CHUNK, id)
+    }
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+enum InlineOrExternalU64V1 {
+    Inline { items: Vec<u64> },
+    External { chunk_ids: Vec<u64>, len: u64, chunk_size: u32 },
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+struct U64ChunkV1 {
+    items: Vec<u64>,
 }
 
 #[derive(Clone)]
 pub struct TokenDataProvider {
     mdb: Arc<Mdb>,
+    blob_mdb: Arc<Mdb>,
     view_blockhash: Option<BlockHash>,
 }
 
 impl TokenDataProvider {
     pub fn new(mdb: Arc<Mdb>) -> Self {
-        Self { mdb, view_blockhash: None }
+        let blob_mdb = Arc::new(mdb.clone_with_prefix(b"tokendata_blob:"));
+        Self { mdb, blob_mdb, view_blockhash: None }
     }
 
     pub fn with_view_blockhash(&self, blockhash: Option<BlockHash>) -> Self {
-        Self { mdb: Arc::clone(&self.mdb), view_blockhash: blockhash }
+        Self {
+            mdb: Arc::clone(&self.mdb),
+            blob_mdb: Arc::clone(&self.blob_mdb),
+            view_blockhash: blockhash,
+        }
     }
 
     pub fn with_height(&self, height: Option<u64>, height_present: bool) -> Result<Self> {
@@ -308,6 +329,10 @@ impl TokenDataProvider {
         TokenDataTable::new(self.mdb.as_ref())
     }
 
+    pub fn blob_mdb(&self) -> &Mdb {
+        self.blob_mdb.as_ref()
+    }
+
     fn raw_get_at(&self, key: &[u8], blockhash: Option<BlockHash>) -> Result<Option<Vec<u8>>> {
         match blockhash {
             Some(blockhash) => self
@@ -316,6 +341,16 @@ impl TokenDataProvider {
                 .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}")),
             None => self.mdb.get(key).map_err(|e| anyhow!("mdb.get failed: {e}")),
         }
+    }
+
+    fn raw_blob_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.blob_mdb.get(key).map_err(|e| anyhow!("blob_mdb.get failed: {e}"))
+    }
+
+    fn raw_blob_multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
+        self.blob_mdb
+            .multi_get(keys)
+            .map_err(|e| anyhow!("blob_mdb.multi_get failed: {e}"))
     }
 
     fn raw_scan_prefix_entries(
@@ -335,49 +370,6 @@ impl TokenDataProvider {
         };
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(entries)
-    }
-
-    fn parse_timestamp_sort_key(
-        &self,
-        prefix: &[u8],
-        key: &[u8],
-    ) -> Option<(u64, u32, [u8; 32])> {
-        let suffix = key.strip_prefix(prefix)?;
-        if suffix.len() < 8 + 32 + 4 {
-            return None;
-        }
-        let mut ts = [0u8; 8];
-        ts.copy_from_slice(&suffix[..8]);
-        let mut txid = [0u8; 32];
-        txid.copy_from_slice(&suffix[8..40]);
-        let mut ordinal = [0u8; 4];
-        ordinal.copy_from_slice(&suffix[40..44]);
-        Some((u64::from_be_bytes(ts), u32::from_be_bytes(ordinal), txid))
-    }
-
-    fn parse_amount_sort_key(
-        &self,
-        prefix: &[u8],
-        key: &[u8],
-    ) -> Option<(u128, u64, u32, [u8; 32])> {
-        let suffix = key.strip_prefix(prefix)?;
-        if suffix.len() < 16 + 8 + 32 + 4 {
-            return None;
-        }
-        let mut amount = [0u8; 16];
-        amount.copy_from_slice(&suffix[..16]);
-        let mut ts = [0u8; 8];
-        ts.copy_from_slice(&suffix[16..24]);
-        let mut txid = [0u8; 32];
-        txid.copy_from_slice(&suffix[24..56]);
-        let mut ordinal = [0u8; 4];
-        ordinal.copy_from_slice(&suffix[56..60]);
-        Some((
-            u128::from_be_bytes(amount),
-            u64::from_be_bytes(ts),
-            u32::from_be_bytes(ordinal),
-            txid,
-        ))
     }
 
     pub fn get_index_height(&self, params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
@@ -420,6 +412,299 @@ impl TokenDataProvider {
             .map_err(|e| anyhow!("mdb.bulk_write failed: {e}"))
     }
 
+    pub fn set_blob_batch(&self, params: SetBlobBatchParams) -> Result<()> {
+        self.blob_mdb
+            .bulk_write(|wb: &mut MdbBatch<'_>| {
+                for (key, value) in &params.puts {
+                    wb.put(key, value);
+                }
+            })
+            .map_err(|e| anyhow!("blob_mdb.bulk_write failed: {e}"))
+    }
+
+    pub fn reset_all_data(&self) -> Result<()> {
+        const DELETE_CHUNK_SIZE: usize = 10_000;
+
+        let logical_keys = self
+            .mdb
+            .scan_prefix_keys(b"")
+            .map_err(|e| anyhow!("mdb.scan_prefix_keys failed during reset: {e}"))?;
+        for chunk in logical_keys.chunks(DELETE_CHUNK_SIZE) {
+            let deletes = chunk.to_vec();
+            self.mdb
+                .bulk_write(|wb: &mut MdbBatch<'_>| {
+                    for key in &deletes {
+                        wb.delete(key);
+                    }
+                })
+                .map_err(|e| anyhow!("mdb.bulk_write reset failed: {e}"))?;
+        }
+
+        let blob_keys = self
+            .blob_mdb
+            .scan_prefix_keys(b"")
+            .map_err(|e| anyhow!("blob_mdb.scan_prefix_keys failed during reset: {e}"))?;
+        for chunk in blob_keys.chunks(DELETE_CHUNK_SIZE) {
+            let deletes = chunk.to_vec();
+            self.blob_mdb
+                .bulk_write(|wb: &mut MdbBatch<'_>| {
+                    for key in &deletes {
+                        wb.delete(key);
+                    }
+                })
+                .map_err(|e| anyhow!("blob_mdb.bulk_write reset failed: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn get_activity_row_counter(&self) -> Result<u64> {
+        let key = self.table().activity_row_counter_key();
+        Ok(self
+            .raw_blob_get(&key)?
+            .and_then(|bytes| decode_u64_value(&bytes).ok())
+            .unwrap_or(0))
+    }
+
+    pub fn get_activity_index_chunk_counter(&self) -> Result<u64> {
+        let key = self.table().activity_index_chunk_counter_key();
+        Ok(self
+            .raw_blob_get(&key)?
+            .and_then(|bytes| decode_u64_value(&bytes).ok())
+            .unwrap_or(0))
+    }
+
+    pub fn append_activity_index_values(
+        &self,
+        meta_key: Vec<u8>,
+        values: &[u64],
+        next_chunk_id: &mut u64,
+        puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        blob_puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<u64> {
+        let current = self
+            .raw_get_at(&meta_key, None)?
+            .and_then(|raw| decode_activity_index_state(&raw))
+            .unwrap_or_else(|| InlineOrExternalU64V1::Inline { items: Vec::new() });
+
+        if values.is_empty() {
+            return Ok(activity_index_total(&current));
+        }
+
+        let table = self.table();
+        let next_state = match current {
+            InlineOrExternalU64V1::Inline { mut items } => {
+                if items.len().saturating_add(values.len()) <= ACTIVITY_INDEX_INLINE_CAP {
+                    items.extend_from_slice(values);
+                    InlineOrExternalU64V1::Inline { items }
+                } else {
+                    let chunk_size = activity_index_chunk_size();
+                    let mut merged = Vec::with_capacity(items.len().saturating_add(values.len()));
+                    merged.append(&mut items);
+                    merged.extend_from_slice(values);
+
+                    let mut chunk_ids = Vec::new();
+                    for chunk in merged.chunks(chunk_size) {
+                        let id = *next_chunk_id;
+                        *next_chunk_id = next_chunk_id.saturating_add(1);
+                        chunk_ids.push(id);
+                        blob_puts.push((
+                            table.activity_index_chunk_blob_key(id),
+                            encode_u64_chunk(chunk.to_vec())?,
+                        ));
+                    }
+                    InlineOrExternalU64V1::External {
+                        chunk_ids,
+                        len: merged.len() as u64,
+                        chunk_size: chunk_size as u32,
+                    }
+                }
+            }
+            InlineOrExternalU64V1::External { mut chunk_ids, len, chunk_size } => {
+                let chunk_size_usize = usize::try_from(chunk_size).unwrap_or(0).max(1);
+                let chunk_size_u64 = chunk_size_usize as u64;
+                let mut pending = values;
+
+                if !chunk_ids.is_empty() && !pending.is_empty() {
+                    let rem = usize::try_from(len % chunk_size_u64).unwrap_or(0);
+                    if rem > 0 {
+                        let last_chunk_id = *chunk_ids.last().unwrap_or(&0);
+                        let last_key = table.activity_index_chunk_blob_key(last_chunk_id);
+                        let mut last_items = self
+                            .raw_blob_get(&last_key)?
+                            .map(|raw| decode_u64_chunk(&raw))
+                            .unwrap_or_default();
+                        if last_items.len() > chunk_size_usize {
+                            last_items.truncate(chunk_size_usize);
+                        }
+                        if last_items.len() < chunk_size_usize {
+                            let free = chunk_size_usize.saturating_sub(last_items.len());
+                            let take = free.min(pending.len());
+                            last_items.extend_from_slice(&pending[..take]);
+                            blob_puts.push((last_key, encode_u64_chunk(last_items)?));
+                            pending = &pending[take..];
+                        }
+                    }
+                }
+
+                while !pending.is_empty() {
+                    let take = chunk_size_usize.min(pending.len());
+                    let id = *next_chunk_id;
+                    *next_chunk_id = next_chunk_id.saturating_add(1);
+                    chunk_ids.push(id);
+                    blob_puts.push((
+                        table.activity_index_chunk_blob_key(id),
+                        encode_u64_chunk(pending[..take].to_vec())?,
+                    ));
+                    pending = &pending[take..];
+                }
+
+                InlineOrExternalU64V1::External {
+                    chunk_ids,
+                    len: len.saturating_add(values.len() as u64),
+                    chunk_size: chunk_size_usize as u32,
+                }
+            }
+        };
+
+        let new_len = activity_index_total(&next_state);
+        puts.push((meta_key, encode_activity_index_state(&next_state)?));
+        Ok(new_len)
+    }
+
+    fn get_activity_rows_by_ids(&self, ids: &[u64]) -> Result<Vec<SchemaTokenActivityV1>> {
+        let blob_keys: Vec<Vec<u8>> =
+            ids.iter().map(|id| self.table().activity_row_blob_key(*id)).collect();
+        Ok(self
+            .raw_blob_multi_get(&blob_keys)?
+            .into_iter()
+            .filter_map(|raw| {
+                raw.and_then(|bytes| SchemaTokenActivityV1::try_from_slice(&bytes).ok())
+            })
+            .collect())
+    }
+
+    fn get_activity_index_row_ids_page(
+        &self,
+        prefix: &[u8],
+        blockhash: Option<BlockHash>,
+        offset: usize,
+        limit: usize,
+        dir: SortDir,
+    ) -> Result<(Vec<u64>, usize)> {
+        let meta_key = self.table().activity_index_meta_key(prefix);
+        let Some(raw) = self.raw_get_at(&meta_key, blockhash)? else {
+            return Ok((Vec::new(), 0));
+        };
+        let Some(state) = decode_activity_index_state(&raw) else {
+            return Ok((Vec::new(), 0));
+        };
+        let total = usize::try_from(activity_index_total(&state)).unwrap_or(usize::MAX);
+        if limit == 0 || offset >= total {
+            return Ok((Vec::new(), total));
+        }
+
+        match state {
+            InlineOrExternalU64V1::Inline { items } => {
+                let selected = match dir {
+                    SortDir::Asc => items.into_iter().skip(offset).take(limit).collect(),
+                    SortDir::Desc => items.into_iter().rev().skip(offset).take(limit).collect(),
+                };
+                Ok((selected, total))
+            }
+            InlineOrExternalU64V1::External { chunk_ids, len, chunk_size } => {
+                let total_u64 = len;
+                let take = limit.min(total.saturating_sub(offset));
+                let (start, end, reverse) = match dir {
+                    SortDir::Asc => {
+                        let start = offset as u64;
+                        (start, start.saturating_add(take as u64), false)
+                    }
+                    SortDir::Desc => {
+                        let end = total_u64.saturating_sub(offset as u64);
+                        (end.saturating_sub(take as u64), end, true)
+                    }
+                };
+                let mut ids = self.read_activity_index_row_id_range(
+                    &chunk_ids,
+                    usize::try_from(chunk_size).unwrap_or(0).max(1),
+                    start,
+                    end,
+                )?;
+                if reverse {
+                    ids.reverse();
+                }
+                Ok((ids, total))
+            }
+        }
+    }
+
+    fn get_activity_index_all_row_ids(
+        &self,
+        prefix: &[u8],
+        blockhash: Option<BlockHash>,
+    ) -> Result<Vec<u64>> {
+        let total = self
+            .raw_get_at(&self.table().activity_index_meta_key(prefix), blockhash)?
+            .and_then(|raw| decode_activity_index_state(&raw))
+            .map(|state| activity_index_total(&state))
+            .unwrap_or(0);
+        let (ids, _) = self.get_activity_index_row_ids_page(
+            prefix,
+            blockhash,
+            0,
+            usize::try_from(total).unwrap_or(usize::MAX),
+            SortDir::Asc,
+        )?;
+        Ok(ids)
+    }
+
+    fn read_activity_index_row_id_range(
+        &self,
+        chunk_ids: &[u64],
+        chunk_size: usize,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u64>> {
+        if start >= end || chunk_size == 0 {
+            return Ok(Vec::new());
+        }
+        let first_chunk = usize::try_from(start / chunk_size as u64).unwrap_or(usize::MAX);
+        let mut last_chunk_excl =
+            usize::try_from((end + chunk_size as u64 - 1) / chunk_size as u64)
+                .unwrap_or(usize::MAX);
+        if first_chunk >= chunk_ids.len() {
+            return Ok(Vec::new());
+        }
+        last_chunk_excl = last_chunk_excl.min(chunk_ids.len());
+        if last_chunk_excl <= first_chunk {
+            return Ok(Vec::new());
+        }
+
+        let keys = chunk_ids[first_chunk..last_chunk_excl]
+            .iter()
+            .map(|id| self.table().activity_index_chunk_blob_key(*id))
+            .collect::<Vec<_>>();
+        let chunks = self.raw_blob_multi_get(&keys)?;
+        let mut out = Vec::new();
+        for (offset, raw_chunk) in chunks.into_iter().enumerate() {
+            let Some(raw_chunk) = raw_chunk else { continue };
+            let items = decode_u64_chunk(&raw_chunk);
+            let global_chunk_idx = first_chunk.saturating_add(offset);
+            let chunk_start = (global_chunk_idx as u64).saturating_mul(chunk_size as u64);
+            let from = usize::try_from(start.saturating_sub(chunk_start))
+                .unwrap_or(usize::MAX)
+                .min(items.len());
+            let to = usize::try_from(end.saturating_sub(chunk_start))
+                .unwrap_or(usize::MAX)
+                .min(items.len());
+            if from < to {
+                out.extend_from_slice(&items[from..to]);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_token_activity_page(
         &self,
         params: GetTokenActivityPageParams,
@@ -431,8 +716,12 @@ impl TokenDataProvider {
             params.sort_by
         };
         let prefix = match source_sort {
-            TokenActivitySortField::Timestamp => table.token_activity_prefix(params.scope, &params.token),
-            TokenActivitySortField::Amount => table.token_activity_amount_prefix(params.scope, &params.token),
+            TokenActivitySortField::Timestamp => {
+                table.token_activity_prefix(params.scope, &params.token)
+            }
+            TokenActivitySortField::Amount => {
+                table.token_activity_amount_prefix(params.scope, &params.token)
+            }
         };
         self.get_activity_page_from_prefix(
             prefix,
@@ -499,21 +788,40 @@ impl TokenDataProvider {
         end_time: Option<u64>,
     ) -> Result<GetTokenActivityPageResult> {
         let blockhash = blockhash.resolve(self.view_blockhash);
+        if matches!(source_sort, TokenActivitySortField::Timestamp)
+            && matches!(requested_sort, TokenActivitySortField::Timestamp)
+            && kind.is_none()
+            && start_time.is_none()
+            && end_time.is_none()
+        {
+            let (selected, total) =
+                self.get_activity_index_row_ids_page(&prefix, blockhash, offset, limit, dir)?;
+            let entries = self.get_activity_rows_by_ids(&selected)?;
+            return Ok(GetTokenActivityPageResult { entries, total });
+        }
+
+        let ids = match source_sort {
+            TokenActivitySortField::Timestamp => {
+                self.get_activity_index_all_row_ids(&prefix, blockhash)?
+            }
+            TokenActivitySortField::Amount => self
+                .raw_scan_prefix_entries(&prefix, blockhash)?
+                .into_iter()
+                .filter_map(|(_, value)| decode_u64_value(&value).ok())
+                .collect::<Vec<_>>(),
+        };
+
         let mut entries: Vec<(SchemaTokenActivityV1, (u128, u64, u32, [u8; 32]))> = self
-            .raw_scan_prefix_entries(&prefix, blockhash)?
+            .get_activity_rows_by_ids(&ids)?
             .into_iter()
-            .filter_map(|(k, v)| {
-                let row = SchemaTokenActivityV1::try_from_slice(&v).ok()?;
-                let sort_meta = match source_sort {
-                    TokenActivitySortField::Timestamp => self
-                        .parse_timestamp_sort_key(&prefix, &k)
-                        .map(|(ts, ordinal, txid)| (0, ts, ordinal, txid))
-                        .unwrap_or((0, row.timestamp, 0, row.txid)),
-                    TokenActivitySortField::Amount => self
-                        .parse_amount_sort_key(&prefix, &k)
-                        .unwrap_or((amount_from_row(&row), row.timestamp, 0, row.txid)),
+            .map(|row| {
+                let meta = match source_sort {
+                    TokenActivitySortField::Timestamp => (0, row.timestamp, 0, row.txid),
+                    TokenActivitySortField::Amount => {
+                        (amount_from_row(&row), row.timestamp, 0, row.txid)
+                    }
                 };
-                Some((row, sort_meta))
+                (row, meta)
             })
             .collect();
 
@@ -553,12 +861,7 @@ impl TokenDataProvider {
             entries.reverse();
         }
         let total = entries.len();
-        let page = entries
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(entry, _)| entry)
-            .collect();
+        let page = entries.into_iter().skip(offset).take(limit).map(|(entry, _)| entry).collect();
         Ok(GetTokenActivityPageResult { entries: page, total })
     }
 }
@@ -579,6 +882,10 @@ pub struct SetIndexHeightParams {
 pub struct SetBatchParams {
     pub blockhash: StateAt,
     pub deletes: Vec<Vec<u8>>,
+    pub puts: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+pub struct SetBlobBatchParams {
     pub puts: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -614,6 +921,34 @@ pub struct GetTokenActivityPageResult {
     pub total: usize,
 }
 
+fn activity_index_chunk_size() -> usize {
+    get_address_index_chunk_size().max(1)
+}
+
+fn activity_index_total(state: &InlineOrExternalU64V1) -> u64 {
+    match state {
+        InlineOrExternalU64V1::Inline { items } => items.len() as u64,
+        InlineOrExternalU64V1::External { len, .. } => *len,
+    }
+}
+
+fn decode_activity_index_state(bytes: &[u8]) -> Option<InlineOrExternalU64V1> {
+    InlineOrExternalU64V1::try_from_slice(bytes).ok()
+}
+
+fn encode_activity_index_state(state: &InlineOrExternalU64V1) -> Result<Vec<u8>> {
+    borsh::to_vec(state).map_err(|e| anyhow!("encode token activity index state failed: {e}"))
+}
+
+fn decode_u64_chunk(bytes: &[u8]) -> Vec<u64> {
+    U64ChunkV1::try_from_slice(bytes).map(|chunk| chunk.items).unwrap_or_default()
+}
+
+fn encode_u64_chunk(items: Vec<u64>) -> Result<Vec<u8>> {
+    borsh::to_vec(&U64ChunkV1 { items })
+        .map_err(|e| anyhow!("encode token activity index chunk failed: {e}"))
+}
+
 fn activity_kind_code(kind: TokenActivityKind) -> u8 {
     match kind {
         TokenActivityKind::Buy => 0,
@@ -642,6 +977,36 @@ pub fn scopes_for_source(source: TokenActivitySource) -> [TokenActivityScope; 2]
         TokenActivitySource::Market => [TokenActivityScope::All, TokenActivityScope::Market],
         TokenActivitySource::Mint => [TokenActivityScope::All, TokenActivityScope::Mint],
     }
+}
+
+fn pointer_counter_key(entity: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(PTR_V1_PREFIX.len() + entity.len() + 9);
+    key.extend_from_slice(PTR_V1_PREFIX);
+    key.extend_from_slice(entity);
+    key.extend_from_slice(b"/counter");
+    key
+}
+
+fn pointer_blob_key(entity: &[u8], id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(PTR_V1_PREFIX.len() + entity.len() + 14);
+    key.extend_from_slice(PTR_V1_PREFIX);
+    key.extend_from_slice(entity);
+    key.extend_from_slice(b"/blob/");
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+pub fn encode_u64_value(value: u64) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+pub fn decode_u64_value(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() != 8 {
+        return Err(anyhow!("invalid u64 value length {}", bytes.len()));
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    Ok(u64::from_le_bytes(arr))
 }
 
 fn push_spk(dst: &mut Vec<u8>, spk: &[u8]) {

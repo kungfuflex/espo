@@ -28,6 +28,10 @@ use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Transaction, Txid};
 use std::collections::{HashMap, HashSet};
 
+fn u128_to_i128_saturating(value: u128) -> i128 {
+    i128::try_from(value).unwrap_or(i128::MAX)
+}
+
 pub struct PoolDiscoveryResult {
     pub tx_meta: HashMap<Txid, (Vec<u8>, bool)>,
 }
@@ -492,8 +496,8 @@ pub fn discover_new_pools(
                     txid: txid_bytes,
                     kind: ActivityKind::PoolCreate,
                     direction: None,
-                    base_delta: 0,
-                    quote_delta: 0,
+                    base_delta: u128_to_i128_saturating(initial_token0_amount),
+                    quote_delta: u128_to_i128_saturating(initial_token1_amount),
                     address_spk,
                     success,
                 };
@@ -513,7 +517,7 @@ pub fn discover_new_pools(
                     state.token_activity_amount_writes.push((
                         table.token_activity_amount_key(
                             &defs.base_alkane_id,
-                            0,
+                            initial_token0_amount,
                             block_ts,
                             seq,
                             activity.kind,
@@ -535,7 +539,7 @@ pub fn discover_new_pools(
                         state.token_activity_amount_writes.push((
                             table.token_activity_amount_key(
                                 &defs.quote_alkane_id,
-                                0,
+                                initial_token1_amount,
                                 block_ts,
                                 seq,
                                 activity.kind,
