@@ -274,6 +274,82 @@ impl Mdb {
         self.scan_range_entries(start_inclusive, end_exclusive)
     }
 
+    pub fn scan_range_entries_page(
+        &self,
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+        offset: usize,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        let ns_start = self.prefixed(start_inclusive);
+        let ns_end = end_exclusive.map(|end| self.prefixed(end));
+        if let Some(tree) = self.versioned_manager() {
+            let entries = tree.range_entries_page_at_root(
+                tree.active_root(),
+                &ns_start,
+                ns_end.as_deref(),
+                offset,
+                limit,
+                reverse,
+            )?;
+            let mut out = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                if key.starts_with(&self.prefix) {
+                    out.push((key[self.prefix.len()..].to_vec(), value));
+                }
+            }
+            return Ok(out);
+        }
+        self.scan_range_entries_page_unversioned(
+            &ns_start,
+            ns_end.as_deref(),
+            offset,
+            limit,
+            reverse,
+        )
+    }
+
+    pub fn scan_range_entries_page_at_blockhash(
+        &self,
+        block_hash: &BlockHash,
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+        offset: usize,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        let ns_start = self.prefixed(start_inclusive);
+        let ns_end = end_exclusive.map(|end| self.prefixed(end));
+        if let Some(tree) = self.versioned_manager() {
+            let Some(root) = tree.root_for_blockhash(block_hash)? else {
+                return Ok(Vec::new());
+            };
+            let entries = tree.range_entries_page_at_root(
+                root,
+                &ns_start,
+                ns_end.as_deref(),
+                offset,
+                limit,
+                reverse,
+            )?;
+            let mut out = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                if key.starts_with(&self.prefix) {
+                    out.push((key[self.prefix.len()..].to_vec(), value));
+                }
+            }
+            return Ok(out);
+        }
+        self.scan_range_entries_page_unversioned(
+            &ns_start,
+            ns_end.as_deref(),
+            offset,
+            limit,
+            reverse,
+        )
+    }
+
     pub fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, RocksError> {
         let ns_prefix = self.prefixed(prefix);
         if let Some(tree) = self.versioned_manager() {
@@ -451,6 +527,61 @@ impl Mdb {
             return None;
         }
         get_global_tree_db()
+    }
+
+    fn scan_range_entries_page_unversioned(
+        &self,
+        ns_start: &[u8],
+        ns_end: Option<&[u8]>,
+        offset: usize,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(limit);
+        let mut skipped = 0usize;
+        let mode = if reverse {
+            match ns_end {
+                Some(end) => IteratorMode::From(end, Direction::Reverse),
+                None => IteratorMode::End,
+            }
+        } else {
+            IteratorMode::From(ns_start, Direction::Forward)
+        };
+
+        for res in self.db.iterator(mode) {
+            let (key, value) = res?;
+            if reverse {
+                if key.as_ref() < ns_start {
+                    break;
+                }
+                if let Some(end) = ns_end {
+                    if key.as_ref() >= end {
+                        continue;
+                    }
+                }
+            } else {
+                if let Some(end) = ns_end {
+                    if key.as_ref() >= end {
+                        break;
+                    }
+                }
+            }
+            if !key.starts_with(&self.prefix) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            out.push((key[self.prefix.len()..].to_vec(), value.to_vec()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 }
 

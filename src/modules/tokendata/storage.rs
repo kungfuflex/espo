@@ -372,6 +372,40 @@ impl TokenDataProvider {
         Ok(entries)
     }
 
+    fn raw_scan_range_entries_page(
+        &self,
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+        blockhash: Option<BlockHash>,
+        offset: usize,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match blockhash {
+            Some(blockhash) => self
+                .mdb
+                .scan_range_entries_page_at_blockhash(
+                    &blockhash,
+                    start_inclusive,
+                    end_exclusive,
+                    offset,
+                    limit,
+                    reverse,
+                )
+                .map_err(|e| anyhow!("mdb.scan_range_entries_page_at_blockhash failed: {e}")),
+            None => self
+                .mdb
+                .scan_range_entries_page(
+                    start_inclusive,
+                    end_exclusive,
+                    offset,
+                    limit,
+                    reverse,
+                )
+                .map_err(|e| anyhow!("mdb.scan_range_entries_page failed: {e}")),
+        }
+    }
+
     pub fn get_index_height(&self, params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         let table = self.table();
         let Some(bytes) = self
@@ -659,6 +693,121 @@ impl TokenDataProvider {
         Ok(ids)
     }
 
+    fn get_activity_index_total(&self, prefix: &[u8], blockhash: Option<BlockHash>) -> Result<usize> {
+        Ok(self
+            .raw_get_at(&self.table().activity_index_meta_key(prefix), blockhash)?
+            .and_then(|raw| decode_activity_index_state(&raw))
+            .map(|state| usize::try_from(activity_index_total(&state)).unwrap_or(usize::MAX))
+            .unwrap_or(0))
+    }
+
+    fn get_activity_index_row_ids_range(
+        &self,
+        prefix: &[u8],
+        blockhash: Option<BlockHash>,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u64>> {
+        if end <= start {
+            return Ok(Vec::new());
+        }
+        let meta_key = self.table().activity_index_meta_key(prefix);
+        let Some(raw) = self.raw_get_at(&meta_key, blockhash)? else {
+            return Ok(Vec::new());
+        };
+        let Some(state) = decode_activity_index_state(&raw) else {
+            return Ok(Vec::new());
+        };
+        let total = usize::try_from(activity_index_total(&state)).unwrap_or(usize::MAX);
+        if start >= total {
+            return Ok(Vec::new());
+        }
+        let start = start.min(total);
+        let end = end.min(total);
+        if end <= start {
+            return Ok(Vec::new());
+        }
+
+        match state {
+            InlineOrExternalU64V1::Inline { items } => Ok(items
+                .into_iter()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .collect()),
+            InlineOrExternalU64V1::External { chunk_ids, chunk_size, .. } => self
+                .read_activity_index_row_id_range(
+                    &chunk_ids,
+                    usize::try_from(chunk_size).unwrap_or(0).max(1),
+                    start as u64,
+                    end as u64,
+                ),
+        }
+    }
+
+    fn get_activity_row_at_index(
+        &self,
+        prefix: &[u8],
+        blockhash: Option<BlockHash>,
+        index: usize,
+    ) -> Result<Option<SchemaTokenActivityV1>> {
+        let ids = self.get_activity_index_row_ids_range(prefix, blockhash, index, index.saturating_add(1))?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.get_activity_rows_by_ids(&ids)?.into_iter().next())
+    }
+
+    fn find_activity_index_timestamp_window(
+        &self,
+        prefix: &[u8],
+        blockhash: Option<BlockHash>,
+        start_time: Option<u64>,
+        end_time: Option<u64>,
+    ) -> Result<(usize, usize)> {
+        let total = self.get_activity_index_total(prefix, blockhash)?;
+        if total == 0 {
+            return Ok((0, 0));
+        }
+
+        let mut lower = 0usize;
+        if let Some(target) = start_time {
+            let mut lo = 0usize;
+            let mut hi = total;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let Some(row) = self.get_activity_row_at_index(prefix, blockhash, mid)? else {
+                    return Ok((0, 0));
+                };
+                if row.timestamp < target {
+                    lo = mid.saturating_add(1);
+                } else {
+                    hi = mid;
+                }
+            }
+            lower = lo;
+        }
+
+        let mut upper = total;
+        if let Some(target) = end_time {
+            let mut lo = lower;
+            let mut hi = total;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let Some(row) = self.get_activity_row_at_index(prefix, blockhash, mid)? else {
+                    return Ok((lower.min(total), lower.min(total)));
+                };
+                if row.timestamp <= target {
+                    lo = mid.saturating_add(1);
+                } else {
+                    hi = mid;
+                }
+            }
+            upper = lo;
+        }
+
+        Ok((lower.min(total), upper.min(total)))
+    }
+
     fn read_activity_index_row_id_range(
         &self,
         chunk_ids: &[u64],
@@ -710,21 +859,21 @@ impl TokenDataProvider {
         params: GetTokenActivityPageParams,
     ) -> Result<GetTokenActivityPageResult> {
         let table = self.table();
+        let timestamp_prefix = table.token_activity_prefix(params.scope, &params.token);
         let source_sort = if params.start_time.is_some() || params.end_time.is_some() {
             TokenActivitySortField::Timestamp
         } else {
             params.sort_by
         };
         let prefix = match source_sort {
-            TokenActivitySortField::Timestamp => {
-                table.token_activity_prefix(params.scope, &params.token)
-            }
+            TokenActivitySortField::Timestamp => timestamp_prefix.clone(),
             TokenActivitySortField::Amount => {
                 table.token_activity_amount_prefix(params.scope, &params.token)
             }
         };
         self.get_activity_page_from_prefix(
             prefix,
+            timestamp_prefix,
             params.blockhash,
             params.kind,
             source_sort,
@@ -742,26 +891,29 @@ impl TokenDataProvider {
         params: GetAddressActivityPageParams,
     ) -> Result<GetTokenActivityPageResult> {
         let table = self.table();
+        let timestamp_prefix = match params.token {
+            Some(token) => {
+                table.address_token_activity_prefix(params.scope, &params.address_spk, &token)
+            }
+            None => table.address_activity_prefix(params.scope, &params.address_spk),
+        };
         let source_sort = if params.start_time.is_some() || params.end_time.is_some() {
             TokenActivitySortField::Timestamp
         } else {
             params.sort_by
         };
         let prefix = match (params.token, source_sort) {
-            (Some(token), TokenActivitySortField::Timestamp) => {
-                table.address_token_activity_prefix(params.scope, &params.address_spk, &token)
-            }
+            (Some(_token), TokenActivitySortField::Timestamp) => timestamp_prefix.clone(),
             (Some(token), TokenActivitySortField::Amount) => table
                 .address_token_activity_amount_prefix(params.scope, &params.address_spk, &token),
-            (None, TokenActivitySortField::Timestamp) => {
-                table.address_activity_prefix(params.scope, &params.address_spk)
-            }
+            (None, TokenActivitySortField::Timestamp) => timestamp_prefix.clone(),
             (None, TokenActivitySortField::Amount) => {
                 table.address_activity_amount_prefix(params.scope, &params.address_spk)
             }
         };
         self.get_activity_page_from_prefix(
             prefix,
+            timestamp_prefix,
             params.blockhash,
             params.kind,
             source_sort,
@@ -777,6 +929,7 @@ impl TokenDataProvider {
     fn get_activity_page_from_prefix(
         &self,
         prefix: Vec<u8>,
+        timestamp_prefix: Vec<u8>,
         blockhash: StateAt,
         kind: Option<TokenActivityKind>,
         source_sort: TokenActivitySortField,
@@ -799,10 +952,81 @@ impl TokenDataProvider {
             let entries = self.get_activity_rows_by_ids(&selected)?;
             return Ok(GetTokenActivityPageResult { entries, total });
         }
+        if matches!(source_sort, TokenActivitySortField::Amount)
+            && matches!(requested_sort, TokenActivitySortField::Amount)
+            && kind.is_none()
+            && start_time.is_none()
+            && end_time.is_none()
+        {
+            let total = self.get_activity_index_total(&timestamp_prefix, blockhash)?;
+            if limit == 0 || offset >= total {
+                return Ok(GetTokenActivityPageResult { entries: Vec::new(), total });
+            }
+            let end_exclusive = prefix_end_exclusive(&prefix);
+            let page = self.raw_scan_range_entries_page(
+                &prefix,
+                end_exclusive.as_deref(),
+                blockhash,
+                offset,
+                limit.min(total.saturating_sub(offset)),
+                matches!(dir, SortDir::Desc),
+            )?;
+            let ids = page
+                .into_iter()
+                .filter_map(|(_, value)| decode_u64_value(&value).ok())
+                .collect::<Vec<_>>();
+            let entries = self.get_activity_rows_by_ids(&ids)?;
+            return Ok(GetTokenActivityPageResult { entries, total });
+        }
+
+        let mut timeframe_applied = false;
+        let mut timeframe_total = None;
+        let timeframe_window = if matches!(source_sort, TokenActivitySortField::Timestamp)
+            && (start_time.is_some() || end_time.is_some())
+        {
+            let (window_start, window_end) =
+                self.find_activity_index_timestamp_window(&prefix, blockhash, start_time, end_time)?;
+            Some((window_start, window_end))
+        } else {
+            None
+        };
+
+        if let Some((window_start, window_end)) = timeframe_window {
+            timeframe_applied = true;
+            let window_total = window_end.saturating_sub(window_start);
+            timeframe_total = Some(window_total);
+            if matches!(requested_sort, TokenActivitySortField::Timestamp) && kind.is_none() {
+                if limit == 0 || offset >= window_total {
+                    return Ok(GetTokenActivityPageResult { entries: Vec::new(), total: window_total });
+                }
+                let take = limit.min(window_total.saturating_sub(offset));
+                let (range_start, range_end, reverse) = match dir {
+                    SortDir::Asc => {
+                        let start = window_start.saturating_add(offset);
+                        (start, start.saturating_add(take), false)
+                    }
+                    SortDir::Desc => {
+                        let end = window_end.saturating_sub(offset);
+                        (end.saturating_sub(take), end, true)
+                    }
+                };
+                let mut ids =
+                    self.get_activity_index_row_ids_range(&prefix, blockhash, range_start, range_end)?;
+                if reverse {
+                    ids.reverse();
+                }
+                let entries = self.get_activity_rows_by_ids(&ids)?;
+                return Ok(GetTokenActivityPageResult { entries, total: window_total });
+            }
+        }
 
         let ids = match source_sort {
             TokenActivitySortField::Timestamp => {
-                self.get_activity_index_all_row_ids(&prefix, blockhash)?
+                if let Some((window_start, window_end)) = timeframe_window {
+                    self.get_activity_index_row_ids_range(&prefix, blockhash, window_start, window_end)?
+                } else {
+                    self.get_activity_index_all_row_ids(&prefix, blockhash)?
+                }
             }
             TokenActivitySortField::Amount => self
                 .raw_scan_prefix_entries(&prefix, blockhash)?
@@ -825,7 +1049,8 @@ impl TokenDataProvider {
             })
             .collect();
 
-        if matches!(source_sort, TokenActivitySortField::Timestamp)
+        if !timeframe_applied
+            && matches!(source_sort, TokenActivitySortField::Timestamp)
             && (start_time.is_some() || end_time.is_some())
         {
             entries.sort_by(|a, b| a.1.cmp(&b.1));
@@ -845,8 +1070,12 @@ impl TokenDataProvider {
         entries = entries
             .into_iter()
             .filter(|(entry, _)| kind.map(|k| entry.kind == k).unwrap_or(true))
-            .filter(|(entry, _)| start_time.map(|s| entry.timestamp >= s).unwrap_or(true))
-            .filter(|(entry, _)| end_time.map(|e| entry.timestamp <= e).unwrap_or(true))
+            .filter(|(entry, _)| {
+                timeframe_applied || start_time.map(|s| entry.timestamp >= s).unwrap_or(true)
+            })
+            .filter(|(entry, _)| {
+                timeframe_applied || end_time.map(|e| entry.timestamp <= e).unwrap_or(true)
+            })
             .collect();
 
         match requested_sort {
@@ -860,7 +1089,11 @@ impl TokenDataProvider {
         if matches!(dir, SortDir::Desc) {
             entries.reverse();
         }
-        let total = entries.len();
+        let total = if timeframe_applied && kind.is_none() {
+            timeframe_total.unwrap_or(entries.len())
+        } else {
+            entries.len()
+        };
         let page = entries.into_iter().skip(offset).take(limit).map(|(entry, _)| entry).collect();
         Ok(GetTokenActivityPageResult { entries: page, total })
     }
@@ -938,6 +1171,18 @@ fn decode_activity_index_state(bytes: &[u8]) -> Option<InlineOrExternalU64V1> {
 
 fn encode_activity_index_state(state: &InlineOrExternalU64V1) -> Result<Vec<u8>> {
     borsh::to_vec(state).map_err(|e| anyhow!("encode token activity index state failed: {e}"))
+}
+
+fn prefix_end_exclusive(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for i in (0..end.len()).rev() {
+        if end[i] != 0xFF {
+            end[i] = end[i].saturating_add(1);
+            end.truncate(i + 1);
+            return Some(end);
+        }
+    }
+    None
 }
 
 fn decode_u64_chunk(bytes: &[u8]) -> Vec<u64> {

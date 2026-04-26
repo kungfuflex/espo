@@ -698,6 +698,134 @@ impl VersionedTreeDb {
         Ok(out)
     }
 
+    pub fn range_entries_page_at_root(
+        &self,
+        root: [u8; 32],
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+        offset: usize,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if reverse {
+            return self.range_entries_page_at_root_reverse(
+                root,
+                start_inclusive,
+                end_exclusive,
+                offset,
+                limit,
+            );
+        }
+        self.range_entries_page_at_root_forward(root, start_inclusive, end_exclusive, offset, limit)
+    }
+
+    fn range_entries_page_at_root_forward(
+        &self,
+        root: [u8; 32],
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        let mut out = Vec::with_capacity(limit);
+        let Some((mut cursor, mut path)) = self.find_leaf_with_path(root, start_inclusive)? else {
+            return Ok(out);
+        };
+        let mut first_leaf = true;
+        let mut remaining_offset = offset;
+
+        loop {
+            let leaf = self.load_leaf(&cursor)?;
+            let start_idx = if first_leaf {
+                leaf.entries.partition_point(|entry| entry.key.as_slice() < start_inclusive)
+            } else {
+                0
+            };
+
+            for entry in leaf.entries.iter().skip(start_idx) {
+                if let Some(end) = end_exclusive {
+                    if entry.key.as_slice() >= end {
+                        return Ok(out);
+                    }
+                }
+                let Some(value) = &entry.value else { continue };
+                if remaining_offset > 0 {
+                    remaining_offset -= 1;
+                    continue;
+                }
+                out.push((entry.key.clone(), value.clone()));
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+
+            first_leaf = false;
+            let Some(next) = self.next_leaf_from_path(&mut path)? else {
+                break;
+            };
+            cursor = next;
+        }
+
+        Ok(out)
+    }
+
+    fn range_entries_page_at_root_reverse(
+        &self,
+        root: [u8; 32],
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        let mut out = Vec::with_capacity(limit);
+        let Some((mut cursor, mut path)) = (match end_exclusive {
+            Some(end) => self.find_leaf_with_path(root, end)?,
+            None => self.rightmost_leaf_with_path(root)?,
+        }) else {
+            return Ok(out);
+        };
+        let mut first_leaf = true;
+        let mut remaining_offset = offset;
+
+        loop {
+            let leaf = self.load_leaf(&cursor)?;
+            let upper = if first_leaf {
+                match end_exclusive {
+                    Some(end) => leaf.entries.partition_point(|entry| entry.key.as_slice() < end),
+                    None => leaf.entries.len(),
+                }
+            } else {
+                leaf.entries.len()
+            };
+
+            for entry in leaf.entries[..upper].iter().rev() {
+                if entry.key.as_slice() < start_inclusive {
+                    return Ok(out);
+                }
+                let Some(value) = &entry.value else { continue };
+                if remaining_offset > 0 {
+                    remaining_offset -= 1;
+                    continue;
+                }
+                out.push((entry.key.clone(), value.clone()));
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+
+            first_leaf = false;
+            let Some(prev) = self.prev_leaf_from_path(&mut path)? else {
+                break;
+            };
+            cursor = prev;
+        }
+
+        Ok(out)
+    }
+
     fn apply_mutation(&self, key: &[u8], value: Option<Vec<u8>>) -> Result<(), RocksError> {
         let mut st = self.state.write().expect("tree state poisoned");
         if let Some(ctx) = st.current_block.as_mut() {
@@ -1022,6 +1150,61 @@ impl VersionedTreeDb {
             }
         }
         Ok(None)
+    }
+
+    fn prev_leaf_from_path(
+        &self,
+        path: &mut Vec<([u8; 32], usize)>,
+    ) -> Result<Option<[u8; 32]>, RocksError> {
+        while let Some((internal_id, child_idx)) = path.pop() {
+            if child_idx == 0 {
+                continue;
+            }
+            let internal = self.load_internal(&internal_id)?;
+            let prev_idx = child_idx - 1;
+            let Some(mut node_id) = internal.children.get(prev_idx).copied() else {
+                continue;
+            };
+            path.push((internal_id, prev_idx));
+            loop {
+                match self.load_node(&node_id)? {
+                    BptreeNode::Leaf(_) => return Ok(Some(node_id)),
+                    BptreeNode::Internal(prev_internal) => {
+                        let Some(last_idx) =
+                            prev_internal.children.len().checked_sub(1)
+                        else {
+                            return Ok(None);
+                        };
+                        path.push((node_id, last_idx));
+                        node_id = prev_internal.children[last_idx];
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn rightmost_leaf_with_path(
+        &self,
+        root: [u8; 32],
+    ) -> Result<Option<([u8; 32], Vec<([u8; 32], usize)>)>, RocksError> {
+        let mut path = Vec::new();
+        let mut current = root;
+        loop {
+            match self.load_node(&current)? {
+                BptreeNode::Leaf(_) => return Ok(Some((current, path))),
+                BptreeNode::Internal(internal) => {
+                    let Some(last_idx) = internal.children.len().checked_sub(1) else {
+                        return Ok(None);
+                    };
+                    let Some(next) = internal.children.get(last_idx).copied() else {
+                        return Ok(None);
+                    };
+                    path.push((current, last_idx));
+                    current = next;
+                }
+            }
+        }
     }
 
     fn load_leaf(&self, id: &[u8; 32]) -> Result<LeafNode, RocksError> {

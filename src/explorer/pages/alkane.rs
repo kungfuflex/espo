@@ -69,9 +69,9 @@ pub struct PageQuery {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AlkaneTab {
+    Activity,
     Holders,
     Volume,
-    Activity,
     Inspect,
 }
 
@@ -79,9 +79,10 @@ impl AlkaneTab {
     fn from_query(raw: Option<&str>) -> Self {
         match raw {
             Some("activity") => AlkaneTab::Activity,
+            Some("holders") => AlkaneTab::Holders,
             Some("inspect") => AlkaneTab::Inspect,
             Some("volume") | Some("transfer_volume") | Some("total_received") => AlkaneTab::Volume,
-            _ => AlkaneTab::Holders,
+            _ => AlkaneTab::Activity,
         }
     }
 }
@@ -344,10 +345,9 @@ pub async fn alkane_page(
         })
         .map(|res| res.total > 0)
         .unwrap_or(false);
-    let tab = if requested_tab == AlkaneTab::Activity && !has_token_activity {
-        AlkaneTab::Holders
-    } else {
-        requested_tab
+    let tab = match requested_tab {
+        AlkaneTab::Activity if !has_token_activity => AlkaneTab::Holders,
+        other => other,
     };
 
     let creation_record = load_creation_record(&state.essentials_mdb, &alk).ok().flatten();
@@ -1056,14 +1056,14 @@ pub async fn alkane_page(
                 section class="alkane-section" {
                     div class="alkane-tabs" {
                         div class="alkane-tab-list" {
-                            a class=(format!("alkane-tab{}", if tab == AlkaneTab::Holders { " active" } else { "" }))
-                                href=(explorer_path(&format!("/alkane/{alk_str}?page={page}&limit={limit}"))) { "Holders" }
                             @if has_token_activity {
                                 a class=(format!("alkane-tab{}", if tab == AlkaneTab::Activity { " active" } else { "" }))
                                     href=(activity_tab_url(&alk_str, page, limit, activity_order, activity_dir, activity_filter)) {
                                     "Activity"
                                 }
                             }
+                            a class=(format!("alkane-tab{}", if tab == AlkaneTab::Holders { " active" } else { "" }))
+                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={page}&limit={limit}"))) { "Holders" }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Volume { " active" } else { "" }))
                                 href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page={page}&limit={limit}"))) { "Volume" }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Inspect { " active" } else { "" }))
