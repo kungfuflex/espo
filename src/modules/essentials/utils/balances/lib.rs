@@ -996,7 +996,7 @@ pub(crate) fn project_tx_output_balances_from_traces(
     traces_for_tx: &[EspoTrace],
     input_balances: Vec<BalanceEntry>,
 ) -> HashMap<u32, Vec<BalanceEntry>> {
-    if traces_for_tx.is_empty() || !tx_has_op_return(tx) {
+    if !tx_has_op_return(tx) {
         return HashMap::new();
     }
 

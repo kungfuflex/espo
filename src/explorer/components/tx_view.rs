@@ -799,10 +799,14 @@ pub fn render_tx(
     let outspends = outspends_fn(txid);
     let protostone_json = protostone_json(tx);
     let runestone_vouts = runestone_vout_indices(tx);
-    let projected_out_balances = traces
-        .filter(|ts| !ts.is_empty())
-        .map(|ts| {
-            project_tx_output_balances_from_traces(tx, ts, input_alkane_balances(tx, outpoint_fn))
+    let projected_out_balances = protostone_json
+        .as_ref()
+        .map(|_| {
+            project_tx_output_balances_from_traces(
+                tx,
+                traces.unwrap_or(&[]),
+                input_alkane_balances(tx, outpoint_fn),
+            )
         })
         .unwrap_or_default();
     let fee_pill_label =
