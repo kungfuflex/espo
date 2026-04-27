@@ -3,8 +3,12 @@ use crate::alkanes::trace::{
     prettyify_protobuf_trace_json,
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
-use crate::config::{get_bitcoind_rpc_client, get_config, get_metashrew_rpc_url};
-use crate::schemas::EspoOutpoint;
+use crate::config::{get_bitcoind_rpc_client, get_config, get_espo_db, get_metashrew_rpc_url};
+use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider};
+use crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch;
+use crate::runtime::mdb::Mdb;
+use crate::runtime::state_at::StateAt;
+use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result};
 use bitcoin::block::Version as BlockVersion;
 use bitcoin::blockdata::block::Header;
@@ -26,7 +30,7 @@ use protorune_support::utils::decode_varint_list;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -409,22 +413,94 @@ fn hex_u128(value: u128) -> String {
     format!("0x{value:x}")
 }
 
+fn mempool_essentials_provider() -> &'static EssentialsProvider {
+    static PROVIDER: OnceLock<EssentialsProvider> = OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        let mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        EssentialsProvider::new(mdb)
+    })
+}
+
+fn alkane_transfer_json(id: &SchemaAlkaneId, value: u128) -> Value {
+    json!({
+        "id": {
+            "block": hex_u128(id.block as u128),
+            "tx": hex_u128(id.tx as u128),
+        },
+        "value": hex_u128(value),
+    })
+}
+
+fn input_alkane_balances_for_tx(tx: &Transaction) -> Vec<BalanceEntry> {
+    let mut outpoints: Vec<(Txid, u32)> = tx
+        .input
+        .iter()
+        .filter_map(|vin| {
+            if vin.previous_output.is_null() {
+                None
+            } else {
+                Some((vin.previous_output.txid, vin.previous_output.vout))
+            }
+        })
+        .collect();
+    outpoints.sort();
+    outpoints.dedup();
+    if outpoints.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(rows) = get_outpoint_balances_with_spent_batch(
+        StateAt::Latest,
+        mempool_essentials_provider(),
+        &outpoints,
+    ) else {
+        return Vec::new();
+    };
+
+    let mut by_alkane: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
+    for lookup in rows.values() {
+        for balance in &lookup.balances {
+            if balance.amount == 0 {
+                continue;
+            }
+            *by_alkane.entry(balance.alkane).or_default() = by_alkane
+                .get(&balance.alkane)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(balance.amount);
+        }
+    }
+
+    by_alkane
+        .into_iter()
+        .map(|(alkane, amount)| BalanceEntry { alkane, amount })
+        .collect()
+}
+
 fn diesel_trace_for_tx(
     txid: &Txid,
     tx: &Transaction,
     vout: u32,
     mint_amount: u128,
+    input_balances: &[BalanceEntry],
 ) -> Option<Vec<EspoTrace>> {
     let mut raw: Value = serde_json::from_str(include_str!("diesel-mint-trace.json")).ok()?;
+    let input_transfer_json: Vec<Value> = input_balances
+        .iter()
+        .filter(|entry| entry.amount > 0)
+        .map(|entry| alkane_transfer_json(&entry.alkane, entry.amount))
+        .collect();
     if let Some(incoming) = raw
         .get_mut(0)
         .and_then(|v| v.get_mut("data"))
         .and_then(|v| v.get_mut("context"))
         .and_then(|v| v.get_mut("incomingAlkanes"))
         .and_then(|v| v.as_array_mut())
-        .and_then(|arr| arr.get_mut(0))
     {
-        incoming["value"] = Value::String(hex_u128(mint_amount));
+        if let Some(first) = incoming.get_mut(0) {
+            first["value"] = Value::String(hex_u128(mint_amount));
+        }
+        incoming.extend(input_transfer_json.iter().cloned());
     }
     if let Some(v) = raw
         .get_mut(0)
@@ -440,9 +516,11 @@ fn diesel_trace_for_tx(
         .and_then(|v| v.get_mut("response"))
         .and_then(|v| v.get_mut("alkanes"))
         .and_then(|v| v.as_array_mut())
-        .and_then(|arr| arr.get_mut(0))
     {
-        alkanes["value"] = Value::String(hex_u128(mint_amount));
+        if let Some(first) = alkanes.get_mut(0) {
+            first["value"] = Value::String(hex_u128(mint_amount));
+        }
+        alkanes.extend(input_transfer_json);
     }
 
     let events: Vec<EspoSandshrewLikeTraceEvent> = serde_json::from_value(raw).ok()?;
@@ -1474,7 +1552,9 @@ fn recalculate_memory_templates() {
             if let Some(tx) = state.txs.get_mut(txid) {
                 if let Some(transaction) = tx.tx.as_ref() {
                     let vout = shadow_base(transaction);
-                    tx.diesel_trace = diesel_trace_for_tx(txid, transaction, vout, per_mint);
+                    let input_balances = input_alkane_balances_for_tx(transaction);
+                    tx.diesel_trace =
+                        diesel_trace_for_tx(txid, transaction, vout, per_mint, &input_balances);
                 }
             }
         }
