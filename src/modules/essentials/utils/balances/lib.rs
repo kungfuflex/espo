@@ -991,6 +991,33 @@ fn apply_transfers_multi(
     Ok(out_map)
 }
 
+pub(crate) fn project_tx_output_balances_from_traces(
+    tx: &Transaction,
+    traces_for_tx: &[EspoTrace],
+    input_balances: Vec<BalanceEntry>,
+) -> HashMap<u32, Vec<BalanceEntry>> {
+    if traces_for_tx.is_empty() || !tx_has_op_return(tx) {
+        return HashMap::new();
+    }
+
+    let protostones = match parse_protostones(tx) {
+        Ok(protostones) => protostones,
+        Err(_) => return HashMap::new(),
+    };
+    if protostones.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut seed_unalloc = Unallocated::default();
+    for entry in input_balances {
+        if entry.amount > 0 {
+            seed_unalloc.add(entry.alkane, entry.amount);
+        }
+    }
+
+    apply_transfers_multi(tx, &protostones, traces_for_tx, seed_unalloc).unwrap_or_default()
+}
+
 /* -------------------------- Holders helpers -------------------------- */
 
 fn holder_order_key(id: &HolderId) -> String {

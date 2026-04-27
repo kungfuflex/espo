@@ -350,7 +350,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
                 }
             }
             h2 class="h2" { "Inputs & Outputs" }
-            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, false))
+            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, fee_rate, false))
             (header_scripts())
         },
     )

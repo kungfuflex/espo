@@ -16,10 +16,12 @@ use crate::explorer::consts::{
     ALKANE_CONTRACT_ICON_BASE, ALKANE_TOKEN_ICON_BASE, alkane_contract_name_overrides,
     alkane_factory_icon_blacklist, alkane_icon_overrides, alkane_name_overrides,
 };
-use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount};
+use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount, format_fee_rate};
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider, load_creation_record};
-use crate::modules::essentials::utils::balances::OutpointLookup;
+use crate::modules::essentials::utils::balances::{
+    OutpointLookup, project_tx_output_balances_from_traces,
+};
 use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
@@ -44,6 +46,52 @@ pub struct TxPill {
 pub enum TxPillTone {
     Success,
     Danger,
+}
+
+fn tx_fee_rate(tx: &Transaction, prev_map: &HashMap<Txid, Transaction>) -> Option<f64> {
+    let mut input_total = 0u64;
+    for vin in &tx.input {
+        if vin.previous_output.is_null() {
+            return None;
+        }
+        let prev_tx = prev_map.get(&vin.previous_output.txid)?;
+        let prev_out = prev_tx.output.get(vin.previous_output.vout as usize)?;
+        input_total = input_total.checked_add(prev_out.value.to_sat())?;
+    }
+
+    let output_total = tx
+        .output
+        .iter()
+        .try_fold(0u64, |acc, output| acc.checked_add(output.value.to_sat()))?;
+    let fee = input_total.checked_sub(output_total)?;
+    let vsize = tx.vsize();
+    if vsize == 0 { None } else { Some(fee as f64 / vsize as f64) }
+}
+
+fn input_alkane_balances(
+    tx: &Transaction,
+    outpoint_fn: &dyn Fn(&Txid, u32) -> OutpointLookup,
+) -> Vec<BalanceEntry> {
+    let mut by_alkane: HashMap<SchemaAlkaneId, u128> = HashMap::new();
+    for vin in &tx.input {
+        if vin.previous_output.is_null() {
+            continue;
+        }
+        let lookup = outpoint_fn(&vin.previous_output.txid, vin.previous_output.vout);
+        for entry in lookup.balances {
+            *by_alkane.entry(entry.alkane).or_default() =
+                by_alkane.get(&entry.alkane).copied().unwrap_or(0).saturating_add(entry.amount);
+        }
+    }
+
+    by_alkane
+        .into_iter()
+        .filter_map(
+            |(alkane, amount)| {
+                if amount == 0 { None } else { Some(BalanceEntry { alkane, amount }) }
+            },
+        )
+        .collect()
 }
 
 fn addr_prefix_suffix(addr: &str) -> (String, String) {
@@ -741,6 +789,7 @@ pub fn render_tx(
     outspends_fn: &dyn Fn(&Txid) -> Vec<Option<Txid>>,
     essentials_mdb: &Mdb,
     pill: Option<TxPill>,
+    fee_rate_override: Option<f64>,
     show_tx_title: bool,
 ) -> Markup {
     let mut alkane_meta_cache: AlkaneMetaCache = HashMap::new();
@@ -750,6 +799,14 @@ pub fn render_tx(
     let outspends = outspends_fn(txid);
     let protostone_json = protostone_json(tx);
     let runestone_vouts = runestone_vout_indices(tx);
+    let projected_out_balances = traces
+        .filter(|ts| !ts.is_empty())
+        .map(|ts| {
+            project_tx_output_balances_from_traces(tx, ts, input_alkane_balances(tx, outpoint_fn))
+        })
+        .unwrap_or_default();
+    let fee_pill_label =
+        fee_rate_override.or_else(|| tx_fee_rate(tx, prev_map)).map(format_fee_rate);
     let vouts_markup = render_vouts(
         txid,
         tx,
@@ -757,6 +814,7 @@ pub fn render_tx(
         outpoint_fn,
         &outspends,
         traces,
+        &projected_out_balances,
         &protostone_json,
         &runestone_vouts,
         &mut alkane_meta_cache,
@@ -779,13 +837,18 @@ pub fn render_tx(
                     (vouts_markup)
                 }
             }
-            @if let Some(p) = pill {
-                @let tone_class = match &p.tone {
-                    TxPillTone::Success => "success",
-                    TxPillTone::Danger => "danger",
-                };
+            @if pill.is_some() || fee_pill_label.is_some() {
                 div class="tx-pill-row" {
-                    span class=(format!("pill tx-pill {}", tone_class)) { (p.label.clone()) }
+                    @if let Some(fee_label) = fee_pill_label.as_ref() {
+                        span class="pill tx-pill tx-pill-fee" { (fee_label) }
+                    }
+                    @if let Some(p) = pill {
+                        @let tone_class = match &p.tone {
+                            TxPillTone::Success => "success",
+                            TxPillTone::Danger => "danger",
+                        };
+                        span class=(format!("pill tx-pill tx-pill-status {}", tone_class)) { (p.label.clone()) }
+                    }
                 }
             }
         }
@@ -869,6 +932,7 @@ fn render_vouts(
     outpoint_fn: &dyn Fn(&Txid, u32) -> OutpointLookup,
     outspends: &[Option<Txid>],
     traces: Option<&[EspoTrace]>,
+    projected_out_balances: &HashMap<u32, Vec<BalanceEntry>>,
     protostone_json: &Option<Value>,
     runestone_vouts: &HashSet<usize>,
     alkane_meta_cache: &mut AlkaneMetaCache,
@@ -886,6 +950,11 @@ fn render_vouts(
             div class="io-list" {
                 @for (vout, o) in tx.output.iter().enumerate() {
                     @let OutpointLookup { balances, spent_by: db_spent, .. } = outpoint_fn(txid, vout as u32);
+                    @let display_balances = if balances.is_empty() {
+                        projected_out_balances.get(&(vout as u32)).cloned().unwrap_or_default()
+                    } else {
+                        balances
+                    };
                     @let spent_by = outspends.get(vout).cloned().flatten().or(db_spent);
                     @let opret = decode_op_return_payload(&o.script_pubkey);
                     @let is_opret = opret.is_some();
@@ -933,7 +1002,7 @@ fn render_vouts(
                                     }
                                 }
                             }
-                            (balances_list(&balances, alkane_meta_cache, essentials_mdb, true))
+                            (balances_list(&display_balances, alkane_meta_cache, essentials_mdb, true))
                         }
                         @match spent_by {
                             Some(spender) => a class=(if is_opret { "io-arrow io-arrow-link out spent opret-arrow" } else { "io-arrow io-arrow-link out spent" }) href=(explorer_path(&format!("/tx/{}", spender))) title="Spent by transaction" { (arrow_svg()) },

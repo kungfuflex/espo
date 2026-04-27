@@ -611,7 +611,7 @@ pub async fn block_page(
                     div class="list" {
                         @for item in tx_items {
                             @let traces: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), true))
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), None, true))
                         }
                     }
                 }
@@ -790,9 +790,9 @@ pub async fn mempool_block_page(
 
     let header_markup = header(HeaderProps {
         title: format!("Mempool Block #{}", display_index),
-        id: Some("Projected from the in-memory mempool".to_string()),
+        id: None,
         show_copy: false,
-        pill: Some(("Projected".to_string(), HeaderPillTone::Warning)),
+        pill: None,
         summary_items,
         cta: None,
         hero_class: None,
@@ -840,11 +840,11 @@ pub async fn mempool_block_page(
                     div class="list" {
                         @for item in detail.txs {
                             @let traces: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
-                            @let fee_pill = TxPill {
-                                label: format_fee_rate(item.fee_rate),
-                                tone: TxPillTone::Success,
+                            @let status_pill = TxPill {
+                                label: "Unconfirmed".to_string(),
+                                tone: TxPillTone::Danger,
                             };
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(fee_pill), true))
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(status_pill), Some(item.fee_rate), true))
                         }
                     }
                 }

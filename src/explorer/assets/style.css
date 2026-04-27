@@ -547,8 +547,8 @@ a:hover {
   font-size: 16px;
 }
 .tx-conf-pill.pending {
-  background: rgba(255, 85, 85, 0.15);
-  color: #ff5555;
+  background: rgba(253, 169, 72, 0.15);
+  color: var(--warning);
 }
 .tx-conf-pill.neutral {
   background: var(--panel);
@@ -1226,19 +1226,33 @@ a:hover {
 }
 .tx-pill-row {
   padding: 0 12px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
 }
 .tx-pill {
   border-radius: 6px !important;
   font-size: 15px;
   font-weight: 500;
+  background: var(--panel2);
+  color: var(--text);
+  border: 0;
+  min-width: 0;
 }
-.tx-pill.success {
-  background: var(--bg-success);
-  color: var(--success);
+.tx-pill-status.success {
+  color: var(--text);
 }
-.tx-pill.danger {
-  background: rgba(255, 85, 85, 0.15);
-  color: #ff5555;
+.tx-pill-status {
+  margin-left: auto;
+}
+.tx-pill-status.danger {
+  background: rgba(253, 169, 72, 0.15);
+  color: var(--warning);
+}
+.tx-pill-fee {
+  color: #fff;
+  white-space: nowrap;
 }
 .tx-title {
   padding: 12px;
