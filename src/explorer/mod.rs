@@ -9,8 +9,8 @@ pub mod paths;
 use std::net::SocketAddr;
 
 use api::{
-    address_chart, alkane_balance_chart, alkane_chart, carousel_blocks, search_guess,
-    simulate_contract,
+    address_chart, alkane_balance_chart, alkane_chart, carousel_blocks, explorer_events_ws,
+    mempool_blocks, search_guess, simulate_contract,
 };
 use axum::Router;
 use axum::extract::Request;
@@ -24,7 +24,7 @@ use mining_pools::{block_mining_pool_api, mining_pool_icon};
 use pages::address::address_page;
 use pages::alkane::alkane_page;
 use pages::alkanes::alkanes_page;
-use pages::block::block_page;
+use pages::block::{block_page, mempool_block_page};
 use pages::home::home_page;
 use pages::search::search;
 use pages::state::ExplorerState;
@@ -32,7 +32,7 @@ use pages::tx::tx_page;
 use tokio::net::TcpListener;
 
 use crate::config::{
-    get_espo_next_height, get_explorer_base_path, get_explorer_networks, get_network,
+    get_config, get_espo_next_height, get_explorer_base_path, get_explorer_networks, get_network,
 };
 use components::layout::{favicon, style, waves_light};
 use paths::with_language;
@@ -42,19 +42,26 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/", get(home_page))
         .route("/search", get(search))
         .route("/block/{height}", get(block_page))
+        .route("/mempool-block/{index}", get(mempool_block_page))
         .route("/tx/{txid}", get(tx_page))
         .route("/address/{address}", get(address_page))
         .route("/alkane/{alkane}", get(alkane_page))
         .route("/alkanes", get(alkanes_page));
 
-    let api = Router::new()
+    let mut api = Router::new()
         .route("/api/blocks/carousel", get(carousel_blocks))
         .route("/api/block/pool", get(block_mining_pool_api))
+        .route("/api/mempool/blocks", get(mempool_blocks))
         .route("/api/search/guess", get(search_guess))
         .route("/api/alkane/simulate", post(simulate_contract))
         .route("/api/alkane/chart", get(alkane_chart))
         .route("/api/alkane/balance-chart", get(alkane_balance_chart))
         .route("/api/address/chart", get(address_chart));
+    let mempool_cfg = &get_config().mempool;
+    if mempool_cfg.websocket_enabled {
+        let ws_path = mempool_cfg.websocket_path.as_deref().unwrap_or("/api/events/ws");
+        api = api.route(ws_path, get(explorer_events_ws));
+    }
 
     let assets = Router::new()
         .route("/static/style.css", get(style))

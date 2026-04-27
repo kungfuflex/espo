@@ -1170,9 +1170,7 @@ impl VersionedTreeDb {
                 match self.load_node(&node_id)? {
                     BptreeNode::Leaf(_) => return Ok(Some(node_id)),
                     BptreeNode::Internal(prev_internal) => {
-                        let Some(last_idx) =
-                            prev_internal.children.len().checked_sub(1)
-                        else {
+                        let Some(last_idx) = prev_internal.children.len().checked_sub(1) else {
                             return Ok(None);
                         };
                         path.push((node_id, last_idx));

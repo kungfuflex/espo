@@ -1,12 +1,33 @@
 use maud::{Markup, PreEscaped, html};
 
+use crate::config::get_config;
 use crate::explorer::mining_pools::bundled_pool_icon_svgs_json;
 use crate::explorer::paths::{current_language, explorer_path};
 
 pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
+    block_carousel_inner(current_height, None, espo_tip)
+}
+
+pub fn block_carousel_with_mempool(selected_mempool_index: Option<usize>, espo_tip: u64) -> Markup {
+    block_carousel_inner(None, selected_mempool_index, espo_tip)
+}
+
+fn block_carousel_inner(
+    current_height: Option<u64>,
+    selected_mempool_index: Option<usize>,
+    espo_tip: u64,
+) -> Markup {
     let current_height = current_height.unwrap_or(espo_tip);
     let base_path_js = format!("{:?}", explorer_path("/"));
     let pool_icons_js = bundled_pool_icon_svgs_json();
+    let mempool_cfg = &get_config().mempool;
+    let ws_path = mempool_cfg.websocket_path.as_deref().unwrap_or("/api/events/ws").to_string();
+    let ws_path_js = format!("{:?}", ws_path);
+    let ws_enabled_js = mempool_cfg.websocket_enabled;
+    let mempool_slot_count = mempool_cfg.template_blocks.max(1);
+    let selected_mempool_js = selected_mempool_index
+        .map(|idx| idx.to_string())
+        .unwrap_or_else(|| "null".to_string());
     let is_chinese = current_language().is_chinese();
     let reset_label = if is_chinese { "返回最新区块" } else { "Back to latest block" };
 
@@ -16,7 +37,11 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   const basePath = {base_path_js};
   const isChinese = {is_chinese};
   const POOL_ICONS = {pool_icons_js};
+  const eventsPath = {ws_path_js};
+  const eventsEnabled = {ws_enabled_js};
+  const MEMPOOL_SLOT_COUNT = {mempool_slot_count};
   const basePrefix = basePath === '/' ? '' : basePath;
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const root = document.querySelector('[data-block-carousel]');
   if (!root) return;
 
@@ -24,7 +49,9 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   const track = root.querySelector('[data-bc-track]');
   const resetButton = root.querySelector('[data-bc-reset]');
   const current = Number(root.dataset.current);
-  const espoTip = Number(root.dataset.espoTip);
+  const selectedMempoolIndex = {selected_mempool_js};
+  let selectedConfirmedHeight = selectedMempoolIndex === null ? current : null;
+  let espoTip = Number(root.dataset.espoTip);
   if (!scroller || !track || !Number.isFinite(current) || !Number.isFinite(espoTip)) return;
 
   const RADIUS = 8;
@@ -38,6 +65,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
 
   const seen = new Set();
   const blocks = [];
+  let mempoolBlocks = [];
   let minH = current;
   let maxH = current;
   let selectedHeight = current;
@@ -50,6 +78,8 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   let initialRetryTimer = null;
   let leftRetryTimer = null;
   let rightRetryTimer = null;
+  let confirmAnimationUntil = 0;
+  let queuedMempoolBlocks = null;
   let leftDepleted = false;
   let rightDepleted = false;
   let initialCentered = false;
@@ -186,8 +216,13 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
 
   function renderFeeStats(block) {{
     const median = formatFeeRate(block.median_fee_rate, true);
-    const min = formatFeeRate(block.min_fee_rate, false);
-    const max = formatFeeRate(block.max_fee_rate, true);
+    const range = Array.isArray(block.fee_range) && block.fee_range.length
+      ? block.fee_range
+      : (Array.isArray(block.feeRange) ? block.feeRange : []);
+    const minValue = range.length ? range[0] : block.min_fee_rate;
+    const maxValue = range.length ? range[range.length - 1] : block.max_fee_rate;
+    const min = formatFeeRate(minValue, false);
+    const max = formatFeeRate(maxValue, true);
     if (!median && !min && !max) return '';
     const medianMarkup = median ? `<div class="bc-fees">~${{median}}</div>` : '';
     const rangeMarkup = min && max ? `<div class="bc-fee-span">${{min}} - ${{max}}</div>` : '';
@@ -230,31 +265,218 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
 
   function renderBlock(block) {{
     return `
-      <div class="bc-slide" data-height="${{block.height}}">
+      <div class="bc-slide" data-height="${{block.height}}" data-bc-key="block:${{block.height}}">
         <div class="bc-top">
           <span class="bc-height-tag">${{block.height}}</span>
         </div>
-        <a class="bc-card${{block.height === current ? ' current' : ''}}" href="${{basePrefix}}/block/${{block.height}}" draggable="false">
+        <a class="bc-card${{block.height === selectedConfirmedHeight ? ' current' : ''}}" href="${{basePrefix}}/block/${{block.height}}" draggable="false">
           <div class="bc-face">
             ${{renderFeeStats(block)}}
             <div class="bc-traces">${{formatTraces(block.traces)}}</div>
             <div class="bc-tx-count">${{formatTxCount(block.tx_count)}}</div>
             <div class="bc-time">${{formatAgo(block.time)}}</div>
           </div>
-          ${{block.height === current ? '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>' : ''}}
+          ${{block.height === selectedConfirmedHeight ? '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>' : ''}}
         </a>
         ${{renderPoolTag(block.pool)}}
       </div>
     `;
   }}
 
+  function renderMempoolBlock(block) {{
+    const href = `${{basePrefix}}/mempool-block/${{block.index + 1}}`;
+    const isCurrent = Number(block.index) === selectedMempoolIndex;
+    const etaMinutes = (Number(block.index) + 1) * 10;
+    const etaLabel = isChinese ? `约 ${{etaMinutes}} 分钟后` : `in ~${{etaMinutes}} minutes`;
+    return `
+      <div class="bc-slide bc-mempool-slide" data-mempool-index="${{block.index}}" data-bc-key="mempool:${{block.index}}">
+        <div class="bc-top"></div>
+        <a class="bc-card bc-mempool-card${{isCurrent ? ' current' : ''}}" href="${{href}}" draggable="false">
+          <div class="bc-face">
+            ${{renderFeeStats(block)}}
+            <div class="bc-traces">${{formatTraces(block.trace_count || 0)}}</div>
+            <div class="bc-tx-count">${{formatTxCount(block.tx_count || 0)}}</div>
+            <div class="bc-time">${{etaLabel}}</div>
+          </div>
+          ${{isCurrent ? '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>' : ''}}
+        </a>
+        <div class="bc-pool-slot"></div>
+      </div>
+    `;
+  }}
+
+  function renderMempoolSkeleton(index) {{
+    return `
+      <div class="bc-slide bc-mempool-slide bc-mempool-placeholder" data-mempool-index="${{index}}" data-bc-key="mempool:${{index}}">
+        <div class="bc-top"></div>
+        <div class="bc-card bc-card-skeleton bc-mempool-card" aria-hidden="true"></div>
+        <div class="bc-pool-slot" aria-hidden="true"></div>
+      </div>
+    `;
+  }}
+
+  function renderBoundary() {{
+    return `
+      <div class="bc-boundary" data-bc-boundary data-bc-key="boundary" aria-hidden="true">
+        <div class="bc-boundary-line"></div>
+      </div>
+    `;
+  }}
+
   function render() {{
     blocks.sort((a, b) => b.height - a.height);
+    const mempoolByIndex = new Map(mempoolBlocks.map((block) => [Number(block.index), block]));
     const html = [];
     for (let i = 0; i < pendingLeft; i++) html.push(renderSkeleton('left', i));
+    for (let i = MEMPOOL_SLOT_COUNT - 1; i >= 0; i--) {{
+      const block = mempoolByIndex.get(i);
+      html.push(block ? renderMempoolBlock(block) : renderMempoolSkeleton(i));
+    }}
+    html.push(renderBoundary());
     for (const block of blocks) html.push(renderBlock(block));
     for (let i = 0; i < pendingRight + bufferRight; i++) html.push(renderSkeleton('right', i));
     track.innerHTML = html.join('');
+  }}
+
+  function htmlToElement(markup) {{
+    const template = document.createElement('template');
+    template.innerHTML = markup.trim();
+    return template.content.firstElementChild;
+  }}
+
+  function syncAttributes(target, source) {{
+    Array.from(target.attributes).forEach((attr) => {{
+      if (!source.hasAttribute(attr.name)) target.removeAttribute(attr.name);
+    }});
+    Array.from(source.attributes).forEach((attr) => {{
+      if (target.getAttribute(attr.name) !== attr.value) {{
+        target.setAttribute(attr.name, attr.value);
+      }}
+    }});
+  }}
+
+  function updateMempoolSlide(existing, next) {{
+    if (!existing || !next) return false;
+    syncAttributes(existing, next);
+    existing.className = next.className;
+
+    const existingTop = existing.querySelector('.bc-top');
+    const nextTop = next.querySelector('.bc-top');
+    if (existingTop && nextTop) existingTop.innerHTML = nextTop.innerHTML;
+
+    const existingPool = existing.querySelector('.bc-pool-slot');
+    const nextPool = next.querySelector('.bc-pool-slot');
+    if (existingPool && nextPool) existingPool.innerHTML = nextPool.innerHTML;
+
+    const existingCard = existing.querySelector('.bc-card');
+    const nextCard = next.querySelector('.bc-card');
+    if (!existingCard || !nextCard || existingCard.tagName !== nextCard.tagName) {{
+      existing.replaceWith(next);
+      return false;
+    }}
+
+    syncAttributes(existingCard, nextCard);
+    existingCard.className = nextCard.className;
+
+    const existingFace = existingCard.querySelector('.bc-face');
+    const nextFace = nextCard.querySelector('.bc-face');
+    if (existingFace && nextFace) {{
+      existingFace.innerHTML = nextFace.innerHTML;
+    }} else {{
+      existingCard.innerHTML = nextCard.innerHTML;
+      return true;
+    }}
+
+    existingCard.querySelectorAll('.bc-indicator').forEach((indicator) => indicator.remove());
+    const nextIndicator = nextCard.querySelector('.bc-indicator');
+    if (nextIndicator) existingCard.appendChild(nextIndicator.cloneNode(true));
+    return true;
+  }}
+
+  function captureCarouselPositions() {{
+    const positions = new Map();
+    track.querySelectorAll('[data-bc-key]').forEach((el) => {{
+      positions.set(el.dataset.bcKey, el.getBoundingClientRect());
+    }});
+    return positions;
+  }}
+
+  function animateCarouselFrom(previousPositions, aliases = new Map(), consumedKeys = new Set()) {{
+    const animated = [];
+    track.querySelectorAll('[data-bc-key]').forEach((el) => {{
+      const key = el.dataset.bcKey;
+      const previousKey = aliases.get(key) || key;
+      const from = previousPositions.get(previousKey);
+      if (!from) return;
+      const to = el.getBoundingClientRect();
+      const dx = from.left - to.left;
+      const dy = from.top - to.top;
+      if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+      el.classList.add('bc-slide-animating');
+      el.style.transition = 'none';
+      el.style.transform = `translate(${{dx}}px, ${{dy}}px) translateY(-4px)`;
+      animated.push(el);
+    }});
+
+    consumedKeys.forEach((key) => {{
+      const el = track.querySelector(`[data-bc-key="${{key}}"]`);
+      if (!el) return;
+      el.classList.add('bc-slide-consumed');
+      animated.push(el);
+    }});
+
+    if (!animated.length) return;
+    requestAnimationFrame(() => {{
+      requestAnimationFrame(() => {{
+        animated.forEach((el) => {{
+          el.style.transition = 'transform 2s ease, opacity 2s ease';
+          el.style.transform = '';
+          el.style.opacity = el.classList.contains('bc-slide-consumed') ? '0' : '';
+        }});
+      }});
+    }});
+
+    window.setTimeout(() => {{
+      animated.forEach((el) => {{
+        el.classList.remove('bc-slide-animating', 'bc-slide-consumed');
+        el.style.transition = '';
+        el.style.transform = '';
+        el.style.opacity = '';
+      }});
+      updateResetButton();
+    }}, 2100);
+  }}
+
+  function renderPreservingAnchor(anchorSelector) {{
+    const anchor = track.querySelector(anchorSelector);
+    const beforeLeft = anchor ? anchor.getBoundingClientRect().left : null;
+    render();
+    if (beforeLeft === null) return;
+    const nextAnchor = track.querySelector(anchorSelector);
+    if (!nextAnchor) return;
+    const afterLeft = nextAnchor.getBoundingClientRect().left;
+    const delta = afterLeft - beforeLeft;
+    if (Math.abs(delta) >= 1) {{
+      scroller.scrollLeft += delta;
+    }}
+  }}
+
+  function renderMempoolUpdate() {{
+    const mempoolByIndex = new Map(mempoolBlocks.map((block) => [Number(block.index), block]));
+    for (let i = MEMPOOL_SLOT_COUNT - 1; i >= 0; i--) {{
+      const key = `mempool:${{i}}`;
+      const existing = track.querySelector(`[data-bc-key="${{key}}"]`);
+      const block = mempoolByIndex.get(i);
+      const next = htmlToElement(block ? renderMempoolBlock(block) : renderMempoolSkeleton(i));
+      if (!existing) {{
+        const boundary = track.querySelector('[data-bc-boundary]');
+        if (boundary) track.insertBefore(next, boundary);
+        continue;
+      }}
+      updateMempoolSlide(existing, next);
+    }}
+    updateResetButton();
+    queueEdgeCheck();
   }}
 
   function slideSpan() {{
@@ -351,6 +573,21 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     return Math.max(0, target);
   }}
 
+  function targetLeftForMempool(index) {{
+    if (index === null || index === undefined) return null;
+    const slide = track.querySelector(`[data-mempool-index="${{index}}"]`);
+    if (!slide) return null;
+    const target = slide.offsetLeft + (slide.offsetWidth / 2) - (scroller.clientWidth / 2);
+    return Math.max(0, target);
+  }}
+
+  function targetLeftForBoundary() {{
+    const boundary = track.querySelector('[data-bc-boundary]');
+    if (!boundary) return targetLeftForHeight(espoTip);
+    const target = boundary.offsetLeft + (boundary.offsetWidth / 2) - (scroller.clientWidth / 2);
+    return Math.max(0, target);
+  }}
+
   function animateScrollTo(left) {{
     cancelProgrammaticScroll();
     const start = scroller.scrollLeft;
@@ -389,6 +626,38 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     scroller.scrollTo({{ left: target, behavior: 'auto' }});
   }}
 
+  function centerMempool(index, smooth) {{
+    const target = targetLeftForMempool(index);
+    if (target === null) return false;
+    if (smooth) {{
+      animateScrollTo(target);
+    }} else {{
+      cancelProgrammaticScroll();
+      scroller.scrollTo({{ left: target, behavior: 'auto' }});
+    }}
+    return true;
+  }}
+
+  function centerBoundaryOrTip(smooth) {{
+    const target = targetLeftForBoundary();
+    if (target !== null) {{
+      if (smooth) animateScrollTo(target);
+      else {{
+        cancelProgrammaticScroll();
+        scroller.scrollTo({{ left: target, behavior: 'auto' }});
+      }}
+      return true;
+    }}
+    centerHeight(espoTip, smooth);
+    return true;
+  }}
+
+  function centerDefault(smooth) {{
+    if (selectedMempoolIndex !== null && centerMempool(selectedMempoolIndex, smooth)) return;
+    if (current === espoTip && centerBoundaryOrTip(smooth)) return;
+    centerHeight(current, smooth);
+  }}
+
   async function scrollToLatest() {{
     stopCarouselMotion();
     if (!seen.has(espoTip)) {{
@@ -399,13 +668,20 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
       }}
     }}
     stopCarouselMotion();
-    requestAnimationFrame(() => centerHeight(espoTip, true));
+    requestAnimationFrame(() => centerBoundaryOrTip(true));
     updateResetButton();
   }}
 
   function updateResetButton() {{
     if (!resetButton) return;
-    root.dataset.canReset = scroller.scrollLeft > 80 ? '1' : '0';
+    const latest = track.querySelector(`[data-height="${{espoTip}}"]`);
+    if (!latest) {{
+      root.dataset.canReset = '0';
+      return;
+    }}
+    const viewport = scroller.getBoundingClientRect();
+    const rect = latest.getBoundingClientRect();
+    root.dataset.canReset = rect.right < viewport.left ? '1' : '0';
   }}
 
   function withStablePrepend(renderFn) {{
@@ -486,10 +762,106 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     loadingInitial = false;
     if (!initialCentered) {{
       initialCentered = true;
-      requestAnimationFrame(() => centerHeight(current, false));
+      requestAnimationFrame(() => centerDefault(false));
     }}
     updateResetButton();
     queueEdgeCheck();
+  }}
+
+  async function fetchMempoolBlocks() {{
+    try {{
+      const res = await fetch(`${{basePrefix}}/api/mempool/blocks`, {{
+        headers: {{ Accept: 'application/json' }}
+      }});
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data && Array.isArray(data.blocks)) {{
+        applyMempoolSnapshot(data);
+      }}
+    }} catch (_) {{}}
+  }}
+
+  function applyMempoolSnapshot(snapshot, force = false) {{
+    if (!snapshot || !Array.isArray(snapshot.blocks)) return;
+    if (!force && performance.now() < confirmAnimationUntil) {{
+      queuedMempoolBlocks = snapshot.blocks;
+      return;
+    }}
+    mempoolBlocks = snapshot.blocks;
+    if (initialCentered) renderMempoolUpdate();
+    else render();
+  }}
+
+  function flushQueuedMempoolBlocks() {{
+    if (queuedMempoolBlocks) {{
+      const next = queuedMempoolBlocks;
+      queuedMempoolBlocks = null;
+      applyMempoolSnapshot({{ blocks: next }}, true);
+      return;
+    }}
+    fetchMempoolBlocks();
+  }}
+
+  function connectEvents() {{
+    if (!eventsEnabled || !window.WebSocket) return;
+    const wsPath = eventsPath.startsWith('/') ? `${{basePrefix}}${{eventsPath}}` : `${{basePrefix}}/${{eventsPath}}`;
+    let socket;
+    try {{
+      socket = new WebSocket(`${{wsProtocol}}//${{window.location.host}}${{wsPath}}`);
+    }} catch (_) {{
+      return;
+    }}
+    socket.addEventListener('open', () => {{
+      try {{
+        socket.send(JSON.stringify({{ action: 'want', data: ['mempool-blocks'] }}));
+        socket.send(JSON.stringify({{ 'refresh-mempool-blocks': true }}));
+      }} catch (_) {{}}
+      fetchMempoolBlocks();
+    }});
+    socket.addEventListener('message', (event) => {{
+      let payload;
+      try {{
+        payload = JSON.parse(event.data);
+      }} catch (_) {{
+        return;
+      }}
+      if (payload.type === 'hello' && payload.data && payload.data.mempool) {{
+        applyMempoolSnapshot(payload.data.mempool);
+      }}
+      if (payload.type === 'mempool-blocks' && payload.data) {{
+        applyMempoolSnapshot(payload.data);
+      }}
+      if (payload.type === 'block') {{
+        const nextTip = Number(payload.data && payload.data.height);
+        const previousTip = espoTip;
+        const previousPositions = captureCarouselPositions();
+        if (Number.isFinite(nextTip) && nextTip > espoTip) {{
+          confirmAnimationUntil = performance.now() + 2650;
+          espoTip = nextTip;
+          root.dataset.espoTip = String(espoTip);
+          if (selectedConfirmedHeight === previousTip) {{
+            selectedConfirmedHeight = nextTip;
+            root.dataset.current = String(nextTip);
+          }}
+        }}
+        window.setTimeout(() => fetchWindow(espoTip).then((batch) => {{
+          if (batch) {{
+            applyBlocks(batch);
+            render();
+            if (Number.isFinite(nextTip) && nextTip > previousTip) {{
+              animateCarouselFrom(
+                previousPositions,
+                new Map([[`block:${{nextTip}}`, 'mempool:0']]),
+                new Set()
+              );
+              window.setTimeout(flushQueuedMempoolBlocks, 2150);
+            }}
+            queueEdgeCheck();
+          }}
+        }}), 500);
+      }}
+    }});
+    socket.addEventListener('close', () => window.setTimeout(connectEvents, 2500));
   }}
 
   async function fetchLeft() {{
@@ -655,11 +1027,16 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   }}, true);
 
   render();
+  fetchMempoolBlocks();
+  connectEvents();
   fetchInitial();
 }})();
 "#,
         base_path_js = base_path_js,
         pool_icons_js = pool_icons_js,
+        ws_path_js = ws_path_js,
+        mempool_slot_count = mempool_slot_count,
+        selected_mempool_js = selected_mempool_js,
         is_chinese = is_chinese
     ));
 

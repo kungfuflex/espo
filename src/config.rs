@@ -113,6 +113,42 @@ fn default_address_index_chunk_size() -> u32 {
     512
 }
 
+fn default_mempool_enabled() -> bool {
+    true
+}
+
+fn default_mempool_raw_poll_secs() -> u64 {
+    60
+}
+
+fn default_mempool_template_poll_secs() -> u64 {
+    10
+}
+
+fn default_mempool_trace_workers() -> usize {
+    1
+}
+
+fn default_mempool_hydration_workers() -> usize {
+    16
+}
+
+fn default_mempool_clear_protection_secs() -> u64 {
+    180
+}
+
+fn default_mempool_max_txs() -> usize {
+    100_000
+}
+
+fn default_mempool_template_blocks() -> usize {
+    8
+}
+
+fn default_mempool_block_weight_units() -> u64 {
+    4_000_000
+}
+
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
@@ -169,6 +205,56 @@ pub struct StrictModeConfig {
 pub struct MiscConfig {
     #[serde(default)]
     pub show_terminal_ad: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MempoolConfig {
+    #[serde(default = "default_mempool_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_mempool_raw_poll_secs")]
+    pub raw_poll_secs: u64,
+    #[serde(default = "default_mempool_template_poll_secs")]
+    pub template_poll_secs: u64,
+    #[serde(default = "default_mempool_trace_workers")]
+    pub trace_workers: usize,
+    #[serde(default = "default_mempool_hydration_workers")]
+    pub hydration_workers: usize,
+    #[serde(default = "default_mempool_clear_protection_secs")]
+    pub clear_protection_secs: u64,
+    #[serde(default = "default_mempool_max_txs")]
+    pub max_txs: usize,
+    #[serde(default = "default_mempool_template_blocks")]
+    pub template_blocks: usize,
+    #[serde(default = "default_mempool_block_weight_units")]
+    pub block_weight_units: u64,
+    #[serde(default)]
+    pub zmq_rawtx_url: Option<String>,
+    #[serde(default)]
+    pub zmq_sequence_url: Option<String>,
+    #[serde(default)]
+    pub websocket_enabled: bool,
+    #[serde(default)]
+    pub websocket_path: Option<String>,
+}
+
+impl Default for MempoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_mempool_enabled(),
+            raw_poll_secs: default_mempool_raw_poll_secs(),
+            template_poll_secs: default_mempool_template_poll_secs(),
+            trace_workers: default_mempool_trace_workers(),
+            hydration_workers: default_mempool_hydration_workers(),
+            clear_protection_secs: default_mempool_clear_protection_secs(),
+            max_txs: default_mempool_max_txs(),
+            template_blocks: default_mempool_template_blocks(),
+            block_weight_units: default_mempool_block_weight_units(),
+            zmq_rawtx_url: None,
+            zmq_sequence_url: None,
+            websocket_enabled: false,
+            websocket_path: Some("/api/events/ws".to_string()),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for DebugBackupConfig {
@@ -267,6 +353,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub misc: MiscConfig,
     #[serde(default)]
+    pub mempool: MempoolConfig,
+    #[serde(default)]
     pub modules: HashMap<String, serde_json::Value>,
 }
 
@@ -302,6 +390,7 @@ pub struct AppConfig {
     pub explorer_networks: Option<ExplorerNetworks>,
     pub google_analytics_tag: Option<String>,
     pub misc: MiscConfig,
+    pub mempool: MempoolConfig,
     pub modules: HashMap<String, serde_json::Value>,
 }
 
@@ -367,6 +456,7 @@ impl AppConfig {
             explorer_networks,
             google_analytics_tag,
             misc: file.misc,
+            mempool: file.mempool,
             modules: file.modules,
         })
     }

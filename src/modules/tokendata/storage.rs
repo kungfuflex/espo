@@ -395,13 +395,7 @@ impl TokenDataProvider {
                 .map_err(|e| anyhow!("mdb.scan_range_entries_page_at_blockhash failed: {e}")),
             None => self
                 .mdb
-                .scan_range_entries_page(
-                    start_inclusive,
-                    end_exclusive,
-                    offset,
-                    limit,
-                    reverse,
-                )
+                .scan_range_entries_page(start_inclusive, end_exclusive, offset, limit, reverse)
                 .map_err(|e| anyhow!("mdb.scan_range_entries_page failed: {e}")),
         }
     }
@@ -693,7 +687,11 @@ impl TokenDataProvider {
         Ok(ids)
     }
 
-    fn get_activity_index_total(&self, prefix: &[u8], blockhash: Option<BlockHash>) -> Result<usize> {
+    fn get_activity_index_total(
+        &self,
+        prefix: &[u8],
+        blockhash: Option<BlockHash>,
+    ) -> Result<usize> {
         Ok(self
             .raw_get_at(&self.table().activity_index_meta_key(prefix), blockhash)?
             .and_then(|raw| decode_activity_index_state(&raw))
@@ -729,11 +727,9 @@ impl TokenDataProvider {
         }
 
         match state {
-            InlineOrExternalU64V1::Inline { items } => Ok(items
-                .into_iter()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .collect()),
+            InlineOrExternalU64V1::Inline { items } => {
+                Ok(items.into_iter().skip(start).take(end.saturating_sub(start)).collect())
+            }
             InlineOrExternalU64V1::External { chunk_ids, chunk_size, .. } => self
                 .read_activity_index_row_id_range(
                     &chunk_ids,
@@ -750,7 +746,12 @@ impl TokenDataProvider {
         blockhash: Option<BlockHash>,
         index: usize,
     ) -> Result<Option<SchemaTokenActivityV1>> {
-        let ids = self.get_activity_index_row_ids_range(prefix, blockhash, index, index.saturating_add(1))?;
+        let ids = self.get_activity_index_row_ids_range(
+            prefix,
+            blockhash,
+            index,
+            index.saturating_add(1),
+        )?;
         if ids.is_empty() {
             return Ok(None);
         }
@@ -984,8 +985,8 @@ impl TokenDataProvider {
         let timeframe_window = if matches!(source_sort, TokenActivitySortField::Timestamp)
             && (start_time.is_some() || end_time.is_some())
         {
-            let (window_start, window_end) =
-                self.find_activity_index_timestamp_window(&prefix, blockhash, start_time, end_time)?;
+            let (window_start, window_end) = self
+                .find_activity_index_timestamp_window(&prefix, blockhash, start_time, end_time)?;
             Some((window_start, window_end))
         } else {
             None
@@ -997,7 +998,10 @@ impl TokenDataProvider {
             timeframe_total = Some(window_total);
             if matches!(requested_sort, TokenActivitySortField::Timestamp) && kind.is_none() {
                 if limit == 0 || offset >= window_total {
-                    return Ok(GetTokenActivityPageResult { entries: Vec::new(), total: window_total });
+                    return Ok(GetTokenActivityPageResult {
+                        entries: Vec::new(),
+                        total: window_total,
+                    });
                 }
                 let take = limit.min(window_total.saturating_sub(offset));
                 let (range_start, range_end, reverse) = match dir {
@@ -1010,8 +1014,12 @@ impl TokenDataProvider {
                         (end.saturating_sub(take), end, true)
                     }
                 };
-                let mut ids =
-                    self.get_activity_index_row_ids_range(&prefix, blockhash, range_start, range_end)?;
+                let mut ids = self.get_activity_index_row_ids_range(
+                    &prefix,
+                    blockhash,
+                    range_start,
+                    range_end,
+                )?;
                 if reverse {
                     ids.reverse();
                 }
@@ -1023,7 +1031,12 @@ impl TokenDataProvider {
         let ids = match source_sort {
             TokenActivitySortField::Timestamp => {
                 if let Some((window_start, window_end)) = timeframe_window {
-                    self.get_activity_index_row_ids_range(&prefix, blockhash, window_start, window_end)?
+                    self.get_activity_index_row_ids_range(
+                        &prefix,
+                        blockhash,
+                        window_start,
+                        window_end,
+                    )?
                 } else {
                     self.get_activity_index_all_row_ids(&prefix, blockhash)?
                 }

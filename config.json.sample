@@ -15,6 +15,21 @@
   "explorer_host": "127.0.0.1:8081",
   "explorer_base_path": "/",
   "google_analytics_tag": null,
+  "mempool": {
+    "enabled": true,
+    "raw_poll_secs": 60,
+    "template_poll_secs": 10,
+    "trace_workers": 1,
+    "hydration_workers": 16,
+    "clear_protection_secs": 180,
+    "max_txs": 100000,
+    "template_blocks": 8,
+    "block_weight_units": 4000000,
+    "zmq_rawtx_url": null,
+    "zmq_sequence_url": null,
+    "websocket_enabled": true,
+    "websocket_path": "/api/events/ws"
+  },
   "network": "mainnet",
   "metashrew_db_label": null,
   "strict_mode": {

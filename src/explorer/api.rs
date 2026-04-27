@@ -1,6 +1,8 @@
 use crate::runtime::state_at::StateAt;
 use axum::Json;
 use axum::extract::Query;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::response::Response;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -22,6 +24,9 @@ use crate::modules::essentials::storage::{
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
+use crate::runtime::mempool::{
+    current_mempool_compact_snapshot, get_mempool_block_transaction_ids, subscribe_mempool_events,
+};
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
@@ -48,6 +53,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::time::{Duration, interval};
 
 #[derive(Deserialize)]
 pub struct CarouselQuery {
@@ -65,6 +71,8 @@ pub struct CarouselBlock {
     pub min_fee_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_fee_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fee_range: Vec<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_count: Option<u32>,
     pub time: Option<u32>,
@@ -76,6 +84,174 @@ pub struct CarouselBlock {
 pub struct CarouselResponse {
     pub espo_tip: u64,
     pub blocks: Vec<CarouselBlock>,
+}
+
+pub async fn mempool_blocks() -> Json<crate::runtime::mempool::MempoolCompactSnapshot> {
+    Json(current_mempool_compact_snapshot())
+}
+
+pub async fn explorer_events_ws(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(handle_explorer_events_socket)
+}
+
+async fn handle_explorer_events_socket(mut socket: WebSocket) {
+    let mut tracked_mempool_block: Option<usize> = None;
+    let initial = json!({
+        "type": "hello",
+        "data": {
+            "mempool": current_mempool_compact_snapshot(),
+            "espo_tip": get_espo_next_height().saturating_sub(1),
+        }
+    });
+    if socket.send(WsMessage::Text(initial.to_string().into())).await.is_err() {
+        return;
+    }
+
+    let mut events = subscribe_mempool_events();
+    let mut heartbeat = interval(Duration::from_secs(25));
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event {
+                    Ok(payload) => {
+                        let parsed_payload = serde_json::from_str::<Value>(&payload).ok();
+                        let client_payload = strip_mempool_deltas_for_client(parsed_payload.as_ref())
+                            .unwrap_or(payload);
+                        if socket.send(WsMessage::Text(client_payload.into())).await.is_err() {
+                            break;
+                        }
+                        if let Some(index) = tracked_mempool_block {
+                            if let Some(parsed) = parsed_payload.clone() {
+                                if parsed.get("type").and_then(|v| v.as_str()) == Some("mempool-blocks") {
+                                    if let Some(delta) = parsed
+                                        .get("data")
+                                        .and_then(|data| data.get("deltas"))
+                                        .and_then(|deltas| deltas.as_array())
+                                        .and_then(|deltas| deltas.iter().find(|delta| {
+                                            delta.get("index").and_then(|v| v.as_u64()) == Some(index as u64)
+                                        }))
+                                    {
+                                        let mut delta = delta.clone();
+                                        if delta.get("reset").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                            let block_ids = get_mempool_block_transaction_ids(index);
+                                            if !block_ids.is_empty() {
+                                                delta["full"] = json!(block_ids);
+                                            }
+                                        }
+                                        let payload = json!({
+                                            "type": "projected-block-transactions",
+                                            "data": delta,
+                                        }).to_string();
+                                        if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let payload = json!({"type": "mempool-blocks", "data": current_mempool_compact_snapshot()}).to_string();
+                        if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = heartbeat.tick() => {
+                let payload = json!({"type": "ping", "ts": now_ts()}).to_string();
+                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                    break;
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(WsMessage::Close(_))) | None => break,
+                    Some(Ok(WsMessage::Text(text))) => {
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+                            let wants_mempool_blocks = parsed
+                                .get("action")
+                                .and_then(|value| value.as_str())
+                                == Some("want")
+                                && parsed
+                                    .get("data")
+                                    .and_then(|value| value.as_array())
+                                    .map(|items| {
+                                        items.iter().any(|item| {
+                                            item.as_str() == Some("mempool-blocks")
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                            if wants_mempool_blocks
+                                || parsed.get("refresh-mempool-blocks").is_some()
+                                || parsed.get("refresh_mempool_blocks").is_some()
+                            {
+                                let payload = json!({
+                                    "type": "mempool-blocks",
+                                    "data": current_mempool_compact_snapshot(),
+                                })
+                                .to_string();
+                                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let requested = parsed
+                                .get("track-mempool-block")
+                                .or_else(|| parsed.get("track_mempool_block"))
+                                .and_then(|value| value.as_u64())
+                                .map(|value| value as usize);
+                            if let Some(index) = requested {
+                                tracked_mempool_block = Some(index);
+                                let snapshot = current_mempool_compact_snapshot();
+                                let block_ids = get_mempool_block_transaction_ids(index);
+                                if !block_ids.is_empty() {
+                                    let payload = json!({
+                                        "type": "projected-block-transactions",
+                                        "data": {
+                                            "index": index,
+                                            "sequence": snapshot.sequence,
+                                            "full": block_ids,
+                                        }
+                                    }).to_string();
+                                    if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            } else if parsed
+                                .get("untrack-mempool-block")
+                                .or_else(|| parsed.get("untrack_mempool_block"))
+                                .is_some()
+                            {
+                                tracked_mempool_block = None;
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+}
+
+fn now_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn strip_mempool_deltas_for_client(payload: Option<&Value>) -> Option<String> {
+    let payload = payload?;
+    if payload.get("type").and_then(|v| v.as_str()) != Some("mempool-blocks") {
+        return None;
+    }
+    let mut stripped = payload.clone();
+    if let Some(data) = stripped.get_mut("data") {
+        data["deltas"] = json!([]);
+    }
+    serde_json::to_string(&stripped).ok()
 }
 
 #[derive(Deserialize)]
@@ -183,23 +359,31 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
 
     for (h, summary) in (start..=end).zip(summaries.into_iter()) {
         let summary = summary.or_else(|| get_cached_block_summary(h as u32));
-        let (traces, time, summary_tx_count, median_fee_rate, min_fee_rate, max_fee_rate) =
-            if let Some(summary) = summary {
-                let time = deserialize::<Header>(&summary.header).ok().map(|hdr| hdr.time as u32);
-                let tx_count = if summary.tx_count > 0 { Some(summary.tx_count) } else { None };
-                let min_fee_rate = summary.fee_range.first().copied();
-                let max_fee_rate = summary.fee_range.last().copied();
-                (
-                    summary.trace_count as usize,
-                    time,
-                    tx_count,
-                    Some(summary.fee_median),
-                    min_fee_rate,
-                    max_fee_rate,
-                )
-            } else {
-                (0, None, None, None, None, None)
-            };
+        let (
+            traces,
+            time,
+            summary_tx_count,
+            median_fee_rate,
+            min_fee_rate,
+            max_fee_rate,
+            fee_range,
+        ) = if let Some(summary) = summary {
+            let time = deserialize::<Header>(&summary.header).ok().map(|hdr| hdr.time as u32);
+            let tx_count = if summary.tx_count > 0 { Some(summary.tx_count) } else { None };
+            let min_fee_rate = summary.fee_range.first().copied();
+            let max_fee_rate = summary.fee_range.last().copied();
+            (
+                summary.trace_count as usize,
+                time,
+                tx_count,
+                Some(summary.fee_median),
+                min_fee_rate,
+                max_fee_rate,
+                summary.fee_range,
+            )
+        } else {
+            (0, None, None, None, None, None, Vec::new())
+        };
         let resolved_pool = resolve_block_mining_pool_with_tx_count(h).ok();
         let tx_count = summary_tx_count
             .or_else(|| resolved_pool.as_ref().map(|result| result.tx_count as u32));
@@ -213,6 +397,7 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
             median_fee_rate,
             min_fee_rate,
             max_fee_rate,
+            fee_range,
             tx_count,
             time,
             pool,

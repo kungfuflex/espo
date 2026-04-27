@@ -54,7 +54,8 @@ use crate::{
     modules::defs::ModuleRegistry,
     runtime::mdb::Mdb,
     runtime::mempool::{
-        purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service,
+        publish_new_block_event, purge_confirmed_from_chain, purge_confirmed_txids,
+        reset_mempool_store, run_mempool_service,
     },
     runtime::rpc::run_rpc,
     runtime::tree_db::get_global_tree_db,
@@ -575,6 +576,7 @@ async fn run_indexer_loop(
                             next_height
                         ),
                     }
+                    publish_new_block_event(next_height, &block_txids);
 
                     if let Some(tree) = get_global_tree_db() {
                         if let Err(e) = tree.finish_block() {

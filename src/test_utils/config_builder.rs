@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, MiscConfig, StrictModeConfig};
+use crate::config::{AppConfig, MempoolConfig, MiscConfig, StrictModeConfig};
 use crate::core::blockfetcher::BlockFetchMode;
 use bitcoin::Network;
 use std::collections::HashMap;
@@ -52,6 +52,7 @@ impl TestConfigBuilder {
             explorer_networks: None,
             google_analytics_tag: None,
             misc: MiscConfig::default(),
+            mempool: MempoolConfig::default(),
             modules: HashMap::new(),
         };
 

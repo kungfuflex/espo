@@ -3154,6 +3154,55 @@ button:hover {
   align-items: center;
   transform: translateY(-4px);
 }
+.bc-slide-animating {
+  z-index: 30;
+  will-change: transform, opacity;
+  pointer-events: none;
+}
+.bc-boundary {
+  flex: 0 0 34px;
+  position: relative;
+  align-self: stretch;
+  min-height: 192px;
+  transform: translateY(-4px);
+}
+.bc-boundary-line {
+  position: absolute;
+  left: 50%;
+  top: 22px;
+  bottom: 26px;
+  width: 2px;
+  transform: translateX(-50%);
+  background-image: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--link) 72%, transparent) 1.5px,
+    transparent 1.8px
+  );
+  background-size: 2px 9px;
+  background-repeat: repeat-y;
+}
+.bc-boundary::before,
+.bc-boundary::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 18px;
+  height: 2px;
+  transform: translateX(-50%);
+  background-image: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--link) 72%, transparent) 1.5px,
+    transparent 1.8px
+  );
+  background-size: 9px 2px;
+  background-repeat: repeat-x;
+}
+.bc-boundary::before {
+  top: 22px;
+}
+.bc-boundary::after {
+  bottom: 26px;
+}
 .bc-top {
   z-index: 10;
   min-height: 20px;
@@ -3261,6 +3310,20 @@ button:hover {
 }
 .bc-card.current {
   outline: none;
+}
+.bc-mempool-card {
+  background:
+    linear-gradient(160deg, color-mix(in srgb, var(--panel3) 84%, var(--link)), var(--panel3));
+  border: 0;
+  animation: bc-opacity-pulse 2s steps(30, end) infinite;
+}
+.bc-mempool-slide,
+.bc-mempool-slide .bc-card {
+  border: 0;
+}
+.bc-mempool-slide .bc-height-tag {
+  color: var(--muted);
+  font-size: 12px;
 }
 .bc-indicator {
   position: absolute;

@@ -19,7 +19,7 @@ use crate::alkanes::trace::{
 use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_network,
 };
-use crate::explorer::components::block_carousel::block_carousel;
+use crate::explorer::components::block_carousel::{block_carousel, block_carousel_with_mempool};
 use crate::explorer::components::header::{
     HeaderPillTone, HeaderProps, HeaderSummaryItem, header, header_scripts,
 };
@@ -40,6 +40,7 @@ use crate::modules::essentials::storage::{
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_outpoint_balances_with_spent_batch,
 };
+use crate::runtime::mempool::{get_mempool_block_detail, get_mempool_transactions};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
 
@@ -71,6 +72,7 @@ pub struct BlockPageQuery {
     pub limit: Option<usize>,
     pub traces: Option<String>,
     pub hide_diesel_mints: Option<String>,
+    pub only_diesel_mints: Option<String>,
 }
 
 struct BlockTxItem {
@@ -653,6 +655,237 @@ pub async fn block_page(
                         } @else {
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
                         }
+                    }
+                }
+            }
+
+            (header_scripts())
+        },
+    )
+    .into_response()
+}
+
+pub async fn mempool_block_page(
+    State(state): State<ExplorerState>,
+    Path(display_index): Path<usize>,
+    Query(q): Query<BlockPageQuery>,
+) -> Response {
+    let network = get_network();
+    let electrum_like = get_electrum_like();
+    let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
+    let page = q.page.unwrap_or(1).max(1);
+    let limit = q.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
+    let only_diesel_mints = q
+        .only_diesel_mints
+        .as_deref()
+        .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
+        .unwrap_or(true);
+    let only_diesel_param = if only_diesel_mints { "1" } else { "0" };
+    let display_index = display_index.max(1);
+    let template_index = display_index - 1;
+    let canonical_path = format!("/mempool-block/{display_index}");
+
+    let Some(detail) = get_mempool_block_detail(template_index, page, limit, only_diesel_mints)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            layout_with_meta(
+                "Mempool Block",
+                &canonical_path,
+                None,
+                html! { p class="error" { "Projected mempool block is not available yet. The mempool service may still be loading." } },
+            ),
+        )
+            .into_response();
+    };
+
+    let tx_total = detail.tx_total;
+    let off = limit.saturating_mul(page.saturating_sub(1));
+    let display_start = if tx_total > 0 && off < tx_total { off + 1 } else { 0 };
+    let display_end =
+        if tx_total > 0 && off < tx_total { (off + detail.txs.len()).min(tx_total) } else { 0 };
+    let last_page = if tx_total > 0 { (tx_total + limit - 1) / limit } else { 1 };
+    let tx_has_prev = page > 1 && off < tx_total;
+    let tx_has_next = display_end < tx_total;
+
+    let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
+    for item in &detail.txs {
+        for (vout, _) in item.tx.output.iter().enumerate() {
+            all_outpoints.push((item.txid, vout as u32));
+        }
+        for vin in &item.tx.input {
+            if !vin.previous_output.is_null() {
+                all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
+            }
+        }
+    }
+    all_outpoints.sort();
+    all_outpoints.dedup();
+    let outpoint_map = get_outpoint_balances_with_spent_batch(
+        StateAt::Latest,
+        &state.essentials_provider(),
+        &all_outpoints,
+    )
+    .unwrap_or_default();
+    let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
+        outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
+    };
+    let outspends_map: std::collections::HashMap<Txid, Vec<Option<Txid>>> = {
+        let mut dedup: Vec<Txid> = detail.txs.iter().map(|t| t.txid).collect();
+        dedup.sort();
+        dedup.dedup();
+        let fetched = electrum_like.batch_transaction_get_outspends(&dedup).unwrap_or_default();
+        dedup.into_iter().zip(fetched.into_iter()).collect()
+    };
+    let outspends_fn = move |txid: &Txid| -> Vec<Option<Txid>> {
+        outspends_map.get(txid).cloned().unwrap_or_default()
+    };
+
+    let mut prev_txids: Vec<Txid> = Vec::new();
+    for item in &detail.txs {
+        for vin in &item.tx.input {
+            if !vin.previous_output.is_null() {
+                prev_txids.push(vin.previous_output.txid);
+            }
+        }
+    }
+    prev_txids.sort();
+    prev_txids.dedup();
+
+    let mut prev_map = get_mempool_transactions(&prev_txids);
+    let missing_prev: Vec<Txid> =
+        prev_txids.into_iter().filter(|txid| !prev_map.contains_key(txid)).collect();
+    if !missing_prev.is_empty() {
+        let raws = electrum_like.batch_transaction_get_raw(&missing_prev).unwrap_or_default();
+        for (i, raw_prev) in raws.into_iter().enumerate() {
+            if raw_prev.is_empty() {
+                continue;
+            }
+            if let Ok(prev_tx) = deserialize::<Transaction>(&raw_prev) {
+                prev_map.insert(missing_prev[i], prev_tx);
+            }
+        }
+    }
+
+    let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
+    summary_items.push(HeaderSummaryItem {
+        label: "Timestamp".to_string(),
+        value: html! { span class="summary-value muted" { "Pending" } },
+    });
+    summary_items.push(HeaderSummaryItem {
+        label: "Tx count".to_string(),
+        value: html! { span class="summary-value" { (format_with_commas(detail.template.tx_count as u64)) } },
+    });
+    summary_items.push(HeaderSummaryItem {
+        label: "Traces".to_string(),
+        value: html! { span class="summary-value" { (format_with_commas(detail.template.trace_count as u64)) } },
+    });
+    summary_items.push(HeaderSummaryItem {
+        label: "Median feerate".to_string(),
+        value: match detail.template.median_fee_rate {
+            Some(fee_rate) => html! { span class="summary-value" { (format_fee_rate(fee_rate)) } },
+            None => html! { span class="summary-value muted" { "—" } },
+        },
+    });
+
+    let header_markup = header(HeaderProps {
+        title: format!("Mempool Block #{}", display_index),
+        id: Some("Projected from the in-memory mempool".to_string()),
+        show_copy: false,
+        pill: Some(("Projected".to_string(), HeaderPillTone::Warning)),
+        summary_items,
+        cta: None,
+        hero_class: None,
+    });
+
+    layout_with_meta(
+        &format!("Mempool Block #{display_index}"),
+        &canonical_path,
+        None,
+        html! {
+            div class="block-hero full-bleed" {
+                (block_carousel_with_mempool(Some(template_index), espo_tip))
+            }
+
+            (header_markup)
+
+            div class="card" {
+                div class="row" {
+                    h2 class="h2" { "Transactions" }
+                    form class="trace-toggle" method="get" action=(explorer_path(&format!("/mempool-block/{display_index}"))) {
+                        input type="hidden" name="limit" value=(limit);
+                        input type="hidden" name="page" value="1";
+                        input type="hidden" name="only_diesel_mints" value=(only_diesel_param);
+                        label class="switch" {
+                            span class="switch-label" { "Only Diesel mints" }
+                            input
+                                class="switch-input"
+                                type="checkbox"
+                                checked[only_diesel_mints]
+                                onchange="this.form.only_diesel_mints.value = this.checked ? '1' : '0'; this.form.submit();";
+                            span class="switch-slider" {}
+                        }
+                    }
+                }
+
+                @if tx_total == 0 {
+                    @if only_diesel_mints {
+                        p class="muted" { "No Diesel mints are projected for this mempool block yet." }
+                    } @else {
+                        p class="muted" { "No transactions projected for this mempool block yet." }
+                    }
+                } @else if detail.txs.is_empty() {
+                    p class="muted" { "No transactions on this page." }
+                } @else {
+                    div class="list" {
+                        @for item in detail.txs {
+                            @let traces: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
+                            @let fee_pill = TxPill {
+                                label: format_fee_rate(item.fee_rate),
+                                tone: TxPillTone::Success,
+                            };
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(fee_pill), true))
+                        }
+                    }
+                }
+
+                div class="pager" {
+                    @if tx_has_prev {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&only_diesel_mints={only_diesel_param}"))) aria-label="First page" {
+                            (icon_skip_left())
+                        }
+                    } @else {
+                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                    }
+                    @if tx_has_prev {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&only_diesel_mints={only_diesel_param}", page - 1))) aria-label="Previous page" {
+                            (icon_left())
+                        }
+                    } @else {
+                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                    }
+                    span class="pager-meta muted" { "Showing "
+                        (display_start)
+                        @if tx_total > 0 {
+                            "-"
+                            (display_end)
+                        }
+                        " / "
+                        (tx_total)
+                    }
+                    @if tx_has_next {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&only_diesel_mints={only_diesel_param}", page + 1))) aria-label="Next page" {
+                            (icon_right())
+                        }
+                    } @else {
+                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                    }
+                    @if tx_has_next {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={last_page}&limit={limit}&only_diesel_mints={only_diesel_param}"))) aria-label="Last page" {
+                            (icon_skip_right())
+                        }
+                    } @else {
+                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
                     }
                 }
             }
