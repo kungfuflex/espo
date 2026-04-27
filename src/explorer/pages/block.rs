@@ -72,7 +72,6 @@ pub struct BlockPageQuery {
     pub limit: Option<usize>,
     pub traces: Option<String>,
     pub hide_diesel_mints: Option<String>,
-    pub only_diesel_mints: Option<String>,
 }
 
 struct BlockTxItem {
@@ -675,17 +674,24 @@ pub async fn mempool_block_page(
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
-    let only_diesel_mints = q
-        .only_diesel_mints
+    let traces_only = q
+        .traces
         .as_deref()
         .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
         .unwrap_or(true);
-    let only_diesel_param = if only_diesel_mints { "1" } else { "0" };
+    let hide_diesel_mints = q
+        .hide_diesel_mints
+        .as_deref()
+        .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
+    let traces_param = if traces_only { "1" } else { "0" };
+    let hide_diesel_param = if hide_diesel_mints { "1" } else { "0" };
     let display_index = display_index.max(1);
     let template_index = display_index - 1;
     let canonical_path = format!("/mempool-block/{display_index}");
 
-    let Some(detail) = get_mempool_block_detail(template_index, page, limit, only_diesel_mints)
+    let Some(detail) =
+        get_mempool_block_detail(template_index, page, limit, traces_only, hide_diesel_mints)
     else {
         return (
             StatusCode::NOT_FOUND,
@@ -815,22 +821,34 @@ pub async fn mempool_block_page(
                     form class="trace-toggle" method="get" action=(explorer_path(&format!("/mempool-block/{display_index}"))) {
                         input type="hidden" name="limit" value=(limit);
                         input type="hidden" name="page" value="1";
-                        input type="hidden" name="only_diesel_mints" value=(only_diesel_param);
+                        input type="hidden" name="traces" value=(traces_param);
+                        input type="hidden" name="hide_diesel_mints" value=(hide_diesel_param);
                         label class="switch" {
-                            span class="switch-label" { "Only Diesel mints" }
+                            span class="switch-label" { "Only Alkanes txs" }
                             input
                                 class="switch-input"
                                 type="checkbox"
-                                checked[only_diesel_mints]
-                                onchange="this.form.only_diesel_mints.value = this.checked ? '1' : '0'; this.form.submit();";
+                                checked[traces_only]
+                                onchange="this.form.traces.value = this.checked ? '1' : '0'; this.form.submit();";
+                            span class="switch-slider" {}
+                        }
+                        label class="switch" {
+                            span class="switch-label" { "Hide Diesel mints" }
+                            input
+                                class="switch-input"
+                                type="checkbox"
+                                checked[hide_diesel_mints]
+                                onchange="this.form.hide_diesel_mints.value = this.checked ? '1' : '0'; this.form.submit();";
                             span class="switch-slider" {}
                         }
                     }
                 }
 
                 @if tx_total == 0 {
-                    @if only_diesel_mints {
-                        p class="muted" { "No Diesel mints are projected for this mempool block yet." }
+                    @if traces_only && hide_diesel_mints {
+                        p class="muted" { "No non-Diesel Alkanes transactions are projected for this mempool block yet." }
+                    } @else if traces_only {
+                        p class="muted" { "No Alkanes transactions are projected for this mempool block yet." }
                     } @else {
                         p class="muted" { "No transactions projected for this mempool block yet." }
                     }
@@ -851,14 +869,14 @@ pub async fn mempool_block_page(
 
                 div class="pager" {
                     @if tx_has_prev {
-                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&only_diesel_mints={only_diesel_param}"))) aria-label="First page" {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}"))) aria-label="First page" {
                             (icon_skip_left())
                         }
                     } @else {
                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
                     }
                     @if tx_has_prev {
-                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&only_diesel_mints={only_diesel_param}", page - 1))) aria-label="Previous page" {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page - 1))) aria-label="Previous page" {
                             (icon_left())
                         }
                     } @else {
@@ -874,14 +892,14 @@ pub async fn mempool_block_page(
                         (tx_total)
                     }
                     @if tx_has_next {
-                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&only_diesel_mints={only_diesel_param}", page + 1))) aria-label="Next page" {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page + 1))) aria-label="Next page" {
                             (icon_right())
                         }
                     } @else {
                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
                     }
                     @if tx_has_next {
-                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={last_page}&limit={limit}&only_diesel_mints={only_diesel_param}"))) aria-label="Last page" {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={last_page}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}"))) aria-label="Last page" {
                             (icon_skip_right())
                         }
                     } @else {

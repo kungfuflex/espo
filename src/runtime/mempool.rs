@@ -556,7 +556,8 @@ pub fn get_mempool_block_detail(
     index: usize,
     page: usize,
     limit: usize,
-    only_diesel_mints: bool,
+    traces_only: bool,
+    hide_diesel_mints: bool,
 ) -> Option<MempoolBlockDetail> {
     let Ok(state) = mempool_state().read() else {
         return None;
@@ -567,10 +568,18 @@ pub fn get_mempool_block_detail(
         .iter()
         .filter_map(|txid_str| Txid::from_str(txid_str).ok())
         .collect();
-    if only_diesel_mints {
-        ordered
-            .retain(|txid| state.txs.get(txid).map(|entry| entry.is_diesel_mint).unwrap_or(false));
-    }
+    ordered.retain(|txid| {
+        let Some(entry) = state.txs.get(txid) else {
+            return false;
+        };
+        if traces_only && entry.protostones.is_empty() {
+            return false;
+        }
+        if hide_diesel_mints && entry.is_diesel_mint {
+            return false;
+        }
+        true
+    });
     ordered.sort_by(|a, b| {
         let aa = state.txs.get(a);
         let bb = state.txs.get(b);
