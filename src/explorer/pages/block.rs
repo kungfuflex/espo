@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
@@ -33,14 +33,17 @@ use crate::explorer::pages::common::format_fee_rate;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    AddressIndexListKind, AlkaneTxSummary, address_index_list_id_alkane_block_txs,
+    AddressIndexListKind, AlkaneTxSummary, BalanceEntry, address_index_list_id_alkane_block_txs,
     get_address_index_list_len, get_address_index_list_range, load_tx_pointer_blob_v3_by_id,
     load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
-    OutpointLookup, get_outpoint_balances_with_spent_batch,
+    OutpointLookup, get_outpoint_balances_with_spent_batch, project_tx_output_balances_from_traces,
 };
-use crate::runtime::mempool::{get_mempool_block_detail, get_mempool_transactions};
+use crate::runtime::mempool::{
+    MempoolBlockTx, get_mempool_block_detail, get_mempool_block_ordered_transactions,
+    get_mempool_transactions,
+};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
 
@@ -175,6 +178,59 @@ fn is_diesel_mint_tx(traces: Option<&[EspoTrace]>) -> bool {
         return false;
     }
     is_diesel_mint_trace(&traces[0])
+}
+
+fn aggregate_balances(
+    entries: &[BalanceEntry],
+    out: &mut BTreeMap<crate::schemas::SchemaAlkaneId, u128>,
+) {
+    for entry in entries {
+        if entry.amount == 0 {
+            continue;
+        }
+        *out.entry(entry.alkane).or_default() =
+            out.get(&entry.alkane).copied().unwrap_or(0).saturating_add(entry.amount);
+    }
+}
+
+fn mempool_block_projected_balances(
+    ordered_txs: &[MempoolBlockTx],
+    db_outpoints: &HashMap<(Txid, u32), OutpointLookup>,
+) -> HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> {
+    let mut projected_by_outpoint: HashMap<(Txid, u32), Vec<BalanceEntry>> = HashMap::new();
+    let mut projected_by_tx: HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> = HashMap::new();
+
+    for item in ordered_txs {
+        let mut input_totals: BTreeMap<crate::schemas::SchemaAlkaneId, u128> = BTreeMap::new();
+        for vin in &item.tx.input {
+            if vin.previous_output.is_null() {
+                continue;
+            }
+            let key = (vin.previous_output.txid, vin.previous_output.vout);
+            if let Some(entries) = projected_by_outpoint.get(&key) {
+                aggregate_balances(entries, &mut input_totals);
+            } else if let Some(lookup) = db_outpoints.get(&key) {
+                aggregate_balances(&lookup.balances, &mut input_totals);
+            }
+        }
+
+        let input_balances: Vec<BalanceEntry> = input_totals
+            .into_iter()
+            .map(|(alkane, amount)| BalanceEntry { alkane, amount })
+            .collect();
+        let traces = item.traces.as_deref().unwrap_or(&[]);
+        let projected = project_tx_output_balances_from_traces(&item.tx, traces, input_balances);
+        if projected.is_empty() {
+            continue;
+        }
+
+        for (vout, entries) in &projected {
+            projected_by_outpoint.insert((item.txid, *vout), entries.clone());
+        }
+        projected_by_tx.insert(item.txid, projected);
+    }
+
+    projected_by_tx
 }
 
 pub async fn block_page(
@@ -610,7 +666,7 @@ pub async fn block_page(
                     div class="list" {
                         @for item in tx_items {
                             @let traces: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), None, true))
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), None, None, true))
                         }
                     }
                 }
@@ -713,12 +769,21 @@ pub async fn mempool_block_page(
     let last_page = if tx_total > 0 { (tx_total + limit - 1) / limit } else { 1 };
     let tx_has_prev = page > 1 && off < tx_total;
     let tx_has_next = display_end < tx_total;
+    let projection_txs = get_mempool_block_ordered_transactions(template_index)
+        .unwrap_or_else(|| detail.txs.clone());
 
     let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
     for item in &detail.txs {
         for (vout, _) in item.tx.output.iter().enumerate() {
             all_outpoints.push((item.txid, vout as u32));
         }
+        for vin in &item.tx.input {
+            if !vin.previous_output.is_null() {
+                all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
+            }
+        }
+    }
+    for item in &projection_txs {
         for vin in &item.tx.input {
             if !vin.previous_output.is_null() {
                 all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
@@ -733,6 +798,7 @@ pub async fn mempool_block_page(
         &all_outpoints,
     )
     .unwrap_or_default();
+    let projected_balances_by_tx = mempool_block_projected_balances(&projection_txs, &outpoint_map);
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
         outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
     };
@@ -862,7 +928,8 @@ pub async fn mempool_block_page(
                                 label: "Unconfirmed".to_string(),
                                 tone: TxPillTone::Danger,
                             };
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(status_pill), Some(item.fee_rate), true))
+                            @let projected_balances = projected_balances_by_tx.get(&item.txid);
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(status_pill), Some(item.fee_rate), projected_balances, true))
                         }
                     }
                 }

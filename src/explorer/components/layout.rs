@@ -234,6 +234,7 @@ pub fn layout_with_meta(
                 (dropdown_scripts())
                 (language_toggle_script(&root_base_path_js))
                 (PreEscaped(NAV_SCRIPT))
+                (navigation_progress_script())
             }
         }
     };
@@ -386,6 +387,262 @@ gtag('config', {tag_js});
         script async src=(format!("https://www.googletagmanager.com/gtag/js?id={tag}")) {}
         script { (PreEscaped(inline_script)) }
     })
+}
+
+fn navigation_progress_script() -> Markup {
+    let script = r#"
+<script>
+(() => {
+  const settings = {
+    minimum: 0.08,
+    maximum: 1,
+    template: '<div class="bar"><div class="peg"></div></div><div class="spinner"><div class="spinner-icon"></div></div><div class="indeterminate"><div class="inc"></div><div class="dec"></div></div>',
+    easing: 'linear',
+    positionUsing: '',
+    speed: 200,
+    trickle: true,
+    trickleSpeed: 200,
+    showSpinner: true,
+    indeterminate: false,
+    indeterminateSelector: '.indeterminate',
+    barSelector: '.bar',
+    spinnerSelector: '.spinner',
+    parent: 'body',
+    direction: 'ltr',
+  };
+  let status = null;
+  let pending = [];
+  let isPaused = false;
+
+  const clamp = (n, min, max) => Math.max(min, Math.min(n, max));
+  const toBarPerc = (n) => settings.direction === 'rtl' ? (1 - n) * 100 : (-1 + n) * 100;
+  const css = (element, properties) => {
+    if (!element) return;
+    Object.keys(properties).forEach((prop) => {
+      const value = properties[prop];
+      if (value !== undefined) element.style[prop] = value;
+    });
+  };
+  const removeElement = (element) => {
+    if (element && element.parentNode) element.parentNode.removeChild(element);
+  };
+  const addClass = (element, name) => {
+    if (element && !element.classList.contains(name)) element.classList.add(name);
+  };
+  const removeClass = (element, name) => {
+    if (element) element.classList.remove(name);
+  };
+  const isStarted = () => typeof status === 'number';
+  const getParent = () => typeof settings.parent === 'string'
+    ? document.querySelector(settings.parent)
+    : settings.parent;
+  const getPositioningCSS = () => {
+    const bodyStyle = document.body.style;
+    const vendorPrefix = 'WebkitTransform' in bodyStyle ? 'Webkit'
+      : 'MozTransform' in bodyStyle ? 'Moz'
+        : 'msTransform' in bodyStyle ? 'ms'
+          : 'OTransform' in bodyStyle ? 'O'
+            : '';
+    if (`${vendorPrefix}Perspective` in bodyStyle) return 'translate3d';
+    if (`${vendorPrefix}Transform` in bodyStyle) return 'translate';
+    return 'margin';
+  };
+  const barPositionCSS = ({ n, speed, ease, perc }) => {
+    if (settings.positionUsing === '') settings.positionUsing = getPositioningCSS();
+    const computedPerc = perc ?? toBarPerc(n);
+    let barCSS = {};
+    if (settings.positionUsing === 'translate3d') {
+      barCSS = { transform: `translate3d(${computedPerc}%,0,0)` };
+    } else if (settings.positionUsing === 'translate') {
+      barCSS = { transform: `translate(${computedPerc}%,0)` };
+    } else if (settings.positionUsing === 'width') {
+      barCSS = {
+        width: `${settings.direction === 'rtl' ? 100 - computedPerc : computedPerc + 100}%`,
+        ...(settings.direction === 'rtl' ? { right: '0', left: 'auto' } : {}),
+      };
+    } else if (settings.positionUsing === 'margin') {
+      barCSS = settings.direction === 'rtl'
+        ? { marginLeft: `${-computedPerc}%` }
+        : { marginRight: `${-computedPerc}%` };
+    }
+    barCSS.transition = `all ${speed}ms ${ease}`;
+    return barCSS;
+  };
+  const remove = (progressElement) => {
+    if (progressElement) {
+      removeElement(progressElement);
+      return;
+    }
+    removeClass(document.documentElement, 'bprogress-busy');
+    const parents = typeof settings.parent === 'string'
+      ? document.querySelectorAll(settings.parent)
+      : [settings.parent];
+    parents.forEach((parent) => removeClass(parent, 'bprogress-custom-parent'));
+    document.querySelectorAll('.bprogress').forEach(removeElement);
+  };
+  const render = (fromStart = false) => {
+    const parent = getParent();
+    const progressElements = parent ? Array.from(parent.querySelectorAll('.bprogress')) : [];
+    if (settings.template !== null && progressElements.length === 0 && parent) {
+      addClass(document.documentElement, 'bprogress-busy');
+      const progress = document.createElement('div');
+      addClass(progress, 'bprogress');
+      progress.innerHTML = settings.template;
+      if (parent !== document.body) addClass(parent, 'bprogress-custom-parent');
+      parent.appendChild(progress);
+      progressElements.push(progress);
+    }
+    progressElements.forEach((progress) => {
+      addClass(document.documentElement, 'bprogress-busy');
+      if (parent !== document.body) addClass(parent, 'bprogress-custom-parent');
+      if (!settings.indeterminate) {
+        const bar = progress.querySelector(settings.barSelector);
+        const perc = fromStart ? toBarPerc(0) : toBarPerc(status || 0);
+        css(bar, barPositionCSS({ n: status || 0, speed: settings.speed, ease: settings.easing, perc }));
+        const indeterminateElem = progress.querySelector(settings.indeterminateSelector);
+        if (indeterminateElem) indeterminateElem.style.display = 'none';
+      } else {
+        const bar = progress.querySelector(settings.barSelector);
+        if (bar) bar.style.display = 'none';
+        const indeterminateElem = progress.querySelector(settings.indeterminateSelector);
+        if (indeterminateElem) indeterminateElem.style.display = '';
+      }
+      if (!settings.showSpinner) {
+        const spinner = progress.querySelector(settings.spinnerSelector);
+        if (spinner) removeElement(spinner);
+      }
+    });
+    return progressElements;
+  };
+  const next = () => {
+    const fn = pending.shift();
+    if (fn) fn(next);
+  };
+  const queue = (fn) => {
+    pending.push(fn);
+    if (pending.length === 1) next();
+  };
+  const set = (n) => {
+    if (isPaused) return BProgress;
+    const started = isStarted();
+    n = clamp(n, settings.minimum, settings.maximum);
+    status = n === settings.maximum ? null : n;
+    const progressElements = render(!started);
+    const speed = settings.speed;
+    const ease = settings.easing;
+    progressElements.forEach((progress) => progress.offsetWidth);
+    queue((queuedNext) => {
+      progressElements.forEach((progress) => {
+        if (!settings.indeterminate) {
+          css(progress.querySelector(settings.barSelector), barPositionCSS({ n, speed, ease }));
+        }
+      });
+      if (n === settings.maximum) {
+        progressElements.forEach((progress) => {
+          css(progress, { transition: 'none', opacity: '1' });
+          progress.offsetWidth;
+        });
+        window.setTimeout(() => {
+          progressElements.forEach((progress) => {
+            css(progress, { transition: `all ${speed}ms ${ease}`, opacity: '0' });
+          });
+          window.setTimeout(() => {
+            progressElements.forEach(remove);
+            removeClass(document.documentElement, 'bprogress-busy');
+            queuedNext();
+          }, speed);
+        }, speed);
+      } else {
+        window.setTimeout(queuedNext, speed);
+      }
+    });
+    return BProgress;
+  };
+  const inc = (amount) => {
+    if (isPaused || settings.indeterminate) return BProgress;
+    let n = status;
+    if (!n) return start();
+    if (n > 1) return BProgress;
+    if (typeof amount !== 'number') {
+      if (n >= 0 && n < 0.2) amount = 0.1;
+      else if (n >= 0.2 && n < 0.5) amount = 0.04;
+      else if (n >= 0.5 && n < 0.8) amount = 0.02;
+      else if (n >= 0.8 && n < 0.99) amount = 0.005;
+      else amount = 0;
+    }
+    return set(clamp(n + amount, 0, 0.994));
+  };
+  const trickle = () => {
+    if (isPaused || settings.indeterminate) return BProgress;
+    return inc();
+  };
+  const start = () => {
+    if (!status) set(0);
+    const work = () => {
+      if (isPaused) return;
+      window.setTimeout(() => {
+        if (!status) return;
+        trickle();
+        work();
+      }, settings.trickleSpeed);
+    };
+    if (settings.trickle) work();
+    return BProgress;
+  };
+  const done = (force) => {
+    if (!force && !status) return BProgress;
+    return inc(0.3 + 0.5 * Math.random()).set(1);
+  };
+  const BProgress = {
+    settings,
+    start,
+    done,
+    inc,
+    set,
+    remove,
+    isStarted,
+  };
+
+  const shouldHandleLink = (event, link) => {
+    if (!link || event.defaultPrevented) return false;
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return false;
+    if (link.target && link.target.toLowerCase() !== '_self') return false;
+    if (link.hasAttribute('download')) return false;
+    const href = link.getAttribute('href');
+    if (!href || href.startsWith('#')) return false;
+    let url;
+    try {
+      url = new URL(href, window.location.href);
+    } catch (_) {
+      return false;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    if (url.origin !== window.location.origin) return false;
+    const sameDocument =
+      url.pathname === window.location.pathname &&
+      url.search === window.location.search &&
+      url.hash !== window.location.hash;
+    return !sameDocument;
+  };
+
+  document.addEventListener('click', (event) => {
+    const link = event.target.closest && event.target.closest('a[href]');
+    if (shouldHandleLink(event, link)) start();
+  });
+
+  document.addEventListener('submit', (event) => {
+    if (!event.defaultPrevented) start();
+  });
+
+  window.addEventListener('beforeunload', start);
+  window.addEventListener('pageshow', () => done());
+
+  window.BProgress = BProgress;
+  window.EspoNavigationProgress = BProgress;
+})();
+</script>
+"#;
+    PreEscaped(script.to_string())
 }
 
 fn search_scripts(base_path_js: &str) -> Markup {
@@ -545,6 +802,7 @@ fn search_scripts(base_path_js: &str) -> Markup {
         const href = firstAlkane.getAttribute('href');
         if (href) {{
           event.preventDefault();
+          if (window.EspoNavigationProgress) window.EspoNavigationProgress.start();
           window.location.assign(href);
           return;
         }}
@@ -646,6 +904,7 @@ fn language_toggle_script(root_base_path_js: &str) -> Markup {
       relative = normalize(relative);
       const nextRelative = toLocalizedPath(relative);
       const target = `${{basePrefix}}${{nextRelative}}${{window.location.search || ''}}${{window.location.hash || ''}}`;
+      if (window.EspoNavigationProgress) window.EspoNavigationProgress.start();
       window.location.assign(target);
     }});
   }});

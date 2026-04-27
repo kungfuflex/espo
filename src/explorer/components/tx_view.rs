@@ -790,6 +790,7 @@ pub fn render_tx(
     essentials_mdb: &Mdb,
     pill: Option<TxPill>,
     fee_rate_override: Option<f64>,
+    projected_out_balances_override: Option<&HashMap<u32, Vec<BalanceEntry>>>,
     show_tx_title: bool,
 ) -> Markup {
     let mut alkane_meta_cache: AlkaneMetaCache = HashMap::new();
@@ -799,16 +800,18 @@ pub fn render_tx(
     let outspends = outspends_fn(txid);
     let protostone_json = protostone_json(tx);
     let runestone_vouts = runestone_vout_indices(tx);
-    let projected_out_balances = protostone_json
-        .as_ref()
-        .map(|_| {
-            project_tx_output_balances_from_traces(
-                tx,
-                traces.unwrap_or(&[]),
-                input_alkane_balances(tx, outpoint_fn),
-            )
-        })
-        .unwrap_or_default();
+    let projected_out_balances = projected_out_balances_override.cloned().unwrap_or_else(|| {
+        protostone_json
+            .as_ref()
+            .map(|_| {
+                project_tx_output_balances_from_traces(
+                    tx,
+                    traces.unwrap_or(&[]),
+                    input_alkane_balances(tx, outpoint_fn),
+                )
+            })
+            .unwrap_or_default()
+    });
     let fee_pill_label =
         fee_rate_override.or_else(|| tx_fee_rate(tx, prev_map)).map(format_fee_rate);
     let vouts_markup = render_vouts(

@@ -53,6 +53,7 @@ pub struct MempoolEntry {
     pub tx: Transaction,
     pub traces: Option<Vec<EspoTrace>>,
     pub first_seen: u64,
+    pub position: Option<MempoolProjectedPosition>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -646,6 +647,7 @@ pub fn get_mempool_block_detail(
         .iter()
         .filter_map(|txid_str| Txid::from_str(txid_str).ok())
         .collect();
+    let package_rates = package_effective_rates_for_block(&ordered, &state.txs, &HashMap::new());
     ordered.retain(|txid| {
         let Some(entry) = state.txs.get(txid) else {
             return false;
@@ -661,8 +663,16 @@ pub fn get_mempool_block_detail(
     ordered.sort_by(|a, b| {
         let aa = state.txs.get(a);
         let bb = state.txs.get(b);
-        let a_rate = aa.map(|tx| tx.fee_rate).unwrap_or_default();
-        let b_rate = bb.map(|tx| tx.fee_rate).unwrap_or_default();
+        let a_rate = package_rates
+            .get(a)
+            .copied()
+            .or_else(|| aa.map(|tx| tx.fee_rate))
+            .unwrap_or_default();
+        let b_rate = package_rates
+            .get(b)
+            .copied()
+            .or_else(|| bb.map(|tx| tx.fee_rate))
+            .unwrap_or_default();
         let a_fee = aa.map(|tx| tx.fee_sat).unwrap_or_default();
         let b_fee = bb.map(|tx| tx.fee_sat).unwrap_or_default();
         b_rate
@@ -686,7 +696,7 @@ pub fn get_mempool_block_detail(
                     traces: combined_traces(entry),
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
-                    fee_rate: entry.fee_rate,
+                    fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
                     position: entry.position.clone(),
                     readiness: derive_readiness(entry),
                 })
@@ -696,6 +706,38 @@ pub fn get_mempool_block_detail(
         Vec::new()
     };
     Some(MempoolBlockDetail { template, tx_total, txs })
+}
+
+pub fn get_mempool_block_ordered_transactions(index: usize) -> Option<Vec<MempoolBlockTx>> {
+    let Ok(state) = mempool_state().read() else {
+        return None;
+    };
+    let template = state.templates.iter().find(|template| template.index == index)?;
+    let ordered: Vec<Txid> = template
+        .transaction_ids
+        .iter()
+        .filter_map(|txid_str| Txid::from_str(txid_str).ok())
+        .collect();
+    let package_rates = package_effective_rates_for_block(&ordered, &state.txs, &HashMap::new());
+    Some(
+        ordered
+            .iter()
+            .filter_map(|txid| {
+                let entry = state.txs.get(txid)?;
+                let tx = entry.tx.clone()?;
+                Some(MempoolBlockTx {
+                    txid: *txid,
+                    tx,
+                    traces: combined_traces(entry),
+                    fee_sat: entry.fee_sat,
+                    vsize: entry.vsize,
+                    fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
+                    position: entry.position.clone(),
+                    readiness: derive_readiness(entry),
+                })
+            })
+            .collect(),
+    )
 }
 
 pub fn publish_new_block_event(height: u32, txids: &[Txid]) {
@@ -1445,6 +1487,65 @@ fn fee_stats_for_block(
     (median, min, max, fee_range)
 }
 
+fn package_effective_rates_for_block(
+    block_txs: &[Txid],
+    state: &HashMap<Txid, MempoolTransactionStruct>,
+    selected_rates: &HashMap<Txid, f64>,
+) -> HashMap<Txid, f64> {
+    let block_set: HashSet<Txid> = block_txs.iter().copied().collect();
+    let mut graph: HashMap<Txid, Vec<Txid>> = HashMap::new();
+    for txid in block_txs {
+        graph.entry(*txid).or_default();
+        let Some(tx) = state.get(txid) else { continue };
+        for parent in &tx.inputs {
+            if !block_set.contains(parent) {
+                continue;
+            }
+            graph.entry(*txid).or_default().push(*parent);
+            graph.entry(*parent).or_default().push(*txid);
+        }
+    }
+
+    let mut out = HashMap::new();
+    let mut seen = HashSet::new();
+    for txid in block_txs {
+        if !seen.insert(*txid) {
+            continue;
+        }
+        let mut stack = vec![*txid];
+        let mut component = Vec::new();
+        while let Some(cur) = stack.pop() {
+            component.push(cur);
+            if let Some(neighbors) = graph.get(&cur) {
+                for next in neighbors {
+                    if seen.insert(*next) {
+                        stack.push(*next);
+                    }
+                }
+            }
+        }
+
+        let total_fee: u64 =
+            component.iter().filter_map(|id| state.get(id).map(|tx| tx.fee_sat)).sum();
+        let total_vsize: u64 =
+            component.iter().filter_map(|id| state.get(id).map(|tx| tx.vsize.max(1))).sum();
+        let package_rate = if component.len() > 1 && total_vsize > 0 {
+            Some(total_fee as f64 / total_vsize as f64)
+        } else {
+            None
+        };
+        for id in component {
+            let rate = package_rate
+                .or_else(|| selected_rates.get(&id).copied())
+                .or_else(|| state.get(&id).map(|tx| tx.fee_rate))
+                .unwrap_or_default();
+            out.insert(id, rate);
+        }
+    }
+
+    out
+}
+
 fn calculate_template_deltas(
     previous: &[MempoolBlockTemplate],
     current: &[MempoolBlockTemplate],
@@ -1538,6 +1639,7 @@ fn recalculate_memory_templates() {
 
     let mut templates = Vec::with_capacity(template_txids.len());
     for (index, txids) in template_txids.iter().enumerate() {
+        let package_rates = package_effective_rates_for_block(txids, &state.txs, &effective_rates);
         let diesel_mints: Vec<Txid> = txids
             .iter()
             .filter(|txid| state.txs.get(*txid).map(|tx| tx.is_diesel_mint).unwrap_or(false))
@@ -1580,7 +1682,7 @@ fn recalculate_memory_templates() {
             }
         }
         let (median_fee_rate, min_fee_rate, max_fee_rate, fee_range) =
-            fee_stats_for_block(txids, &state.txs, &effective_rates);
+            fee_stats_for_block(txids, &state.txs, &package_rates);
         templates.push(MempoolBlockTemplate {
             index,
             tx_count: txids.len(),
@@ -2031,6 +2133,7 @@ pub fn get_tx_from_mempool(txid: &Txid) -> Option<MempoolEntry> {
         tx,
         traces: combined_traces(entry),
         first_seen: entry.first_seen,
+        position: entry.position.clone(),
     })
 }
 
@@ -2051,6 +2154,7 @@ pub fn pending_for_address(addr: &str) -> Vec<MempoolEntry> {
                 tx,
                 traces: combined_traces(entry),
                 first_seen: entry.first_seen,
+                position: entry.position.clone(),
             })
         })
         .collect();

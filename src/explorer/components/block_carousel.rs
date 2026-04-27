@@ -263,6 +263,15 @@ fn block_carousel_inner(
     `;
   }}
 
+  function refreshRelativeTimes() {{
+    track.querySelectorAll('[data-bc-time]').forEach((el) => {{
+      const ts = Number(el.dataset.bcTime);
+      if (Number.isFinite(ts) && ts > 0) {{
+        el.textContent = formatAgo(ts);
+      }}
+    }});
+  }}
+
   function renderBlock(block) {{
     return `
       <div class="bc-slide" data-height="${{block.height}}" data-bc-key="block:${{block.height}}">
@@ -274,7 +283,7 @@ fn block_carousel_inner(
             ${{renderFeeStats(block)}}
             <div class="bc-traces">${{formatTraces(block.traces)}}</div>
             <div class="bc-tx-count">${{formatTxCount(block.tx_count)}}</div>
-            <div class="bc-time">${{formatAgo(block.time)}}</div>
+            <div class="bc-time" data-bc-time="${{block.time || ''}}">${{formatAgo(block.time)}}</div>
           </div>
           ${{block.height === selectedConfirmedHeight ? '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>' : ''}}
         </a>
@@ -336,6 +345,7 @@ fn block_carousel_inner(
     for (const block of blocks) html.push(renderBlock(block));
     for (let i = 0; i < pendingRight + bufferRight; i++) html.push(renderSkeleton('right', i));
     track.innerHTML = html.join('');
+    refreshRelativeTimes();
   }}
 
   function htmlToElement(markup) {{
@@ -382,8 +392,10 @@ fn block_carousel_inner(
     const nextFace = nextCard.querySelector('.bc-face');
     if (existingFace && nextFace) {{
       existingFace.innerHTML = nextFace.innerHTML;
+      refreshRelativeTimes();
     }} else {{
       existingCard.innerHTML = nextCard.innerHTML;
+      refreshRelativeTimes();
       return true;
     }}
 
@@ -674,14 +686,19 @@ fn block_carousel_inner(
 
   function updateResetButton() {{
     if (!resetButton) return;
-    const latest = track.querySelector(`[data-height="${{espoTip}}"]`);
-    if (!latest) {{
-      root.dataset.canReset = '0';
+    const target = targetLeftForBoundary();
+    if (target !== null) {{
+      root.dataset.canReset = scroller.scrollLeft > target + 8 ? '1' : '0';
       return;
     }}
-    const viewport = scroller.getBoundingClientRect();
-    const rect = latest.getBoundingClientRect();
-    root.dataset.canReset = rect.right < viewport.left ? '1' : '0';
+    const latest = track.querySelector(`[data-height="${{espoTip}}"]`);
+    if (latest) {{
+      const viewport = scroller.getBoundingClientRect();
+      const rect = latest.getBoundingClientRect();
+      root.dataset.canReset = rect.right < viewport.left ? '1' : '0';
+    }} else {{
+      root.dataset.canReset = scroller.scrollLeft > 8 ? '1' : '0';
+    }}
   }}
 
   function withStablePrepend(renderFn) {{
@@ -982,6 +999,8 @@ fn block_carousel_inner(
   }}
 
   scroller.addEventListener('scroll', queueEdgeCheck, {{ passive: true }});
+  refreshRelativeTimes();
+  window.setInterval(refreshRelativeTimes, 60_000);
   if (resetButton) {{
     resetButton.addEventListener('click', (event) => {{
       event.preventDefault();

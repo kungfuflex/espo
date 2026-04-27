@@ -17,7 +17,7 @@ use crate::alkanes::trace::{
 use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_metashrew,
 };
-use crate::explorer::components::block_carousel::block_carousel;
+use crate::explorer::components::block_carousel::{block_carousel, block_carousel_with_mempool};
 use crate::explorer::components::header::{
     HeaderCta, HeaderPillTone, HeaderProps, HeaderSummaryItem, header, header_scripts,
 };
@@ -331,6 +331,13 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
         cta,
         hero_class: None,
     });
+    let selected_mempool_index = if tx_height.is_none() {
+        mempool_entry
+            .as_ref()
+            .and_then(|entry| entry.position.as_ref().map(|pos| pos.block))
+    } else {
+        None
+    };
 
     layout_with_meta(
         &format!("Tx {txid}"),
@@ -338,7 +345,11 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
         None,
         html! {
             div class="block-hero full-bleed" {
-                (block_carousel(tx_height, espo_tip))
+                @if let Some(index) = selected_mempool_index {
+                    (block_carousel_with_mempool(Some(index), espo_tip))
+                } @else {
+                    (block_carousel(tx_height, espo_tip))
+                }
             }
             (header_markup)
             @if let Some(url) = mempool_url {
@@ -350,7 +361,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
                 }
             }
             h2 class="h2" { "Inputs & Outputs" }
-            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, fee_rate, false))
+            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, fee_rate, None, false))
             (header_scripts())
         },
     )

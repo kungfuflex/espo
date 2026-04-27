@@ -132,6 +132,24 @@ fn activity_tab_url(
     ))
 }
 
+fn alkane_tab_autoscroll_script() -> Markup {
+    PreEscaped(
+        r#"<script>
+(() => {
+  const scrollToTabs = () => {
+    const target = document.querySelector('.alkane-tab-list');
+    if (!target) return;
+    const top = Math.max(0, target.getBoundingClientRect().top + window.scrollY);
+    window.scrollTo({ top, left: 0, behavior: 'auto' });
+  };
+  scrollToTabs();
+  requestAnimationFrame(scrollToTabs);
+})();
+</script>"#
+            .to_string(),
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActivityOrder {
     Timestamp,
@@ -1058,30 +1076,30 @@ pub async fn alkane_page(
                         div class="alkane-tab-list" {
                             @if has_token_activity {
                                 a class=(format!("alkane-tab{}", if tab == AlkaneTab::Activity { " active" } else { "" }))
-                                    href=(activity_tab_url(&alk_str, page, limit, activity_order, activity_dir, activity_filter)) {
+                                    href=(activity_tab_url(&alk_str, 1, limit, activity_order, activity_dir, activity_filter)) {
                                     "Activity"
                                 }
                             }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Holders { " active" } else { "" }))
-                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={page}&limit={limit}"))) { "Holders" }
+                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page=1&limit={limit}"))) { "Holders" }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Volume { " active" } else { "" }))
-                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page={page}&limit={limit}"))) { "Volume" }
+                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page=1&limit={limit}"))) { "Volume" }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Inspect { " active" } else { "" }))
-                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=inspect&page={page}&limit={limit}"))) { "Inspect Contract" }
+                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=inspect&page=1&limit={limit}"))) { "Inspect Contract" }
                         }
                         div class="alkane-tab-panel" {
                             @if tab == AlkaneTab::Holders {
                                 (table_markup)
                                 div class="pager" {
                                     @if has_prev {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?page=1&limit={limit}"))) aria-label="First page" {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page=1&limit={limit}"))) aria-label="First page" {
                                             (icon_skip_left())
                                         }
                                     } @else {
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
                                     }
                                     @if has_prev {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?page={}&limit={limit}", page - 1))) aria-label="Previous page" {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={}&limit={limit}", page - 1))) aria-label="Previous page" {
                                             (icon_left())
                                         }
                                     } @else {
@@ -1097,14 +1115,14 @@ pub async fn alkane_page(
                                         (total)
                                     }
                                     @if has_next {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?page={}&limit={limit}", page + 1))) aria-label="Next page" {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={}&limit={limit}", page + 1))) aria-label="Next page" {
                                             (icon_right())
                                         }
                                     } @else {
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
                                     }
                                     @if has_next {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?page={}&limit={limit}", last_page))) aria-label="Last page" {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={}&limit={limit}", last_page))) aria-label="Last page" {
                                             (icon_skip_right())
                                         }
                                     } @else {
@@ -1277,6 +1295,9 @@ pub async fn alkane_page(
             }
             @if tab == AlkaneTab::Inspect {
                 (inspect_scripts())
+            }
+            @if page > 1 {
+                (alkane_tab_autoscroll_script())
             }
         },
     )
