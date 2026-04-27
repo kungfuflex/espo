@@ -54,6 +54,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   let rightDepleted = false;
   let initialCentered = false;
   let scrollRaf = null;
+  let programmaticScrollRaf = null;
 
   let isDragging = false;
   let dragStartX = 0;
@@ -65,19 +66,46 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   let dragMoved = false;
   let suppressClickUntil = 0;
 
-  function stopMomentum() {{
+  function cancelMomentumFrame() {{
     if (momentumRaf) {{
       cancelAnimationFrame(momentumRaf);
       momentumRaf = null;
     }}
   }}
 
+  function stopMomentum() {{
+    cancelMomentumFrame();
+    velocity = 0;
+  }}
+
+  function cancelProgrammaticScroll() {{
+    if (programmaticScrollRaf) {{
+      cancelAnimationFrame(programmaticScrollRaf);
+      programmaticScrollRaf = null;
+    }}
+  }}
+
+  function stopCarouselMotion() {{
+    stopMomentum();
+    cancelProgrammaticScroll();
+    if (scrollRaf) {{
+      cancelAnimationFrame(scrollRaf);
+      scrollRaf = null;
+    }}
+    isDragging = false;
+    dragMoved = false;
+    suppressClickUntil = 0;
+    root.dataset.dragging = '0';
+    scroller.scrollTo({{ left: scroller.scrollLeft, behavior: 'auto' }});
+  }}
+
   function resetMomentum(x) {{
+    cancelProgrammaticScroll();
     lastPointerX = x;
     lastVelocityTs = performance.now();
     velocity = 0;
     dragMoved = false;
-    stopMomentum();
+    cancelMomentumFrame();
   }}
 
   function updateVelocity(x) {{
@@ -91,7 +119,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
   }}
 
   function animateMomentum() {{
-    stopMomentum();
+    cancelMomentumFrame();
     if (Math.abs(velocity) < 0.01) return;
     let last = performance.now();
     const step = (now) => {{
@@ -316,15 +344,53 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     ensureRightBuffer(Math.max(rightBufferCount(), needed));
   }}
 
-  function centerHeight(height, smooth) {{
+  function targetLeftForHeight(height) {{
     const slide = track.querySelector(`[data-height="${{height}}"]`);
-    if (!slide) return;
+    if (!slide) return null;
     const target = slide.offsetLeft + (slide.offsetWidth / 2) - (scroller.clientWidth / 2);
-    scroller.scrollTo({{ left: Math.max(0, target), behavior: smooth ? 'smooth' : 'auto' }});
+    return Math.max(0, target);
+  }}
+
+  function animateScrollTo(left) {{
+    cancelProgrammaticScroll();
+    const start = scroller.scrollLeft;
+    const delta = left - start;
+    if (Math.abs(delta) < 1) {{
+      scroller.scrollLeft = left;
+      queueEdgeCheck();
+      return;
+    }}
+    const duration = 420;
+    let startedAt = null;
+    const step = (now) => {{
+      if (startedAt === null) startedAt = now;
+      const elapsed = Math.min(1, (now - startedAt) / duration);
+      const eased = 1 - Math.pow(1 - elapsed, 3);
+      scroller.scrollLeft = start + (delta * eased);
+      queueEdgeCheck();
+      if (elapsed < 1) {{
+        programmaticScrollRaf = requestAnimationFrame(step);
+      }} else {{
+        programmaticScrollRaf = null;
+        updateResetButton();
+      }}
+    }};
+    programmaticScrollRaf = requestAnimationFrame(step);
+  }}
+
+  function centerHeight(height, smooth) {{
+    const target = targetLeftForHeight(height);
+    if (target === null) return;
+    if (smooth) {{
+      animateScrollTo(target);
+      return;
+    }}
+    cancelProgrammaticScroll();
+    scroller.scrollTo({{ left: target, behavior: 'auto' }});
   }}
 
   async function scrollToLatest() {{
-    stopMomentum();
+    stopCarouselMotion();
     if (!seen.has(espoTip)) {{
       const batch = await fetchWindow(espoTip);
       if (batch) {{
@@ -332,7 +398,8 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
         render();
       }}
     }}
-    centerHeight(espoTip, true);
+    stopCarouselMotion();
+    requestAnimationFrame(() => centerHeight(espoTip, true));
     updateResetButton();
   }}
 
