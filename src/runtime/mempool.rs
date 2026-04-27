@@ -415,8 +415,7 @@ fn diesel_trace_for_tx(
     vout: u32,
     mint_amount: u128,
 ) -> Option<Vec<EspoTrace>> {
-    let mut raw: Value =
-        serde_json::from_str(include_str!("../../context/diesel-mint-trace.json")).ok()?;
+    let mut raw: Value = serde_json::from_str(include_str!("diesel-mint-trace.json")).ok()?;
     if let Some(incoming) = raw
         .get_mut(0)
         .and_then(|v| v.get_mut("data"))

@@ -1,0 +1,109 @@
+[
+  {
+    "data": {
+      "context": {
+        "caller": {
+          "block": "0x0",
+          "tx": "0x0"
+        },
+        "incomingAlkanes": [
+          {
+            "id": {
+              "block": "0x2",
+              "tx": "0x0"
+            },
+            "value": "0xb5964d62"
+          }
+        ],
+        "inputs": [
+          "0x4d",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0",
+          "0x0"
+        ],
+        "myself": {
+          "block": "0x2",
+          "tx": "0x0"
+        },
+        "vout": 3
+      },
+      "fuel": 3500000,
+      "type": "call"
+    },
+    "event": "invoke"
+  },
+  {
+    "data": {
+      "response": {
+        "alkanes": [],
+        "data": "0xec0f0000000000000000000000000000",
+        "storage": []
+      },
+      "status": "success"
+    },
+    "event": "return"
+  },
+  {
+    "data": {
+      "response": {
+        "alkanes": [],
+        "data": "0x60b0ad12000000000000000000000000",
+        "storage": []
+      },
+      "status": "success"
+    },
+    "event": "return"
+  },
+  {
+    "data": {
+      "response": {
+        "alkanes": [
+          {
+            "id": {
+              "block": "0x2",
+              "tx": "0x0"
+            },
+            "value": "0xb5964d62"
+          },
+          {
+            "id": {
+              "block": "0x2",
+              "tx": "0x0"
+            },
+            "value": "0x12aa6"
+          }
+        ],
+        "data": "0x",
+        "storage": [
+          {
+            "key": "/fees",
+            "value": "0x2d8f0169110000000000000000000000"
+          },
+          {
+            "key": "/totalsupply",
+            "value": "0x3a2c7796a53900000000000000000000"
+          },
+          {
+            "key": "0x2f74782d6861736865732fab5fac6db20567a291b8664f75daacb0290770e50e2338a850a6a133237a5457",
+            "value": "0x01"
+          },
+          {
+            "key": "/upgraded_seen/pr\u000e\u0000\u0000\u0000\u0000\u0000",
+            "value": "0x01000000"
+          }
+        ]
+      },
+      "status": "success"
+    },
+    "event": "return"
+  }
+]
