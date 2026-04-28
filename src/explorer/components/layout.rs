@@ -402,7 +402,7 @@ fn navigation_progress_script() -> Markup {
     speed: 200,
     trickle: true,
     trickleSpeed: 200,
-    showSpinner: true,
+    showSpinner: false,
     indeterminate: false,
     indeterminateSelector: '.indeterminate',
     barSelector: '.bar',

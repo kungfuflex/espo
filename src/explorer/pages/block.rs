@@ -25,7 +25,7 @@ use crate::explorer::components::header::{
 };
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
-    icon_arrow_up_right, icon_left, icon_right, icon_skip_left, icon_skip_right,
+    icon_arrow_up_right, icon_pager_first, icon_pager_last, icon_pager_left, icon_pager_right,
 };
 use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
@@ -675,17 +675,17 @@ pub async fn block_page(
                     div class="pager" {
                         @if tx_has_prev {
                             a class="pill iconbtn" href=(explorer_path(&format!("/block/{height}?tab=txs&page=1&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}"))) aria-label="First page" {
-                                (icon_skip_left())
+                                (icon_pager_first())
                             }
                         } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                         }
                         @if tx_has_prev {
                             a class="pill iconbtn" href=(explorer_path(&format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page - 1))) aria-label="Previous page" {
-                                (icon_left())
+                                (icon_pager_left())
                             }
                         } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                         }
                         span class="pager-meta muted" { "Showing "
                             (if tx_total > 0 { display_start } else { 0 })
@@ -698,17 +698,17 @@ pub async fn block_page(
                         }
                         @if tx_has_next {
                             a class="pill iconbtn" href=(explorer_path(&format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page + 1))) aria-label="Next page" {
-                                (icon_right())
+                                (icon_pager_right())
                             }
                         } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                         }
                         @if tx_has_next {
                             a class="pill iconbtn" href=(explorer_path(&format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", last_page))) aria-label="Last page" {
-                                (icon_skip_right())
+                                (icon_pager_last())
                             }
                         } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
+                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                         }
                     }
                 }
@@ -937,17 +937,17 @@ pub async fn mempool_block_page(
                 div class="pager" {
                     @if tx_has_prev {
                         a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}"))) aria-label="First page" {
-                            (icon_skip_left())
+                            (icon_pager_first())
                         }
                     } @else {
-                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                     }
                     @if tx_has_prev {
                         a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page - 1))) aria-label="Previous page" {
-                            (icon_left())
+                            (icon_pager_left())
                         }
                     } @else {
-                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                     }
                     span class="pager-meta muted" { "Showing "
                         (display_start)
@@ -960,17 +960,17 @@ pub async fn mempool_block_page(
                     }
                     @if tx_has_next {
                         a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page + 1))) aria-label="Next page" {
-                            (icon_right())
+                            (icon_pager_right())
                         }
                     } @else {
-                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                     }
                     @if tx_has_next {
                         a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={last_page}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}"))) aria-label="Last page" {
-                            (icon_skip_right())
+                            (icon_pager_last())
                         }
                     } @else {
-                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
+                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                     }
                 }
             }

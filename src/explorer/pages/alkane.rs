@@ -13,7 +13,8 @@ use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
     icon_activity, icon_activity_add_liquidity, icon_activity_mint, icon_activity_pool_create,
     icon_activity_remove_liquidity, icon_activity_trade_buy, icon_activity_trade_sell,
-    icon_caret_right, icon_dropdown_caret, icon_left, icon_right, icon_skip_left, icon_skip_right,
+    icon_caret_right, icon_dropdown_caret, icon_pager_first, icon_pager_last, icon_pager_left,
+    icon_pager_right,
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
@@ -1093,17 +1094,17 @@ pub async fn alkane_page(
                                 div class="pager" {
                                     @if has_prev {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page=1&limit={limit}"))) aria-label="First page" {
-                                            (icon_skip_left())
+                                            (icon_pager_first())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                                     }
                                     @if has_prev {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={}&limit={limit}", page - 1))) aria-label="Previous page" {
-                                            (icon_left())
+                                            (icon_pager_left())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                                     }
                                     span class="pager-meta muted" { "Showing "
                                         (if total > 0 { display_start } else { 0 })
@@ -1116,17 +1117,17 @@ pub async fn alkane_page(
                                     }
                                     @if has_next {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={}&limit={limit}", page + 1))) aria-label="Next page" {
-                                            (icon_right())
+                                            (icon_pager_right())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                                     }
                                     @if has_next {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={}&limit={limit}", last_page))) aria-label="Last page" {
-                                            (icon_skip_right())
+                                            (icon_pager_last())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                                     }
                                 }
                             } @else if tab == AlkaneTab::Volume {
@@ -1137,17 +1138,17 @@ pub async fn alkane_page(
                                 div class="pager" {
                                     @if activity_has_prev {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page=1&limit={limit}"))) aria-label="First page" {
-                                            (icon_skip_left())
+                                            (icon_pager_first())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                                     }
                                     @if activity_has_prev {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page={}&limit={limit}", page - 1))) aria-label="Previous page" {
-                                            (icon_left())
+                                            (icon_pager_left())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                                     }
                                     span class="pager-meta muted" { "Showing "
                                         (if activity_total > 0 { activity_display_start } else { 0 })
@@ -1160,17 +1161,17 @@ pub async fn alkane_page(
                                     }
                                     @if activity_has_next {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page={}&limit={limit}", page + 1))) aria-label="Next page" {
-                                            (icon_right())
+                                            (icon_pager_right())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                                     }
                                     @if activity_has_next {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page={activity_last_page}&limit={limit}"))) aria-label="Last page" {
-                                            (icon_skip_right())
+                                            (icon_pager_last())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                                     }
                                 }
                             } @else if tab == AlkaneTab::Activity {
@@ -1184,17 +1185,17 @@ pub async fn alkane_page(
                                 div class="pager" {
                                     @if token_activity_has_prev {
                                         a class="pill iconbtn" href=(activity_tab_url(&alk_str, 1, limit, activity_order, activity_dir, activity_filter)) aria-label="First page" {
-                                            (icon_skip_left())
+                                            (icon_pager_first())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                                     }
                                     @if token_activity_has_prev {
                                         a class="pill iconbtn" href=(activity_tab_url(&alk_str, page - 1, limit, activity_order, activity_dir, activity_filter)) aria-label="Previous page" {
-                                            (icon_left())
+                                            (icon_pager_left())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                                     }
                                     span class="pager-meta muted" { "Showing "
                                         (if token_activity_total > 0 { token_activity_display_start } else { 0 })
@@ -1207,17 +1208,17 @@ pub async fn alkane_page(
                                     }
                                     @if token_activity_has_next {
                                         a class="pill iconbtn" href=(activity_tab_url(&alk_str, page + 1, limit, activity_order, activity_dir, activity_filter)) aria-label="Next page" {
-                                            (icon_right())
+                                            (icon_pager_right())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                                     }
                                     @if token_activity_has_next {
                                         a class="pill iconbtn" href=(activity_tab_url(&alk_str, token_activity_last_page, limit, activity_order, activity_dir, activity_filter)) aria-label="Last page" {
-                                            (icon_skip_right())
+                                            (icon_pager_last())
                                         }
                                     } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                                     }
                                 }
                             } @else {

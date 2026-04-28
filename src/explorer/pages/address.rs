@@ -19,8 +19,8 @@ use crate::explorer::components::alk_balances::render_alkane_balance_cards;
 use crate::explorer::components::header::{HeaderProps, HeaderSummaryItem, header, header_scripts};
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
-    icon_arrow_up_right, icon_dropdown_caret, icon_left, icon_right, icon_skip_left,
-    icon_skip_right,
+    icon_arrow_up_right, icon_dropdown_caret, icon_pager_first, icon_pager_last, icon_pager_left,
+    icon_pager_right,
 };
 use crate::explorer::components::tx_view::{
     AlkaneMetaCache, TxPill, TxPillTone, alkane_meta, icon_bg_style, render_tx,
@@ -990,17 +990,17 @@ pub async fn address_page(
                     div class="pager" {
                         @if tx_has_prev {
                             a class="pill iconbtn" href=(first_href) aria-label="First page" {
-                                (icon_skip_left())
+                                (icon_pager_first())
                             }
                         } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                         }
                         @if tx_has_prev {
                             a class="pill iconbtn" href=(prev_href) aria-label="Previous page" {
-                                (icon_left())
+                                (icon_pager_left())
                             }
                         } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                         }
                         span class="pager-meta muted" { "Showing "
                             (if tx_total > 0 { display_start } else { 0 })
@@ -1013,17 +1013,17 @@ pub async fn address_page(
                         }
                         @if tx_has_next {
                             a class="pill iconbtn" href=(next_href) aria-label="Next page" {
-                                (icon_right())
+                                (icon_pager_right())
                             }
                         } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                         }
                         @if tx_has_next && !use_cursor {
                             a class="pill iconbtn" href=(last_href) aria-label="Last page" {
-                                (icon_skip_right())
+                                (icon_pager_last())
                             }
                         } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
+                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                         }
                     }
                 }

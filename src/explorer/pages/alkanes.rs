@@ -8,7 +8,7 @@ use serde::Deserialize;
 use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
-    icon_left, icon_right, icon_skip_left, icon_skip_right,
+    icon_pager_first, icon_pager_last, icon_pager_left, icon_pager_right,
 };
 use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
 use crate::explorer::components::tx_view::alkane_icon_url;
@@ -301,14 +301,14 @@ pub async fn alkanes_page(
             (table)
             div class="pager" {
                 @if has_prev {
-                    a class="pill iconbtn" href=(alkanes_url(1, limit, field, dir)) aria-label="First page" { (icon_skip_left()) }
+                    a class="pill iconbtn" href=(alkanes_url(1, limit, field, dir)) aria-label="First page" { (icon_pager_first()) }
                 } @else {
-                    span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                    span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                 }
                 @if has_prev {
-                    a class="pill iconbtn" href=(alkanes_url(page - 1, limit, field, dir)) aria-label="Previous page" { (icon_left()) }
+                    a class="pill iconbtn" href=(alkanes_url(page - 1, limit, field, dir)) aria-label="Previous page" { (icon_pager_left()) }
                 } @else {
-                    span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                    span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                 }
                 span class="pager-meta muted" { "Showing "
                     (display_start)
@@ -320,14 +320,14 @@ pub async fn alkanes_page(
                     (total)
                 }
                 @if has_next {
-                    a class="pill iconbtn" href=(alkanes_url(page + 1, limit, field, dir)) aria-label="Next page" { (icon_right()) }
+                    a class="pill iconbtn" href=(alkanes_url(page + 1, limit, field, dir)) aria-label="Next page" { (icon_pager_right()) }
                 } @else {
-                    span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                    span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                 }
                 @if has_next {
-                    a class="pill iconbtn" href=(alkanes_url(last_page, limit, field, dir)) aria-label="Last page" { (icon_skip_right()) }
+                    a class="pill iconbtn" href=(alkanes_url(last_page, limit, field, dir)) aria-label="Last page" { (icon_pager_last()) }
                 } @else {
-                    span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
+                    span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                 }
             }
         },
