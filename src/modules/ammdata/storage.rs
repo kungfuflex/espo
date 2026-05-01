@@ -1659,13 +1659,15 @@ impl AmmDataProvider {
         let table = self.table();
         let resolved_blockhash = params.blockhash.resolve(self.view_blockhash);
         let rel_prefix = table.btc_usd_price_prefix();
-        let entries = self
-            .get_list_entries_desc(GetListEntriesDescParams {
-                blockhash: params.blockhash,
-                prefix: rel_prefix,
-            })
-            .map(|resp| resp.entries)
-            .unwrap_or_default();
+        let end_exclusive = prefix_end_exclusive(&rel_prefix);
+        let entries = self.raw_scan_range_entries_page_at(
+            &rel_prefix,
+            end_exclusive.as_deref(),
+            resolved_blockhash,
+            0,
+            16,
+            true,
+        )?;
         for (k, v) in entries {
             let Some(height) = table.parse_btc_usd_price_key(&k) else {
                 continue;
@@ -1690,6 +1692,35 @@ impl AmmDataProvider {
                         }
                     }
                 }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn get_btc_usd_price_at_or_before_height(&self, height: u32) -> Result<Option<u128>> {
+        let table = self.table();
+        let rel_prefix = table.btc_usd_price_prefix();
+        let end_exclusive = table.btc_usd_price_key(u64::from(height).saturating_add(1));
+        let entries = self.raw_scan_range_entries_page_at(
+            &rel_prefix,
+            Some(&end_exclusive),
+            self.view_blockhash,
+            0,
+            16,
+            true,
+        )?;
+        for (_k, v) in entries {
+            if let Ok(price) = decode_u128_value(&v) {
+                if price > 0 {
+                    return Ok(Some(price));
+                }
+            }
+        }
+
+        if height < ammdata_genesis_block(get_network()) {
+            let fallback = AmmDataConfig::load_from_global_config()?.pre_ammdata_btc_usd_price;
+            if fallback > 0 {
+                return Ok(Some(fallback));
             }
         }
         Ok(None)
@@ -1754,6 +1785,34 @@ impl AmmDataProvider {
         };
         keys.sort();
         Ok(keys)
+    }
+
+    fn raw_scan_range_entries_page_at(
+        &self,
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+        blockhash: Option<BlockHash>,
+        offset: usize,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match blockhash {
+            Some(blockhash) => self
+                .mdb
+                .scan_range_entries_page_at_blockhash(
+                    &blockhash,
+                    start_inclusive,
+                    end_exclusive,
+                    offset,
+                    limit,
+                    reverse,
+                )
+                .map_err(|e| anyhow!("mdb.scan_range_entries_page_at_blockhash failed: {e}")),
+            None => self
+                .mdb
+                .scan_range_entries_page(start_inclusive, end_exclusive, offset, limit, reverse)
+                .map_err(|e| anyhow!("mdb.scan_range_entries_page failed: {e}")),
+        }
     }
 
     pub fn get_raw_value(&self, params: GetRawValueParams) -> Result<GetRawValueResult> {
@@ -4775,6 +4834,18 @@ pub fn decode_u128_value(bytes: &[u8]) -> anyhow::Result<u128> {
 
 pub fn encode_u128_value(value: u128) -> anyhow::Result<Vec<u8>> {
     Ok(value.to_le_bytes().to_vec())
+}
+
+fn prefix_end_exclusive(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for i in (0..end.len()).rev() {
+        if end[i] != 0xFF {
+            end[i] = end[i].saturating_add(1);
+            end.truncate(i + 1);
+            return Some(end);
+        }
+    }
+    None
 }
 
 pub fn decode_f64_value(bytes: &[u8]) -> anyhow::Result<f64> {

@@ -5,7 +5,7 @@ use super::storage::{
 };
 use crate::config::get_network;
 use crate::modules::ammdata::consts::{PRICE_SCALE, SATS_PER_BTC};
-use crate::modules::ammdata::storage::{AmmDataProvider, GetLatestBtcUsdPriceParams};
+use crate::modules::ammdata::storage::AmmDataProvider;
 use crate::modules::defs::RpcNsRegistrar;
 use crate::schemas::SchemaAlkaneId;
 use alloy_primitives::U256;
@@ -13,6 +13,7 @@ use bitcoin::Address;
 use bitcoin::Txid;
 use bitcoin::hashes::Hash;
 use serde_json::json;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -156,6 +157,19 @@ fn row_json(row: &SchemaTokenActivityV1, btc_price_usd_scaled: Option<u128>) -> 
     })
 }
 
+fn btc_price_cache_for_rows(
+    rows: &[SchemaTokenActivityV1],
+    amm_provider: &AmmDataProvider,
+) -> HashMap<u32, Option<u128>> {
+    let mut cache = HashMap::<u32, Option<u128>>::new();
+    for row in rows {
+        cache.entry(row.height).or_insert_with(|| {
+            amm_provider.get_btc_usd_price_at_or_before_height(row.height).ok().flatten()
+        });
+    }
+    cache
+}
+
 pub fn register_rpc(
     reg: &RpcNsRegistrar,
     provider: Arc<TokenDataProvider>,
@@ -238,31 +252,22 @@ pub fn register_rpc(
                         end_time,
                     }) {
                         Ok(resp) => {
-                            let mut btc_price_cache = std::collections::HashMap::<u32, Option<u128>>::new();
+                            let btc_price_cache =
+                                btc_price_cache_for_rows(&resp.entries, amm_provider.as_ref());
                             let entries = resp
                                 .entries
                                 .iter()
                                 .map(|row| {
-                                    let btc_price = *btc_price_cache.entry(row.height).or_insert_with(|| {
-                                        amm_provider
-                                            .with_height(Some(row.height as u64), true)
-                                            .ok()
-                                            .and_then(|view| {
-                                                view.get_latest_btc_usd_price(GetLatestBtcUsdPriceParams {
-                                                    blockhash: crate::runtime::state_at::StateAt::Latest,
-                                                })
-                                                .ok()
-                                                .flatten()
-                                            })
-                                    });
+                                    let btc_price =
+                                        btc_price_cache.get(&row.height).copied().flatten();
                                     row_json(row, btc_price)
                                 })
                                 .collect::<Vec<_>>();
                             json!({
-                            "ok": true,
-                            "total": resp.total,
-                            "entries": entries,
-                        })
+                                "ok": true,
+                                "total": resp.total,
+                                "entries": entries,
+                            })
                         }
                         Err(e) => json!({
                             "ok": false,
@@ -356,31 +361,22 @@ pub fn register_rpc(
                         end_time,
                     }) {
                         Ok(resp) => {
-                            let mut btc_price_cache = std::collections::HashMap::<u32, Option<u128>>::new();
+                            let btc_price_cache =
+                                btc_price_cache_for_rows(&resp.entries, amm_provider.as_ref());
                             let entries = resp
                                 .entries
                                 .iter()
                                 .map(|row| {
-                                    let btc_price = *btc_price_cache.entry(row.height).or_insert_with(|| {
-                                        amm_provider
-                                            .with_height(Some(row.height as u64), true)
-                                            .ok()
-                                            .and_then(|view| {
-                                                view.get_latest_btc_usd_price(GetLatestBtcUsdPriceParams {
-                                                    blockhash: crate::runtime::state_at::StateAt::Latest,
-                                                })
-                                                .ok()
-                                                .flatten()
-                                            })
-                                    });
+                                    let btc_price =
+                                        btc_price_cache.get(&row.height).copied().flatten();
                                     row_json(row, btc_price)
                                 })
                                 .collect::<Vec<_>>();
                             json!({
-                            "ok": true,
-                            "total": resp.total,
-                            "entries": entries,
-                        })
+                                "ok": true,
+                                "total": resp.total,
+                                "entries": entries,
+                            })
                         }
                         Err(e) => json!({
                             "ok": false,
