@@ -11,6 +11,7 @@ use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
@@ -37,6 +38,8 @@ use crate::modules::essentials::storage::{
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_rows_batch,
 };
+use crate::modules::runes::main::runes_enabled_from_global_config;
+use crate::modules::runes::storage::RunesProvider;
 use crate::runtime::mempool::{MempoolEntry, pending_by_txid, pending_for_address};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
@@ -47,8 +50,39 @@ pub struct AddressPageQuery {
     pub page: Option<usize>,
     pub limit: Option<usize>,
     pub traces: Option<String>,
+    pub txs: Option<String>,
     pub cursor: Option<String>,
     pub stack: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TxFilter {
+    All,
+    Alkane,
+    Rune,
+}
+
+impl TxFilter {
+    fn from_query(txs: Option<&str>, traces: Option<&str>) -> Self {
+        match txs {
+            Some("all") => Self::All,
+            Some("rune") | Some("runes") => Self::Rune,
+            Some("alkane") | Some("alkanes") => Self::Alkane,
+            _ => {
+                let traces_only =
+                    traces.map(|v| matches!(v, "1" | "true" | "on" | "yes")).unwrap_or(true);
+                if traces_only { Self::Alkane } else { Self::All }
+            }
+        }
+    }
+
+    fn query_value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Alkane => "alkane",
+            Self::Rune => "rune",
+        }
+    }
 }
 
 struct AddressTxRender {
@@ -179,12 +213,15 @@ pub async fn address_page(
 
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
-    let traces_only = q
-        .traces
-        .as_deref()
-        .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
-        .unwrap_or(true);
-    let traces_param = if traces_only { "1" } else { "0" };
+    let runes_enabled = runes_enabled_from_global_config();
+    let requested_filter = TxFilter::from_query(q.txs.as_deref(), q.traces.as_deref());
+    let tx_filter = if !runes_enabled && requested_filter == TxFilter::Rune {
+        TxFilter::Alkane
+    } else {
+        requested_filter
+    };
+    let traces_only = tx_filter == TxFilter::Alkane;
+    let txs_param = tx_filter.query_value();
     let all_range_label = if current_language().is_chinese() { "全部" } else { "All" };
     let cursor_txid = q.cursor.as_ref().and_then(|v| Txid::from_str(v).ok());
     let cursor_stack: Vec<String> = q
@@ -210,6 +247,7 @@ pub async fn address_page(
         cursor_stack.len()
     );
     let essentials_provider = state.essentials_provider();
+    let runes_provider = RunesProvider::new(Arc::new(state.runes_mdb.clone()));
     let address_stats_t0 = Instant::now();
     let address_stats = electrum_like
         .address_stats(&address)
@@ -290,7 +328,11 @@ pub async fn address_page(
     pending_entries.sort_by(|a, b| b.txid.cmp(&a.txid));
     let pending_filtered: Vec<MempoolEntry> = pending_entries
         .into_iter()
-        .filter(|e| !traces_only || e.traces.as_ref().map_or(false, |t| !t.is_empty()))
+        .filter(|e| match tx_filter {
+            TxFilter::All => true,
+            TxFilter::Alkane => e.traces.as_ref().map_or(false, |t| !t.is_empty()),
+            TxFilter::Rune => ordinals::Runestone::decipher(&e.tx).is_some(),
+        })
         .collect();
     let pending_total = pending_filtered.len();
     log_address_page_perf(
@@ -327,7 +369,7 @@ pub async fn address_page(
     let confirmed_offset = off.saturating_sub(pending_total);
 
     let mut next_cursor: Option<Txid> = None;
-    if traces_only {
+    if tx_filter == TxFilter::Alkane {
         let confirmed_total_t0 = Instant::now();
         let confirmed_total = get_address_index_list_len(
             &essentials_provider,
@@ -451,6 +493,71 @@ pub async fn address_page(
                 tx_has_next
             ),
         );
+    } else if tx_filter == TxFilter::Rune {
+        let confirmed_total_t0 = Instant::now();
+        let confirmed_total =
+            runes_provider.get_address_tx_count(&address_str).unwrap_or(0) as usize;
+        log_address_page_perf(
+            &address_str,
+            "runes.get_address_tx_count",
+            confirmed_total_t0,
+            &format!("confirmed_total={}", confirmed_total),
+        );
+        let confirmed_slice_start = confirmed_offset.min(confirmed_total);
+        let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
+
+        if confirmed_slice_end > confirmed_slice_start {
+            let range_start = confirmed_total.saturating_sub(confirmed_slice_end) as u64;
+            let range_end = confirmed_total.saturating_sub(confirmed_slice_start) as u64;
+            let pointers = runes_provider
+                .get_address_tx_range(&address_str, range_start, range_end)
+                .unwrap_or_default();
+            let pointers: Vec<_> = pointers.into_iter().rev().collect();
+            let txids: Vec<Txid> =
+                pointers.iter().map(|pointer| Txid::from_byte_array(pointer.txid)).collect();
+
+            let raw_txs_t0 = Instant::now();
+            let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+            log_address_page_perf(
+                &address_str,
+                "electrum_like.batch_transaction_get_raw.rune_txs",
+                raw_txs_t0,
+                &format!("txids={} raws={}", txids.len(), raw_txs.len()),
+            );
+
+            for (idx, txid) in txids.iter().enumerate() {
+                let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                if raw.is_empty() {
+                    continue;
+                }
+                let tx: Transaction = match deserialize(&raw) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("[address_page] failed to decode rune tx {}: {e}", txid);
+                        continue;
+                    }
+                };
+                let summary = load_tx_summary_v2(&essentials_provider, txid);
+                let confirmations = pointers.get(idx).and_then(|pointer| {
+                    let h = pointer.height as u64;
+                    chain_tip.and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
+                });
+                let traces = summary
+                    .as_ref()
+                    .map(|s| traces_from_summary(txid, s))
+                    .filter(|t| !t.is_empty());
+                tx_renders.push(AddressTxRender {
+                    txid: *txid,
+                    tx,
+                    traces,
+                    confirmations,
+                    is_mempool: false,
+                });
+            }
+        }
+
+        tx_total = pending_total + confirmed_total;
+        tx_has_next = (off + tx_renders.len()) < tx_total;
     } else {
         match address_stats.as_ref().map(|s| s.backend) {
             Some(ElectrumLikeBackend::ElectrumRpc) => {
@@ -602,7 +709,7 @@ pub async fn address_page(
     let display_start = if tx_total > 0 && off < tx_total { off + 1 } else { 0 };
     let display_end = (off + tx_renders.len()).min(tx_total);
     let last_page = if tx_total > 0 { (tx_total + limit - 1) / limit } else { 1 };
-    let use_cursor = !traces_only && history_error.is_none();
+    let use_cursor = tx_filter == TxFilter::All && history_error.is_none();
     let prev_cursor = cursor_stack.last().cloned();
     let prev_stack = if cursor_stack.len() > 1 {
         cursor_stack[..cursor_stack.len() - 1].join(",")
@@ -617,9 +724,9 @@ pub async fn address_page(
     let next_stack = if next_stack_vec.is_empty() { None } else { Some(next_stack_vec.join(",")) };
     let next_cursor_str = next_cursor.map(|t| t.to_string());
     let base_path = explorer_path(&format!("/address/{}", address_str));
-    let first_href = format!("{base_path}?page=1&limit={limit}&traces={traces_param}");
+    let first_href = format!("{base_path}?page=1&limit={limit}&txs={txs_param}");
     let prev_href = if use_cursor {
-        let mut q = format!("page={}&limit={limit}&traces={traces_param}", page - 1);
+        let mut q = format!("page={}&limit={limit}&txs={txs_param}", page - 1);
         if let Some(prev) = prev_cursor.as_ref() {
             q.push_str(&format!("&cursor={}", prev));
         }
@@ -628,10 +735,10 @@ pub async fn address_page(
         }
         format!("{base_path}?{q}")
     } else {
-        format!("{base_path}?page={}&limit={limit}&traces={traces_param}", page - 1)
+        format!("{base_path}?page={}&limit={limit}&txs={txs_param}", page - 1)
     };
     let next_href = if use_cursor {
-        let mut q = format!("page={}&limit={limit}&traces={traces_param}", page + 1);
+        let mut q = format!("page={}&limit={limit}&txs={txs_param}", page + 1);
         if let Some(next) = next_cursor_str.as_ref() {
             q.push_str(&format!("&cursor={}", next));
         }
@@ -640,9 +747,9 @@ pub async fn address_page(
         }
         format!("{base_path}?{q}")
     } else {
-        format!("{base_path}?page={}&limit={limit}&traces={traces_param}", page + 1)
+        format!("{base_path}?page={}&limit={limit}&txs={txs_param}", page + 1)
     };
-    let last_href = format!("{base_path}?page={last_page}&limit={limit}&traces={traces_param}");
+    let last_href = format!("{base_path}?page={last_page}&limit={limit}&txs={txs_param}");
 
     let mut prev_txids: Vec<Txid> = Vec::new();
     for item in &tx_renders {
@@ -948,18 +1055,22 @@ pub async fn address_page(
             div class="card" {
                 div class="row" {
                     h2 class="h2" { "Transactions" }
-                    form class="trace-toggle" method="get" action=(explorer_path(&format!("/address/{}", address_str))) {
-                        input type="hidden" name="page" value="1";
-                        input type="hidden" name="limit" value=(limit);
-                        input type="hidden" name="traces" value=(traces_param);
-                        label class="switch" {
-                            span class="switch-label" { "Only Alkanes txs" }
-                            input
-                                class="switch-input"
-                                type="checkbox"
-                                checked[traces_only]
-                                onchange="this.form.traces.value = this.checked ? '1' : '0'; this.form.submit();";
-                            span class="switch-slider" {}
+                    div class="trace-toggle" {
+                        div class="segmented-control" role="group" aria-label="Transaction filter" {
+                            a class=(if tx_filter == TxFilter::All { "segment active" } else { "segment" })
+                                href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=all", address_str))) {
+                                "All txs"
+                            }
+                            a class=(if tx_filter == TxFilter::Alkane { "segment active" } else { "segment" })
+                                href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=alkane", address_str))) {
+                                "Alkane txs"
+                            }
+                            @if runes_enabled {
+                                a class=(if tx_filter == TxFilter::Rune { "segment active" } else { "segment" })
+                                    href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=rune", address_str))) {
+                                    "Rune txs"
+                                }
+                            }
                         }
                     }
                 }

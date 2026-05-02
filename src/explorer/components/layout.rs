@@ -11,6 +11,7 @@ use crate::explorer::components::svg_assets::{
 };
 use crate::explorer::i18n::translate_html;
 use crate::explorer::paths::{current_language, explorer_base_path, explorer_path};
+use crate::modules::runes::main::runes_enabled_from_global_config;
 
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 const FAVICON_SVG: &str = include_str!("../assets/favicon.svg");
@@ -118,6 +119,7 @@ pub fn layout_with_meta(
     let base_path_js = format!("{:?}", explorer_path("/"));
     let root_base_path_js = format!("{:?}", explorer_base_path());
     let network_dropdown = network_dropdown();
+    let runes_enabled = runes_enabled_from_global_config();
     let google_analytics = google_analytics_scripts();
     let lang_toggle_label =
         if language.is_chinese() { "Switch to English" } else { "切换到中文" };
@@ -194,6 +196,9 @@ pub fn layout_with_meta(
                             div class="navlinks-container" {
                                 a class="navlink" href=(explorer_path("/")) { "Blocks" }
                                 a class="navlink" href=(explorer_path("/alkanes")) { "Alkanes" }
+                                @if runes_enabled {
+                                    a class="navlink" href=(explorer_path("/runes")) { "Runes" }
+                                }
                             }
                             div class="nav-actions" {
                                 button class="nav-icon-btn nav-search-toggle" type="button" aria-label="Search" data-search-toggle="" {
@@ -206,6 +211,9 @@ pub fn layout_with_meta(
                             div class="nav-menu" data-menu="" aria-hidden="true" {
                                 a class="nav-menu-link" href=(explorer_path("/")) { "Blocks" }
                                 a class="nav-menu-link" href=(explorer_path("/alkanes")) { "Alkanes" }
+                                @if runes_enabled {
+                                    a class="nav-menu-link" href=(explorer_path("/runes")) { "Runes" }
+                                }
                             }
                         }
                     }

@@ -26,6 +26,8 @@ use pages::alkane::alkane_page;
 use pages::alkanes::alkanes_page;
 use pages::block::{block_page, mempool_block_page};
 use pages::home::home_page;
+use pages::rune::{rune_icon_asset, rune_page};
+use pages::runes::runes_page;
 use pages::search::search;
 use pages::state::ExplorerState;
 use pages::tx::tx_page;
@@ -34,11 +36,13 @@ use tokio::net::TcpListener;
 use crate::config::{
     get_config, get_espo_next_height, get_explorer_base_path, get_explorer_networks, get_network,
 };
+use crate::modules::runes::main::runes_enabled_from_global_config;
 use components::layout::{favicon, style, waves_light};
 use paths::with_language;
 
 pub fn explorer_router(state: ExplorerState) -> Router {
-    let pages = Router::new()
+    let runes_enabled = runes_enabled_from_global_config();
+    let mut pages = Router::new()
         .route("/", get(home_page))
         .route("/search", get(search))
         .route("/block/{height}", get(block_page))
@@ -47,6 +51,9 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/address/{address}", get(address_page))
         .route("/alkane/{alkane}", get(alkane_page))
         .route("/alkanes", get(alkanes_page));
+    if runes_enabled {
+        pages = pages.route("/rune/{rune}", get(rune_page)).route("/runes", get(runes_page));
+    }
 
     let mut api = Router::new()
         .route("/api/blocks/carousel", get(carousel_blocks))
@@ -63,11 +70,14 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         api = api.route(ws_path, get(explorer_events_ws));
     }
 
-    let assets = Router::new()
+    let mut assets = Router::new()
         .route("/static/style.css", get(style))
         .route("/static/waves-light.svg", get(waves_light))
         .route("/static/mining-pools/{slug}", get(mining_pool_icon))
         .route("/favicon.svg", get(favicon));
+    if runes_enabled {
+        assets = assets.route("/static/rune-icons/{rune}", get(rune_icon_asset));
+    }
     let seo = Router::new()
         .route("/robots.txt", get(robots_txt))
         .route("/sitemap.xml", get(sitemap_xml));
@@ -131,6 +141,10 @@ async fn sitemap_xml() -> impl IntoResponse {
     let latest_start = tip.saturating_sub(49);
     let mut paths: Vec<String> =
         vec!["/".to_string(), "/zh".to_string(), "/alkanes".to_string(), "/zh/alkanes".to_string()];
+    if runes_enabled_from_global_config() {
+        paths.push("/runes".to_string());
+        paths.push("/zh/runes".to_string());
+    }
     for height in (latest_start..=tip).rev() {
         paths.push(format!("/block/{height}"));
         paths.push(format!("/zh/block/{height}"));

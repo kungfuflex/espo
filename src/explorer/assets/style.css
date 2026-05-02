@@ -1025,6 +1025,46 @@ a:hover {
   gap: 2px;
   min-width: 0;
 }
+.alkane-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.alkane-icon,
+.token-icon {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+}
+.token-icon {
+  width: 64px;
+  height: 64px;
+}
+.rune-icon-frame {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--panel2);
+  border: 1px solid var(--panel3);
+  color: var(--text);
+  font-weight: 800;
+  line-height: 1;
+}
+.rune-icon-image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.rune-icon-symbol {
+  font-size: 18px;
+}
+.token-icon .rune-icon-symbol {
+  font-size: 28px;
+}
 .alkane-meta .alk-sym {
   max-width: 100%;
   overflow: hidden;
@@ -1843,6 +1883,36 @@ a:hover {
   display: inline-flex;
   align-items: center;
   gap: 10px;
+}
+.segmented-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--panel3);
+  border-radius: 8px;
+  background: var(--panel2);
+}
+.segment {
+  min-height: 30px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.segment:hover {
+  color: var(--text);
+  background: var(--panel3);
+}
+.segment.active {
+  color: var(--text);
+  background: var(--panel3);
+}
+.segment.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 .switch {
   display: inline-flex;

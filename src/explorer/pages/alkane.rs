@@ -910,7 +910,7 @@ pub async fn alkane_page(
                         span class="alk-icon-letter" { (fallback_letter) }
                     }
                     div class="alkane-hero-text" {
-                        span class="alkane-tag" { "TOKEN" }
+                        span class="alkane-tag" { "ALKANE" }
                         h1 class="alkane-hero-title" { (display_name.clone()) }
                         span class="alkane-hero-id mono" { (alk_str.clone()) }
                     }

@@ -38,6 +38,7 @@ use crate::modules::essentials::main::Essentials;
 use crate::modules::essentials::storage::preload_block_summary_cache;
 use crate::modules::oylapi::main::OylApi;
 use crate::modules::pizzafun::main::Pizzafun;
+use crate::modules::runes::main::{Runes, runes_enabled_from_global_config};
 use crate::modules::subfrost::main::Subfrost;
 use crate::modules::tokendata::main::TokenData;
 use crate::utils::{EtaTracker, fmt_duration};
@@ -391,6 +392,9 @@ async fn run_indexer_loop(
 ) {
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
     let genesis_height = alkanes_genesis_block(network);
+    let stop_after_block = std::env::var("ESPO_STOP_AFTER_BLOCK")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
     let rewind_target = Arc::new(AtomicU32::new(NO_REWIND));
     let mut last_tip: Option<u32> = None;
     let mut mempool_started = false;
@@ -472,6 +476,15 @@ async fn run_indexer_loop(
         };
         safe_tip_waits.reset();
         update_safe_tip(tip);
+        let target_tip = stop_after_block.unwrap_or(tip);
+        if stop_after_block.is_some_and(|end| next_height > end) {
+            eprintln!(
+                "[indexer] reached configured stop block {}; shutting down indexer",
+                next_height.saturating_sub(1)
+            );
+            shutdown_requested.store(true, Ordering::Relaxed);
+            break;
+        }
         if let Some(prev_tip) = last_tip {
             if tip > prev_tip {
                 if let Err(e) = metashrew_sdb.catch_up_now() {
@@ -485,11 +498,11 @@ async fn run_indexer_loop(
         last_tip = Some(tip);
 
         if next_height == start_height && !logged_start {
-            let remaining = tip.saturating_sub(next_height) + 1;
+            let remaining = target_tip.saturating_sub(next_height) + 1;
             let eta_str = fmt_duration(eta.eta(remaining));
             eprintln!(
                 "[indexer] starting at {}, safe tip {}, {} blocks behind, ETA ~ {}",
-                next_height, tip, remaining, eta_str
+                next_height, target_tip, remaining, eta_str
             );
             logged_start = true;
         }
@@ -498,9 +511,9 @@ async fn run_indexer_loop(
             break;
         }
 
-        if next_height <= tip {
+        if next_height <= target_tip {
             // Compute a fresh ETA before starting the block
-            let remaining = tip.saturating_sub(next_height) + 1;
+            let remaining = target_tip.saturating_sub(next_height) + 1;
             let eta_str = fmt_duration(eta.eta(remaining));
 
             eprintln!(
@@ -517,7 +530,7 @@ async fn run_indexer_loop(
                 );
             }
 
-            match get_espo_block(next_height.into(), tip.into())
+            match get_espo_block(next_height.into(), target_tip.into())
                 .with_context(|| format!("failed to load espo block {next_height}"))
             {
                 Ok(espo_block) => {
@@ -633,7 +646,7 @@ async fn run_indexer_loop(
             if !safe_tip_hook_ran {
                 if let Some(script) = cfg.safe_tip_hook_script.as_deref() {
                     safe_tip_hook_ran = true;
-                    run_safe_tip_hook(script, next_height, tip);
+                    run_safe_tip_hook(script, next_height, target_tip);
                 }
             }
             // Caught up; chill then poll again
@@ -644,7 +657,7 @@ async fn run_indexer_loop(
             break;
         }
 
-        if !mempool_started && next_height >= tip.saturating_sub(1) {
+        if stop_after_block.is_none() && !mempool_started && next_height >= tip.saturating_sub(1) {
             mempool_started = true;
             let network_for_task = network;
             std::thread::spawn(move || {
@@ -689,6 +702,11 @@ async fn main() -> Result<()> {
         mods.register_module(AmmData::new());
     } else {
         eprintln!("[modules] ammdata disabled (missing config)");
+    }
+    if runes_enabled_from_global_config() {
+        mods.register_module(Runes::new());
+    } else {
+        eprintln!("[modules] runes disabled (requires modules.runes.enable=true)");
     }
     mods.register_module(TokenData::new());
     if get_module_config("subfrost").is_some() {
@@ -738,7 +756,7 @@ async fn main() -> Result<()> {
     let global_genesis = alkanes_genesis_block(network);
 
     // Decide initial start height (resume at last+1 per module)
-    let start_height = mods
+    let mut start_height = mods
         .modules()
         .iter()
         .map(|m| {
@@ -751,6 +769,13 @@ async fn main() -> Result<()> {
         .min()
         .unwrap_or(global_genesis)
         .max(global_genesis);
+    if let Some(forced_start) = std::env::var("ESPO_START_BLOCK")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        eprintln!("[indexer] forcing start block from ESPO_START_BLOCK={forced_start}");
+        start_height = forced_start;
+    }
 
     let height_cell = Arc::new(AtomicU32::new(start_height));
 

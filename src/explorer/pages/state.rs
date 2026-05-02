@@ -7,14 +7,16 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ExplorerState {
     pub essentials_mdb: Mdb,
+    pub runes_mdb: Mdb,
     pub network: Network,
 }
 
 impl ExplorerState {
     pub fn new() -> Self {
         let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
+        let runes_mdb = Mdb::from_db(crate::config::get_espo_db(), b"runes:");
         let network = get_network();
-        Self { essentials_mdb, network }
+        Self { essentials_mdb, runes_mdb, network }
     }
 
     pub fn essentials_provider(&self) -> EssentialsProvider {

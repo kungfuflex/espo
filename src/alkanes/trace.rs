@@ -470,6 +470,10 @@ fn select_canonical_traces(
     canonical_txids: &HashSet<String>,
     selected: &[(Txid, Transaction)],
 ) -> Result<CanonicalTraceSelection> {
+    if std::env::var_os("ESPO_SKIP_CANONICAL_TRACES").is_some() {
+        return Ok(CanonicalTraceSelection::default());
+    }
+
     let metashrew = get_metashrew();
     let metashrew_sdb = get_metashrew_sdb();
     metashrew_sdb

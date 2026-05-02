@@ -14,6 +14,7 @@ use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
 use crate::config::{get_bitcoind_rpc_client, get_espo_next_height, show_terminal_ad};
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::layout::layout_with_meta;
+use crate::explorer::components::rune_icon::rune_icon;
 use crate::explorer::components::svg_assets::icon_right;
 use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
 use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summaries};
@@ -23,6 +24,8 @@ use crate::modules::essentials::storage::{
     AlkaneTxSummary, EssentialsProvider, EssentialsTable, GetHoldersOrderedPageParams,
     HoldersCountEntry, load_creation_record, load_tx_summary_v2,
 };
+use crate::modules::runes::main::runes_enabled_from_global_config;
+use crate::modules::runes::storage::{RuneEntry, RunesProvider};
 use crate::schemas::EspoOutpoint;
 use std::sync::Arc;
 
@@ -173,14 +176,41 @@ fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<A
     out
 }
 
+fn top_runes_table(rows: Vec<(RuneEntry, u64)>) -> Markup {
+    if rows.is_empty() {
+        return html! { p class="muted" { "No runes found." } };
+    }
+
+    html! {
+        table class="table holders_table home-table" {
+            tbody {
+                @for (entry, holders) in rows {
+                    @let id = entry.id.to_string();
+                    tr {
+                        td class="alkane-main-cell" {
+                            div class="alkane-main" {
+                                (rune_icon(&entry, "alkane-icon"))
+                                div class="alkane-meta" {
+                                    a class="alk-sym link mono alkane-name-link" href=(explorer_path(&format!("/rune/{id}"))) { (entry.spaced_name.clone()) }
+                                    div class="muted mono alkane-id" { (id) }
+                                }
+                            }
+                        }
+                        td class="mono holders-count" { (holders) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
     let rpc = get_bitcoind_rpc_client();
     let tip = rpc.get_blockchain_info().map(|i| i.blocks).unwrap_or(0);
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let latest_height = espo_tip.min(tip);
+    let runes_enabled = runes_enabled_from_global_config();
     let top_alkanes = load_top_alkanes_by_holders(&state.essentials_mdb, 10);
-    let latest_alkane_txs = load_latest_alkane_txs(&state.essentials_mdb, 4);
-    let latest_block_link = explorer_path(&format!("/block/{espo_tip}?traces=1"));
     let alkanes_link = explorer_path("/alkanes");
     let recent_block_heights: Vec<u64> =
         (latest_height.saturating_sub(9)..=latest_height).rev().collect();
@@ -192,25 +222,40 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
         alkanes_table(&top_alkanes, false, false, true)
     };
 
-    let latest_txs_table: Markup = if latest_alkane_txs.is_empty() {
-        html! { p class="muted" { "No alkane transactions found." } }
+    let (secondary_title, secondary_link_label, secondary_link, secondary_table): (
+        &str,
+        &str,
+        String,
+        Markup,
+    ) = if runes_enabled {
+        let top_runes = RunesProvider::new(Arc::new(state.runes_mdb.clone()))
+            .get_top_runes(1, 10)
+            .unwrap_or_default();
+        ("Top Runes", "View more Runes", explorer_path("/runes"), top_runes_table(top_runes))
     } else {
-        html! {
-            table class="table holders_table home-table" {
-                tbody {
-                    @for row in latest_alkane_txs {
-                        tr {
-                            td class="tx-trace-cell" {
-                                div class="tx-trace-header" {
-                                    a class="link mono tx-trace-id" href=(explorer_path(&format!("/tx/{}", row.txid))) { (row.txid) }
+        let latest_alkane_txs = load_latest_alkane_txs(&state.essentials_mdb, 4);
+        let latest_block_link = explorer_path(&format!("/block/{espo_tip}?traces=1"));
+        let latest_txs_table: Markup = if latest_alkane_txs.is_empty() {
+            html! { p class="muted" { "No alkane transactions found." } }
+        } else {
+            html! {
+                table class="table holders_table home-table" {
+                    tbody {
+                        @for row in latest_alkane_txs {
+                            tr {
+                                td class="tx-trace-cell" {
+                                    div class="tx-trace-header" {
+                                        a class="link mono tx-trace-id" href=(explorer_path(&format!("/tx/{}", row.txid))) { (row.txid) }
+                                    }
+                                    (render_trace_summaries(std::slice::from_ref(&row.trace), &state.essentials_mdb))
                                 }
-                                (render_trace_summaries(std::slice::from_ref(&row.trace), &state.essentials_mdb))
                             }
                         }
                     }
                 }
             }
-        }
+        };
+        ("Latest Traces", "View more Alkane txs", latest_block_link, latest_txs_table)
     };
 
     layout_with_meta(
@@ -272,14 +317,14 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
                 }
                 div class="home-table-block" {
                     div class="home-table-header" {
-                            h2 class="h2" { "Latest Traces" }
-                        a class="home-table-link" href=(latest_block_link) {
-                            "View more Alkane txs"
+                        h2 class="h2" { (secondary_title) }
+                        a class="home-table-link" href=(secondary_link) {
+                            (secondary_link_label)
                             (icon_right())
                         }
                     }
                     div class="home-table-card" {
-                        (latest_txs_table)
+                        (secondary_table)
                     }
                 }
             }
