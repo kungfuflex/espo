@@ -173,11 +173,13 @@ fn main() -> Result<()> {
             height,
             blockhash: blockhash.to_byte_array(),
             trace_count: old_summary.trace_count,
+            interaction_count: old_summary.trace_count,
             tx_count,
             header,
             fee_avg: fee_summary.avg,
             fee_median: fee_summary.median,
             fee_range: fee_summary.range.to_vec(),
+            pool: None,
         };
 
         if let Err(err) = provider.put_block_summary_indexes(&new_summary) {

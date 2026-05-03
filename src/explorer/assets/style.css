@@ -201,7 +201,7 @@ a:hover {
 .dropdown-trigger {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 14px;
   padding: 10px;
   border: 0;
   border-radius: 8px;
@@ -1024,6 +1024,7 @@ a:hover {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  max-width: 100%;
 }
 .alkane-main {
   display: flex;
@@ -1041,32 +1042,11 @@ a:hover {
   width: 64px;
   height: 64px;
 }
-.rune-icon-frame {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-  border-radius: 6px;
-  background: var(--panel2);
-  border: 1px solid var(--panel3);
-  color: var(--text);
-  font-weight: 800;
-  line-height: 1;
-}
-.rune-icon-image {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
+.alkane-meta .alk-sym,
+.alkane-name-link {
   display: block;
-}
-.rune-icon-symbol {
-  font-size: 18px;
-}
-.token-icon .rune-icon-symbol {
-  font-size: 28px;
-}
-.alkane-meta .alk-sym {
   max-width: 100%;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1881,21 +1861,22 @@ a:hover {
 .trace-toggle {
   margin-left: auto;
   display: inline-flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 16px;
 }
 .segmented-control {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
-  padding: 2px;
+  gap: 4px;
+  padding: 4px;
   border: 1px solid var(--panel3);
   border-radius: 8px;
   background: var(--panel2);
 }
 .segment {
   min-height: 30px;
-  padding: 6px 10px;
+  padding: 8px 12px;
   border-radius: 6px;
   color: var(--muted);
   font-weight: 600;
@@ -1905,6 +1886,7 @@ a:hover {
 .segment:hover {
   color: var(--text);
   background: var(--panel3);
+  text-decoration: none;
 }
 .segment.active {
   color: var(--text);
@@ -1957,6 +1939,26 @@ a:hover {
 .switch-input:checked + .switch-slider::before {
   transform: translateX(20px);
 }
+@media (max-width: 720px) {
+  .trace-toggle {
+    width: 100%;
+    margin-left: 0;
+    align-items: flex-start;
+    justify-content: flex-start;
+  }
+  .trace-toggle .segmented-control {
+    max-width: 100%;
+    overflow-x: auto;
+    gap: 2px;
+    padding: 2px;
+  }
+  .trace-toggle .segment {
+    min-height: 26px;
+    padding: 5px 7px;
+    font-size: 12px;
+    border-radius: 5px;
+  }
+}
 .address-balance-chart-card {
   position: relative;
   display: flex;
@@ -1992,6 +1994,13 @@ a:hover {
   min-width: 260px;
   max-height: 320px;
   overflow-y: auto;
+}
+.address-balance-dropdown-group-title {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0;
+  padding: 4px;
 }
 .address-balance-dropdown .dropdown-icon {
   width: 22px;
@@ -2144,6 +2153,7 @@ a:hover {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 .trace-contract-icon,
 .alk-icon-wrap {
@@ -2168,6 +2178,7 @@ a:hover {
   inset: 0;
   width: 100%;
   height: 100%;
+  object-fit: cover;
   border-radius: 50%;
   z-index: 2;
   background-position: center;
@@ -2181,9 +2192,19 @@ a:hover {
   z-index: 1;
   font-size: 14px;
 }
+.alkane-icon.alk-icon-wrap {
+  width: 38px;
+  height: 38px;
+}
+.token-icon.alk-icon-wrap {
+  width: 64px;
+  height: 64px;
+}
 .trace-contract-meta {
   display: grid;
   gap: 2px;
+  min-width: 0;
+  max-width: 100%;
 }
 .trace-method-icon {
   display: flex;
@@ -2242,6 +2263,7 @@ a:hover {
   flex-direction: column;
   gap: 6px;
   min-width: 0;
+  max-width: 100%;
 }
 .alkane-tag {
   display: inline-flex;
@@ -2261,6 +2283,10 @@ a:hover {
   margin: 0;
   font-size: 30px;
   line-height: 1.2;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .alkane-hero-id {
   color: var(--muted2);
@@ -2544,7 +2570,12 @@ a:hover {
   font-size: 14px;
 }
 .alkane-inspect-name {
+  display: block;
   font-size: 18px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .alkane-inspect-id {
   color: var(--muted2);
@@ -2697,10 +2728,12 @@ button:hover {
   }
 }
 .trace-contract-name {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: 8px;
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 600;
   color: var(--muted);
 }
@@ -2900,12 +2933,15 @@ button:hover {
   border-radius: 8px;
   padding: 12px;
   width: 100%;
+  min-width: 0;
 }
 .alk-line {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 2px 0;
+  min-width: 0;
+  width: 100%;
 }
 .alk-arrow .icon {
   width: 16px;
@@ -2922,8 +2958,15 @@ button:hover {
   color: #fff;
   font-weight: 600;
   letter-spacing: 0.1px;
+  flex: 0 0 auto;
 }
 .alk-sym {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--muted3);
   font-weight: 600;
   text-transform: uppercase;
@@ -2951,6 +2994,11 @@ button:hover {
   }
 }
 .alk-name {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--muted2);
   font-size: 13px;
 }
@@ -3180,6 +3228,7 @@ button:hover {
   flex-direction: row;
   flex-wrap: wrap;
   gap: 8px;
+  min-width: 0;
 }
 .search-result {
   display: inline-flex;
@@ -3192,6 +3241,8 @@ button:hover {
   text-decoration: none;
   font-weight: 600;
   width: fit-content;
+  max-width: 100%;
+  min-width: 0;
 }
 .search-result:hover {
   background: #444855;
@@ -3212,6 +3263,15 @@ button:hover {
   font-weight: 700;
   color: #fff;
   background: var(--link-dark);
+  flex: 0 0 auto;
+}
+.search-result-label {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .search-alk-icon {
   width: 28px;
@@ -3270,7 +3330,7 @@ button:hover {
   position: absolute;
   left: 12px;
   top: 50%;
-  z-index: 20;
+  z-index: 8;
   width: 50px;
   height: 50px;
   padding: 0;
@@ -3472,6 +3532,9 @@ button:hover {
 .bc-card:hover {
   transform: none;
   text-decoration: none;
+}
+.bc-shell-face {
+  min-height: 100%;
 }
 .bc-card.current {
   outline: none;

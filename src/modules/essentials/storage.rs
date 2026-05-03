@@ -2646,6 +2646,18 @@ impl EssentialsProvider {
         Ok(())
     }
 
+    pub fn update_block_summary_by_hash(&self, summary: &BlockSummary) -> Result<()> {
+        let Some(blockhash) = summary.block_hash() else {
+            return Err(anyhow!("block summary missing blockhash"));
+        };
+        let summary_key = self.table().block_summary_by_hash_key(&blockhash);
+        let summary_bytes = borsh::to_vec(summary)?;
+        self.blob_mdb
+            .put(&summary_key, &summary_bytes)
+            .map_err(|e| anyhow!("blob_mdb.put block summary failed: {e}"))?;
+        Ok(())
+    }
+
     pub fn get_mempool_seen_page(
         &self,
         params: GetMempoolSeenPageParams,
@@ -3022,22 +3034,45 @@ impl EssentialsProvider {
             .ok()
             .and_then(|resp| resp.summary);
 
-        let (trace_count, tx_count, header_hex, blockhash, fee_avg, fee_median, fee_range, found) =
-            if let Some(summary) = summary {
-                let blockhash = summary.block_hash().map(|h| h.to_string());
-                (
-                    summary.trace_count,
-                    summary.tx_count,
-                    Some(hex::encode(summary.header)),
-                    blockhash,
-                    summary.fee_avg,
-                    summary.fee_median,
-                    summary.fee_range,
-                    true,
-                )
-            } else {
-                (0, 0, None, None, 0.0, 0.0, Vec::new(), false)
-            };
+        let (
+            trace_count,
+            interaction_count,
+            tx_count,
+            header_hex,
+            blockhash,
+            fee_avg,
+            fee_median,
+            fee_range,
+            pool,
+            found,
+        ) = if let Some(summary) = summary {
+            let blockhash = summary.block_hash().map(|h| h.to_string());
+            let pool = summary.pool.map(|pool| {
+                json!({
+                    "id": pool.id,
+                    "name": pool.name,
+                    "slug": pool.slug,
+                    "matched": pool.matched,
+                    "link": pool.link,
+                    "mempool_url": pool.mempool_url,
+                    "icon_url": pool.icon_url,
+                })
+            });
+            (
+                summary.trace_count,
+                summary.interaction_count,
+                summary.tx_count,
+                Some(hex::encode(summary.header)),
+                blockhash,
+                summary.fee_avg,
+                summary.fee_median,
+                summary.fee_range,
+                pool,
+                true,
+            )
+        } else {
+            (0, 0, 0, None, None, 0.0, 0.0, Vec::new(), None, false)
+        };
 
         Ok(RpcGetBlockSummaryResult {
             value: json!({
@@ -3045,12 +3080,14 @@ impl EssentialsProvider {
                 "height": height,
                 "found": found,
                 "trace_count": trace_count,
+                "interaction_count": interaction_count,
                 "tx_count": tx_count,
                 "blockhash": blockhash,
                 "header_hex": header_hex,
                 "fee_avg": fee_avg,
                 "fee_median": fee_median,
                 "fee_range": fee_range,
+                "pool": pool,
             }),
         })
     }
@@ -5205,7 +5242,45 @@ pub struct HoldersCountEntry {
 }
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct BlockSummaryPool {
+    pub id: Option<u16>,
+    pub name: String,
+    pub slug: String,
+    pub matched: bool,
+    pub link: Option<String>,
+    pub mempool_url: Option<String>,
+    pub icon_url: Option<String>,
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct BlockSummary {
+    pub height: u32,
+    pub blockhash: [u8; 32],
+    pub trace_count: u32,
+    pub interaction_count: u32,
+    pub tx_count: u32,
+    pub header: Vec<u8>,
+    pub fee_avg: f64,
+    pub fee_median: f64,
+    pub fee_range: Vec<f64>,
+    pub pool: Option<BlockSummaryPool>,
+}
+
+#[derive(Clone, Debug, BorshDeserialize)]
+struct LegacyBlockSummaryV3 {
+    pub height: u32,
+    pub blockhash: [u8; 32],
+    pub trace_count: u32,
+    pub interaction_count: u32,
+    pub tx_count: u32,
+    pub header: Vec<u8>,
+    pub fee_avg: f64,
+    pub fee_median: f64,
+    pub fee_range: Vec<f64>,
+}
+
+#[derive(Clone, Debug, BorshDeserialize)]
+struct LegacyBlockSummaryV2 {
     pub height: u32,
     pub blockhash: [u8; 32],
     pub trace_count: u32,
@@ -5234,15 +5309,45 @@ impl BlockSummary {
         Self::try_from_slice(raw)
             .ok()
             .or_else(|| {
+                LegacyBlockSummaryV3::try_from_slice(raw).ok().map(|legacy| Self {
+                    height: legacy.height,
+                    blockhash: legacy.blockhash,
+                    trace_count: legacy.trace_count,
+                    interaction_count: legacy.interaction_count,
+                    tx_count: legacy.tx_count,
+                    header: legacy.header,
+                    fee_avg: legacy.fee_avg,
+                    fee_median: legacy.fee_median,
+                    fee_range: legacy.fee_range,
+                    pool: None,
+                })
+            })
+            .or_else(|| {
+                LegacyBlockSummaryV2::try_from_slice(raw).ok().map(|legacy| Self {
+                    height: legacy.height,
+                    blockhash: legacy.blockhash,
+                    trace_count: legacy.trace_count,
+                    interaction_count: legacy.trace_count,
+                    tx_count: legacy.tx_count,
+                    header: legacy.header,
+                    fee_avg: legacy.fee_avg,
+                    fee_median: legacy.fee_median,
+                    fee_range: legacy.fee_range,
+                    pool: None,
+                })
+            })
+            .or_else(|| {
                 LegacyBlockSummaryV1::try_from_slice(raw).ok().map(|legacy| Self {
                     height: 0,
                     blockhash: [0; 32],
                     trace_count: legacy.trace_count,
+                    interaction_count: legacy.trace_count,
                     tx_count: legacy.tx_count,
                     header: legacy.header,
                     fee_avg: 0.0,
                     fee_median: 0.0,
                     fee_range: Vec::new(),
+                    pool: None,
                 })
             })
             .or_else(|| {
@@ -5250,11 +5355,13 @@ impl BlockSummary {
                     height: 0,
                     blockhash: [0; 32],
                     trace_count: legacy.trace_count,
+                    interaction_count: legacy.trace_count,
                     tx_count: 0,
                     header: legacy.header,
                     fee_avg: 0.0,
                     fee_median: 0.0,
                     fee_range: Vec::new(),
+                    pool: None,
                 })
             })
     }
@@ -5334,6 +5441,7 @@ pub fn preload_block_summary_cache(mdb: &Mdb) -> usize {
 
     let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
     let mut loaded = 0usize;
+    let mut misses_after_first_summary = 0usize;
     let mut height = index_height;
     loop {
         if loaded >= BLOCK_SUMMARY_CACHE_CAP {
@@ -5342,6 +5450,12 @@ pub fn preload_block_summary_cache(mdb: &Mdb) -> usize {
         if let Ok(Some(summary)) = provider.get_latest_block_summary_by_height(height) {
             cache_block_summary(height, summary);
             loaded += 1;
+            misses_after_first_summary = 0;
+        } else if loaded > 0 {
+            misses_after_first_summary += 1;
+            if misses_after_first_summary >= 256 {
+                break;
+            }
         }
         if height == 0 {
             break;

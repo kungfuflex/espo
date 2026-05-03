@@ -1,13 +1,14 @@
 use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
 use crate::config::{debug_enabled, get_metashrew, get_network};
 use crate::debug;
+use crate::explorer::mining_pools::detect_pool_from_coinbase_tx;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::consts::{
     ESSENTIALS_GENESIS_INSPECTIONS, essentials_genesis_block,
 };
 use crate::modules::essentials::rpc;
 use crate::modules::essentials::storage::{
-    BlockSummary, EssentialsProvider, GetRawValueParams, cache_block_summary,
+    BlockSummary, BlockSummaryPool, EssentialsProvider, GetRawValueParams, cache_block_summary,
     compute_block_fee_rate_summary, encode_creation_record,
 };
 use crate::modules::essentials::utils::creation_meta::{get_cap, get_value_per_mint};
@@ -18,6 +19,7 @@ use crate::modules::essentials::utils::inspections::{
 use crate::modules::essentials::utils::names::{
     get_name as get_alkane_name, normalize_alkane_name,
 };
+use crate::modules::runes::main::{runes_enabled_from_global_config, runes_genesis_block};
 use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
@@ -167,7 +169,11 @@ impl EspoModule for Essentials {
     }
 
     fn get_genesis_block(&self, network: Network) -> u32 {
-        essentials_genesis_block(network)
+        if runes_enabled_from_global_config() {
+            essentials_genesis_block(network).min(runes_genesis_block(network))
+        } else {
+            essentials_genesis_block(network)
+        }
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
@@ -227,6 +233,11 @@ impl EspoModule for Essentials {
             .iter()
             .map(|tx| tx.traces.as_ref().map(|t| t.len()).unwrap_or(0))
             .sum::<usize>() as u32;
+        let interaction_count = block
+            .transactions
+            .iter()
+            .filter(|tx| tx.traces.as_ref().map(|t| !t.is_empty()).unwrap_or(false))
+            .count() as u32;
         let tx_count = block.transactions.len() as u32;
         let mut header_bytes = Vec::new();
         block.block_header.consensus_encode(&mut header_bytes)?;
@@ -235,15 +246,29 @@ impl EspoModule for Essentials {
             Some(summary) => summary,
             None => compute_block_fee_rate_summary(&blockhash)?,
         };
+        let pool = block.transactions.first().map(|tx| {
+            let display = detect_pool_from_coinbase_tx(&tx.transaction, get_network());
+            BlockSummaryPool {
+                id: display.id,
+                name: display.name,
+                slug: display.slug,
+                matched: display.matched,
+                link: display.link,
+                mempool_url: display.mempool_url,
+                icon_url: display.icon_url,
+            }
+        });
         let block_summary = BlockSummary {
             height: block.height,
             blockhash: blockhash.to_byte_array(),
             trace_count,
+            interaction_count,
             tx_count,
             header: header_bytes,
             fee_avg: fee_summary.avg,
             fee_median: fee_summary.median,
             fee_range: fee_summary.range.to_vec(),
+            pool,
         };
 
         let mut total_pairs_dedup = 0usize;

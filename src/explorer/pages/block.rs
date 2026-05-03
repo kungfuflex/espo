@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -84,6 +84,7 @@ pub struct BlockPageQuery {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxFilter {
     All,
+    Action,
     Alkane,
     Rune,
 }
@@ -92,6 +93,7 @@ impl TxFilter {
     fn from_query(txs: Option<&str>, traces: Option<&str>) -> Self {
         match txs {
             Some("all") => Self::All,
+            Some("action") | Some("actions") | Some("all_actions") => Self::Action,
             Some("rune") | Some("runes") => Self::Rune,
             Some("alkane") | Some("alkanes") => Self::Alkane,
             _ => {
@@ -105,6 +107,7 @@ impl TxFilter {
     fn query_value(self) -> &'static str {
         match self {
             Self::All => "all",
+            Self::Action => "actions",
             Self::Alkane => "alkane",
             Self::Rune => "rune",
         }
@@ -291,12 +294,17 @@ pub async fn block_page(
     let espo_indexed = height <= espo_tip;
     let essentials_provider = state.essentials_provider();
     let runes_enabled = runes_enabled_from_global_config();
-    let requested_filter = TxFilter::from_query(q.txs.as_deref(), q.traces.as_deref());
-    let tx_filter = if !runes_enabled && requested_filter == TxFilter::Rune {
-        TxFilter::Alkane
+    let requested_filter = if runes_enabled && q.txs.is_none() && q.traces.is_none() {
+        TxFilter::Action
     } else {
-        requested_filter
+        TxFilter::from_query(q.txs.as_deref(), q.traces.as_deref())
     };
+    let tx_filter =
+        if !runes_enabled && matches!(requested_filter, TxFilter::Rune | TxFilter::Action) {
+            TxFilter::Alkane
+        } else {
+            requested_filter
+        };
     let hide_diesel_mints = q
         .hide_diesel_mints
         .as_deref()
@@ -366,7 +374,72 @@ pub async fn block_page(
     let hide_diesel_param = if hide_diesel_mints { "1" } else { "0" };
 
     if espo_indexed {
-        if tx_filter == TxFilter::Alkane {
+        if tx_filter == TxFilter::Action {
+            let total = runes_provider.get_action_block_tx_count(height).unwrap_or(0) as usize;
+            let mut pointers = if hide_diesel_mints {
+                runes_provider
+                    .get_action_block_tx_range(height, 0, total as u64)
+                    .unwrap_or_default()
+            } else {
+                let off = limit.saturating_mul(page.saturating_sub(1));
+                let end = (off + limit).min(total);
+                runes_provider
+                    .get_action_block_tx_range(height, off as u64, end as u64)
+                    .unwrap_or_default()
+            };
+            if hide_diesel_mints {
+                pointers.retain(|pointer| {
+                    let txid = Txid::from_byte_array(pointer.txid);
+                    let summary = load_tx_summary_v2(&essentials_provider, &txid);
+                    let traces = summary
+                        .as_ref()
+                        .map(|s| traces_from_summary(&txid, s))
+                        .filter(|t| !t.is_empty());
+                    !is_diesel_mint_tx(traces.as_deref())
+                        && !is_uncommon_goods_mint_tx(&txid, &runes_provider)
+                });
+            }
+
+            tx_total = if hide_diesel_mints { pointers.len() } else { total };
+            let off = limit.saturating_mul(page.saturating_sub(1));
+            let end = (off + limit).min(tx_total);
+            tx_has_prev = page > 1 && off < tx_total;
+            tx_has_next = end < tx_total;
+            if tx_total > 0 && off < tx_total {
+                display_start = off + 1;
+                display_end = end;
+                last_page = (tx_total + limit - 1) / limit;
+            }
+
+            let page_pointers = if hide_diesel_mints {
+                pointers.into_iter().skip(off).take(end.saturating_sub(off)).collect::<Vec<_>>()
+            } else {
+                pointers
+            };
+            let txids: Vec<Txid> = page_pointers
+                .iter()
+                .map(|pointer| Txid::from_byte_array(pointer.txid))
+                .collect();
+            let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+            for (idx, txid) in txids.iter().enumerate() {
+                let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                if raw.is_empty() {
+                    continue;
+                }
+                let Ok(tx) = deserialize::<Transaction>(&raw) else {
+                    continue;
+                };
+                let summary = load_tx_summary_v2(&essentials_provider, txid);
+                let traces = summary
+                    .as_ref()
+                    .map(|s| traces_from_summary(txid, s))
+                    .filter(|t| !t.is_empty());
+                tx_items.push(BlockTxItem { txid: *txid, tx, traces });
+            }
+            if tx_total > 0 && off < tx_total {
+                display_end = (off + tx_items.len()).min(tx_total);
+            }
+        } else if tx_filter == TxFilter::Alkane {
             let list_id = address_index_list_id_alkane_block_txs(height);
             let total = get_address_index_list_len(
                 &essentials_provider,
@@ -405,7 +478,7 @@ pub async fn block_page(
                         .map(|s| traces_from_summary(txid, s))
                         .filter(|t| !t.is_empty());
                     if !is_diesel_mint_tx(traces.as_deref())
-                        && !is_uncommon_goods_mint_tx(txid, &runes_provider)
+                        && (!runes_enabled || !is_uncommon_goods_mint_tx(txid, &runes_provider))
                     {
                         filtered_txids.push(*txid);
                     }
@@ -574,7 +647,8 @@ pub async fn block_page(
             if hide_diesel_mints {
                 tx_items.retain(|item| {
                     !is_diesel_mint_tx(item.traces.as_deref())
-                        && !is_uncommon_goods_mint_tx(&item.txid, &runes_provider)
+                        && (!runes_enabled
+                            || !is_uncommon_goods_mint_tx(&item.txid, &runes_provider))
                 });
             }
             if tx_total > 0 {
@@ -651,6 +725,44 @@ pub async fn block_page(
     let confirmations = (tip >= height).then_some(tip - height + 1);
     let traces_count: Option<usize> =
         block_summary.as_ref().map(|summary| summary.trace_count as usize);
+    let interaction_count: Option<usize> = if runes_enabled && espo_indexed {
+        let mut txids: HashSet<Txid> = HashSet::new();
+        let list_id = address_index_list_id_alkane_block_txs(height);
+        let alkane_total = get_address_index_list_len(
+            &essentials_provider,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneBlockTxs,
+            &list_id,
+        )
+        .unwrap_or(0);
+        if alkane_total > 0 {
+            let ids = get_address_index_list_range(
+                &essentials_provider,
+                StateAt::Latest,
+                AddressIndexListKind::AlkaneBlockTxs,
+                &list_id,
+                0,
+                alkane_total,
+            )
+            .unwrap_or_default();
+            for id in ids {
+                if let Some(blob) = load_tx_pointer_blob_v3_by_id(&essentials_provider, id) {
+                    txids.insert(Txid::from_byte_array(blob.txid));
+                }
+            }
+        }
+        let rune_total = runes_provider.get_block_tx_count(height).unwrap_or(0);
+        if rune_total > 0 {
+            for pointer in
+                runes_provider.get_block_tx_range(height, 0, rune_total).unwrap_or_default()
+            {
+                txids.insert(Txid::from_byte_array(pointer.txid));
+            }
+        }
+        Some(if txids.is_empty() { traces_count.unwrap_or(0) } else { txids.len() })
+    } else {
+        traces_count
+    };
     let tx_count: Option<u64> = block_summary
         .as_ref()
         .and_then(|summary| (summary.tx_count > 0).then_some(summary.tx_count as u64))
@@ -678,8 +790,8 @@ pub async fn block_page(
         },
     });
     summary_items.push(HeaderSummaryItem {
-        label: "Traces".to_string(),
-        value: match traces_count {
+        label: if runes_enabled { "Interactions" } else { "Traces" }.to_string(),
+        value: match interaction_count {
             Some(t) => html! { span class="summary-value" { (format_with_commas(t as u64)) } },
             None => html! { span class="summary-value muted" { (if espo_indexed { "—" } else { "Not indexed" }) } },
         },
@@ -736,16 +848,22 @@ pub async fn block_page(
                             div class="segmented-control" role="group" aria-label="Transaction filter" {
                                 a class=(if tx_filter == TxFilter::All { "segment active" } else { "segment" })
                                     href=(explorer_path(&format!("/block/{height}?tab=txs&page=1&limit={limit}&txs=all&hide_diesel_mints={hide_diesel_param}"))) {
-                                    "All txs"
+                                    "All Txs"
+                                }
+                                @if runes_enabled {
+                                    a class=(if tx_filter == TxFilter::Action { "segment active" } else { "segment" })
+                                        href=(explorer_path(&format!("/block/{height}?tab=txs&page=1&limit={limit}&txs=actions&hide_diesel_mints={hide_diesel_param}"))) {
+                                        "All Actions"
+                                    }
                                 }
                                 a class=(if tx_filter == TxFilter::Alkane { "segment active" } else { "segment" })
                                     href=(explorer_path(&format!("/block/{height}?tab=txs&page=1&limit={limit}&txs=alkane&hide_diesel_mints={hide_diesel_param}"))) {
-                                    "Alkane txs"
+                                    "Only Alkanes"
                                 }
                                 @if runes_enabled {
                                     a class=(if tx_filter == TxFilter::Rune { "segment active" } else { "segment" })
                                         href=(explorer_path(&format!("/block/{height}?tab=txs&page=1&limit={limit}&txs=rune&hide_diesel_mints={hide_diesel_param}"))) {
-                                        "Rune txs"
+                                        "Only Runes"
                                     }
                                 }
                             }
@@ -756,7 +874,13 @@ pub async fn block_page(
                                 input type="hidden" name="txs" value=(txs_param);
                                 input type="hidden" name="hide_diesel_mints" value=(hide_diesel_param);
                                 label class="switch" {
-                                    span class="switch-label" { "Hide Diesel+UG mints" }
+                                    span class="switch-label" {
+                                        @if runes_enabled {
+                                            "Hide Diesel+UG mints"
+                                        } @else {
+                                            "Hide Diesel mints"
+                                        }
+                                    }
                                     input
                                         class="switch-input"
                                         type="checkbox"
@@ -806,13 +930,13 @@ pub async fn block_page(
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                         }
                         span class="pager-meta muted" { "Showing "
-                            (if tx_total > 0 { display_start } else { 0 })
+                            (format_with_commas(if tx_total > 0 { display_start as u64 } else { 0 }))
                             @if tx_total > 0 {
                                 "-"
-                                (display_end)
+                                (format_with_commas(display_end as u64))
                             }
                             " / "
-                            (tx_total)
+                            (format_with_commas(tx_total as u64))
                         }
                         @if tx_has_next {
                             a class="pill iconbtn" href=(explorer_path(&format!("/block/{height}?tab=txs&page={}&limit={limit}&txs={txs_param}&hide_diesel_mints={hide_diesel_param}", page + 1))) aria-label="Next page" {
@@ -858,6 +982,7 @@ pub async fn mempool_block_page(
         .as_deref()
         .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
         .unwrap_or(false);
+    let runes_enabled = runes_enabled_from_global_config();
     let traces_param = if traces_only { "1" } else { "0" };
     let hide_diesel_param = if hide_diesel_mints { "1" } else { "0" };
     let display_index = display_index.max(1);
@@ -967,7 +1092,7 @@ pub async fn mempool_block_page(
         value: html! { span class="summary-value" { (format_with_commas(detail.template.tx_count as u64)) } },
     });
     summary_items.push(HeaderSummaryItem {
-        label: "Traces".to_string(),
+        label: if runes_enabled { "Interactions" } else { "Traces" }.to_string(),
         value: html! { span class="summary-value" { (format_with_commas(detail.template.trace_count as u64)) } },
     });
     summary_items.push(HeaderSummaryItem {
@@ -1006,13 +1131,15 @@ pub async fn mempool_block_page(
                         div class="segmented-control" role="group" aria-label="Transaction filter" {
                             a class=(if traces_only { "segment" } else { "segment active" })
                                 href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&traces=0&hide_diesel_mints={hide_diesel_param}"))) {
-                                "All txs"
+                                "All Txs"
                             }
                             a class=(if traces_only { "segment active" } else { "segment" })
                                 href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&traces=1&hide_diesel_mints={hide_diesel_param}"))) {
-                                "Alkane txs"
+                                "Only Alkanes"
                             }
-                            span class="segment disabled" aria-disabled="true" { "Rune txs" }
+                            @if runes_enabled {
+                                span class="segment disabled" aria-disabled="true" { "Only Runes" }
+                            }
                         }
                         form method="get" action=(explorer_path(&format!("/mempool-block/{display_index}"))) {
                             input type="hidden" name="limit" value=(limit);
@@ -1020,7 +1147,13 @@ pub async fn mempool_block_page(
                             input type="hidden" name="traces" value=(traces_param);
                             input type="hidden" name="hide_diesel_mints" value=(hide_diesel_param);
                             label class="switch" {
-                                span class="switch-label" { "Hide Diesel+UG mints" }
+                                span class="switch-label" {
+                                    @if runes_enabled {
+                                        "Hide Diesel+UG mints"
+                                    } @else {
+                                        "Hide Diesel mints"
+                                    }
+                                }
                                 input
                                     class="switch-input"
                                     type="checkbox"
@@ -1072,13 +1205,13 @@ pub async fn mempool_block_page(
                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                     }
                     span class="pager-meta muted" { "Showing "
-                        (display_start)
+                        (format_with_commas(display_start as u64))
                         @if tx_total > 0 {
                             "-"
-                            (display_end)
+                            (format_with_commas(display_end as u64))
                         }
                         " / "
-                        (tx_total)
+                        (format_with_commas(tx_total as u64))
                     }
                     @if tx_has_next {
                         a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page + 1))) aria-label="Next page" {

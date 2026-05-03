@@ -28,13 +28,7 @@ impl Mdb {
     fn should_enable_versioned_namespace(prefix: &[u8]) -> bool {
         matches!(
             prefix,
-            b"essentials:"
-                | b"ammdata:"
-                | b"tokendata:"
-                | b"subfrost:"
-                | b"pizzafun:"
-                | b"oylapi:"
-                | b"runes:"
+            b"essentials:" | b"ammdata:" | b"tokendata:" | b"subfrost:" | b"pizzafun:" | b"oylapi:"
         )
     }
 

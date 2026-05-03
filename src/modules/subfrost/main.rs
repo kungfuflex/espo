@@ -87,8 +87,8 @@ impl EspoModule for Subfrost {
         }
     }
 
-    fn get_genesis_block(&self, _network: Network) -> u32 {
-        0
+    fn get_genesis_block(&self, network: Network) -> u32 {
+        crate::modules::essentials::consts::essentials_genesis_block(network)
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {

@@ -1,7 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bitcoin::{Address, Txid};
 use electrum_client::{Client as ElectrumClient, ElectrumApi, Param};
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{StreamExt, stream};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -9,6 +9,8 @@ use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::runtime::{Handle, Runtime};
+
+const ESPLORA_RAW_TX_CONCURRENCY: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ElectrumLikeBackend {
@@ -193,6 +195,9 @@ impl EsploraElectrumLike {
     }
 
     async fn fetch_one_indexed(&self, idx: usize, txid: &Txid) -> Result<(usize, Vec<u8>)> {
+        if crate::runtime::shutdown::is_shutdown_requested() {
+            bail!("shutdown requested");
+        }
         let url = format!("{}/tx/{}/raw", self.base_url, txid);
         let resp = self
             .http
@@ -211,6 +216,9 @@ impl EsploraElectrumLike {
     where
         F: Future<Output = Result<T>>,
     {
+        if crate::runtime::shutdown::is_shutdown_requested() {
+            bail!("shutdown requested");
+        }
         match Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
             Err(_) => {
@@ -321,16 +329,25 @@ impl ElectrumLike for EsploraElectrumLike {
         }
 
         self.block_on_result(async {
-            let mut futs = FuturesUnordered::new();
-            for (idx, txid) in txids.iter().enumerate() {
-                futs.push(self.fetch_one_indexed(idx, txid));
-            }
-
+            let mut futs = stream::iter(txids.iter().enumerate())
+                .map(|(idx, txid)| async move {
+                    let txid = *txid;
+                    (txid, self.fetch_one_indexed(idx, &txid).await)
+                })
+                .buffer_unordered(ESPLORA_RAW_TX_CONCURRENCY);
             let mut out = vec![Vec::new(); txids.len()];
-            while let Some(res) = futs.next().await {
+            while let Some((_, res)) = futs.next().await {
+                if crate::runtime::shutdown::is_shutdown_requested() {
+                    break;
+                }
                 match res {
                     Ok((idx, raw)) => out[idx] = raw,
-                    Err(e) => eprintln!("[esplora] failed to fetch raw tx: {e:?}"),
+                    Err(e) => {
+                        if crate::runtime::shutdown::is_shutdown_requested() {
+                            break;
+                        }
+                        eprintln!("[esplora] failed to fetch raw tx: {e:?}");
+                    }
                 }
             }
             Ok(out)

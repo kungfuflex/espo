@@ -6,12 +6,13 @@ use axum::response::Response;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::config::{get_config, get_espo_next_height, get_metashrew_rpc_url, get_network};
+use crate::config::{
+    get_bitcoind_rpc_client, get_config, get_espo_db, get_espo_next_height, get_metashrew_rpc_url,
+    get_network,
+};
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
-use crate::explorer::mining_pools::{
-    MiningPoolDisplay, resolve_block_mining_pool, resolve_block_mining_pool_with_tx_count,
-};
+use crate::explorer::mining_pools::MiningPoolDisplay;
 use crate::explorer::pages::common::ALKANE_SCALE;
 use crate::explorer::paths::explorer_path;
 use crate::modules::ammdata::config::AmmDataConfig;
@@ -19,10 +20,12 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
 };
 use crate::modules::essentials::storage::{
-    EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
+    BlockSummaryPool, EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
     GetListEntriesDescParams, HoldersCountEntry, get_cached_block_summary, load_creation_record,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
+use crate::modules::runes::main::{runes_enabled_from_global_config, runes_genesis_block};
+use crate::modules::runes::storage::{RuneEntry, RunesProvider, SchemaRuneId};
 use crate::runtime::mdb::Mdb;
 use crate::runtime::mempool::{
     current_mempool_compact_snapshot, get_mempool_block_transaction_ids, subscribe_mempool_events,
@@ -42,6 +45,7 @@ use bitcoin::locktime::absolute::LockTime;
 use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use bitcoin::transaction::Version;
 use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
+use bitcoincore_rpc::RpcApi;
 use bitcoincore_rpc::bitcoin::Network;
 use borsh::BorshDeserialize;
 use ordinals::Runestone;
@@ -64,6 +68,7 @@ pub struct CarouselQuery {
 #[derive(Serialize)]
 pub struct CarouselBlock {
     pub height: u64,
+    pub shell: bool,
     pub traces: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub median_fee_rate: Option<f64>,
@@ -86,8 +91,39 @@ pub struct CarouselResponse {
     pub blocks: Vec<CarouselBlock>,
 }
 
+fn block_summary_pool_to_display(pool: BlockSummaryPool) -> MiningPoolDisplay {
+    MiningPoolDisplay {
+        id: pool.id,
+        name: pool.name,
+        slug: pool.slug,
+        matched: pool.matched,
+        link: pool.link,
+        mempool_url: pool.mempool_url,
+        icon_url: pool.icon_url,
+    }
+}
+
+const MEMPOOL_BLOCKS_MAX_TIP_LAG: u64 = 12;
+
+pub(crate) fn mempool_blocks_visible_for_espo_tip(espo_tip: u64) -> bool {
+    get_bitcoind_rpc_client()
+        .get_blockchain_info()
+        .map(|info| espo_tip.saturating_add(MEMPOOL_BLOCKS_MAX_TIP_LAG) >= info.blocks as u64)
+        .unwrap_or(false)
+}
+
+fn explorer_mempool_snapshot() -> crate::runtime::mempool::MempoolCompactSnapshot {
+    let mut snapshot = current_mempool_compact_snapshot();
+    let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
+    if !mempool_blocks_visible_for_espo_tip(espo_tip) {
+        snapshot.blocks.clear();
+        snapshot.deltas.clear();
+    }
+    snapshot
+}
+
 pub async fn mempool_blocks() -> Json<crate::runtime::mempool::MempoolCompactSnapshot> {
-    Json(current_mempool_compact_snapshot())
+    Json(explorer_mempool_snapshot())
 }
 
 pub async fn explorer_events_ws(ws: WebSocketUpgrade) -> Response {
@@ -99,7 +135,7 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
     let initial = json!({
         "type": "hello",
         "data": {
-            "mempool": current_mempool_compact_snapshot(),
+            "mempool": explorer_mempool_snapshot(),
             "espo_tip": get_espo_next_height().saturating_sub(1),
         }
     });
@@ -115,8 +151,21 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                 match event {
                     Ok(payload) => {
                         let parsed_payload = serde_json::from_str::<Value>(&payload).ok();
-                        let client_payload = strip_mempool_deltas_for_client(parsed_payload.as_ref())
-                            .unwrap_or(payload);
+                        let client_payload = if parsed_payload
+                            .as_ref()
+                            .and_then(|value| value.get("type"))
+                            .and_then(|value| value.as_str())
+                            == Some("mempool-blocks")
+                        {
+                            json!({
+                                "type": "mempool-blocks",
+                                "data": explorer_mempool_snapshot(),
+                            })
+                            .to_string()
+                        } else {
+                            strip_mempool_deltas_for_client(parsed_payload.as_ref())
+                                .unwrap_or(payload)
+                        };
                         if socket.send(WsMessage::Text(client_payload.into())).await.is_err() {
                             break;
                         }
@@ -151,7 +200,7 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let payload = json!({"type": "mempool-blocks", "data": current_mempool_compact_snapshot()}).to_string();
+                        let payload = json!({"type": "mempool-blocks", "data": explorer_mempool_snapshot()}).to_string();
                         if socket.send(WsMessage::Text(payload.into())).await.is_err() {
                             break;
                         }
@@ -189,7 +238,7 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                             {
                                 let payload = json!({
                                     "type": "mempool-blocks",
-                                    "data": current_mempool_compact_snapshot(),
+                                    "data": explorer_mempool_snapshot(),
                                 })
                                 .to_string();
                                 if socket.send(WsMessage::Text(payload.into())).await.is_err() {
@@ -203,7 +252,7 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                                 .map(|value| value as usize);
                             if let Some(index) = requested {
                                 tracked_mempool_block = Some(index);
-                                let snapshot = current_mempool_compact_snapshot();
+                                let snapshot = explorer_mempool_snapshot();
                                 let block_ids = get_mempool_block_transaction_ids(index);
                                 if !block_ids.is_empty() {
                                     let payload = json!({
@@ -312,6 +361,8 @@ pub struct AlkaneChartResponse {
 pub struct AddressChartQuery {
     pub address: Option<String>,
     pub alkane: Option<String>,
+    pub rune: Option<String>,
+    pub kind: Option<String>,
     pub range: Option<String>,
 }
 
@@ -341,64 +392,88 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let center = q.center.unwrap_or(espo_tip).min(espo_tip);
     let radius = q.radius.unwrap_or(8).min(50); // guardrail
+    let runes_enabled = runes_enabled_from_global_config();
+    let first_summary_height = if runes_enabled {
+        runes_genesis_block(get_network()) as u64
+    } else {
+        crate::consts::alkanes_genesis_block(get_network()) as u64
+    };
 
     let start = center.saturating_sub(radius);
     let end = (center + radius).min(espo_tip);
+    if start > end {
+        return Json(CarouselResponse { espo_tip, blocks: Vec::new() });
+    }
 
     let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
     let essentials_provider = EssentialsProvider::new(essentials_mdb.clone());
-    let heights: Vec<u32> = (start..=end).map(|h| h as u32).collect();
-    let summaries =
+    let summary_heights: Vec<u32> =
+        (start..=end).filter(|h| *h >= first_summary_height).map(|h| h as u32).collect();
+    let summaries = if summary_heights.is_empty() {
+        Vec::new()
+    } else {
         essentials_provider
-            .get_block_summaries_by_heights(&heights)
+            .get_block_summaries_by_heights(&summary_heights)
             .unwrap_or_else(|err| {
                 eprintln!("[carousel] failed to load block summaries: {err}");
-                vec![None; heights.len()]
-            });
+                vec![None; summary_heights.len()]
+            })
+    };
+    let mut summaries_by_height: HashMap<_, _> =
+        summary_heights.into_iter().zip(summaries.into_iter()).collect();
     let mut blocks: Vec<CarouselBlock> = Vec::with_capacity((end - start + 1) as usize);
 
-    for (h, summary) in (start..=end).zip(summaries.into_iter()) {
-        let summary = summary.or_else(|| get_cached_block_summary(h as u32));
+    for h in start..=end {
+        let shell = h < first_summary_height;
+        let summary = if shell {
+            None
+        } else {
+            summaries_by_height
+                .remove(&(h as u32))
+                .flatten()
+                .or_else(|| get_cached_block_summary(h as u32))
+        };
         let (
-            traces,
+            summary_trace_count,
+            summary_interaction_count,
             time,
             summary_tx_count,
             median_fee_rate,
             min_fee_rate,
             max_fee_rate,
             fee_range,
+            pool,
         ) = if let Some(summary) = summary {
             let time = deserialize::<Header>(&summary.header).ok().map(|hdr| hdr.time as u32);
             let tx_count = if summary.tx_count > 0 { Some(summary.tx_count) } else { None };
             let min_fee_rate = summary.fee_range.first().copied();
             let max_fee_rate = summary.fee_range.last().copied();
+            let pool = summary.pool.map(block_summary_pool_to_display);
             (
                 summary.trace_count as usize,
+                summary.interaction_count as usize,
                 time,
                 tx_count,
                 Some(summary.fee_median),
                 min_fee_rate,
                 max_fee_rate,
                 summary.fee_range,
+                pool,
             )
         } else {
-            (0, None, None, None, None, None, Vec::new())
+            (0, 0, None, None, None, None, None, Vec::new(), None)
         };
-        let resolved_pool = resolve_block_mining_pool_with_tx_count(h).ok();
-        let tx_count = summary_tx_count
-            .or_else(|| resolved_pool.as_ref().map(|result| result.tx_count as u32));
-        let pool = resolved_pool
-            .map(|result| result.pool)
-            .or_else(|| resolve_block_mining_pool(h).ok().map(|result| result.pool));
+        let traces = if runes_enabled { summary_interaction_count } else { summary_trace_count };
 
         blocks.push(CarouselBlock {
             height: h,
+            shell,
             traces,
             median_fee_rate,
             min_fee_rate,
             max_fee_rate,
             fee_range,
-            tx_count,
+            tx_count: summary_tx_count,
             time,
             pool,
         });
@@ -425,6 +500,13 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     }
 
     let mut alkanes: Vec<RankedAlkaneItem> = Vec::new();
+    struct RankedRuneItem {
+        item: SearchGuessItem,
+        holders: u64,
+    }
+
+    let mut runes: Vec<RankedRuneItem> = Vec::new();
+    let mut seen_runes: HashSet<SchemaRuneId> = HashSet::new();
     let mut txid: Vec<SearchGuessItem> = Vec::new();
     let mut addresses: Vec<SearchGuessItem> = Vec::new();
     let search_cfg = AmmDataConfig::load_from_global_config().ok();
@@ -516,6 +598,41 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
                 holders,
             });
         }
+    }
+
+    fn push_rune_item(
+        provider: &RunesProvider,
+        seen_runes: &mut HashSet<SchemaRuneId>,
+        runes: &mut Vec<RankedRuneItem>,
+        entry: RuneEntry,
+    ) -> bool {
+        if !seen_runes.insert(entry.id) {
+            return false;
+        }
+        let holders = provider.get_holders_count(entry.id).unwrap_or(0);
+        let id = entry.id.to_string();
+        let icon_url = if provider.get_rune_icon(entry.id).ok().flatten().is_some() {
+            Some(explorer_path(&format!("/static/rune-icons/{id}")))
+        } else {
+            None
+        };
+        let fallback_letter = entry
+            .symbol
+            .as_ref()
+            .and_then(|s| s.chars().next())
+            .or_else(|| entry.name.chars().next())
+            .map(|c| c.to_string());
+        runes.push(RankedRuneItem {
+            item: SearchGuessItem {
+                label: entry.spaced_name,
+                value: id.clone(),
+                href: Some(explorer_path(&format!("/rune/{id}"))),
+                icon_url,
+                fallback_letter,
+            },
+            holders,
+        });
+        true
     }
 
     if let Some(query_norm) = normalize_alkane_name(&query) {
@@ -622,6 +739,21 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
                     if matches >= 5 {
                         break;
                     }
+                }
+            }
+        }
+    }
+
+    if runes_enabled_from_global_config() {
+        let runes_provider = RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:")));
+        if let Ok(Some(entry)) = runes_provider.get_rune_by_query(&query) {
+            let _ = push_rune_item(&runes_provider, &mut seen_runes, &mut runes, entry);
+        }
+        if runes.len() < 5 {
+            let needed = 5usize.saturating_sub(runes.len());
+            if let Ok(entries) = runes_provider.get_runes_by_name_prefix(&query, needed) {
+                for entry in entries {
+                    let _ = push_rune_item(&runes_provider, &mut seen_runes, &mut runes, entry);
                 }
             }
         }
@@ -760,6 +892,17 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             kind: "alkanes".to_string(),
             title: "Alkanes".to_string(),
             items: alkanes,
+        });
+    }
+    if !runes.is_empty() {
+        runes.sort_by(|a, b| {
+            b.holders.cmp(&a.holders).then_with(|| a.item.label.cmp(&b.item.label))
+        });
+        let runes: Vec<SearchGuessItem> = runes.into_iter().map(|item| item.item).collect();
+        groups.push(SearchGuessGroup {
+            kind: "runes".to_string(),
+            title: "Runes".to_string(),
+            items: runes,
         });
     }
     if !txid.is_empty() {
@@ -913,24 +1056,6 @@ pub async fn address_chart(Query(q): Query<AddressChartQuery>) -> Json<AddressCh
             error: Some("missing_or_invalid_address".to_string()),
         });
     };
-    let Some(alkane_raw) = q.alkane.as_deref() else {
-        return Json(AddressChartResponse {
-            ok: false,
-            available: false,
-            range: "1d".to_string(),
-            points: Vec::new(),
-            error: Some("missing_or_invalid_alkane".to_string()),
-        });
-    };
-    let Some(alkane) = parse_alkane_id(alkane_raw) else {
-        return Json(AddressChartResponse {
-            ok: false,
-            available: false,
-            range: "1d".to_string(),
-            points: Vec::new(),
-            error: Some("missing_or_invalid_alkane".to_string()),
-        });
-    };
     let address = match Address::from_str(address_raw.trim())
         .ok()
         .and_then(|a| a.require_network(get_network()).ok())
@@ -949,6 +1074,114 @@ pub async fn address_chart(Query(q): Query<AddressChartQuery>) -> Json<AddressCh
 
     let range = normalize_address_chart_range(q.range.as_deref());
     let (lookback_blocks, range_interval) = address_chart_range_params(&range);
+
+    let kind = q
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(if q.rune.is_some() { "rune" } else { "alkane" });
+    if kind.eq_ignore_ascii_case("rune") {
+        let Some(rune_raw) = q.rune.as_deref() else {
+            return Json(AddressChartResponse {
+                ok: false,
+                available: false,
+                range,
+                points: Vec::new(),
+                error: Some("missing_or_invalid_rune".to_string()),
+            });
+        };
+        let Some(rune_id) = parse_rune_id(rune_raw) else {
+            return Json(AddressChartResponse {
+                ok: false,
+                available: false,
+                range,
+                points: Vec::new(),
+                error: Some("missing_or_invalid_rune".to_string()),
+            });
+        };
+        if !runes_enabled_from_global_config() {
+            return Json(AddressChartResponse {
+                ok: true,
+                available: false,
+                range,
+                points: Vec::new(),
+                error: None,
+            });
+        }
+        let provider = RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:")));
+        let Some(index_height) = provider.get_index_height().ok().flatten() else {
+            return Json(AddressChartResponse {
+                ok: true,
+                available: false,
+                range,
+                points: Vec::new(),
+                error: None,
+            });
+        };
+        let Some(entry) = provider.get_rune(rune_id).ok().flatten() else {
+            return Json(AddressChartResponse {
+                ok: false,
+                available: false,
+                range,
+                points: Vec::new(),
+                error: Some("rune_not_found".to_string()),
+            });
+        };
+        let indexed_min = runes_genesis_block(get_network());
+        let chain_tip = (get_espo_next_height().saturating_sub(1)) as u32;
+        let range_max = chain_tip.min(index_height);
+        let range_min = match lookback_blocks {
+            Some(lookback) => range_max.saturating_sub(lookback).max(indexed_min),
+            None => indexed_min,
+        };
+        if range_min > range_max {
+            return Json(AddressChartResponse {
+                ok: true,
+                available: false,
+                range,
+                points: Vec::new(),
+                error: None,
+            });
+        }
+        let scale = 10f64.powi(entry.divisibility as i32);
+        let points = provider
+            .get_address_balance_history_points(
+                &address,
+                rune_id,
+                range_min,
+                range_max,
+                range_interval,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|point| AddressChartPoint {
+                height: point.height,
+                value: (point.amount as f64) / scale,
+            })
+            .collect::<Vec<_>>();
+        let available = !points.is_empty();
+        return Json(AddressChartResponse { ok: true, available, range, points, error: None });
+    }
+
+    let Some(alkane_raw) = q.alkane.as_deref() else {
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range,
+            points: Vec::new(),
+            error: Some("missing_or_invalid_alkane".to_string()),
+        });
+    };
+    let Some(alkane) = parse_alkane_id(alkane_raw) else {
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range,
+            points: Vec::new(),
+            error: Some("missing_or_invalid_alkane".to_string()),
+        });
+    };
     let Some((indexed_min, indexed_max)) =
         get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
     else {
@@ -1898,6 +2131,13 @@ fn parse_alkane_id(s: &str) -> Option<SchemaAlkaneId> {
     let block = parse_u32_any(a)?;
     let tx = parse_u64_any(b)?;
     Some(SchemaAlkaneId { block, tx })
+}
+
+fn parse_rune_id(s: &str) -> Option<SchemaRuneId> {
+    let (a, b) = s.split_once(':')?;
+    let block = parse_u64_any(a)?;
+    let tx = parse_u32_any(b)?;
+    Some(SchemaRuneId { block, tx })
 }
 
 fn parse_u32_any(s: &str) -> Option<u32> {

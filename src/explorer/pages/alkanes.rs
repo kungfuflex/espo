@@ -12,6 +12,7 @@ use crate::explorer::components::svg_assets::{
 };
 use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
 use crate::explorer::components::tx_view::alkane_icon_url;
+use crate::explorer::pages::common::format_integer;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
@@ -311,13 +312,13 @@ pub async fn alkanes_page(
                     span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                 }
                 span class="pager-meta muted" { "Showing "
-                    (display_start)
+                    (format_integer(display_start as u128))
                     @if total > 0 {
                         "-"
-                        (display_end)
+                        (format_integer(display_end as u128))
                     }
                     " / "
-                    (total)
+                    (format_integer(total as u128))
                 }
                 @if has_next {
                     a class="pill iconbtn" href=(alkanes_url(page + 1, limit, field, dir)) aria-label="Next page" { (icon_pager_right()) }

@@ -20,7 +20,7 @@ use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
     AlkaneMetaCache, alkane_icon_url_unfiltered, alkane_meta, icon_bg_style,
 };
-use crate::explorer::pages::common::fmt_alkane_amount;
+use crate::explorer::pages::common::{fmt_alkane_amount, format_integer};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::ammdata::config::AmmDataConfig;
@@ -1107,13 +1107,13 @@ pub async fn alkane_page(
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                                     }
                                     span class="pager-meta muted" { "Showing "
-                                        (if total > 0 { display_start } else { 0 })
+                                        (format_integer(if total > 0 { display_start as u128 } else { 0 }))
                                         @if total > 0 {
                                             "-"
-                                            (display_end)
+                                            (format_integer(display_end as u128))
                                         }
                                         " / "
-                                        (total)
+                                        (format_integer(total as u128))
                                     }
                                     @if has_next {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={}&limit={limit}", page + 1))) aria-label="Next page" {
@@ -1151,13 +1151,13 @@ pub async fn alkane_page(
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                                     }
                                     span class="pager-meta muted" { "Showing "
-                                        (if activity_total > 0 { activity_display_start } else { 0 })
+                                        (format_integer(if activity_total > 0 { activity_display_start as u128 } else { 0 }))
                                         @if activity_total > 0 {
                                             "-"
-                                            (activity_display_end)
+                                            (format_integer(activity_display_end as u128))
                                         }
                                         " / "
-                                        (activity_total)
+                                        (format_integer(activity_total as u128))
                                     }
                                     @if activity_has_next {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page={}&limit={limit}", page + 1))) aria-label="Next page" {
@@ -1198,13 +1198,13 @@ pub async fn alkane_page(
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                                     }
                                     span class="pager-meta muted" { "Showing "
-                                        (if token_activity_total > 0 { token_activity_display_start } else { 0 })
+                                        (format_integer(if token_activity_total > 0 { token_activity_display_start as u128 } else { 0 }))
                                         @if token_activity_total > 0 {
                                             "-"
-                                            (token_activity_display_end)
+                                            (format_integer(token_activity_display_end as u128))
                                         }
                                         " / "
-                                        (token_activity_total)
+                                        (format_integer(token_activity_total as u128))
                                     }
                                     @if token_activity_has_next {
                                         a class="pill iconbtn" href=(activity_tab_url(&alk_str, page + 1, limit, activity_order, activity_dir, activity_filter)) aria-label="Next page" {

@@ -29,24 +29,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-use crate::config::{DebugBackupConfig, init_block_source};
+use crate::config::{DebugBackupConfig, get_block_source, init_block_source};
 //modules
 use crate::config::get_metashrew_sdb;
 use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
-use crate::modules::essentials::storage::preload_block_summary_cache;
+use crate::modules::essentials::storage::{
+    EssentialsProvider, GetBlockSummaryParams, cache_block_summary, preload_block_summary_cache,
+};
 use crate::modules::oylapi::main::OylApi;
 use crate::modules::pizzafun::main::Pizzafun;
 use crate::modules::runes::main::{Runes, runes_enabled_from_global_config};
+use crate::modules::runes::storage::RunesProvider;
 use crate::modules::subfrost::main::Subfrost;
 use crate::modules::tokendata::main::TokenData;
 use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
 
+use crate::core::blockfetcher::BlockSource;
 use crate::explorer::run_explorer;
 use crate::{
-    alkanes::{trace::get_espo_block, utils::get_safe_tip},
+    alkanes::{
+        trace::{EspoAlkanesTransaction, EspoBlock, get_espo_block},
+        utils::get_safe_tip,
+    },
     config::{
         get_bitcoind_rpc_client, get_config, get_espo_db, get_module_config, init_config,
         update_safe_tip,
@@ -59,9 +66,12 @@ use crate::{
         reset_mempool_store, run_mempool_service,
     },
     runtime::rpc::run_rpc,
+    runtime::shutdown::request_shutdown,
+    runtime::state_at::StateAt,
     runtime::tree_db::get_global_tree_db,
 };
 use bitcoin::Txid;
+use bitcoin::hashes::Hash;
 use bitcoincore_rpc::RpcApi;
 pub use espo::{ESPO_HEIGHT, SAFE_TIP};
 use rocksdb::checkpoint::Checkpoint;
@@ -362,6 +372,78 @@ fn run_safe_tip_hook(script: &str, next_height: u32, tip: u32) {
     });
 }
 
+fn get_indexer_block(height: u32, tip: u32, network: bitcoin::Network) -> Result<EspoBlock> {
+    let alkane_genesis = alkanes_genesis_block(network);
+    if height >= alkane_genesis {
+        return get_espo_block(height.into(), tip.into());
+    }
+
+    eprintln!(
+        "[indexer] loading raw pre-alkane block #{} without traces (alkane_genesis={})",
+        height, alkane_genesis
+    );
+    let block_result = get_block_source()
+        .get_block_result_by_height(height, tip)
+        .with_context(|| format!("BlockSource: get raw pre-alkane block {height}"))?;
+    let tx_count = block_result.block.txdata.len();
+    Ok(EspoBlock {
+        is_latest: height == tip,
+        height,
+        block_header: block_result.block.header,
+        host_function_values: (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        fee_summary: block_result.fee_summary,
+        tx_count,
+        transactions: block_result
+            .block
+            .txdata
+            .into_iter()
+            .map(|transaction| EspoAlkanesTransaction { traces: None, transaction })
+            .collect(),
+    })
+}
+
+fn update_indexed_block_interaction_summary(
+    essentials_provider: &EssentialsProvider,
+    runes_provider: Option<&RunesProvider>,
+    block: &EspoBlock,
+) -> Result<()> {
+    let Some(mut summary) = essentials_provider
+        .get_block_summary(GetBlockSummaryParams {
+            blockhash: StateAt::Latest,
+            height: block.height,
+        })?
+        .summary
+    else {
+        return Ok(());
+    };
+
+    let mut interaction_txids: std::collections::HashSet<Txid> = std::collections::HashSet::new();
+    for tx in block.transactions.iter() {
+        if tx.traces.as_ref().map(|traces| !traces.is_empty()).unwrap_or(false) {
+            interaction_txids.insert(tx.transaction.compute_txid());
+        }
+    }
+    if let Some(provider) = runes_provider {
+        let total = provider.get_block_tx_count(block.height as u64).unwrap_or(0);
+        if total > 0 {
+            for pointer in
+                provider.get_block_tx_range(block.height as u64, 0, total).unwrap_or_default()
+            {
+                interaction_txids.insert(Txid::from_byte_array(pointer.txid));
+            }
+        }
+    }
+    let interaction_count = interaction_txids.len().min(u32::MAX as usize) as u32;
+
+    if summary.interaction_count != interaction_count {
+        summary.interaction_count = interaction_count;
+        essentials_provider.update_block_summary_by_hash(&summary)?;
+        cache_block_summary(block.height, summary);
+    }
+
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -396,6 +478,10 @@ async fn run_indexer_loop(
         .ok()
         .and_then(|value| value.parse::<u32>().ok());
     let rewind_target = Arc::new(AtomicU32::new(NO_REWIND));
+    let essentials_provider =
+        EssentialsProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"essentials:")));
+    let runes_summary_provider = runes_enabled_from_global_config()
+        .then(|| RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:"))));
     let mut last_tip: Option<u32> = None;
     let mut mempool_started = false;
     let mut logged_start = false;
@@ -435,6 +521,19 @@ async fn run_indexer_loop(
 
         let requested_rewind = rewind_target.swap(NO_REWIND, Ordering::SeqCst);
         if requested_rewind != NO_REWIND && requested_rewind < next_height {
+            for m in mods.modules() {
+                if let Err(e) = m.handle_reorg(requested_rewind) {
+                    eprintln!(
+                        "[module:{}] failed to handle reorg to height {}: {e:?}",
+                        m.get_name(),
+                        requested_rewind
+                    );
+                    shutdown_requested.store(true, Ordering::Relaxed);
+                }
+            }
+            if shutdown_requested.load(Ordering::Relaxed) {
+                break;
+            }
             next_height = requested_rewind;
             if let Some(h) = ESPO_HEIGHT.get() {
                 h.store(next_height, Ordering::Relaxed);
@@ -530,7 +629,7 @@ async fn run_indexer_loop(
                 );
             }
 
-            match get_espo_block(next_height.into(), target_tip.into())
+            match get_indexer_block(next_height, target_tip, network)
                 .with_context(|| format!("failed to load espo block {next_height}"))
             {
                 Ok(espo_block) => {
@@ -557,7 +656,12 @@ async fn run_indexer_loop(
                         }
                     }
 
+                    let mut deferred_runes_module = None;
                     for m in mods.modules() {
+                        if m.get_name() == "runes" {
+                            deferred_runes_module = Some(m.clone());
+                            continue;
+                        }
                         if next_height >= m.get_genesis_block(network) {
                             if let Err(e) = m.index_block(espo_block.clone()) {
                                 eprintln!(
@@ -595,6 +699,29 @@ async fn run_indexer_loop(
                         if let Err(e) = tree.finish_block() {
                             eprintln!("[tree] failed to finish block {}: {e:?}", next_height);
                         }
+                    }
+
+                    if let Some(m) = deferred_runes_module {
+                        if next_height >= m.get_genesis_block(network) {
+                            if let Err(e) = m.index_block(espo_block.clone()) {
+                                eprintln!(
+                                    "[module:{}] height {}: {e:?}",
+                                    m.get_name(),
+                                    next_height
+                                );
+                            }
+                        }
+                    }
+
+                    if let Err(e) = update_indexed_block_interaction_summary(
+                        &essentials_provider,
+                        runes_summary_provider.as_ref(),
+                        &espo_block,
+                    ) {
+                        eprintln!(
+                            "[summary] failed to update interaction count at height {}: {e:?}",
+                            next_height
+                        );
                     }
 
                     if let Some(backup) = cfg.debug_backup.as_ref() {
@@ -680,11 +807,11 @@ async fn run_indexer_loop(
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_config()?;
+    tokio::task::block_in_place(init_config)?;
     let cfg = get_config().clone();
     let network = get_network();
     let view_only = cfg.view_only;
-    init_block_source()?;
+    tokio::task::block_in_place(init_block_source)?;
 
     if view_only {
         eprintln!(
@@ -753,8 +880,6 @@ async fn main() -> Result<()> {
         eprintln!("[explorer] listening on {}", explorer_addr);
     }
 
-    let global_genesis = alkanes_genesis_block(network);
-
     // Decide initial start height (resume at last+1 per module)
     let mut start_height = mods
         .modules()
@@ -767,8 +892,7 @@ async fn main() -> Result<()> {
             }
         })
         .min()
-        .unwrap_or(global_genesis)
-        .max(global_genesis);
+        .unwrap_or_else(|| alkanes_genesis_block(network));
     if let Some(forced_start) = std::env::var("ESPO_START_BLOCK")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -830,6 +954,7 @@ async fn main() -> Result<()> {
             result = &mut shutdown_signal => {
                 result?;
                 eprintln!("[PROCESS] exit signal received , waiting for modules");
+                request_shutdown();
                 shutdown_requested.store(true, Ordering::Relaxed);
                 break;
             }

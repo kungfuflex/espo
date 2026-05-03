@@ -9,6 +9,7 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoSandshrewLikeTraceStatus,
     EspoTrace, prettyify_protobuf_trace_json,
 };
+use crate::explorer::components::rune_icon::rune_icon;
 use crate::explorer::components::svg_assets::{
     arrow_svg, icon_arrow_bend_down_right, icon_caret_right, icon_magic_wand,
 };
@@ -16,7 +17,9 @@ use crate::explorer::consts::{
     ALKANE_CONTRACT_ICON_BASE, ALKANE_TOKEN_ICON_BASE, alkane_contract_name_overrides,
     alkane_factory_icon_blacklist, alkane_icon_overrides, alkane_name_overrides,
 };
-use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount, format_fee_rate};
+use crate::explorer::pages::common::{
+    fmt_alkane_amount, fmt_amount, fmt_scaled_amount, format_fee_rate,
+};
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider, load_creation_record};
 use crate::modules::essentials::utils::balances::{
@@ -252,6 +255,59 @@ fn protostone_json(tx: &Transaction) -> Option<Value> {
         })
         .collect();
     Some(json!(view))
+}
+
+fn runestone_json(tx: &Transaction) -> Option<Value> {
+    let runestone = match Runestone::decipher(tx) {
+        Some(Artifact::Runestone(r)) => r,
+        _ => return None,
+    };
+    let edicts: Vec<_> = runestone
+        .edicts
+        .iter()
+        .map(|edict| {
+            json!({
+                "id": {
+                    "block": edict.id.block.to_string(),
+                    "tx": edict.id.tx.to_string(),
+                },
+                "amount": edict.amount.to_string(),
+                "output": edict.output.to_string(),
+            })
+        })
+        .collect();
+    let etching = runestone.etching.as_ref().map(|etching| {
+        json!({
+            "divisibility": etching.divisibility,
+            "premine": etching.premine.map(|v| v.to_string()),
+            "rune": etching.rune.map(|r| r.to_string()),
+            "spacers": etching.spacers,
+            "symbol": etching.symbol.map(|c| c.to_string()),
+            "terms": etching.terms.as_ref().map(|terms| json!({
+                "amount": terms.amount.map(|v| v.to_string()),
+                "cap": terms.cap.map(|v| v.to_string()),
+                "height": [
+                    terms.height.0.map(|v| v.to_string()),
+                    terms.height.1.map(|v| v.to_string()),
+                ],
+                "offset": [
+                    terms.offset.0.map(|v| v.to_string()),
+                    terms.offset.1.map(|v| v.to_string()),
+                ],
+            })),
+            "turbo": etching.turbo,
+        })
+    });
+
+    Some(json!({
+        "etching": etching,
+        "mint": runestone.mint.map(|id| json!({
+            "block": id.block.to_string(),
+            "tx": id.tx.to_string(),
+        })),
+        "pointer": runestone.pointer.map(|v| v.to_string()),
+        "edicts": edicts,
+    }))
 }
 
 fn opreturn_utf8(data: &[u8]) -> String {
@@ -791,68 +847,78 @@ fn render_rune_trace_summaries(
     }
 
     html! {
-        div class="trace-summary-list rune-trace-summary-list" {
-            @if let Some(id) = io.etched {
-                @let entry = runes_provider.get_rune(id).ok().flatten();
-                @let name = entry
-                    .as_ref()
-                    .map(|entry| entry.spaced_name.clone())
-                    .unwrap_or_else(|| id.to_string());
-                @let symbol = entry
-                    .as_ref()
-                    .and_then(|entry| entry.symbol.clone())
-                    .unwrap_or_else(|| "¤".to_string());
-                @let path = explorer_path(&format!("/rune/{id}"));
-                div class="trace-summary rune-trace-summary" {
-                    span class="trace-summary-label" { "Rune etch:" }
-                    div class="trace-contract-row" {
-                        div class="trace-contract-icon rune-symbol" aria-hidden="true" {
+        @if let Some(id) = io.etched {
+            @let entry = runes_provider.get_rune(id).ok().flatten();
+            @let name = entry
+                .as_ref()
+                .map(|entry| entry.spaced_name.clone())
+                .unwrap_or_else(|| id.to_string());
+            @let symbol = entry
+                .as_ref()
+                .and_then(|entry| entry.symbol.clone())
+                .unwrap_or_else(|| "¤".to_string());
+            @let path = explorer_path(&format!("/rune/{id}"));
+            div class="trace-summary rune-trace-summary" {
+                span class="trace-summary-label" { "Rune etch:" }
+                div class="trace-contract-row" {
+                    @if let Some(entry) = entry.as_ref() {
+                        (rune_icon(entry, "trace-contract-icon"))
+                    } @else {
+                        div class="trace-contract-icon" aria-hidden="true" {
                             span class="trace-icon-letter" { (symbol) }
                         }
-                        div class="trace-contract-meta" {
-                            a class="trace-contract-name link" href=(path) { (name) }
-                            span class="trace-contract-id mono" { (id.to_string()) }
-                        }
                     }
-                    div class="trace-method-pill" {
-                        span class="trace-method-name" { "etch" }
+                    div class="trace-contract-meta" {
+                        a class="trace-contract-name link" href=(path) { (name) }
                     }
-                    div class="trace-status success" {
-                        span class="trace-status-icon" aria-hidden="true" { (icon_arrow_bend_down_right()) }
-                        span class="trace-status-text" { "Etched rune" }
-                    }
+                    span class="io-arrow" { (arrow_svg()) }
+                }
+                div class="trace-method-pill" {
+                    span class="trace-method-name" { "etch" }
+                }
+                div class="trace-status success" {
+                    span class="trace-status-icon" aria-hidden="true" { (icon_arrow_bend_down_right()) }
+                    span class="trace-status-text" { "Etched rune" }
                 }
             }
-            @for minted in io.minted.iter() {
-                @let entry = runes_provider.get_rune(minted.id).ok().flatten();
-                @let name = entry
-                    .as_ref()
-                    .map(|entry| entry.spaced_name.clone())
-                    .unwrap_or_else(|| minted.id.to_string());
-                @let symbol = entry
-                    .as_ref()
-                    .and_then(|entry| entry.symbol.clone())
-                    .unwrap_or_else(|| "¤".to_string());
-                @let path = explorer_path(&format!("/rune/{}", minted.id));
-                div class="trace-summary rune-trace-summary" {
-                    span class="trace-summary-label" { "Rune mint:" }
-                    div class="trace-contract-row" {
-                        div class="trace-contract-icon rune-symbol" aria-hidden="true" {
+        }
+        @for minted in io.minted.iter() {
+            @let entry = runes_provider.get_rune(minted.id).ok().flatten();
+            @let amount = entry
+                .as_ref()
+                .map(|entry| fmt_scaled_amount(minted.amount, entry.divisibility))
+                .unwrap_or_else(|| minted.amount.to_string());
+            @let name = entry
+                .as_ref()
+                .map(|entry| entry.spaced_name.clone())
+                .unwrap_or_else(|| minted.id.to_string());
+            @let symbol = entry
+                .as_ref()
+                .and_then(|entry| entry.symbol.clone())
+                .unwrap_or_else(|| "¤".to_string());
+            @let path = explorer_path(&format!("/rune/{}", minted.id));
+            div class="trace-summary rune-trace-summary" {
+                span class="trace-summary-label" { "Rune mint:" }
+                div class="trace-contract-row" {
+                    @if let Some(entry) = entry.as_ref() {
+                        (rune_icon(entry, "trace-contract-icon"))
+                    } @else {
+                        div class="trace-contract-icon" aria-hidden="true" {
                             span class="trace-icon-letter" { (symbol) }
                         }
-                        div class="trace-contract-meta" {
-                            a class="trace-contract-name link" href=(path) { (name) }
-                            span class="trace-contract-id mono" { (minted.id.to_string()) }
-                        }
                     }
-                    div class="trace-method-pill" {
-                        span class="trace-method-name" { "mint" }
-                        span class="trace-opcode" { (minted.amount) }
+                    div class="trace-contract-meta" {
+                        a class="trace-contract-name link" href=(path) { (name) }
                     }
-                    div class="trace-status success" {
-                        span class="trace-status-icon" aria-hidden="true" { (icon_arrow_bend_down_right()) }
-                        span class="trace-status-text" { "Minted rune" }
-                    }
+                    span class="io-arrow" { (arrow_svg()) }
+                }
+                div class="trace-method-pill" {
+                    span class="trace-method-name" { "mint" }
+                    span class="trace-opcode" { (amount) }
+                }
+                div class="trace-status success" {
+                    span class="trace-status-icon" aria-hidden="true" { (icon_arrow_bend_down_right()) }
+                    span class="trace-status-text" { "Minted rune" }
                 }
             }
         }
@@ -879,7 +945,6 @@ pub fn render_tx(
     let runes_provider =
         RunesProvider::new(Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"runes:")));
     let tx_rune_io = runes_provider.get_tx_io(txid).ok().flatten();
-    let rune_trace_summaries = render_rune_trace_summaries(tx_rune_io.as_ref(), &runes_provider);
     let vins_markup = render_vins(
         tx,
         network,
@@ -892,6 +957,7 @@ pub fn render_tx(
     );
     let outspends = outspends_fn(txid);
     let protostone_json = protostone_json(tx);
+    let runestone_json = runestone_json(tx);
     let runestone_vouts = runestone_vout_indices(tx);
     let projected_out_balances = projected_out_balances_override.cloned().unwrap_or_else(|| {
         protostone_json
@@ -916,6 +982,7 @@ pub fn render_tx(
         traces,
         &projected_out_balances,
         &protostone_json,
+        &runestone_json,
         &runestone_vouts,
         &mut alkane_meta_cache,
         &mut alkane_impl_cache,
@@ -929,7 +996,6 @@ pub fn render_tx(
             @if show_tx_title {
                 span class="mono tx-title" { a class="link" href=(explorer_path(&format!("/tx/{}", txid))) { (txid) } }
             }
-            (rune_trace_summaries)
             div class="tx-io-grid" {
                 div class="io-col" {
                     div class="io-col-title" { "Inputs" }
@@ -1042,6 +1108,7 @@ fn render_vouts(
     traces: Option<&[EspoTrace]>,
     projected_out_balances: &HashMap<u32, Vec<BalanceEntry>>,
     protostone_json: &Option<Value>,
+    runestone_json: &Option<Value>,
     runestone_vouts: &HashSet<usize>,
     alkane_meta_cache: &mut AlkaneMetaCache,
     alkane_impl_cache: &mut AlkaneImplCache,
@@ -1073,6 +1140,7 @@ fn render_vouts(
                             @match opret {
                                 Some(payload) => {
                                     @let is_protostone = runestone_vouts.contains(&vout) && protostone_json.is_some();
+                                    @let is_runestone = runestone_vouts.contains(&vout) && runestone_json.is_some();
                                     @let traces_for_vout: Vec<&EspoTrace> = traces.map(|ts| {
                                         let matches: Vec<&EspoTrace> = ts
                                             .iter()
@@ -1090,7 +1158,21 @@ fn render_vouts(
                                             .collect();
                                         if !matches.is_empty() { matches } else { ts.iter().collect() }
                                     }).unwrap_or_default();
-                                    (render_op_return(&payload, o.value, is_protostone, protostone_json.as_ref(), &traces_for_vout, &mut inspection_cache, alkane_meta_cache, alkane_impl_cache, essentials_mdb))
+                                    (render_op_return(
+                                        &payload,
+                                        o.value,
+                                        is_protostone,
+                                        protostone_json.as_ref(),
+                                        is_runestone,
+                                        runestone_json.as_ref(),
+                                        tx_rune_io,
+                                        runes_provider,
+                                        &traces_for_vout,
+                                        &mut inspection_cache,
+                                        alkane_meta_cache,
+                                        alkane_impl_cache,
+                                        essentials_mdb,
+                                    ))
                                 }
                                 None => {
                                     @let addr_opt = Address::from_script(o.script_pubkey.as_script(), network).ok();
@@ -1133,6 +1215,10 @@ fn render_op_return(
     amount: Amount,
     is_protostone: bool,
     protostone_json: Option<&Value>,
+    is_runestone: bool,
+    runestone_json: Option<&Value>,
+    tx_rune_io: Option<&TxRuneIo>,
+    runes_provider: &RunesProvider,
     traces: &[&EspoTrace],
     inspection_cache: &mut InspectionCache,
     meta_cache: &mut AlkaneMetaCache,
@@ -1140,6 +1226,11 @@ fn render_op_return(
     essentials_mdb: &Mdb,
 ) -> Markup {
     let fallback = opreturn_utf8(&payload.data);
+    let is_decoded_message = is_protostone || is_runestone;
+    let has_rune_summary = is_runestone
+        && tx_rune_io
+            .map(|io| io.etched.is_some() || !io.minted.is_empty())
+            .unwrap_or(false);
     let trace_views: Vec<(String, Option<Value>)> = traces
         .iter()
         .map(|t| {
@@ -1163,11 +1254,15 @@ fn render_op_return(
                         span class="opret-caret" aria-hidden="true" { (icon_caret_right()) }
                         span class="opret-title mono" {
                             "OP_RETURN"
-                            @if is_protostone {
+                            @if is_protostone || is_runestone {
                                 " ( "
                                 span class="opret-meta" {
                                     span class="opret-diamond" aria-hidden="true" {}
-                                    " Protostone message)"
+                                    @if is_protostone {
+                                        " Protostone message)"
+                                    } @else {
+                                        " Runestone message)"
+                                    }
                                 }
                             }
                         }
@@ -1175,8 +1270,14 @@ fn render_op_return(
                     span class="io-amount mono muted" { (fmt_amount(amount)) }
                 }
             }
-            @if is_protostone {
+            @if is_decoded_message {
                 div class="opret-body protostone-body" {
+                    @if has_rune_summary {
+                        div class="trace-view" {
+                            (render_rune_trace_summaries(tx_rune_io, runes_provider))
+                            (render_runestone_toggle(runestone_json, &fallback))
+                        }
+                    }
                     @for (idx, ((trace_raw, trace_parsed), trace)) in trace_views.iter().zip(traces.iter()).enumerate() {
                         @let label = format!("Alkanes Trace #{}", idx + 1);
                         @let summary = summarize_contract_call(*trace, inspection_cache, meta_cache, impl_cache, essentials_mdb);
@@ -1193,17 +1294,34 @@ fn render_op_return(
                             }
                         }
                     }
-                    details class="opret-toggle" {
-                        summary class="opret-toggle-summary" {
-                            span class="opret-toggle-caret" aria-hidden="true" { (icon_caret_right()) }
-                            span class="opret-toggle-label" { "Protostone message" }
+                    @if is_protostone {
+                        details class="opret-toggle" {
+                            summary class="opret-toggle-summary" {
+                                span class="opret-toggle-caret" aria-hidden="true" { (icon_caret_right()) }
+                                span class="opret-toggle-label" { "Protostone message" }
+                            }
+                            div class="opret-toggle-body" { (json_viewer(protostone_json, &fallback)) }
                         }
-                        div class="opret-toggle-body" { (json_viewer(protostone_json, &fallback)) }
+                    }
+                    @if is_runestone && !has_rune_summary {
+                        (render_runestone_toggle(runestone_json, &fallback))
                     }
                 }
             } @else {
                 pre class="opret-body" { (fallback) }
             }
+        }
+    }
+}
+
+fn render_runestone_toggle(runestone_json: Option<&Value>, fallback: &str) -> Markup {
+    html! {
+        details class="opret-toggle" {
+            summary class="opret-toggle-summary" {
+                span class="opret-toggle-caret" aria-hidden="true" { (icon_caret_right()) }
+                span class="opret-toggle-label" { "Runestone" }
+            }
+            div class="opret-toggle-body" { (json_viewer(runestone_json, fallback)) }
         }
     }
 }
@@ -1260,23 +1378,31 @@ fn rune_balances_list(
         div class="io-alkanes io-runes" {
             @for be in entries {
                 @let entry = provider.get_rune(be.id).ok().flatten();
-                @let name = entry
-                    .as_ref()
-                    .map(|entry| entry.spaced_name.clone())
-                    .unwrap_or_else(|| be.id.to_string());
+                @let id = be.id.to_string();
                 @let symbol = entry
                     .as_ref()
                     .and_then(|entry| entry.symbol.clone())
                     .unwrap_or_else(|| "¤".to_string());
-                @let id = be.id.to_string();
+                @let name = entry
+                    .as_ref()
+                    .map(|entry| entry.spaced_name.clone())
+                    .unwrap_or_else(|| id.clone());
+                @let amount = entry
+                    .as_ref()
+                    .map(|entry| fmt_scaled_amount(be.amount, entry.divisibility))
+                    .unwrap_or_else(|| be.amount.to_string());
                 div class="alk-line" {
                     @if show_arrow {
                         span class="alk-arrow" aria-hidden="true" { (icon_arrow_bend_down_right()) }
                     }
-                    div class="alk-icon-wrap rune-symbol" aria-hidden="true" {
-                        span class="alk-icon-letter" { (symbol) }
+                    @if let Some(entry) = entry.as_ref() {
+                        (rune_icon(entry, "alk-icon-wrap"))
+                    } @else {
+                        div class="alk-icon-wrap" aria-hidden="true" {
+                            span class="alk-icon-letter" { (symbol.clone()) }
+                        }
                     }
-                    span class="alk-amt mono" { (be.amount) }
+                    span class="alk-amt mono" { (amount) }
                     a class="alk-sym link mono" href=(explorer_path(&format!("/rune/{id}"))) { (name) }
                 }
             }

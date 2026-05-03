@@ -2,10 +2,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NANA_DIR="${NANA_DIR:-$ROOT/context/Nana}"
 HEIGHT_START="${HEIGHT_START:-840000}"
 BLOCKS="${BLOCKS:-100}"
 ESPO_RPC="${ESPO_RPC:-http://127.0.0.1:5780/rpc}"
+
+if [[ -z "${NANA_DIR:-}" ]]; then
+  echo "NANA_DIR must be set to an explicit Nana checkout path." >&2
+  exit 2
+fi
 
 cat >&2 <<MSG
 This helper is the repeatable Runes parity harness scaffold.

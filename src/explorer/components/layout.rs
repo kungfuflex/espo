@@ -695,7 +695,7 @@ fn search_scripts(base_path_js: &str) -> Markup {
   }};
 
   const buildIcon = (group, item) => {{
-    if (group.kind === 'alkanes') {{
+    if (group.kind === 'alkanes' || group.kind === 'runes') {{
       const wrap = document.createElement('span');
       wrap.className = 'alk-icon-wrap search-alk-icon';
       const img = document.createElement('span');

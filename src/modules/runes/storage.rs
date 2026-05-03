@@ -2,17 +2,37 @@ use crate::config::get_address_index_chunk_size;
 use crate::runtime::mdb::Mdb;
 use anyhow::{Result, anyhow};
 use bitcoin::hashes::Hash;
-use bitcoin::{ScriptBuf, Txid};
+use bitcoin::{BlockHash, ScriptBuf, Txid};
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Rune, RuneId, SpacedRune, Terms};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::inscriptions::RuneIcon;
 
 const INDEX_HEIGHT_KEY: &[u8] = b"/index_height";
+const INDEX_BLOCK_HASH_KEY: &[u8] = b"/index_block_hash";
+const UNDO_PREFIX: &[u8] = b"/undo/";
 const TX_INDEX_INLINE_CAP: usize = 8;
+
+// Raw Runes writes bypass the versioned B+tree for speed, so every block stores
+// the pre-image of each touched key. Reorg handling replays these records backward.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+struct RunesBlockUndo {
+    height: u32,
+    block_hash: [u8; 32],
+    prev_index_height: Option<u32>,
+    prev_index_block_hash: Option<[u8; 32]>,
+    changes: Vec<RuneUndoChange>,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+struct RuneUndoChange {
+    key: Vec<u8>,
+    previous: Option<Vec<u8>>,
+}
 
 #[derive(
     BorshSerialize,
@@ -155,11 +175,151 @@ pub struct OutpointRuneBalances {
 pub struct RuneMintActivity {
     pub id: SchemaRuneId,
     pub txid: [u8; 32],
+    pub chain_txids: Vec<[u8; 32]>,
+    pub cpfp: bool,
     pub height: u32,
     pub tx_index: u32,
     pub timestamp: u64,
     pub amount: u128,
+    pub fee_paid_sats: u128,
+    pub mint_price_paid_sats: [u8; 32],
+    pub mint_price_paid_usd: [u8; 32],
     pub destination: Option<String>,
+    pub success: bool,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuneActivityKind {
+    Etch,
+    Mint,
+}
+
+impl RuneActivityKind {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Etch => "etch",
+            Self::Mint => "mint",
+        }
+    }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct RuneActivity {
+    pub id: SchemaRuneId,
+    pub txid: [u8; 32],
+    pub chain_txids: Vec<[u8; 32]>,
+    pub cpfp: bool,
+    pub height: u32,
+    pub tx_index: u32,
+    pub timestamp: u64,
+    pub kind: RuneActivityKind,
+    pub amount: u128,
+    pub fee_paid_sats: u128,
+    pub mint_price_paid_sats: [u8; 32],
+    pub mint_price_paid_usd: [u8; 32],
+    pub destination: Option<String>,
+    pub success: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuneActivityScope {
+    All,
+    Market,
+    Mint,
+    Etch,
+}
+
+impl RuneActivityScope {
+    fn segment(self) -> &'static [u8] {
+        match self {
+            Self::All => b"all",
+            Self::Market => b"market",
+            Self::Mint => b"mint",
+            Self::Etch => b"etch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuneActivitySortField {
+    Timestamp,
+    Amount,
+}
+
+impl RuneActivitySortField {
+    fn segment(self) -> &'static [u8] {
+        match self {
+            Self::Timestamp => b"timestamp",
+            Self::Amount => b"amount",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortDir {
+    Desc,
+    Asc,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetRuneActivityPageParams {
+    pub id: SchemaRuneId,
+    pub address: Option<String>,
+    pub offset: usize,
+    pub limit: usize,
+    pub kind: Option<RuneActivityKind>,
+    pub scope: RuneActivityScope,
+    pub sort_by: RuneActivitySortField,
+    pub dir: SortDir,
+    pub start_time: Option<u64>,
+    pub end_time: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetRuneAddressActivityPageParams {
+    pub address: String,
+    pub id: Option<SchemaRuneId>,
+    pub offset: usize,
+    pub limit: usize,
+    pub kind: Option<RuneActivityKind>,
+    pub scope: RuneActivityScope,
+    pub sort_by: RuneActivitySortField,
+    pub dir: SortDir,
+    pub start_time: Option<u64>,
+    pub end_time: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuneActivityPage {
+    pub total: usize,
+    pub entries: Vec<RuneActivity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuneBalanceHistoryPoint {
+    pub height: u32,
+    pub amount: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuneAddressAmountEntry {
+    pub address: String,
+    pub amount: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RuneVolumeKind {
+    TransferVolume,
+    TotalReceived,
+}
+
+impl RuneVolumeKind {
+    fn segment(self) -> &'static [u8] {
+        match self {
+            Self::TransferVolume => b"transfer",
+            Self::TotalReceived => b"received",
+        }
+    }
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -189,6 +349,8 @@ enum RuneTxIndexList {
 pub enum RuneTxIndexKind {
     Block,
     Address,
+    ActionBlock,
+    ActionAddress,
 }
 
 impl RuneTxIndexKind {
@@ -196,8 +358,19 @@ impl RuneTxIndexKind {
         match self {
             Self::Block => b"block",
             Self::Address => b"address",
+            Self::ActionBlock => b"action_block",
+            Self::ActionAddress => b"action_address",
         }
     }
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ActionTxPointerBlob {
+    pub txid: [u8; 32],
+    pub height: u32,
+    pub tx_index: u32,
+    pub has_alkane: bool,
+    pub has_rune: bool,
 }
 
 #[derive(Clone)]
@@ -224,6 +397,16 @@ impl RunesProvider {
         }))
     }
 
+    pub fn get_index_block_hash(&self) -> Result<Option<BlockHash>> {
+        Ok(self.mdb.get(INDEX_BLOCK_HASH_KEY)?.and_then(|bytes| {
+            (bytes.len() == 32).then(|| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                BlockHash::from_byte_array(arr)
+            })
+        }))
+    }
+
     pub fn set_index_height(&self, height: u32) -> Result<()> {
         self.mdb.put(INDEX_HEIGHT_KEY, &height.to_le_bytes())?;
         Ok(())
@@ -239,6 +422,172 @@ impl RunesProvider {
             }
         })?;
         Ok(())
+    }
+
+    pub fn set_block_batch(
+        &self,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+        index_height: u32,
+        block_hash: &BlockHash,
+    ) -> Result<()> {
+        let t0 = Instant::now();
+        let put_count = puts.len();
+        let delete_count = deletes.len();
+        let put_bytes: usize = puts.iter().map(|(key, value)| key.len() + value.len()).sum();
+        let delete_bytes: usize = deletes.iter().map(|key| key.len()).sum();
+        let mut read_keys = HashSet::new();
+        let mut append_only_put_keys = Vec::new();
+        for key in &deletes {
+            read_keys.insert(key.clone());
+        }
+        for (key, _) in &puts {
+            if runes_put_key_requires_preimage(key) {
+                read_keys.insert(key.clone());
+            } else {
+                append_only_put_keys.push(key.clone());
+            }
+        }
+        append_only_put_keys.sort();
+        append_only_put_keys.dedup();
+        let mut read_keys: Vec<Vec<u8>> = read_keys.into_iter().collect();
+        read_keys.sort();
+        let read_key_count = read_keys.len();
+
+        let t_read = Instant::now();
+        let previous_values = self.mdb.multi_get(&read_keys)?;
+        let read_elapsed = t_read.elapsed();
+        let mut changes = read_keys
+            .into_iter()
+            .zip(previous_values)
+            .map(|(key, previous)| RuneUndoChange { key, previous })
+            .collect::<Vec<_>>();
+        changes.extend(
+            append_only_put_keys
+                .into_iter()
+                .map(|key| RuneUndoChange { key, previous: None }),
+        );
+        let touched_count = changes.len();
+        let prev_index_height = self.get_index_height()?;
+        let prev_index_block_hash = self.get_index_block_hash()?.map(|hash| hash.to_byte_array());
+        let block_hash_bytes = block_hash.to_byte_array();
+        let undo = RunesBlockUndo {
+            height: index_height,
+            block_hash: block_hash_bytes,
+            prev_index_height,
+            prev_index_block_hash,
+            changes,
+        };
+        let t_encode = Instant::now();
+        let undo_value = encode(&undo)?;
+        let encode_elapsed = t_encode.elapsed();
+        let undo_bytes = undo_value.len();
+
+        let t_write = Instant::now();
+        self.mdb.bulk_write(|wb| {
+            for key in deletes {
+                wb.delete(&key);
+            }
+            for (key, value) in puts {
+                wb.put(&key, &value);
+            }
+            wb.put(INDEX_HEIGHT_KEY, &index_height.to_le_bytes());
+            wb.put(INDEX_BLOCK_HASH_KEY, &block_hash_bytes);
+            wb.put(&undo_key(index_height), &undo_value);
+        })?;
+        if crate::config::debug_enabled() {
+            eprintln!(
+                "[RUNES][storage] height={} puts={} deletes={} touched={} preimage_keys={} put_bytes={} delete_key_bytes={} undo_bytes={} preimage_read={:?} undo_encode={:?} write={:?} total={:?}",
+                index_height,
+                put_count,
+                delete_count,
+                touched_count,
+                read_key_count,
+                put_bytes,
+                delete_bytes,
+                undo_bytes,
+                read_elapsed,
+                encode_elapsed,
+                t_write.elapsed(),
+                t0.elapsed()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn has_undo_for_height(&self, height: u32) -> Result<bool> {
+        Ok(self.mdb.get(&undo_key(height))?.is_some())
+    }
+
+    pub fn rollback_before_height(&self, next_height: u32) -> Result<()> {
+        self.rollback_to_height(next_height.checked_sub(1))
+    }
+
+    fn rollback_to_height(&self, target_height: Option<u32>) -> Result<()> {
+        loop {
+            let Some(current_height) = self.get_index_height()? else {
+                return Ok(());
+            };
+            if let Some(target_height) = target_height {
+                if current_height <= target_height {
+                    return Ok(());
+                }
+            }
+
+            let key = undo_key(current_height);
+            let Some(undo_bytes) = self.mdb.get(&key)? else {
+                return Err(anyhow!(
+                    "runes rollback missing undo journal for height {current_height}; full runes reindex required"
+                ));
+            };
+            let undo = RunesBlockUndo::try_from_slice(&undo_bytes).map_err(|e| {
+                anyhow!("failed to decode runes undo journal at {current_height}: {e}")
+            })?;
+            if undo.height != current_height {
+                return Err(anyhow!(
+                    "runes rollback journal height mismatch: key height {current_height}, record height {}",
+                    undo.height
+                ));
+            }
+            if let Some(current_hash) = self.get_index_block_hash()? {
+                if current_hash.to_byte_array() != undo.block_hash {
+                    return Err(anyhow!(
+                        "runes rollback journal hash mismatch at height {current_height}: index hash {}, journal hash {}",
+                        current_hash,
+                        BlockHash::from_byte_array(undo.block_hash)
+                    ));
+                }
+            }
+
+            self.mdb.bulk_write(|wb| {
+                for change in undo.changes {
+                    match change.previous {
+                        Some(value) => wb.put(&change.key, &value),
+                        None => wb.delete(&change.key),
+                    }
+                }
+                match undo.prev_index_height {
+                    Some(height) => wb.put(INDEX_HEIGHT_KEY, &height.to_le_bytes()),
+                    None => wb.delete(INDEX_HEIGHT_KEY),
+                }
+                match undo.prev_index_block_hash {
+                    Some(hash) => wb.put(INDEX_BLOCK_HASH_KEY, &hash),
+                    None => wb.delete(INDEX_BLOCK_HASH_KEY),
+                }
+                wb.delete(&key);
+            })?;
+        }
+    }
+
+    pub fn clear_namespace(&self) -> Result<usize> {
+        let keys = self.mdb.scan_prefix_keys(b"")?;
+        let count = keys.len();
+        self.mdb.bulk_write(|wb| {
+            for key in keys {
+                wb.delete(&key);
+            }
+        })?;
+        Ok(count)
     }
 
     pub fn get_rune(&self, id: SchemaRuneId) -> Result<Option<RuneEntry>> {
@@ -257,12 +606,66 @@ impl RunesProvider {
         self.get_rune(id)
     }
 
+    pub fn get_runes_by_name_prefix(&self, query: &str, limit: usize) -> Result<Vec<RuneEntry>> {
+        let normalized = normalize_name(query);
+        if normalized.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let prefix = id_by_name_key(&normalized);
+        let mut seen = HashSet::new();
+        let mut rows = Vec::new();
+        for (key, raw) in self.mdb.scan_prefix_entries(&prefix)? {
+            if key.len() <= prefix.len() {
+                continue;
+            }
+            let id = SchemaRuneId::try_from_slice(&raw)?;
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(entry) = self.get_rune(id)? {
+                rows.push(entry);
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     pub fn get_outpoint_balances(
         &self,
         txid: &Txid,
         vout: u32,
     ) -> Result<Option<OutpointRuneBalances>> {
         self.get_entry(&outpoint_key(txid, vout))
+    }
+
+    pub fn get_address_outpoints(
+        &self,
+        address: &str,
+    ) -> Result<Vec<(Txid, u32, OutpointRuneBalances)>> {
+        let mut rows = Vec::new();
+        for key in self.mdb.scan_prefix_keys(&address_outpoint_prefix(address))? {
+            let Some((txid, vout)) = decode_address_outpoint_key(address, &key) else {
+                continue;
+            };
+            let Some(balances) = self.get_outpoint_balances(&txid, vout)? else {
+                continue;
+            };
+            rows.push((txid, vout, balances));
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(rows)
+    }
+
+    pub fn get_live_outpoints(&self) -> Result<HashSet<(Txid, u32)>> {
+        let mut out = HashSet::new();
+        for key in self.mdb.scan_prefix_keys(b"/outpoint/")? {
+            if let Some(outpoint) = decode_outpoint_key(&key) {
+                out.insert(outpoint);
+            }
+        }
+        Ok(out)
     }
 
     pub fn get_holders(
@@ -287,6 +690,15 @@ impl RunesProvider {
     }
 
     pub fn get_top_runes(&self, page: usize, limit: usize) -> Result<Vec<(RuneEntry, u64)>> {
+        self.get_runes_by_holders(page, limit, true)
+    }
+
+    pub fn get_runes_by_holders(
+        &self,
+        page: usize,
+        limit: usize,
+        desc: bool,
+    ) -> Result<Vec<(RuneEntry, u64)>> {
         let mut rows = Vec::new();
         for item in self.mdb.scan_prefix_entries(b"/rune/by_id/")? {
             let (_key, value) = item;
@@ -294,13 +706,46 @@ impl RunesProvider {
             let holders = self.get_holders_count(entry.id)?;
             rows.push((entry, holders));
         }
-        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.number.cmp(&b.0.number)));
+        rows.sort_by(|a, b| {
+            let ord = a.1.cmp(&b.1).then_with(|| b.0.number.cmp(&a.0.number));
+            if desc { ord.reverse() } else { ord }
+        });
+        let start = limit.saturating_mul(page.saturating_sub(1));
+        Ok(rows.into_iter().skip(start).take(limit).collect())
+    }
+
+    pub fn get_runes_by_age(
+        &self,
+        page: usize,
+        limit: usize,
+        desc: bool,
+    ) -> Result<Vec<(RuneEntry, u64)>> {
+        let mut rows = Vec::new();
+        for item in self.mdb.scan_prefix_entries(b"/rune/by_id/")? {
+            let (_key, value) = item;
+            let entry = RuneEntry::try_from_slice(&value)?;
+            let holders = self.get_holders_count(entry.id)?;
+            rows.push((entry, holders));
+        }
+        rows.sort_by(|a, b| {
+            let ord =
+                a.0.id
+                    .block
+                    .cmp(&b.0.id.block)
+                    .then_with(|| a.0.id.tx.cmp(&b.0.id.tx))
+                    .then_with(|| a.0.number.cmp(&b.0.number));
+            if desc { ord.reverse() } else { ord }
+        });
         let start = limit.saturating_mul(page.saturating_sub(1));
         Ok(rows.into_iter().skip(start).take(limit).collect())
     }
 
     pub fn get_holders_count(&self, id: SchemaRuneId) -> Result<u64> {
         Ok(self.mdb.get(&holders_count_key(id))?.and_then(|v| decode_u64(&v)).unwrap_or(0))
+    }
+
+    pub fn get_rune_count(&self) -> Result<u64> {
+        Ok(self.mdb.scan_prefix_keys(b"/rune/by_id/")?.len() as u64)
     }
 
     pub fn get_address_balances(&self, address: &str) -> Result<Vec<(SchemaRuneId, u128)>> {
@@ -320,6 +765,84 @@ impl RunesProvider {
         Ok(out)
     }
 
+    pub fn get_address_balance_history_points(
+        &self,
+        address: &str,
+        id: SchemaRuneId,
+        range_min: u32,
+        range_max: u32,
+        interval: u32,
+    ) -> Result<Vec<RuneBalanceHistoryPoint>> {
+        if range_min > range_max {
+            return Ok(Vec::new());
+        }
+        let len = self
+            .mdb
+            .get(&address_balance_history_list_len_key(address, id))?
+            .and_then(|bytes| decode_u32(&bytes))
+            .unwrap_or(0);
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let height_keys: Vec<Vec<u8>> = (0..len)
+            .map(|idx| address_balance_history_list_idx_key(address, id, idx))
+            .collect();
+        let height_values = self.mdb.multi_get(&height_keys)?;
+        let mut heights = Vec::new();
+        for raw in height_values.into_iter().flatten() {
+            if raw.len() == 4 {
+                heights.push(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]));
+            }
+        }
+        heights.retain(|height| *height <= range_max);
+        heights.sort_unstable();
+        heights.dedup();
+        if heights.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let value_keys: Vec<Vec<u8>> = heights
+            .iter()
+            .map(|height| address_balance_history_key(address, id, *height))
+            .collect();
+        let value_rows = self.mdb.multi_get(&value_keys)?;
+        let mut changes = Vec::new();
+        for (height, raw) in heights.into_iter().zip(value_rows.into_iter()) {
+            let Some(bytes) = raw else { continue };
+            let amount = decode_u128(&bytes).unwrap_or(0);
+            changes.push((height, amount));
+        }
+        changes.sort_by_key(|(height, _)| *height);
+        changes.dedup_by_key(|(height, _)| *height);
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut idx = 0usize;
+        let mut current = 0u128;
+        while idx < changes.len() && changes[idx].0 <= range_min {
+            current = changes[idx].1;
+            idx += 1;
+        }
+
+        let step = interval.max(1);
+        let mut height = range_min;
+        let mut points = Vec::new();
+        loop {
+            while idx < changes.len() && changes[idx].0 <= height {
+                current = changes[idx].1;
+                idx += 1;
+            }
+            points.push(RuneBalanceHistoryPoint { height, amount: current });
+            if height == range_max {
+                break;
+            }
+            height = height.saturating_add(step).min(range_max);
+        }
+        Ok(points)
+    }
+
     pub fn get_mint_activity(
         &self,
         id: SchemaRuneId,
@@ -327,16 +850,177 @@ impl RunesProvider {
         limit: usize,
     ) -> Result<Vec<RuneMintActivity>> {
         let prefix = mint_activity_prefix(id);
+        let end = prefix_end_exclusive(&prefix);
+        let offset = limit.saturating_mul(page.saturating_sub(1));
         let mut rows = Vec::new();
-        for item in self.mdb.scan_prefix_entries(&prefix)? {
+        for item in
+            self.mdb.scan_range_entries_page(&prefix, end.as_deref(), offset, limit, true)?
+        {
             let (_key, value) = item;
             rows.push(RuneMintActivity::try_from_slice(&value)?);
         }
-        rows.sort_by(|a, b| {
-            b.timestamp.cmp(&a.timestamp).then_with(|| b.tx_index.cmp(&a.tx_index))
-        });
+        Ok(rows)
+    }
+
+    pub fn get_volume(
+        &self,
+        id: SchemaRuneId,
+        kind: RuneVolumeKind,
+        page: usize,
+        limit: usize,
+    ) -> Result<(usize, Vec<RuneAddressAmountEntry>)> {
+        let len = self
+            .mdb
+            .get(&rune_volume_list_len_key(kind, id))?
+            .and_then(|bytes| decode_u32(&bytes))
+            .unwrap_or(0);
+        let mut rows = Vec::new();
+        if len > 0 {
+            for idx in 0..len {
+                let Some(raw_addr) = self.mdb.get(&rune_volume_list_idx_key(kind, id, idx))? else {
+                    continue;
+                };
+                let Ok(address) = std::str::from_utf8(&raw_addr).map(|s| s.to_string()) else {
+                    continue;
+                };
+                let amount = self
+                    .mdb
+                    .get(&rune_volume_entry_key(kind, id, &address))?
+                    .and_then(|bytes| decode_u128(&bytes))
+                    .unwrap_or(0);
+                if amount > 0 {
+                    rows.push(RuneAddressAmountEntry { address, amount });
+                }
+            }
+        }
+        rows.sort_by(|a, b| b.amount.cmp(&a.amount).then_with(|| a.address.cmp(&b.address)));
+        let total = rows.len();
         let start = limit.saturating_mul(page.saturating_sub(1));
-        Ok(rows.into_iter().skip(start).take(limit).collect())
+        Ok((total, rows.into_iter().skip(start).take(limit).collect()))
+    }
+
+    pub fn get_rune_activity_page(
+        &self,
+        params: GetRuneActivityPageParams,
+    ) -> Result<RuneActivityPage> {
+        let prefix = match params.address.as_ref() {
+            Some(address) => rune_address_token_activity_index_prefix(
+                address,
+                params.id,
+                params.scope,
+                params.sort_by,
+            ),
+            None => rune_activity_index_prefix(params.id, params.scope, params.sort_by),
+        };
+        let total_hint = if params.address.is_none() {
+            self.rune_activity_total_hint(params.id, params.scope)?
+        } else {
+            None
+        };
+        self.get_rune_activity_page_by_prefix(
+            prefix,
+            params.offset,
+            params.limit,
+            params.dir,
+            total_hint,
+            params.kind,
+            params.start_time,
+            params.end_time,
+        )
+    }
+
+    pub fn get_rune_address_activity_page(
+        &self,
+        params: GetRuneAddressActivityPageParams,
+    ) -> Result<RuneActivityPage> {
+        let prefix = match params.id {
+            Some(id) => rune_address_token_activity_index_prefix(
+                &params.address,
+                id,
+                params.scope,
+                params.sort_by,
+            ),
+            None => {
+                rune_address_activity_index_prefix(&params.address, params.scope, params.sort_by)
+            }
+        };
+        self.get_rune_activity_page_by_prefix(
+            prefix,
+            params.offset,
+            params.limit,
+            params.dir,
+            None,
+            params.kind,
+            params.start_time,
+            params.end_time,
+        )
+    }
+
+    fn get_rune_activity_page_by_prefix(
+        &self,
+        prefix: Vec<u8>,
+        offset: usize,
+        limit: usize,
+        dir: SortDir,
+        total_hint: Option<usize>,
+        kind: Option<RuneActivityKind>,
+        start_time: Option<u64>,
+        end_time: Option<u64>,
+    ) -> Result<RuneActivityPage> {
+        let end = prefix_end_exclusive(&prefix);
+        if kind.is_some() || start_time.is_some() || end_time.is_some() {
+            let mut entries = Vec::new();
+            for (_key, raw) in self.mdb.scan_prefix_entries(&prefix)? {
+                let activity = RuneActivity::try_from_slice(&raw)?;
+                if kind.map(|needle| activity.kind == needle).unwrap_or(true)
+                    && start_time.map(|start| activity.timestamp >= start).unwrap_or(true)
+                    && end_time.map(|end| activity.timestamp <= end).unwrap_or(true)
+                {
+                    entries.push(activity);
+                }
+            }
+            if matches!(dir, SortDir::Desc) {
+                entries.reverse();
+            }
+            let total = entries.len();
+            let entries = entries.into_iter().skip(offset).take(limit).collect();
+            return Ok(RuneActivityPage { total, entries });
+        }
+        let selected = self.mdb.scan_range_entries_page(
+            &prefix,
+            end.as_deref(),
+            offset,
+            limit,
+            matches!(dir, SortDir::Desc),
+        )?;
+        let mut entries = Vec::new();
+        for (_key, raw) in selected {
+            entries.push(RuneActivity::try_from_slice(&raw)?);
+        }
+        let total = total_hint.unwrap_or_else(|| {
+            self.mdb
+                .scan_prefix_keys(&prefix)
+                .map(|keys| keys.len())
+                .unwrap_or(offset + entries.len())
+        });
+        Ok(RuneActivityPage { total, entries })
+    }
+
+    fn rune_activity_total_hint(
+        &self,
+        id: SchemaRuneId,
+        scope: RuneActivityScope,
+    ) -> Result<Option<usize>> {
+        let Some(entry) = self.get_rune(id)? else {
+            return Ok(Some(0));
+        };
+        let total = match scope {
+            RuneActivityScope::All => entry.mints.saturating_add(1),
+            RuneActivityScope::Mint => entry.mints,
+            RuneActivityScope::Etch => 1,
+            RuneActivityScope::Market => 0,
+        };
+        Ok(Some(total.min(usize::MAX as u128) as usize))
     }
 
     pub fn get_tx_io(&self, txid: &Txid) -> Result<Option<TxRuneIo>> {
@@ -379,6 +1063,42 @@ impl RunesProvider {
         )
     }
 
+    pub fn get_action_block_tx_count(&self, height: u64) -> Result<u64> {
+        self.get_tx_index_len(&action_tx_block_list_key(height))
+    }
+
+    pub fn get_action_block_tx_range(
+        &self,
+        height: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<ActionTxPointerBlob>> {
+        self.get_action_tx_index_pointer_range(
+            RuneTxIndexKind::ActionBlock,
+            &action_tx_block_list_key(height),
+            start,
+            end,
+        )
+    }
+
+    pub fn get_action_address_tx_count(&self, address: &str) -> Result<u64> {
+        self.get_tx_index_len(&action_tx_address_list_key(address))
+    }
+
+    pub fn get_action_address_tx_range(
+        &self,
+        address: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<ActionTxPointerBlob>> {
+        self.get_action_tx_index_pointer_range(
+            RuneTxIndexKind::ActionAddress,
+            &action_tx_address_list_key(address),
+            start,
+            end,
+        )
+    }
+
     pub fn get_rune_icon(&self, id: SchemaRuneId) -> Result<Option<RuneIcon>> {
         self.get_entry(&rune_icon_key(id))
     }
@@ -402,6 +1122,23 @@ impl RunesProvider {
         let mut out = Vec::with_capacity(pointer_ids.len());
         for id in pointer_ids {
             if let Some(blob) = self.get_entry::<RuneTxPointerBlob>(&rune_tx_pointer_key(id))? {
+                out.push(blob);
+            }
+        }
+        Ok(out)
+    }
+
+    fn get_action_tx_index_pointer_range(
+        &self,
+        kind: RuneTxIndexKind,
+        list_key: &[u8],
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<ActionTxPointerBlob>> {
+        let pointer_ids = self.get_tx_index_range(kind, list_key, start, end)?;
+        let mut out = Vec::with_capacity(pointer_ids.len());
+        for id in pointer_ids {
+            if let Some(blob) = self.get_entry::<ActionTxPointerBlob>(&action_tx_pointer_key(id))? {
                 out.push(blob);
             }
         }
@@ -482,8 +1219,18 @@ pub fn rune_tx_pointer_count_key() -> Vec<u8> {
     b"/tx_index/pointer/count".to_vec()
 }
 
+pub fn action_tx_pointer_count_key() -> Vec<u8> {
+    b"/tx_index/actions/pointer/count".to_vec()
+}
+
 pub fn rune_tx_pointer_key(id: u64) -> Vec<u8> {
     let mut key = b"/tx_index/pointer/".to_vec();
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+pub fn action_tx_pointer_key(id: u64) -> Vec<u8> {
+    let mut key = b"/tx_index/actions/pointer/".to_vec();
     key.extend_from_slice(&id.to_be_bytes());
     key
 }
@@ -494,8 +1241,20 @@ pub fn rune_tx_block_list_key(height: u64) -> Vec<u8> {
     key
 }
 
+pub fn action_tx_block_list_key(height: u64) -> Vec<u8> {
+    let mut key = b"/tx_index/actions/block/".to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
 pub fn rune_tx_address_list_key(address: &str) -> Vec<u8> {
     let mut key = b"/tx_index/address/".to_vec();
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+pub fn action_tx_address_list_key(address: &str) -> Vec<u8> {
+    let mut key = b"/tx_index/actions/address/".to_vec();
     key.extend_from_slice(address.as_bytes());
     key
 }
@@ -521,6 +1280,22 @@ pub fn encode_rune_tx_pointer_blob(
     io: &TxRuneIo,
 ) -> Result<Vec<u8>> {
     encode(&RuneTxPointerBlob { txid: txid.to_byte_array(), height, tx_index, io: io.clone() })
+}
+
+pub fn encode_action_tx_pointer_blob(
+    txid: &Txid,
+    height: u32,
+    tx_index: u32,
+    has_alkane: bool,
+    has_rune: bool,
+) -> Result<Vec<u8>> {
+    encode(&ActionTxPointerBlob {
+        txid: txid.to_byte_array(),
+        height,
+        tx_index,
+        has_alkane,
+        has_rune,
+    })
 }
 
 pub fn append_rune_tx_index_values(
@@ -654,7 +1429,7 @@ pub fn rune_entry_to_json(entry: &RuneEntry, holders: u64) -> Value {
         "supply": entry.supply().to_string(),
         "burned": entry.burned.to_string(),
         "holders": holders,
-        "etching_txid": hex::encode(entry.etching_txid),
+        "etching_txid": Txid::from_byte_array(entry.etching_txid).to_string(),
         "timestamp": entry.timestamp,
         "turbo": entry.turbo,
         "terms": entry.terms.as_ref().map(|terms| json!({
@@ -703,6 +1478,38 @@ pub fn encode<T: BorshSerialize>(value: &T) -> Result<Vec<u8>> {
     borsh::to_vec(value).map_err(|e| anyhow!("runes encode failed: {e}"))
 }
 
+fn undo_key(height: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(UNDO_PREFIX.len() + 4);
+    key.extend_from_slice(UNDO_PREFIX);
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
+fn runes_put_key_requires_preimage(key: &[u8]) -> bool {
+    if key == b"/tx_index/pointer/count"
+        || key == b"/tx_index/actions/pointer/count"
+        || key == b"/rune/seq/count"
+        || key.starts_with(b"/tx_index/chunk_count/")
+        || key.starts_with(b"/tx_index/chunk/")
+        || key.starts_with(b"/tx_index/address/")
+        || key.starts_with(b"/tx_index/actions/block/")
+        || key.starts_with(b"/tx_index/actions/address/")
+        || key.starts_with(b"/rune/by_id/")
+        || key.starts_with(b"/holder/")
+        || key.starts_with(b"/holder_count/")
+        || key.starts_with(b"/address/")
+        || key.starts_with(b"/address_balance_height/")
+        || key.starts_with(b"/address_balance_height_idx/")
+        || key.starts_with(b"/volume/")
+        || key.starts_with(b"/volume_idx/")
+        || key.starts_with(b"/tx_index/chunk/address/")
+    {
+        return true;
+    }
+
+    false
+}
+
 pub fn encode_u128(value: u128) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
@@ -727,6 +1534,19 @@ pub fn decode_u64(value: &[u8]) -> Option<u64> {
     let mut arr = [0u8; 8];
     arr.copy_from_slice(value);
     Some(u64::from_le_bytes(arr))
+}
+
+pub fn encode_u32(value: u32) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+pub fn decode_u32(value: &[u8]) -> Option<u32> {
+    if value.len() != 4 {
+        return None;
+    }
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(value);
+    Some(u32::from_le_bytes(arr))
 }
 
 fn id_key_bytes(id: SchemaRuneId) -> [u8; 12] {
@@ -794,6 +1614,45 @@ pub fn outpoint_key(txid: &Txid, vout: u32) -> Vec<u8> {
     key
 }
 
+pub fn decode_outpoint_key(key: &[u8]) -> Option<(Txid, u32)> {
+    let tail = key.strip_prefix(b"/outpoint/")?;
+    if tail.len() != 36 {
+        return None;
+    }
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&tail[..32]);
+    let mut vout = [0u8; 4];
+    vout.copy_from_slice(&tail[32..36]);
+    Some((Txid::from_byte_array(txid), u32::from_be_bytes(vout)))
+}
+
+pub fn address_outpoint_prefix(address: &str) -> Vec<u8> {
+    let mut key = b"/address_outpoint/".to_vec();
+    key.extend_from_slice(address.as_bytes());
+    key.push(b'/');
+    key
+}
+
+pub fn address_outpoint_key(address: &str, txid: &Txid, vout: u32) -> Vec<u8> {
+    let mut key = address_outpoint_prefix(address);
+    key.extend_from_slice(txid.as_byte_array());
+    key.extend_from_slice(&vout.to_be_bytes());
+    key
+}
+
+pub fn decode_address_outpoint_key(address: &str, key: &[u8]) -> Option<(Txid, u32)> {
+    let prefix = address_outpoint_prefix(address);
+    let tail = key.strip_prefix(prefix.as_slice())?;
+    if tail.len() != 36 {
+        return None;
+    }
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&tail[..32]);
+    let mut vout = [0u8; 4];
+    vout.copy_from_slice(&tail[32..36]);
+    Some((Txid::from_byte_array(txid), u32::from_be_bytes(vout)))
+}
+
 pub fn holder_prefix(id: SchemaRuneId) -> Vec<u8> {
     let mut key = b"/holder/".to_vec();
     key.extend_from_slice(&id_key_bytes(id));
@@ -826,6 +1685,42 @@ pub fn address_balance_key(address: &str, id: SchemaRuneId) -> Vec<u8> {
     key
 }
 
+pub fn address_balance_history_prefix(address: &str, id: SchemaRuneId) -> Vec<u8> {
+    let mut key = b"/address_balance_height/v1/".to_vec();
+    key.extend_from_slice(address.as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(&id_key_bytes(id));
+    key.push(b'/');
+    key
+}
+
+pub fn address_balance_history_key(address: &str, id: SchemaRuneId, height: u32) -> Vec<u8> {
+    let mut key = address_balance_history_prefix(address, id);
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
+pub fn address_balance_history_list_prefix(address: &str, id: SchemaRuneId) -> Vec<u8> {
+    let mut key = b"/address_balance_height_idx/v1/".to_vec();
+    key.extend_from_slice(address.as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(&id_key_bytes(id));
+    key.push(b'/');
+    key
+}
+
+pub fn address_balance_history_list_len_key(address: &str, id: SchemaRuneId) -> Vec<u8> {
+    let mut key = address_balance_history_list_prefix(address, id);
+    key.extend_from_slice(b"len");
+    key
+}
+
+pub fn address_balance_history_list_idx_key(address: &str, id: SchemaRuneId, idx: u32) -> Vec<u8> {
+    let mut key = address_balance_history_list_prefix(address, id);
+    key.extend_from_slice(&idx.to_be_bytes());
+    key
+}
+
 pub fn mint_activity_prefix(id: SchemaRuneId) -> Vec<u8> {
     let mut key = b"/activity/mint/".to_vec();
     key.extend_from_slice(&id_key_bytes(id));
@@ -838,6 +1733,152 @@ pub fn mint_activity_key(id: SchemaRuneId, timestamp: u64, txid: &Txid, ordinal:
     key.extend_from_slice(&timestamp.to_be_bytes());
     key.extend_from_slice(txid.as_byte_array());
     key.extend_from_slice(&ordinal.to_be_bytes());
+    key
+}
+
+fn prefix_end_exclusive(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for i in (0..end.len()).rev() {
+        if end[i] != 0xff {
+            end[i] += 1;
+            end.truncate(i + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+pub fn rune_activity_index_key(
+    activity: &RuneActivity,
+    scope: RuneActivityScope,
+    sort_by: RuneActivitySortField,
+) -> Vec<u8> {
+    rune_activity_index_key_from_prefix(
+        rune_activity_index_prefix(activity.id, scope, sort_by),
+        activity,
+        sort_by,
+    )
+}
+
+pub fn rune_address_activity_index_key(
+    activity: &RuneActivity,
+    address: &str,
+    scope: RuneActivityScope,
+    sort_by: RuneActivitySortField,
+) -> Vec<u8> {
+    rune_activity_index_key_from_prefix(
+        rune_address_activity_index_prefix(address, scope, sort_by),
+        activity,
+        sort_by,
+    )
+}
+
+pub fn rune_address_token_activity_index_key(
+    activity: &RuneActivity,
+    address: &str,
+    scope: RuneActivityScope,
+    sort_by: RuneActivitySortField,
+) -> Vec<u8> {
+    rune_activity_index_key_from_prefix(
+        rune_address_token_activity_index_prefix(address, activity.id, scope, sort_by),
+        activity,
+        sort_by,
+    )
+}
+
+fn rune_activity_index_key_from_prefix(
+    mut key: Vec<u8>,
+    activity: &RuneActivity,
+    sort_by: RuneActivitySortField,
+) -> Vec<u8> {
+    match sort_by {
+        RuneActivitySortField::Timestamp => {
+            key.extend_from_slice(&activity.timestamp.to_be_bytes())
+        }
+        RuneActivitySortField::Amount => key.extend_from_slice(&activity.amount.to_be_bytes()),
+    }
+    key.extend_from_slice(&activity.height.to_be_bytes());
+    key.extend_from_slice(&activity.tx_index.to_be_bytes());
+    key.extend_from_slice(activity.kind.key().as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(&activity.txid);
+    key
+}
+
+pub fn rune_activity_index_prefix(
+    id: SchemaRuneId,
+    scope: RuneActivityScope,
+    sort_by: RuneActivitySortField,
+) -> Vec<u8> {
+    let mut key = b"/activity/v2/".to_vec();
+    key.extend_from_slice(&id_key_bytes(id));
+    key.push(b'/');
+    key.extend_from_slice(scope.segment());
+    key.push(b'/');
+    key.extend_from_slice(sort_by.segment());
+    key.push(b'/');
+    key
+}
+
+pub fn rune_address_activity_index_prefix(
+    address: &str,
+    scope: RuneActivityScope,
+    sort_by: RuneActivitySortField,
+) -> Vec<u8> {
+    let mut key = b"/activity_address/v2/".to_vec();
+    key.extend_from_slice(address.as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(scope.segment());
+    key.push(b'/');
+    key.extend_from_slice(sort_by.segment());
+    key.push(b'/');
+    key
+}
+
+pub fn rune_address_token_activity_index_prefix(
+    address: &str,
+    id: SchemaRuneId,
+    scope: RuneActivityScope,
+    sort_by: RuneActivitySortField,
+) -> Vec<u8> {
+    let mut key = b"/activity_address_token/v2/".to_vec();
+    key.extend_from_slice(address.as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(&id_key_bytes(id));
+    key.push(b'/');
+    key.extend_from_slice(scope.segment());
+    key.push(b'/');
+    key.extend_from_slice(sort_by.segment());
+    key.push(b'/');
+    key
+}
+
+pub fn rune_volume_entry_key(kind: RuneVolumeKind, id: SchemaRuneId, address: &str) -> Vec<u8> {
+    let mut key = b"/volume/".to_vec();
+    key.extend_from_slice(kind.segment());
+    key.push(b'/');
+    key.extend_from_slice(&id_key_bytes(id));
+    key.push(b'/');
+    key.extend_from_slice(address.as_bytes());
+    key
+}
+
+pub fn rune_volume_list_len_key(kind: RuneVolumeKind, id: SchemaRuneId) -> Vec<u8> {
+    let mut key = b"/volume_idx/".to_vec();
+    key.extend_from_slice(kind.segment());
+    key.push(b'/');
+    key.extend_from_slice(&id_key_bytes(id));
+    key.extend_from_slice(b"/len");
+    key
+}
+
+pub fn rune_volume_list_idx_key(kind: RuneVolumeKind, id: SchemaRuneId, idx: u32) -> Vec<u8> {
+    let mut key = b"/volume_idx/".to_vec();
+    key.extend_from_slice(kind.segment());
+    key.push(b'/');
+    key.extend_from_slice(&id_key_bytes(id));
+    key.push(b'/');
+    key.extend_from_slice(&idx.to_be_bytes());
     key
 }
 
@@ -855,4 +1896,42 @@ pub fn rune_icon_key(id: SchemaRuneId) -> Vec<u8> {
 
 pub fn script_to_address(script: &ScriptBuf, network: bitcoin::Network) -> Option<String> {
     bitcoin::Address::from_script(script, network).ok().map(|a| a.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_provider() -> (TempDir, RunesProvider) {
+        let dir = TempDir::new().expect("tempdir");
+        let mdb = Mdb::open(dir.path(), b"runes:").expect("open mdb");
+        (dir, RunesProvider::new(Arc::new(mdb)))
+    }
+
+    #[test]
+    fn block_undo_rolls_raw_runes_state_back() {
+        let (_dir, provider) = test_provider();
+        let h1 = BlockHash::from_byte_array([1; 32]);
+        let h2 = BlockHash::from_byte_array([2; 32]);
+
+        provider
+            .set_block_batch(vec![(b"/a".to_vec(), b"one".to_vec())], Vec::new(), 1, &h1)
+            .expect("write block 1");
+        provider
+            .set_block_batch(vec![(b"/b".to_vec(), b"two".to_vec())], vec![b"/a".to_vec()], 2, &h2)
+            .expect("write block 2");
+
+        provider.rollback_before_height(2).expect("rollback block 2");
+        assert_eq!(provider.get_index_height().expect("height"), Some(1));
+        assert_eq!(provider.get_index_block_hash().expect("hash"), Some(h1));
+        assert_eq!(provider.mdb().get(b"/a").expect("a"), Some(b"one".to_vec()));
+        assert_eq!(provider.mdb().get(b"/b").expect("b"), None);
+        assert!(!provider.has_undo_for_height(2).expect("undo 2"));
+
+        provider.rollback_before_height(1).expect("rollback block 1");
+        assert_eq!(provider.get_index_height().expect("height"), None);
+        assert_eq!(provider.get_index_block_hash().expect("hash"), None);
+        assert_eq!(provider.mdb().get(b"/a").expect("a"), None);
+    }
 }

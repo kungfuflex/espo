@@ -3,31 +3,60 @@ use super::inscriptions::{
 };
 use super::rpc;
 use super::storage::{
-    OutpointRuneBalances, RuneBalance, RuneEntry, RuneMintActivity, RuneTxIndexKind, RunesProvider,
-    SchemaRuneId, TxRuneIo, address_balance_key, append_rune_tx_index_values, encode,
-    encode_rune_tx_pointer_blob, encode_u64, encode_u128, entry_key, holder_key, holders_count_key,
-    id_by_name_key, id_by_rune_key, make_entry, mint_activity_key, outpoint_key, rune_icon_key,
+    OutpointRuneBalances, RuneActivity, RuneActivityKind, RuneActivityScope, RuneActivitySortField,
+    RuneBalance, RuneEntry, RuneMintActivity, RuneTxIndexKind, RuneVolumeKind, RunesProvider,
+    SchemaRuneId, TxRuneIo, action_tx_address_list_key, action_tx_block_list_key,
+    action_tx_pointer_count_key, action_tx_pointer_key, address_balance_history_key,
+    address_balance_history_list_idx_key, address_balance_history_list_len_key,
+    address_balance_key, address_outpoint_key, append_rune_tx_index_values, encode,
+    encode_action_tx_pointer_blob, encode_rune_tx_pointer_blob, encode_u32, encode_u64,
+    encode_u128, entry_key, holder_key, holders_count_key, id_by_name_key, id_by_rune_key,
+    make_entry, mint_activity_key, outpoint_key, rune_activity_index_key,
+    rune_address_activity_index_key, rune_address_token_activity_index_key, rune_icon_key,
     rune_tx_address_list_key, rune_tx_block_list_key, rune_tx_chunk_counter_key,
-    rune_tx_pointer_count_key, rune_tx_pointer_key, script_to_address, seq_count_key, seq_key,
+    rune_tx_pointer_count_key, rune_tx_pointer_key, rune_volume_entry_key,
+    rune_volume_list_idx_key, rune_volume_list_len_key, script_to_address, seq_count_key, seq_key,
     tx_io_key,
 };
 use super::transfer::{OutputRuneSheets, RuneSheet, RunestoneTransfer, TransferRules};
 use crate::alkanes::trace::EspoBlock;
-use crate::config::{get_bitcoind_rpc_client, get_network};
+use crate::config::{
+    debug_enabled, get_bitcoind_rpc_client, get_electrum_like, get_espo_db, get_network,
+};
+use crate::modules::ammdata::consts::{PRICE_SCALE, SATS_PER_BTC};
+use crate::modules::ammdata::storage::AmmDataProvider;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
+use crate::modules::essentials::storage::{
+    AddressIndexListKind, EssentialsProvider, address_index_list_id_alkane_block_txs,
+    get_address_index_list_len, get_address_index_list_range, load_tx_pointer_blob_v3_by_id,
+};
 use crate::runtime::mdb::Mdb;
+use crate::runtime::state_at::StateAt;
+use alloy_primitives::U256;
 use anyhow::Result;
+use bitcoin::blockdata::script::Instruction;
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
-use bitcoin::{Network, OutPoint, Transaction, Txid};
+use bitcoin::{Network, OutPoint, Transaction, Txid, opcodes};
 use bitcoincore_rpc::RpcApi;
 use ordinals::{Artifact, Edict, Etching, Height, Rune, RuneId, Runestone};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 const MAINNET_RUNES_GENESIS: u32 = 840_000;
 const GENESIS_RUNE_ID: SchemaRuneId = SchemaRuneId { block: 1, tx: 0 };
+
+pub fn runes_genesis_block(network: Network) -> u32 {
+    match network {
+        Network::Bitcoin => MAINNET_RUNES_GENESIS,
+        Network::Testnet => Rune::first_rune_height(Network::Testnet),
+        Network::Regtest | Network::Signet => 0,
+        _ => 0,
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunesConfig {
@@ -45,6 +74,7 @@ pub fn runes_enabled_from_global_config() -> bool {
 pub struct Runes {
     provider: Option<Arc<RunesProvider>>,
     index_height: Arc<RwLock<Option<u32>>>,
+    live_outpoints: Arc<RwLock<HashSet<(Txid, u32)>>>,
     config: RunesConfig,
 }
 
@@ -53,6 +83,7 @@ impl Runes {
         Self {
             provider: None,
             index_height: Arc::new(RwLock::new(None)),
+            live_outpoints: Arc::new(RwLock::new(HashSet::new())),
             config: RunesConfig { enable: false },
         }
     }
@@ -76,7 +107,45 @@ impl EspoModule for Runes {
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
         let provider = Arc::new(RunesProvider::new(mdb));
         match provider.get_index_height() {
-            Ok(height) => {
+            Ok(mut height) => {
+                if height.is_some()
+                    && provider.get_rune(GENESIS_RUNE_ID).ok().flatten().is_none()
+                    && runes_genesis_block(get_network()) == MAINNET_RUNES_GENESIS
+                {
+                    let cleared = provider.clear_namespace().unwrap_or_else(|err| {
+                        eprintln!("[RUNES] failed to clear invalid runes namespace: {err:?}");
+                        0
+                    });
+                    eprintln!(
+                        "[RUNES] index height exists without genesis rune; cleared {cleared} keys and treating runes index as uninitialized"
+                    );
+                    height = None;
+                }
+                if let Some(indexed_height) = height {
+                    if !provider.has_undo_for_height(indexed_height).unwrap_or(false) {
+                        let cleared = provider.clear_namespace().unwrap_or_else(|err| {
+                            eprintln!(
+                                "[RUNES] failed to clear runes namespace without undo journal: {err:?}"
+                            );
+                            0
+                        });
+                        eprintln!(
+                            "[RUNES] index height {indexed_height} has no undo journal; cleared {cleared} keys and treating runes index as uninitialized"
+                        );
+                        height = None;
+                    }
+                }
+
+                let live_outpoints = if height.is_some() {
+                    provider.get_live_outpoints().unwrap_or_else(|err| {
+                        eprintln!("[RUNES] failed to preload live outpoints: {err:?}");
+                        HashSet::new()
+                    })
+                } else {
+                    HashSet::new()
+                };
+                eprintln!("[RUNES] preloaded {} live rune outpoints", live_outpoints.len());
+                *self.live_outpoints.write().unwrap() = live_outpoints;
                 *self.index_height.write().unwrap() = height;
                 eprintln!("[RUNES] loaded index height: {:?}", height);
             }
@@ -86,15 +155,11 @@ impl EspoModule for Runes {
     }
 
     fn get_genesis_block(&self, network: Network) -> u32 {
-        match network {
-            Network::Bitcoin => MAINNET_RUNES_GENESIS,
-            Network::Regtest | Network::Signet => 0,
-            Network::Testnet => Rune::first_rune_height(Network::Testnet),
-            _ => MAINNET_RUNES_GENESIS,
-        }
+        runes_genesis_block(network)
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
+        let t0 = Instant::now();
         if !self.config.enable {
             return Ok(());
         }
@@ -103,16 +168,41 @@ impl EspoModule for Runes {
                 return Ok(());
             }
         }
-        let mut indexer =
-            BlockRunesIndexer::new(self.provider(), block.height, block.block_header.time);
+        let mut live_outpoints = self.live_outpoints.write().unwrap();
+        let mut indexer = BlockRunesIndexer::new(
+            self.provider(),
+            block.height,
+            block.block_header.time,
+            &mut live_outpoints,
+        );
         indexer.index_block(&block)?;
-        self.provider().set_index_height(block.height)?;
         *self.index_height.write().unwrap() = Some(block.height);
+        if debug_enabled() {
+            eprintln!(
+                "[indexer] module=runes height={} index_block done in {:?}",
+                block.height,
+                t0.elapsed()
+            );
+        }
         Ok(())
     }
 
     fn get_index_height(&self) -> Option<u32> {
         *self.index_height.read().unwrap()
+    }
+
+    fn handle_reorg(&self, next_height: u32) -> Result<()> {
+        if !self.config.enable {
+            return Ok(());
+        }
+        self.provider().rollback_before_height(next_height)?;
+        let height = self.provider().get_index_height()?;
+        let live_outpoints =
+            if height.is_some() { self.provider().get_live_outpoints()? } else { HashSet::new() };
+        *self.live_outpoints.write().unwrap() = live_outpoints;
+        *self.index_height.write().unwrap() = height;
+        eprintln!("[RUNES] reorg rollback complete; index height: {:?}", height);
+        Ok(())
     }
 
     fn register_rpc(&self, reg: &RpcNsRegistrar) {
@@ -133,6 +223,7 @@ impl EspoModule for Runes {
 
 struct BlockRunesIndexer<'a> {
     provider: &'a RunesProvider,
+    live_outpoints: &'a mut HashSet<(Txid, u32)>,
     height: u32,
     timestamp: u64,
     network: Network,
@@ -142,21 +233,44 @@ struct BlockRunesIndexer<'a> {
     rune_to_id: HashMap<u128, SchemaRuneId>,
     next_seq: Option<u64>,
     address_balance_cache: HashMap<(String, SchemaRuneId), u128>,
+    address_balance_history_touched: HashSet<(String, SchemaRuneId)>,
     holder_balance_cache: HashMap<(SchemaRuneId, String), u128>,
     holder_count_cache: HashMap<SchemaRuneId, u64>,
+    volume_cache: HashMap<(RuneVolumeKind, SchemaRuneId, String), u128>,
+    volume_len_cache: HashMap<(RuneVolumeKind, SchemaRuneId), u32>,
     next_tx_pointer: Option<u64>,
+    next_action_pointer: Option<u64>,
     next_block_chunk_id: Option<u64>,
     next_address_chunk_id: Option<u64>,
+    next_action_block_chunk_id: Option<u64>,
+    next_action_address_chunk_id: Option<u64>,
     block_tx_pointer_ids: Vec<u64>,
     address_tx_pointer_ids: HashMap<String, Vec<u64>>,
+    action_block_pointer_ids: Vec<u64>,
+    action_address_pointer_ids: HashMap<String, Vec<u64>>,
+    action_candidates: BTreeMap<Txid, ActionCandidate>,
     puts: Vec<(Vec<u8>, Vec<u8>)>,
-    deletes: Vec<Vec<u8>>,
+    deletes: HashSet<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ActionCandidate {
+    tx_index: u32,
+    has_alkane: bool,
+    has_rune: bool,
+    addresses: HashSet<String>,
 }
 
 impl<'a> BlockRunesIndexer<'a> {
-    fn new(provider: &'a RunesProvider, height: u32, timestamp: u32) -> Self {
+    fn new(
+        provider: &'a RunesProvider,
+        height: u32,
+        timestamp: u32,
+        live_outpoints: &'a mut HashSet<(Txid, u32)>,
+    ) -> Self {
         Self {
             provider,
+            live_outpoints,
             height,
             timestamp: timestamp as u64,
             network: get_network(),
@@ -166,50 +280,102 @@ impl<'a> BlockRunesIndexer<'a> {
             rune_to_id: HashMap::new(),
             next_seq: None,
             address_balance_cache: HashMap::new(),
+            address_balance_history_touched: HashSet::new(),
             holder_balance_cache: HashMap::new(),
             holder_count_cache: HashMap::new(),
+            volume_cache: HashMap::new(),
+            volume_len_cache: HashMap::new(),
             next_tx_pointer: None,
+            next_action_pointer: None,
             next_block_chunk_id: None,
             next_address_chunk_id: None,
+            next_action_block_chunk_id: None,
+            next_action_address_chunk_id: None,
             block_tx_pointer_ids: Vec::new(),
             address_tx_pointer_ids: HashMap::new(),
+            action_block_pointer_ids: Vec::new(),
+            action_address_pointer_ids: HashMap::new(),
+            action_candidates: BTreeMap::new(),
             puts: Vec::new(),
-            deletes: Vec::new(),
+            deletes: HashSet::new(),
         }
     }
 
     fn index_block(&mut self, block: &EspoBlock) -> Result<()> {
+        let t_scan = Instant::now();
+        let block_tx_map: HashMap<Txid, &Transaction> = block
+            .transactions
+            .iter()
+            .map(|atx| (atx.transaction.compute_txid(), &atx.transaction))
+            .collect();
+        let external_prev_map = load_external_prev_txs_for_rune_mints(block);
         for (tx_index, atx) in block.transactions.iter().enumerate() {
-            self.index_tx(tx_index as u32, &atx.transaction)?;
+            self.index_tx(tx_index as u32, &atx.transaction, &block_tx_map, &external_prev_map)?;
         }
+        self.collect_alkane_action_candidates(block, &block_tx_map)?;
+        let scan_elapsed = t_scan.elapsed();
+        let t_flush = Instant::now();
+        self.flush_address_balance_history()?;
+        self.flush_action_tx_indexes()?;
         self.flush_tx_indexes()?;
-        let puts = std::mem::take(&mut self.puts);
-        let deletes = std::mem::take(&mut self.deletes);
-        self.provider.set_batch(puts, deletes)?;
+        let flush_elapsed = t_flush.elapsed();
+        let delete_set = std::mem::take(&mut self.deletes);
+        let mut puts = std::mem::take(&mut self.puts);
+        if !delete_set.is_empty() {
+            puts.retain(|(key, _)| !delete_set.contains(key));
+        }
+        let deletes: Vec<Vec<u8>> = delete_set.into_iter().collect();
+        let put_count = puts.len();
+        let delete_count = deletes.len();
+        let block_hash = block.block_header.block_hash();
+        let t_write = Instant::now();
+        self.provider.set_block_batch(puts, deletes, self.height, &block_hash)?;
+        if debug_enabled() {
+            eprintln!(
+                "[RUNES][block] height={} txs={} scan={:?} flush_tx_indexes={:?} write_batch={:?} puts={} deletes={}",
+                self.height,
+                block.transactions.len(),
+                scan_elapsed,
+                flush_elapsed,
+                t_write.elapsed(),
+                put_count,
+                delete_count
+            );
+        }
         Ok(())
     }
 
-    fn index_tx(&mut self, tx_index: u32, tx: &Transaction) -> Result<()> {
+    fn index_tx(
+        &mut self,
+        tx_index: u32,
+        tx: &Transaction,
+        block_tx_map: &HashMap<Txid, &Transaction>,
+        external_prev_map: &HashMap<Txid, Transaction>,
+    ) -> Result<()> {
         let txid = tx.compute_txid();
         if self.height == MAINNET_RUNES_GENESIS && tx_index == 0 {
             self.ensure_genesis_rune(txid)?;
         }
-        let artifact = Runestone::decipher(tx);
-        let mut touched_addresses = HashSet::new();
-        let mut unallocated = self.unallocated(tx, &mut touched_addresses)?;
-        if artifact.is_none() && unallocated.is_empty() {
+        let has_runestone = tx_has_runestone_carrier(tx);
+        let has_rune_input = tx.input.iter().any(|input| {
+            self.ephem
+                .contains_key(&(input.previous_output.txid, input.previous_output.vout))
+                || self
+                    .live_outpoints
+                    .contains(&(input.previous_output.txid, input.previous_output.vout))
+        });
+        if !has_runestone && !has_rune_input {
             return Ok(());
         }
-
+        let artifact = has_runestone.then(|| Runestone::decipher(tx)).flatten();
+        let mut touched_addresses = HashSet::new();
+        let mut transfer_participants: HashMap<SchemaRuneId, HashSet<String>> = HashMap::new();
+        let mut transfer_amounts: HashMap<SchemaRuneId, u128> = HashMap::new();
         let mut io = TxRuneIo::default();
-        for (input_idx, input) in tx.input.iter().enumerate() {
-            let key = (input.previous_output.txid, input.previous_output.vout);
-            if let Some(prev) = self.provider.get_outpoint_balances(&key.0, key.1)? {
-                if let Some(address) = prev.address.as_ref() {
-                    touched_addresses.insert(address.clone());
-                }
-                io.inputs.insert(input_idx as u32, prev.balances);
-            }
+        let mut unallocated =
+            self.unallocated(tx, &mut touched_addresses, &mut transfer_participants, &mut io)?;
+        if artifact.is_none() && unallocated.is_empty() {
+            return Ok(());
         }
 
         let etched = match artifact.as_ref() {
@@ -241,6 +407,12 @@ impl<'a> BlockRunesIndexer<'a> {
                 }
             }
         }
+        let mint_fee_paid_sats = if minted.is_empty() {
+            0
+        } else {
+            compute_tx_fee_sats(tx, block_tx_map, external_prev_map)
+        };
+        let btc_usd_price = if minted.is_empty() { None } else { self.btc_usd_price_at_height() };
 
         let mut allocated: OutputRuneSheets<SchemaRuneId> = BTreeMap::new();
         if let Some(Artifact::Runestone(runestone)) = artifact.as_ref() {
@@ -307,32 +479,101 @@ impl<'a> BlockRunesIndexer<'a> {
                 balances: balances.clone(),
             };
             self.ephem.insert((txid, vout), row.clone());
+            self.live_outpoints.insert((txid, vout));
             self.queue_put(outpoint_key(&txid, vout), encode(&row)?);
             if let Some(address) = address.as_ref() {
+                self.queue_put(address_outpoint_key(address, &txid, vout), Vec::new());
                 touched_addresses.insert(address.clone());
                 for balance in &balances {
+                    transfer_participants.entry(balance.id).or_default().insert(address.clone());
+                    *transfer_amounts.entry(balance.id).or_default() = transfer_amounts
+                        .get(&balance.id)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(balance.amount);
+                    self.apply_volume_delta(
+                        RuneVolumeKind::TotalReceived,
+                        balance.id,
+                        address,
+                        balance.amount,
+                    )?;
                     self.apply_address_delta(address, balance.id, balance.amount as i128)?;
                 }
             }
             io.outputs.insert(vout, balances);
         }
 
+        for (id, amount) in transfer_amounts {
+            let Some(participants) = transfer_participants.get(&id) else {
+                continue;
+            };
+            for address in participants {
+                self.apply_volume_delta(RuneVolumeKind::TransferVolume, id, address, amount)?;
+            }
+        }
+
         for balance in minted {
-            if let Some(((_, vout), row)) = self.ephem.iter().find(|((tid, _), _)| *tid == txid) {
-                let destination = row.address.clone();
-                let activity = RuneMintActivity {
-                    id: balance.id,
+            let destination = self.first_output_address_for_rune(txid, balance.id);
+            let divisibility =
+                self.load_entry(balance.id)?.map(|entry| entry.divisibility).unwrap_or_default();
+            let mint_price_paid_sats =
+                scale_rune_fee_price_sats(mint_fee_paid_sats, balance.amount, divisibility);
+            let mint_price_paid_usd = scale_rune_fee_price_usd(mint_price_paid_sats, btc_usd_price);
+            let activity = RuneMintActivity {
+                id: balance.id,
+                txid: txid.to_byte_array(),
+                chain_txids: vec![txid.to_byte_array()],
+                cpfp: false,
+                height: self.height,
+                tx_index,
+                timestamp: self.timestamp,
+                amount: balance.amount,
+                fee_paid_sats: mint_fee_paid_sats,
+                mint_price_paid_sats,
+                mint_price_paid_usd,
+                destination: destination.clone(),
+                success: true,
+            };
+            self.puts.push((
+                mint_activity_key(balance.id, self.timestamp, &txid, tx_index),
+                encode(&activity)?,
+            ));
+            self.queue_rune_activity(RuneActivity {
+                id: balance.id,
+                txid: txid.to_byte_array(),
+                chain_txids: vec![txid.to_byte_array()],
+                cpfp: false,
+                height: self.height,
+                tx_index,
+                timestamp: self.timestamp,
+                kind: RuneActivityKind::Mint,
+                amount: balance.amount,
+                fee_paid_sats: mint_fee_paid_sats,
+                mint_price_paid_sats,
+                mint_price_paid_usd,
+                destination,
+                success: true,
+            })?;
+        }
+
+        if let Some(id) = io.etched {
+            if let Some(entry) = self.load_entry(id)? {
+                self.queue_rune_activity(RuneActivity {
+                    id,
                     txid: txid.to_byte_array(),
+                    chain_txids: vec![txid.to_byte_array()],
+                    cpfp: false,
                     height: self.height,
                     tx_index,
                     timestamp: self.timestamp,
-                    amount: balance.amount,
-                    destination,
-                };
-                self.puts.push((
-                    mint_activity_key(balance.id, self.timestamp, &txid, *vout),
-                    encode(&activity)?,
-                ));
+                    kind: RuneActivityKind::Etch,
+                    amount: entry.premine,
+                    fee_paid_sats: 0,
+                    mint_price_paid_sats: [0u8; 32],
+                    mint_price_paid_usd: [0u8; 32],
+                    destination: self.first_output_address_for_rune(txid, id),
+                    success: true,
+                })?;
             }
         }
 
@@ -353,23 +594,31 @@ impl<'a> BlockRunesIndexer<'a> {
         &mut self,
         tx: &Transaction,
         touched_addresses: &mut HashSet<String>,
+        transfer_participants: &mut HashMap<SchemaRuneId, HashSet<String>>,
+        io: &mut TxRuneIo,
     ) -> Result<RuneSheet<SchemaRuneId>> {
         let mut unallocated = RuneSheet::new();
         let spending_txid = tx.compute_txid().to_byte_array();
-        for input in &tx.input {
+        for (input_idx, input) in tx.input.iter().enumerate() {
             let prev = input.previous_output;
             let row = if let Some(row) = self.ephem.remove(&(prev.txid, prev.vout)) {
                 Some(row)
+            } else if !self.live_outpoints.contains(&(prev.txid, prev.vout)) {
+                None
             } else {
                 self.provider.get_outpoint_balances(&prev.txid, prev.vout)?
             };
             let Some(row) = row else {
                 continue;
             };
+            self.live_outpoints.remove(&(prev.txid, prev.vout));
             self.queue_delete(outpoint_key(&prev.txid, prev.vout));
+            io.inputs.insert(input_idx as u32, row.balances.clone());
             if let Some(address) = row.address.as_ref() {
+                self.queue_delete(address_outpoint_key(address, &prev.txid, prev.vout));
                 touched_addresses.insert(address.clone());
                 for balance in &row.balances {
+                    transfer_participants.entry(balance.id).or_default().insert(address.clone());
                     self.apply_address_delta(address, balance.id, -(balance.amount as i128))?;
                 }
             }
@@ -379,6 +628,58 @@ impl<'a> BlockRunesIndexer<'a> {
         }
         let _ = spending_txid;
         Ok(unallocated)
+    }
+
+    fn first_output_address_for_rune(&self, txid: Txid, id: SchemaRuneId) -> Option<String> {
+        let mut candidates: Vec<(u32, String)> = self
+            .ephem
+            .iter()
+            .filter_map(|((candidate_txid, vout), row)| {
+                if *candidate_txid != txid {
+                    return None;
+                }
+                let has_rune = row.balances.iter().any(|balance| balance.id == id);
+                has_rune.then(|| row.address.clone().map(|address| (*vout, address))).flatten()
+            })
+            .collect();
+        candidates.sort_by_key(|(vout, _)| *vout);
+        candidates.into_iter().map(|(_, address)| address).next()
+    }
+
+    fn btc_usd_price_at_height(&self) -> Option<u128> {
+        let essentials_provider = Arc::new(EssentialsProvider::new(Arc::new(Mdb::from_db(
+            get_espo_db(),
+            b"essentials:",
+        ))));
+        let amm_provider = AmmDataProvider::new(
+            Arc::new(Mdb::from_db(get_espo_db(), b"ammdata:")),
+            essentials_provider,
+        );
+        amm_provider.get_btc_usd_price_at_or_before_height(self.height).ok().flatten()
+    }
+
+    fn queue_rune_activity(&mut self, activity: RuneActivity) -> Result<()> {
+        let scopes = match activity.kind {
+            RuneActivityKind::Etch => [RuneActivityScope::All, RuneActivityScope::Etch],
+            RuneActivityKind::Mint => [RuneActivityScope::All, RuneActivityScope::Mint],
+        };
+        for scope in scopes {
+            for sort_by in [RuneActivitySortField::Timestamp, RuneActivitySortField::Amount] {
+                self.puts
+                    .push((rune_activity_index_key(&activity, scope, sort_by), encode(&activity)?));
+                if let Some(address) = activity.destination.as_ref() {
+                    self.puts.push((
+                        rune_address_activity_index_key(&activity, address, scope, sort_by),
+                        encode(&activity)?,
+                    ));
+                    self.puts.push((
+                        rune_address_token_activity_index_key(&activity, address, scope, sort_by),
+                        encode(&activity)?,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn queue_tx_index(
@@ -394,7 +695,16 @@ impl<'a> BlockRunesIndexer<'a> {
             encode_rune_tx_pointer_blob(&txid, self.height, tx_index, io)?,
         ));
         self.block_tx_pointer_ids.push(pointer_id);
+        let candidate = self.action_candidates.entry(txid).or_insert_with(|| ActionCandidate {
+            tx_index,
+            has_alkane: false,
+            has_rune: false,
+            addresses: HashSet::new(),
+        });
+        candidate.tx_index = candidate.tx_index.min(tx_index);
+        candidate.has_rune = true;
         for address in touched_addresses {
+            candidate.addresses.insert(address.clone());
             self.address_tx_pointer_ids.entry(address).or_default().push(pointer_id);
         }
         Ok(())
@@ -419,10 +729,32 @@ impl<'a> BlockRunesIndexer<'a> {
         Ok(id)
     }
 
+    fn next_action_pointer_id(&mut self) -> Result<u64> {
+        let id = match self.next_action_pointer {
+            Some(id) => id,
+            None => {
+                let id = self
+                    .provider
+                    .mdb()
+                    .get(&action_tx_pointer_count_key())?
+                    .and_then(|bytes| super::storage::decode_u64(&bytes))
+                    .unwrap_or(0);
+                self.next_action_pointer = Some(id);
+                id
+            }
+        };
+        self.next_action_pointer = Some(id.saturating_add(1));
+        self.puts
+            .push((action_tx_pointer_count_key(), encode_u64(id.saturating_add(1))));
+        Ok(id)
+    }
+
     fn next_chunk_id(&mut self, kind: RuneTxIndexKind) -> Result<&mut u64> {
         let slot = match kind {
             RuneTxIndexKind::Block => &mut self.next_block_chunk_id,
             RuneTxIndexKind::Address => &mut self.next_address_chunk_id,
+            RuneTxIndexKind::ActionBlock => &mut self.next_action_block_chunk_id,
+            RuneTxIndexKind::ActionAddress => &mut self.next_action_address_chunk_id,
         };
         if slot.is_none() {
             let id = self
@@ -434,6 +766,140 @@ impl<'a> BlockRunesIndexer<'a> {
             *slot = Some(id);
         }
         Ok(slot.as_mut().expect("chunk id initialized"))
+    }
+
+    fn collect_alkane_action_candidates(
+        &mut self,
+        block: &EspoBlock,
+        block_tx_map: &HashMap<Txid, &Transaction>,
+    ) -> Result<()> {
+        let essentials =
+            EssentialsProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"essentials:")));
+        let list_id = address_index_list_id_alkane_block_txs(self.height as u64);
+        let total = get_address_index_list_len(
+            &essentials,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneBlockTxs,
+            &list_id,
+        )
+        .unwrap_or(0);
+        if total == 0 {
+            return Ok(());
+        }
+        let ids = get_address_index_list_range(
+            &essentials,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneBlockTxs,
+            &list_id,
+            0,
+            total,
+        )
+        .unwrap_or_default();
+        let mut alkane_txids = Vec::new();
+        for id in ids {
+            let Some(blob) = load_tx_pointer_blob_v3_by_id(&essentials, id) else {
+                continue;
+            };
+            let txid = Txid::from_byte_array(blob.txid);
+            let candidate = self.action_candidates.entry(txid).or_insert_with(|| ActionCandidate {
+                tx_index: blob.tx_idx,
+                has_alkane: false,
+                has_rune: false,
+                addresses: HashSet::new(),
+            });
+            candidate.tx_index = candidate.tx_index.min(blob.tx_idx);
+            candidate.has_alkane = true;
+            alkane_txids.push(txid);
+        }
+        if alkane_txids.is_empty() {
+            return Ok(());
+        }
+
+        let external_prev_map = load_external_prev_txs_for_action_addresses(block, &alkane_txids);
+        for txid in alkane_txids {
+            let Some(tx) = block_tx_map.get(&txid).copied() else {
+                continue;
+            };
+            let addresses =
+                bitcoin_addresses_for_tx(tx, block_tx_map, &external_prev_map, self.network);
+            if let Some(candidate) = self.action_candidates.get_mut(&txid) {
+                candidate.addresses.extend(addresses);
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_action_tx_indexes(&mut self) -> Result<()> {
+        let mut candidates: Vec<(Txid, ActionCandidate)> =
+            std::mem::take(&mut self.action_candidates).into_iter().collect();
+        candidates.sort_by_key(|(txid, candidate)| (candidate.tx_index, *txid));
+        let mut pointer_ids_by_txid = HashMap::new();
+        for (txid, candidate) in &candidates {
+            if !candidate.has_alkane && !candidate.has_rune {
+                continue;
+            }
+            let pointer_id = self.next_action_pointer_id()?;
+            self.puts.push((
+                action_tx_pointer_key(pointer_id),
+                encode_action_tx_pointer_blob(
+                    txid,
+                    self.height,
+                    candidate.tx_index,
+                    candidate.has_alkane,
+                    candidate.has_rune,
+                )?,
+            ));
+            pointer_ids_by_txid.insert(*txid, pointer_id);
+            self.action_block_pointer_ids.push(pointer_id);
+        }
+
+        for (txid, candidate) in candidates {
+            let Some(pointer_id) = pointer_ids_by_txid.get(&txid).copied() else {
+                continue;
+            };
+            for address in candidate.addresses {
+                self.action_address_pointer_ids.entry(address).or_default().push(pointer_id);
+            }
+        }
+
+        if !self.action_block_pointer_ids.is_empty() {
+            let values = std::mem::take(&mut self.action_block_pointer_ids);
+            let mut next_chunk_id = *self.next_chunk_id(RuneTxIndexKind::ActionBlock)?;
+            append_rune_tx_index_values(
+                self.provider,
+                RuneTxIndexKind::ActionBlock,
+                action_tx_block_list_key(self.height as u64),
+                &values,
+                &mut next_chunk_id,
+                &mut self.puts,
+            )?;
+            self.next_action_block_chunk_id = Some(next_chunk_id);
+            self.puts.push((
+                rune_tx_chunk_counter_key(RuneTxIndexKind::ActionBlock),
+                encode_u64(next_chunk_id),
+            ));
+        }
+
+        let address_tx_pointer_ids = std::mem::take(&mut self.action_address_pointer_ids);
+        if !address_tx_pointer_ids.is_empty() {
+            let mut next_chunk_id = *self.next_chunk_id(RuneTxIndexKind::ActionAddress)?;
+            for (address, values) in address_tx_pointer_ids {
+                append_rune_tx_index_values(
+                    self.provider,
+                    RuneTxIndexKind::ActionAddress,
+                    action_tx_address_list_key(&address),
+                    &values,
+                    &mut next_chunk_id,
+                    &mut self.puts,
+                )?;
+            }
+            self.next_action_address_chunk_id = Some(next_chunk_id);
+            self.puts.push((
+                rune_tx_chunk_counter_key(RuneTxIndexKind::ActionAddress),
+                encode_u64(next_chunk_id),
+            ));
+        }
+        Ok(())
     }
 
     fn flush_tx_indexes(&mut self) -> Result<()> {
@@ -651,15 +1117,12 @@ impl<'a> BlockRunesIndexer<'a> {
     }
 
     fn queue_put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.deletes.retain(|pending| pending != &key);
+        self.deletes.remove(&key);
         self.puts.push((key, value));
     }
 
     fn queue_delete(&mut self, key: Vec<u8>) {
-        self.puts.retain(|(pending, _)| pending != &key);
-        if !self.deletes.iter().any(|pending| pending == &key) {
-            self.deletes.push(key);
-        }
+        self.deletes.insert(key);
     }
 
     fn rune_exists(&mut self, rune: Rune) -> Result<bool> {
@@ -748,6 +1211,7 @@ impl<'a> BlockRunesIndexer<'a> {
             prev.saturating_add(delta as u128)
         };
         self.address_balance_cache.insert(address_cache_key, next);
+        self.address_balance_history_touched.insert((address.to_string(), id));
         if next == 0 {
             self.queue_delete(key);
         } else {
@@ -806,6 +1270,83 @@ impl<'a> BlockRunesIndexer<'a> {
         }
         Ok(())
     }
+
+    fn flush_address_balance_history(&mut self) -> Result<()> {
+        let touched: Vec<(String, SchemaRuneId)> =
+            self.address_balance_history_touched.drain().collect();
+        for (address, id) in touched {
+            let amount =
+                self.address_balance_cache.get(&(address.clone(), id)).copied().unwrap_or(0);
+            self.queue_put(
+                address_balance_history_key(&address, id, self.height),
+                encode_u128(amount),
+            );
+            let len_key = address_balance_history_list_len_key(&address, id);
+            let len = self
+                .provider
+                .mdb()
+                .get(&len_key)?
+                .and_then(|bytes| super::storage::decode_u32(&bytes))
+                .unwrap_or(0);
+            self.queue_put(
+                address_balance_history_list_idx_key(&address, id, len),
+                self.height.to_be_bytes().to_vec(),
+            );
+            self.queue_put(len_key, encode_u32(len.saturating_add(1)));
+        }
+        Ok(())
+    }
+
+    fn apply_volume_delta(
+        &mut self,
+        kind: RuneVolumeKind,
+        id: SchemaRuneId,
+        address: &str,
+        delta: u128,
+    ) -> Result<()> {
+        if delta == 0 {
+            return Ok(());
+        }
+        let cache_key = (kind, id, address.to_string());
+        let key = rune_volume_entry_key(kind, id, address);
+        let (prev, had_row) = match self.volume_cache.get(&cache_key).copied() {
+            Some(value) => (value, true),
+            None => {
+                let raw = self.provider.mdb().get(&key)?;
+                let had_row = raw.is_some();
+                let value = raw.and_then(|bytes| super::storage::decode_u128(&bytes)).unwrap_or(0);
+                (value, had_row)
+            }
+        };
+        let next = prev.saturating_add(delta);
+        self.volume_cache.insert(cache_key, next);
+        self.queue_put(key, encode_u128(next));
+
+        if had_row {
+            return Ok(());
+        }
+
+        let len_key = rune_volume_list_len_key(kind, id);
+        let len_cache_key = (kind, id);
+        let len = match self.volume_len_cache.get(&len_cache_key).copied() {
+            Some(value) => value,
+            None => {
+                let value = self
+                    .provider
+                    .mdb()
+                    .get(&len_key)?
+                    .and_then(|bytes| super::storage::decode_u32(&bytes))
+                    .unwrap_or(0);
+                self.volume_len_cache.insert(len_cache_key, value);
+                value
+            }
+        };
+        self.queue_put(rune_volume_list_idx_key(kind, id, len), address.as_bytes().to_vec());
+        let next_len = len.saturating_add(1);
+        self.volume_len_cache.insert(len_cache_key, next_len);
+        self.queue_put(len_key, encode_u32(next_len));
+        Ok(())
+    }
 }
 
 fn balances_from_sheet(sheet: &RuneSheet<SchemaRuneId>) -> Vec<RuneBalance> {
@@ -815,4 +1356,195 @@ fn balances_from_sheet(sheet: &RuneSheet<SchemaRuneId>) -> Vec<RuneBalance> {
             (*amount > 0).then_some(RuneBalance { id: *id, amount: *amount })
         })
         .collect()
+}
+
+fn load_external_prev_txs_for_rune_mints(block: &EspoBlock) -> HashMap<Txid, Transaction> {
+    let block_txids: HashSet<Txid> =
+        block.transactions.iter().map(|atx| atx.transaction.compute_txid()).collect();
+    let mut needed = Vec::new();
+    let mut seen = HashSet::new();
+    for atx in &block.transactions {
+        let tx = &atx.transaction;
+        if !tx_has_runestone_carrier(tx) {
+            continue;
+        }
+        let has_mint =
+            Runestone::decipher(tx).as_ref().and_then(|artifact| artifact.mint()).is_some();
+        if !has_mint {
+            continue;
+        }
+        for input in &tx.input {
+            if input.previous_output.is_null() || block_txids.contains(&input.previous_output.txid)
+            {
+                continue;
+            }
+            if seen.insert(input.previous_output.txid) {
+                needed.push(input.previous_output.txid);
+            }
+        }
+    }
+    if needed.is_empty() {
+        return HashMap::new();
+    }
+    let raws = get_electrum_like().batch_transaction_get_raw(&needed).unwrap_or_default();
+    let mut out = HashMap::new();
+    for (idx, raw) in raws.into_iter().enumerate() {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Ok(tx) = deserialize::<Transaction>(&raw) {
+            out.insert(needed[idx], tx);
+        }
+    }
+    out
+}
+
+fn compute_tx_fee_sats(
+    tx: &Transaction,
+    block_tx_map: &HashMap<Txid, &Transaction>,
+    external_prev_map: &HashMap<Txid, Transaction>,
+) -> u128 {
+    let mut input_total = 0u128;
+    for input in &tx.input {
+        if input.previous_output.is_null() {
+            continue;
+        }
+        let prev_tx = block_tx_map
+            .get(&input.previous_output.txid)
+            .copied()
+            .or_else(|| external_prev_map.get(&input.previous_output.txid));
+        let Some(prev_tx) = prev_tx else { return 0 };
+        let Some(prev_out) = prev_tx.output.get(input.previous_output.vout as usize) else {
+            return 0;
+        };
+        input_total = input_total.saturating_add(prev_out.value.to_sat() as u128);
+    }
+    let output_total = tx
+        .output
+        .iter()
+        .fold(0u128, |acc, output| acc.saturating_add(output.value.to_sat() as u128));
+    input_total.saturating_sub(output_total)
+}
+
+fn scale_rune_fee_price_sats(
+    fee_paid_sats: u128,
+    minted_amount: u128,
+    divisibility: u8,
+) -> [u8; 32] {
+    if fee_paid_sats == 0 || minted_amount == 0 {
+        return [0u8; 32];
+    }
+    let mut unit_scale = U256::from(1u8);
+    for _ in 0..divisibility {
+        unit_scale = unit_scale.saturating_mul(U256::from(10u8));
+    }
+    let price = U256::from(fee_paid_sats)
+        .saturating_mul(unit_scale)
+        .saturating_mul(U256::from(PRICE_SCALE))
+        / U256::from(minted_amount);
+    u256_to_be(price)
+}
+
+fn scale_rune_fee_price_usd(
+    mint_price_paid_sats: [u8; 32],
+    btc_price_usd_scaled: Option<u128>,
+) -> [u8; 32] {
+    let Some(btc_price_usd_scaled) = btc_price_usd_scaled else {
+        return [0u8; 32];
+    };
+    let sats_scaled = U256::from_be_bytes(mint_price_paid_sats);
+    if sats_scaled.is_zero() {
+        return [0u8; 32];
+    }
+    let usd_scaled = sats_scaled.saturating_mul(U256::from(btc_price_usd_scaled))
+        / U256::from(PRICE_SCALE.saturating_mul(SATS_PER_BTC));
+    u256_to_be(usd_scaled)
+}
+
+fn u256_to_be(value: U256) -> [u8; 32] {
+    value.to_be_bytes::<32>()
+}
+
+fn load_external_prev_txs_for_action_addresses(
+    block: &EspoBlock,
+    txids: &[Txid],
+) -> HashMap<Txid, Transaction> {
+    let block_tx_map: HashMap<Txid, &Transaction> = block
+        .transactions
+        .iter()
+        .map(|atx| (atx.transaction.compute_txid(), &atx.transaction))
+        .collect();
+    let mut needed = Vec::new();
+    let mut seen = HashSet::new();
+    for txid in txids {
+        let Some(tx) = block_tx_map.get(txid).copied() else {
+            continue;
+        };
+        for input in &tx.input {
+            if input.previous_output.is_null()
+                || block_tx_map.contains_key(&input.previous_output.txid)
+            {
+                continue;
+            }
+            if seen.insert(input.previous_output.txid) {
+                needed.push(input.previous_output.txid);
+            }
+        }
+    }
+    if needed.is_empty() {
+        return HashMap::new();
+    }
+    let raws = get_electrum_like().batch_transaction_get_raw(&needed).unwrap_or_default();
+    let mut out = HashMap::new();
+    for (idx, raw) in raws.into_iter().enumerate() {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Ok(tx) = deserialize::<Transaction>(&raw) {
+            out.insert(needed[idx], tx);
+        }
+    }
+    out
+}
+
+fn bitcoin_addresses_for_tx(
+    tx: &Transaction,
+    block_tx_map: &HashMap<Txid, &Transaction>,
+    external_prev_map: &HashMap<Txid, Transaction>,
+    network: Network,
+) -> HashSet<String> {
+    let mut addresses = HashSet::new();
+    for output in &tx.output {
+        if output.script_pubkey.is_op_return() {
+            continue;
+        }
+        if let Some(address) = script_to_address(&output.script_pubkey, network) {
+            addresses.insert(address);
+        }
+    }
+    for input in &tx.input {
+        if input.previous_output.is_null() {
+            continue;
+        }
+        let prev_tx = block_tx_map
+            .get(&input.previous_output.txid)
+            .copied()
+            .or_else(|| external_prev_map.get(&input.previous_output.txid));
+        let Some(prev_tx) = prev_tx else { continue };
+        let Some(prev_out) = prev_tx.output.get(input.previous_output.vout as usize) else {
+            continue;
+        };
+        if let Some(address) = script_to_address(&prev_out.script_pubkey, network) {
+            addresses.insert(address);
+        }
+    }
+    addresses
+}
+
+fn tx_has_runestone_carrier(tx: &Transaction) -> bool {
+    tx.output.iter().any(|output| {
+        let mut instructions = output.script_pubkey.instructions();
+        matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_RETURN))))
+            && matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_PUSHNUM_13))))
+    })
 }

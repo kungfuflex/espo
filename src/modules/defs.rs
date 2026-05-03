@@ -105,6 +105,10 @@ pub trait EspoModule: Send + Sync {
     fn index_block(&self, block: EspoBlock) -> Result<()>;
     fn get_index_height(&self) -> Option<u32>;
 
+    fn handle_reorg(&self, _next_height: u32) -> Result<()> {
+        Ok(())
+    }
+
     /// Modules can only register RPCs via a namespaced registrar.
     /// For a module named "ammdata", all methods will be "ammdata.<suffix>".
     fn register_rpc(&self, reg: &RpcNsRegistrar);

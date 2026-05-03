@@ -14,9 +14,10 @@ use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
 use crate::config::{get_bitcoind_rpc_client, get_espo_next_height, show_terminal_ad};
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::layout::layout_with_meta;
-use crate::explorer::components::rune_icon::rune_icon;
 use crate::explorer::components::svg_assets::icon_right;
-use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
+use crate::explorer::components::table::{
+    AlkaneTableRow, alkanes_table_compact_holders, runes_table_compact_holders,
+};
 use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summaries};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
@@ -25,7 +26,7 @@ use crate::modules::essentials::storage::{
     HoldersCountEntry, load_creation_record, load_tx_summary_v2,
 };
 use crate::modules::runes::main::runes_enabled_from_global_config;
-use crate::modules::runes::storage::{RuneEntry, RunesProvider};
+use crate::modules::runes::storage::RunesProvider;
 use crate::schemas::EspoOutpoint;
 use std::sync::Arc;
 
@@ -176,34 +177,6 @@ fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<A
     out
 }
 
-fn top_runes_table(rows: Vec<(RuneEntry, u64)>) -> Markup {
-    if rows.is_empty() {
-        return html! { p class="muted" { "No runes found." } };
-    }
-
-    html! {
-        table class="table holders_table home-table" {
-            tbody {
-                @for (entry, holders) in rows {
-                    @let id = entry.id.to_string();
-                    tr {
-                        td class="alkane-main-cell" {
-                            div class="alkane-main" {
-                                (rune_icon(&entry, "alkane-icon"))
-                                div class="alkane-meta" {
-                                    a class="alk-sym link mono alkane-name-link" href=(explorer_path(&format!("/rune/{id}"))) { (entry.spaced_name.clone()) }
-                                    div class="muted mono alkane-id" { (id) }
-                                }
-                            }
-                        }
-                        td class="mono holders-count" { (holders) }
-                    }
-                }
-            }
-        }
-    }
-}
-
 pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
     let rpc = get_bitcoind_rpc_client();
     let tip = rpc.get_blockchain_info().map(|i| i.blocks).unwrap_or(0);
@@ -219,7 +192,7 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
     let top_alkanes_table: Markup = if top_alkanes.is_empty() {
         html! { p class="muted" { "No alkanes found." } }
     } else {
-        alkanes_table(&top_alkanes, false, false, true)
+        alkanes_table_compact_holders(&top_alkanes, false, false, true)
     };
 
     let (secondary_title, secondary_link_label, secondary_link, secondary_table): (
@@ -231,7 +204,12 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
         let top_runes = RunesProvider::new(Arc::new(state.runes_mdb.clone()))
             .get_top_runes(1, 10)
             .unwrap_or_default();
-        ("Top Runes", "View more Runes", explorer_path("/runes"), top_runes_table(top_runes))
+        let table = if top_runes.is_empty() {
+            html! { p class="muted" { "No runes found." } }
+        } else {
+            runes_table_compact_holders(&top_runes, false, false, true)
+        };
+        ("Top Runes", "View more Runes", explorer_path("/runes"), table)
     } else {
         let latest_alkane_txs = load_latest_alkane_txs(&state.essentials_mdb, 4);
         let latest_block_link = explorer_path(&format!("/block/{espo_tip}?traces=1"));

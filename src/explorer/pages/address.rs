@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
 use crate::config::{get_bitcoind_rpc_client, get_electrum_like};
-use crate::explorer::components::alk_balances::render_alkane_balance_cards;
+use crate::explorer::components::alk_balances::{
+    render_alkane_balance_cards, render_rune_balance_cards,
+};
 use crate::explorer::components::header::{HeaderProps, HeaderSummaryItem, header, header_scripts};
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
@@ -58,6 +60,7 @@ pub struct AddressPageQuery {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxFilter {
     All,
+    Action,
     Alkane,
     Rune,
 }
@@ -66,6 +69,7 @@ impl TxFilter {
     fn from_query(txs: Option<&str>, traces: Option<&str>) -> Self {
         match txs {
             Some("all") => Self::All,
+            Some("action") | Some("actions") | Some("all_actions") => Self::Action,
             Some("rune") | Some("runes") => Self::Rune,
             Some("alkane") | Some("alkanes") => Self::Alkane,
             _ => {
@@ -79,6 +83,7 @@ impl TxFilter {
     fn query_value(self) -> &'static str {
         match self {
             Self::All => "all",
+            Self::Action => "actions",
             Self::Alkane => "alkane",
             Self::Rune => "rune",
         }
@@ -95,7 +100,8 @@ struct AddressTxRender {
 
 #[derive(Clone)]
 struct AddressChartToken {
-    alkane_id: String,
+    kind: &'static str,
+    token_id: String,
     label: String,
     asset_name: String,
     symbol: String,
@@ -214,12 +220,17 @@ pub async fn address_page(
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
     let runes_enabled = runes_enabled_from_global_config();
-    let requested_filter = TxFilter::from_query(q.txs.as_deref(), q.traces.as_deref());
-    let tx_filter = if !runes_enabled && requested_filter == TxFilter::Rune {
-        TxFilter::Alkane
+    let requested_filter = if runes_enabled && q.txs.is_none() && q.traces.is_none() {
+        TxFilter::Action
     } else {
-        requested_filter
+        TxFilter::from_query(q.txs.as_deref(), q.traces.as_deref())
     };
+    let tx_filter =
+        if !runes_enabled && matches!(requested_filter, TxFilter::Rune | TxFilter::Action) {
+            TxFilter::Alkane
+        } else {
+            requested_filter
+        };
     let traces_only = tx_filter == TxFilter::Alkane;
     let txs_param = tx_filter.query_value();
     let all_range_label = if current_language().is_chinese() { "全部" } else { "All" };
@@ -283,9 +294,26 @@ pub async fn address_page(
     balance_entries.sort_by(|a, b| {
         a.alkane.block.cmp(&b.alkane.block).then_with(|| a.alkane.tx.cmp(&b.alkane.tx))
     });
+
+    let rune_balances_t0 = Instant::now();
+    let rune_balance_entries = if runes_enabled {
+        runes_provider.get_address_balances(&address_str).unwrap_or_else(|err| {
+            eprintln!("[address_page] failed to fetch rune balances for {address_str}: {err:?}");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+    log_address_page_perf(
+        &address_str,
+        "runes.get_address_balances",
+        rune_balances_t0,
+        &format!("runes={}", rune_balance_entries.len()),
+    );
+
     let chart_tokens_t0 = Instant::now();
     let mut chart_meta_cache: AlkaneMetaCache = HashMap::new();
-    let chart_tokens: Vec<AddressChartToken> = balance_entries
+    let mut chart_tokens: Vec<AddressChartToken> = balance_entries
         .iter()
         .map(|entry| {
             let alkane_id = format!("{}:{}", entry.alkane.block, entry.alkane.tx);
@@ -296,7 +324,8 @@ pub async fn address_page(
                 alkane_id.clone()
             };
             AddressChartToken {
-                alkane_id: alkane_id.clone(),
+                kind: "alkane",
+                token_id: alkane_id.clone(),
                 label,
                 asset_name: meta.name.value.clone(),
                 symbol: meta.symbol.clone(),
@@ -305,7 +334,36 @@ pub async fn address_page(
             }
         })
         .collect();
-    let default_chart_alkane = chart_tokens.first().map(|token| token.alkane_id.clone());
+    for (id, _) in &rune_balance_entries {
+        let id_s = id.to_string();
+        let entry = runes_provider.get_rune(*id).ok().flatten();
+        let label = entry
+            .as_ref()
+            .map(|entry| {
+                if entry.spaced_name == id_s {
+                    id_s.clone()
+                } else {
+                    format!("{} ({id_s})", entry.spaced_name)
+                }
+            })
+            .unwrap_or_else(|| id_s.clone());
+        let asset_name =
+            entry.as_ref().map(|entry| entry.spaced_name.clone()).unwrap_or(id_s.clone());
+        let symbol = entry
+            .as_ref()
+            .and_then(|entry| entry.symbol.clone())
+            .unwrap_or_else(|| "¤".to_string());
+        chart_tokens.push(AddressChartToken {
+            kind: "rune",
+            token_id: id_s.clone(),
+            label,
+            asset_name,
+            symbol: symbol.clone(),
+            icon_url: explorer_path(&format!("/static/rune-icons/{id_s}")),
+            fallback_letter: symbol,
+        });
+    }
+    let default_chart_token = chart_tokens.first().cloned();
     log_address_page_perf(
         &address_str,
         "build_chart_tokens",
@@ -330,6 +388,10 @@ pub async fn address_page(
         .into_iter()
         .filter(|e| match tx_filter {
             TxFilter::All => true,
+            TxFilter::Action => {
+                e.traces.as_ref().map_or(false, |t| !t.is_empty())
+                    || ordinals::Runestone::decipher(&e.tx).is_some()
+            }
             TxFilter::Alkane => e.traces.as_ref().map_or(false, |t| !t.is_empty()),
             TxFilter::Rune => ordinals::Runestone::decipher(&e.tx).is_some(),
         })
@@ -369,7 +431,72 @@ pub async fn address_page(
     let confirmed_offset = off.saturating_sub(pending_total);
 
     let mut next_cursor: Option<Txid> = None;
-    if tx_filter == TxFilter::Alkane {
+    if tx_filter == TxFilter::Action {
+        let confirmed_total_t0 = Instant::now();
+        let confirmed_total =
+            runes_provider.get_action_address_tx_count(&address_str).unwrap_or(0) as usize;
+        log_address_page_perf(
+            &address_str,
+            "runes.get_action_address_tx_count",
+            confirmed_total_t0,
+            &format!("confirmed_total={}", confirmed_total),
+        );
+        let confirmed_slice_start = confirmed_offset.min(confirmed_total);
+        let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
+
+        if confirmed_slice_end > confirmed_slice_start {
+            let range_start = confirmed_total.saturating_sub(confirmed_slice_end) as u64;
+            let range_end = confirmed_total.saturating_sub(confirmed_slice_start) as u64;
+            let pointers = runes_provider
+                .get_action_address_tx_range(&address_str, range_start, range_end)
+                .unwrap_or_default();
+            let pointers: Vec<_> = pointers.into_iter().rev().collect();
+            let txids: Vec<Txid> =
+                pointers.iter().map(|pointer| Txid::from_byte_array(pointer.txid)).collect();
+
+            let raw_txs_t0 = Instant::now();
+            let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+            log_address_page_perf(
+                &address_str,
+                "electrum_like.batch_transaction_get_raw.action_txs",
+                raw_txs_t0,
+                &format!("txids={} raws={}", txids.len(), raw_txs.len()),
+            );
+
+            for (idx, txid) in txids.iter().enumerate() {
+                let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                if raw.is_empty() {
+                    continue;
+                }
+                let tx: Transaction = match deserialize(&raw) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("[address_page] failed to decode action tx {}: {e}", txid);
+                        continue;
+                    }
+                };
+                let summary = load_tx_summary_v2(&essentials_provider, txid);
+                let confirmations = pointers.get(idx).and_then(|pointer| {
+                    let h = pointer.height as u64;
+                    chain_tip.and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
+                });
+                let traces = summary
+                    .as_ref()
+                    .map(|s| traces_from_summary(txid, s))
+                    .filter(|t| !t.is_empty());
+                tx_renders.push(AddressTxRender {
+                    txid: *txid,
+                    tx,
+                    traces,
+                    confirmations,
+                    is_mempool: false,
+                });
+            }
+        }
+
+        tx_total = pending_total + confirmed_total;
+        tx_has_next = (off + tx_renders.len()) < tx_total;
+    } else if tx_filter == TxFilter::Alkane {
         let confirmed_total_t0 = Instant::now();
         let confirmed_total = get_address_index_list_len(
             &essentials_provider,
@@ -886,6 +1013,15 @@ pub async fn address_page(
         &format!("entries={}", balance_entries.len()),
     );
 
+    let rune_balances_markup_t0 = Instant::now();
+    let rune_balances_markup = render_rune_balance_cards(&rune_balance_entries, &runes_provider);
+    log_address_page_perf(
+        &address_str,
+        "render_rune_balance_cards",
+        rune_balances_markup_t0,
+        &format!("entries={}", rune_balance_entries.len()),
+    );
+
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
     summary_items.push(HeaderSummaryItem {
         label: "Confirmed balance".to_string(),
@@ -972,43 +1108,53 @@ pub async fn address_page(
                 }
             }
 
+            @if !rune_balance_entries.is_empty() {
+                h2 class="h2" { "Rune Balances" }
+                (rune_balances_markup)
+            }
+
             @if !balance_entries.is_empty() {
                 h2 class="h2" { "Alkane Balances" }
                 (balances_markup)
-                @if let Some(default_alkane) = default_chart_alkane.as_ref() {
-                    div
-                        class="card address-balance-chart-card"
-                        data-address-chart=""
-                        data-address=(address_str.clone())
-                        data-default-alkane=(default_alkane)
-                        data-default-range="all"
-                    {
-                        div class="address-balance-chart-head" {
-                            h2 class="h2" { "Balance History" }
-                            div class="address-balance-chart-controls" {
-                                div class="dropdown address-balance-dropdown" data-dropdown="" data-open="" data-address-chart-token="" {
-                                    button
-                                        class="dropdown-trigger"
-                                        type="button"
-                                        aria-label="Alkane"
-                                        aria-haspopup="true"
-                                        aria-expanded="false"
-                                        data-dropdown-toggle=""
-                                    {
-                                        span class="dropdown-icon dropdown-trigger-icon" data-address-chart-token-trigger-icon="" {
-                                            (address_chart_token_icon(
-                                                &chart_tokens[0].icon_url,
-                                                &chart_tokens[0].fallback_letter
-                                            ))
-                                        }
-                                        span class="dropdown-label" data-address-chart-token-trigger-label="" {
-                                            (chart_tokens[0].label.clone())
-                                        }
-                                        span class="dropdown-caret" { (icon_dropdown_caret()) }
+            }
+
+            @if let Some(default_token) = default_chart_token.as_ref() {
+                div
+                    class="card address-balance-chart-card"
+                    data-address-chart=""
+                    data-address=(address_str.clone())
+                    data-default-token-kind=(default_token.kind)
+                    data-default-token-id=(default_token.token_id.clone())
+                    data-default-range="all"
+                {
+                    div class="address-balance-chart-head" {
+                        h2 class="h2" { "Balance History" }
+                        div class="address-balance-chart-controls" {
+                            div class="dropdown address-balance-dropdown" data-dropdown="" data-open="" data-address-chart-token="" {
+                                button
+                                    class="dropdown-trigger"
+                                    type="button"
+                                    aria-label="Token"
+                                    aria-haspopup="true"
+                                    aria-expanded="false"
+                                    data-dropdown-toggle=""
+                                {
+                                    span class="dropdown-icon dropdown-trigger-icon" data-address-chart-token-trigger-icon="" {
+                                        (address_chart_token_icon(
+                                            &default_token.icon_url,
+                                            &default_token.fallback_letter
+                                        ))
                                     }
-                                    div class="dropdown-panel address-balance-dropdown-panel" role="menu" aria-hidden="true" {
-                                        @for token in chart_tokens.iter() {
-                                            @let item_class = if token.alkane_id == chart_tokens[0].alkane_id {
+                                    span class="dropdown-label" data-address-chart-token-trigger-label="" {
+                                        (default_token.label.clone())
+                                    }
+                                    span class="dropdown-caret" { (icon_dropdown_caret()) }
+                                }
+                                div class="dropdown-panel address-balance-dropdown-panel" role="menu" aria-hidden="true" {
+                                    @if chart_tokens.iter().any(|token| token.kind == "alkane") {
+                                        div class="address-balance-dropdown-group-title" { "ALKANES" }
+                                        @for token in chart_tokens.iter().filter(|token| token.kind == "alkane") {
+                                            @let item_class = if token.kind == default_token.kind && token.token_id == default_token.token_id {
                                                 "dropdown-item selected"
                                             } else {
                                                 "dropdown-item"
@@ -1018,7 +1164,37 @@ pub async fn address_page(
                                                 href="#"
                                                 role="menuitem"
                                                 data-address-chart-token-option=""
-                                                data-alkane-id=(token.alkane_id.clone())
+                                                data-token-kind=(token.kind)
+                                                data-token-id=(token.token_id.clone())
+                                                data-name=(token.asset_name.clone())
+                                                data-symbol=(token.symbol.clone())
+                                                data-label=(token.label.clone())
+                                            {
+                                                span class="dropdown-icon" {
+                                                    (address_chart_token_icon(
+                                                        &token.icon_url,
+                                                        &token.fallback_letter
+                                                    ))
+                                                }
+                                                span class="dropdown-label" { (token.label.clone()) }
+                                            }
+                                        }
+                                    }
+                                    @if chart_tokens.iter().any(|token| token.kind == "rune") {
+                                        div class="address-balance-dropdown-group-title" { "RUNES" }
+                                        @for token in chart_tokens.iter().filter(|token| token.kind == "rune") {
+                                            @let item_class = if token.kind == default_token.kind && token.token_id == default_token.token_id {
+                                                "dropdown-item selected"
+                                            } else {
+                                                "dropdown-item"
+                                            };
+                                            a
+                                                class=(item_class)
+                                                href="#"
+                                                role="menuitem"
+                                                data-address-chart-token-option=""
+                                                data-token-kind=(token.kind)
+                                                data-token-id=(token.token_id.clone())
                                                 data-name=(token.asset_name.clone())
                                                 data-symbol=(token.symbol.clone())
                                                 data-label=(token.label.clone())
@@ -1036,18 +1212,18 @@ pub async fn address_page(
                                 }
                             }
                         }
-                        div class="address-balance-chart-plot" data-address-chart-root {
-                            div class="address-balance-chart-loading" data-address-chart-loading="" data-spinning="1" {
-                                span class="spinner address-balance-chart-spinner" data-address-chart-loading-spinner="" aria-hidden="true" {}
-                                span data-address-chart-loading-text="" { "Loading chart..." }
-                            }
+                    }
+                    div class="address-balance-chart-plot" data-address-chart-root {
+                        div class="address-balance-chart-loading" data-address-chart-loading="" data-spinning="1" {
+                            span class="spinner address-balance-chart-spinner" data-address-chart-loading-spinner="" aria-hidden="true" {}
+                            span data-address-chart-loading-text="" { "Loading chart..." }
                         }
-                        div class="address-balance-chart-tabs" {
-                            button type="button" class="address-balance-chart-tab" data-range="1d" { "1D" }
-                            button type="button" class="address-balance-chart-tab" data-range="1w" { "1W" }
-                            button type="button" class="address-balance-chart-tab" data-range="1m" { "1M" }
-                            button type="button" class="address-balance-chart-tab active" data-range="all" { (all_range_label) }
-                        }
+                    }
+                    div class="address-balance-chart-tabs" {
+                        button type="button" class="address-balance-chart-tab" data-range="1d" { "1D" }
+                        button type="button" class="address-balance-chart-tab" data-range="1w" { "1W" }
+                        button type="button" class="address-balance-chart-tab" data-range="1m" { "1M" }
+                        button type="button" class="address-balance-chart-tab active" data-range="all" { (all_range_label) }
                     }
                 }
             }
@@ -1059,16 +1235,22 @@ pub async fn address_page(
                         div class="segmented-control" role="group" aria-label="Transaction filter" {
                             a class=(if tx_filter == TxFilter::All { "segment active" } else { "segment" })
                                 href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=all", address_str))) {
-                                "All txs"
+                                "All Txs"
+                            }
+                            @if runes_enabled {
+                                a class=(if tx_filter == TxFilter::Action { "segment active" } else { "segment" })
+                                    href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=actions", address_str))) {
+                                    "All Actions"
+                                }
                             }
                             a class=(if tx_filter == TxFilter::Alkane { "segment active" } else { "segment" })
                                 href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=alkane", address_str))) {
-                                "Alkane txs"
+                                "Only Alkanes"
                             }
                             @if runes_enabled {
                                 a class=(if tx_filter == TxFilter::Rune { "segment active" } else { "segment" })
                                     href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=rune", address_str))) {
-                                    "Rune txs"
+                                    "Only Runes"
                                 }
                             }
                         }
@@ -1114,13 +1296,13 @@ pub async fn address_page(
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                         }
                         span class="pager-meta muted" { "Showing "
-                            (if tx_total > 0 { display_start } else { 0 })
+                            (format_with_commas(if tx_total > 0 { display_start as u64 } else { 0 }))
                             @if tx_total > 0 {
                                 "-"
-                                (display_end)
+                                (format_with_commas(display_end as u64))
                             }
                             " / "
-                            (tx_total)
+                            (format_with_commas(tx_total as u64))
                         }
                         @if tx_has_next {
                             a class="pill iconbtn" href=(next_href) aria-label="Next page" {
@@ -1164,8 +1346,9 @@ fn address_chart_scripts() -> Markup {
   const address = card.dataset.address || '';
   if (!address) return;
 
-  let activeAlkane = card.dataset.defaultAlkane || '';
-  if (!activeAlkane) return;
+  let activeTokenKind = card.dataset.defaultTokenKind || 'alkane';
+  let activeTokenId = card.dataset.defaultTokenId || '';
+  if (!activeTokenId) return;
 
   const root = card.querySelector('[data-address-chart-root]');
   const loadingEl = card.querySelector('[data-address-chart-loading]');
@@ -1201,36 +1384,42 @@ fn address_chart_scripts() -> Markup {
     return theme;
   })();
 
-  const optionById = (alkaneId) => {
-    if (!alkaneId) return null;
+  const optionById = (kind, tokenId) => {
+    if (!tokenId) return null;
     return (
       optionNodes.find(
-        (node) => ((node.dataset && node.dataset.alkaneId) || '').trim() === alkaneId
+        (node) =>
+          ((node.dataset && node.dataset.tokenKind) || 'alkane').trim() === kind &&
+          ((node.dataset && node.dataset.tokenId) || '').trim() === tokenId
       ) || null
     );
   };
 
-  const currentOption = () => optionById(activeAlkane) || optionNodes[0] || null;
+  const currentOption = () => optionById(activeTokenKind, activeTokenId) || optionNodes[0] || null;
 
   const syncSelectedMeta = () => {
     const option = currentOption();
     if (!option) {
       return;
     }
-    const nextAlkane = ((option.dataset && option.dataset.alkaneId) || '').trim();
-    if (nextAlkane) activeAlkane = nextAlkane;
+    const nextKind = ((option.dataset && option.dataset.tokenKind) || 'alkane').trim();
+    const nextToken = ((option.dataset && option.dataset.tokenId) || '').trim();
+    if (nextToken) {
+      activeTokenKind = nextKind || 'alkane';
+      activeTokenId = nextToken;
+    }
     activeName = option.dataset ? (option.dataset.name || '').trim() : '';
     if (!activeName) {
       activeName = option.dataset ? (option.dataset.label || '').trim() : '';
     }
     if (!activeName) {
-      activeName = activeAlkane;
+      activeName = activeTokenId;
     }
     const icon = option.querySelector('.dropdown-icon');
     activeIconHtml = icon ? icon.innerHTML : '';
     if (triggerLabelEl) {
-      const label = (option.dataset && option.dataset.label) || option.textContent || activeAlkane;
-      triggerLabelEl.textContent = (label || activeAlkane).trim();
+      const label = (option.dataset && option.dataset.label) || option.textContent || activeTokenId;
+      triggerLabelEl.textContent = (label || activeTokenId).trim();
     }
     if (triggerIconEl) {
       triggerIconEl.innerHTML = activeIconHtml;
@@ -1252,7 +1441,7 @@ fn address_chart_scripts() -> Markup {
 
   const formatTooltipValue = (value) => {
     const amount = formatAmount(value, 8);
-    const tokenName = activeName || activeAlkane;
+    const tokenName = activeName || activeTokenId;
     return tokenName ? `${amount} ${tokenName}` : amount;
   };
 
@@ -1489,9 +1678,14 @@ fn address_chart_scripts() -> Markup {
   const fetchRange = async (range) => {
     const params = new URLSearchParams({
       address,
-      alkane: activeAlkane,
+      kind: activeTokenKind,
       range
     });
+    if (activeTokenKind === 'rune') {
+      params.set('rune', activeTokenId);
+    } else {
+      params.set('alkane', activeTokenId);
+    }
     const res = await fetch(`${apiPath}?${params.toString()}`, {
       headers: { Accept: 'application/json' }
     });
@@ -1556,9 +1750,11 @@ fn address_chart_scripts() -> Markup {
   optionNodes.forEach((option) => {
     option.addEventListener('click', (event) => {
       event.preventDefault();
-      const selected = ((option.dataset && option.dataset.alkaneId) || '').trim();
-      if (!selected || selected === activeAlkane) return;
-      activeAlkane = selected;
+      const selectedKind = ((option.dataset && option.dataset.tokenKind) || 'alkane').trim();
+      const selected = ((option.dataset && option.dataset.tokenId) || '').trim();
+      if (!selected || (selected === activeTokenId && selectedKind === activeTokenKind)) return;
+      activeTokenKind = selectedKind || 'alkane';
+      activeTokenId = selected;
       syncSelectedMeta();
       if (dropdownEl) {
         dropdownEl.dataset.open = '';

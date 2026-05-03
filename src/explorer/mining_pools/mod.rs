@@ -57,7 +57,6 @@ pub struct BlockMiningPoolResult {
 pub(crate) struct ResolvedBlockMiningPool {
     pub(crate) block_hash: BlockHash,
     pub(crate) pool: MiningPoolDisplay,
-    pub(crate) tx_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -122,7 +121,7 @@ pub(crate) fn resolve_block_mining_pool_with_tx_count(
         .with_context(|| format!("bitcoind get_block({block_hash})"))?;
     let pool = detect_pool_from_block(&block_hash, &block, get_network())
         .context("detect mining pool from coinbase transaction")?;
-    Ok(ResolvedBlockMiningPool { block_hash, pool, tx_count: block.txdata.len() })
+    Ok(ResolvedBlockMiningPool { block_hash, pool })
 }
 
 fn detect_pool_from_block(
@@ -137,7 +136,7 @@ fn detect_pool_from_block(
     Ok(detect_pool_from_coinbase_tx(coinbase, network))
 }
 
-fn detect_pool_from_coinbase_tx(coinbase: &Transaction, network: Network) -> MiningPoolDisplay {
+pub fn detect_pool_from_coinbase_tx(coinbase: &Transaction, network: Network) -> MiningPoolDisplay {
     let coinbase_ascii = coinbase
         .input
         .first()

@@ -1,8 +1,10 @@
 use maud::{Markup, PreEscaped, html};
 
 use crate::config::get_config;
+use crate::explorer::api::mempool_blocks_visible_for_espo_tip;
 use crate::explorer::mining_pools::bundled_pool_icon_svgs_json;
 use crate::explorer::paths::{current_language, explorer_path};
+use crate::modules::runes::main::runes_enabled_from_global_config;
 
 pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     block_carousel_inner(current_height, None, espo_tip)
@@ -30,6 +32,9 @@ fn block_carousel_inner(
         .unwrap_or_else(|| "null".to_string());
     let is_chinese = current_language().is_chinese();
     let reset_label = if is_chinese { "返回最新区块" } else { "Back to latest block" };
+    let runes_enabled = runes_enabled_from_global_config();
+    let runes_enabled_js = runes_enabled;
+    let mempool_blocks_enabled_js = mempool_blocks_visible_for_espo_tip(espo_tip);
 
     let script = PreEscaped(format!(
         r#"
@@ -40,6 +45,9 @@ fn block_carousel_inner(
   const eventsPath = {ws_path_js};
   const eventsEnabled = {ws_enabled_js};
   const MEMPOOL_SLOT_COUNT = {mempool_slot_count};
+  const RUNES_ENABLED = {runes_enabled_js};
+  const MEMPOOL_BLOCKS_ENABLED = {mempool_blocks_enabled_js};
+  const LIVE_TIP_ANIMATION_ENABLED = MEMPOOL_BLOCKS_ENABLED;
   const basePrefix = basePath === '/' ? '' : basePath;
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const root = document.querySelector('[data-block-carousel]');
@@ -57,12 +65,15 @@ fn block_carousel_inner(
   const RADIUS = 8;
   const SKELETON_BATCH = RADIUS * 2;
   const EDGE_THRESHOLD = 320;
-  const LEFT_BUFFER_VIEWPORTS = 3;
-  const RIGHT_BUFFER_VIEWPORTS = 3;
-  const WINDOW_VIEWPORTS_LEFT = 2;
-  const WINDOW_VIEWPORTS_RIGHT = 3;
-  const MIN_WINDOW_BLOCKS = 64;
+  const LEFT_BUFFER_VIEWPORTS = 2;
+  const RIGHT_BUFFER_VIEWPORTS = 2;
+  const WINDOW_VIEWPORTS_LEFT = 1;
+  const WINDOW_VIEWPORTS_RIGHT = 2;
+  const MIN_VIEWPORT_BLOCKS = 10;
+  const MIN_WINDOW_BLOCKS = 36;
   const RETRY_MS = 1500;
+  const TIP_REFRESH_DEBOUNCE_MS = 120;
+  const TIP_ANIMATION_MS = 2000;
 
   const seen = new Set();
   const blocks = [];
@@ -87,6 +98,13 @@ fn block_carousel_inner(
   let initialCentered = false;
   let scrollRaf = null;
   let programmaticScrollRaf = null;
+  let latestTipRefreshTimer = null;
+  let latestTipRefreshInFlight = false;
+  let latestTipRefreshAnimate = false;
+  let latestTipRefreshFromTip = null;
+  let lastTipAnimationAt = 0;
+  let followLatest = selectedMempoolIndex !== null || current === espoTip;
+  let suppressFollowScrollUntil = 0;
 
   let isDragging = false;
   let dragStartX = 0;
@@ -97,6 +115,8 @@ fn block_carousel_inner(
   let momentumRaf = null;
   let dragMoved = false;
   let suppressClickUntil = 0;
+  let touchMomentumUntil = 0;
+  let touchActive = false;
 
   function cancelMomentumFrame() {{
     if (momentumRaf) {{
@@ -159,6 +179,7 @@ fn block_carousel_inner(
       last = now;
       if (Math.abs(velocity) < 0.01) {{
         momentumRaf = null;
+        queueEdgeCheck();
         return;
       }}
       scroller.scrollLeft -= velocity * dt;
@@ -194,6 +215,9 @@ fn block_carousel_inner(
     const amount = Number.isFinite(Number(count))
       ? new Intl.NumberFormat('en-US', {{ maximumFractionDigits: 0 }}).format(Number(count))
       : String(count);
+    if (RUNES_ENABLED) {{
+      return isChinese ? `${{amount}} 次操作` : `${{amount}} actions`;
+    }}
     return isChinese ? `${{amount}} 条跟踪` : `${{amount}} traces`;
   }}
 
@@ -275,17 +299,24 @@ fn block_carousel_inner(
   }}
 
   function renderBlock(block) {{
+    const isShell = block.shell === true;
+    const cardClass = `bc-card${{isShell ? ' bc-shell-card' : ''}}${{block.height === selectedConfirmedHeight ? ' current' : ''}}`;
+    const faceMarkup = isShell
+      ? '<div class="bc-shell-face" aria-hidden="true"></div>'
+      : `
+            ${{renderFeeStats(block)}}
+            <div class="bc-traces">${{formatTraces(block.traces)}}</div>
+            <div class="bc-tx-count">${{formatTxCount(block.tx_count)}}</div>
+            <div class="bc-time" data-bc-time="${{block.time || ''}}">${{formatAgo(block.time)}}</div>
+        `;
     return `
       <div class="bc-slide" data-height="${{block.height}}" data-bc-key="block:${{block.height}}">
         <div class="bc-top">
           <span class="bc-height-tag">${{block.height}}</span>
         </div>
-        <a class="bc-card${{block.height === selectedConfirmedHeight ? ' current' : ''}}" href="${{basePrefix}}/block/${{block.height}}" draggable="false">
+        <a class="${{cardClass}}" href="${{basePrefix}}/block/${{block.height}}" draggable="false">
           <div class="bc-face">
-            ${{renderFeeStats(block)}}
-            <div class="bc-traces">${{formatTraces(block.traces)}}</div>
-            <div class="bc-tx-count">${{formatTxCount(block.tx_count)}}</div>
-            <div class="bc-time" data-bc-time="${{block.time || ''}}">${{formatAgo(block.time)}}</div>
+            ${{faceMarkup}}
           </div>
           ${{block.height === selectedConfirmedHeight ? '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>' : ''}}
         </a>
@@ -335,7 +366,7 @@ fn block_carousel_inner(
   }}
 
   function shouldRenderMempoolSide() {{
-    return selectedMempoolIndex !== null || maxH >= espoTip;
+    return MEMPOOL_BLOCKS_ENABLED && (isFollowingLatest() || maxH >= espoTip);
   }}
 
   function render() {{
@@ -449,7 +480,7 @@ fn block_carousel_inner(
     requestAnimationFrame(() => {{
       requestAnimationFrame(() => {{
         animated.forEach((el) => {{
-          el.style.transition = 'transform 2s ease, opacity 2s ease';
+          el.style.transition = `transform ${{TIP_ANIMATION_MS}}ms ease, opacity ${{TIP_ANIMATION_MS}}ms ease`;
           el.style.transform = '';
           el.style.opacity = el.classList.contains('bc-slide-consumed') ? '0' : '';
         }});
@@ -464,7 +495,7 @@ fn block_carousel_inner(
         el.style.opacity = '';
       }});
       updateResetButton();
-    }}, 2100);
+    }}, TIP_ANIMATION_MS + 80);
   }}
 
   function renderPreservingAnchor(anchorSelector) {{
@@ -509,23 +540,32 @@ fn block_carousel_inner(
 
   function rightBufferCount() {{
     return Math.max(
-      SKELETON_BATCH * 2,
+      SKELETON_BATCH,
       Math.ceil((scroller.clientWidth * RIGHT_BUFFER_VIEWPORTS) / slideSpan())
     );
   }}
 
   function leftBufferCount() {{
     return Math.max(
-      SKELETON_BATCH * 2,
+      SKELETON_BATCH,
       Math.ceil((scroller.clientWidth * LEFT_BUFFER_VIEWPORTS) / slideSpan())
     );
   }}
 
   function viewportBlockCount() {{
-    return Math.max(1, Math.ceil(scroller.clientWidth / slideSpan()));
+    return Math.max(MIN_VIEWPORT_BLOCKS, Math.ceil(scroller.clientWidth / slideSpan()));
+  }}
+
+  function isTouchMomentumActive() {{
+    return performance.now() < touchMomentumUntil;
+  }}
+
+  function isUserScrollActive() {{
+    return isDragging || touchActive || momentumRaf !== null || isTouchMomentumActive();
   }}
 
   function pruneBlocksAroundViewport() {{
+    if (isUserScrollActive()) return;
     if (!blocks.length) return;
     const maxBlocks = Math.max(MIN_WINDOW_BLOCKS, viewportBlockCount() * (WINDOW_VIEWPORTS_LEFT + WINDOW_VIEWPORTS_RIGHT + 1));
     if (blocks.length <= maxBlocks) return;
@@ -585,6 +625,7 @@ fn block_carousel_inner(
   }}
 
   function ensureRightBuffer(count = rightBufferCount()) {{
+    if (isUserScrollActive()) return false;
     if (rightDepleted) return false;
     if (bufferRight >= count) return false;
     bufferRight = count;
@@ -601,6 +642,7 @@ fn block_carousel_inner(
   }}
 
   function ensureLeftBufferAhead() {{
+    if (isUserScrollActive()) return;
     if (leftDepleted || maxH >= espoTip) return;
     const desiredLeftRunway = scroller.clientWidth * LEFT_BUFFER_VIEWPORTS;
     if (scroller.scrollLeft >= desiredLeftRunway) return;
@@ -702,7 +744,44 @@ fn block_carousel_inner(
     centerHeight(current, smooth);
   }}
 
+  function restoreFollowLatest() {{
+    followLatest = true;
+    selectedConfirmedHeight = espoTip;
+    root.dataset.current = String(espoTip);
+  }}
+
+  function markUserNavigated() {{
+    if (performance.now() < suppressFollowScrollUntil) return;
+    followLatest = false;
+    selectedConfirmedHeight = null;
+    latestTipRefreshAnimate = false;
+    latestTipRefreshFromTip = null;
+    if (latestTipRefreshTimer) {{
+      clearTimeout(latestTipRefreshTimer);
+      latestTipRefreshTimer = null;
+    }}
+  }}
+
+  function isFollowingLatest() {{
+    return followLatest;
+  }}
+
+  function pinLatestInView() {{
+    if (!isFollowingLatest() || isDragging) return false;
+    stopMomentum();
+    cancelProgrammaticScroll();
+    selectedHeight = espoTip;
+    const target = selectedMempoolIndex !== null
+      ? targetLeftForBoundary()
+      : targetLeftForHeight(espoTip);
+    if (target === null) return false;
+    suppressFollowScrollUntil = performance.now() + 250;
+    scroller.scrollTo({{ left: target, behavior: 'auto' }});
+    return true;
+  }}
+
   async function scrollToLatest() {{
+    restoreFollowLatest();
     stopCarouselMotion();
     selectedHeight = espoTip;
     if (!seen.has(espoTip)) {{
@@ -827,6 +906,7 @@ fn block_carousel_inner(
   }}
 
   async function fetchMempoolBlocks() {{
+    if (!MEMPOOL_BLOCKS_ENABLED) return;
     try {{
       const res = await fetch(`${{basePrefix}}/api/mempool/blocks`, {{
         headers: {{ Accept: 'application/json' }}
@@ -840,6 +920,7 @@ fn block_carousel_inner(
   }}
 
   function applyMempoolSnapshot(snapshot, force = false) {{
+    if (!MEMPOOL_BLOCKS_ENABLED) return;
     if (!snapshot || !Array.isArray(snapshot.blocks)) return;
     if (!force && performance.now() < confirmAnimationUntil) {{
       queuedMempoolBlocks = snapshot.blocks;
@@ -851,6 +932,7 @@ fn block_carousel_inner(
   }}
 
   function flushQueuedMempoolBlocks() {{
+    if (!MEMPOOL_BLOCKS_ENABLED) return;
     if (queuedMempoolBlocks) {{
       const next = queuedMempoolBlocks;
       queuedMempoolBlocks = null;
@@ -858,6 +940,88 @@ fn block_carousel_inner(
       return;
     }}
     fetchMempoolBlocks();
+  }}
+
+  function scheduleLatestTipRefresh(fromTip, shouldAnimate) {{
+    if (!isFollowingLatest()) {{
+      latestTipRefreshAnimate = false;
+      latestTipRefreshFromTip = null;
+      return;
+    }}
+    if (LIVE_TIP_ANIMATION_ENABLED && shouldAnimate) {{
+      const now = performance.now();
+      const canAnimate =
+        latestTipRefreshFromTip === null &&
+        espoTip === fromTip + 1 &&
+        now - lastTipAnimationAt > TIP_ANIMATION_MS + 120;
+      latestTipRefreshAnimate = latestTipRefreshAnimate || canAnimate;
+      if (canAnimate) latestTipRefreshFromTip = fromTip;
+    }}
+    if (latestTipRefreshTimer || latestTipRefreshInFlight) return;
+    latestTipRefreshTimer = window.setTimeout(refreshLatestTipWindow, TIP_REFRESH_DEBOUNCE_MS);
+  }}
+
+  async function refreshLatestTipWindow() {{
+    latestTipRefreshTimer = null;
+    if (latestTipRefreshInFlight) return;
+
+    const targetTip = espoTip;
+    const followingLatest = isFollowingLatest();
+    if (!followingLatest) {{
+      latestTipRefreshAnimate = false;
+      latestTipRefreshFromTip = null;
+      updateResetButton();
+      queueEdgeCheck();
+      return;
+    }}
+
+    latestTipRefreshInFlight = true;
+    const shouldAnimate =
+      LIVE_TIP_ANIMATION_ENABLED &&
+      followingLatest &&
+      latestTipRefreshAnimate &&
+      latestTipRefreshFromTip !== null &&
+      targetTip === latestTipRefreshFromTip + 1;
+    const previousPositions = shouldAnimate ? captureCarouselPositions() : null;
+    latestTipRefreshAnimate = false;
+    latestTipRefreshFromTip = null;
+
+    const batch = await fetchWindow(targetTip);
+    if (!isFollowingLatest()) {{
+      latestTipRefreshInFlight = false;
+      updateResetButton();
+      queueEdgeCheck();
+      return;
+    }}
+    latestTipRefreshInFlight = false;
+    if (!batch) {{
+      scheduleLatestTipRefresh(targetTip, false);
+      return;
+    }}
+
+    const added = applyBlocks(batch);
+    leftDepleted = maxH >= espoTip;
+    if (leftDepleted) bufferLeft = 0;
+    render();
+    const pinnedLatest = shouldAnimate ? false : pinLatestInView();
+
+    if (shouldAnimate && !pinnedLatest && added === 1 && maxH === targetTip) {{
+      animateCarouselFrom(
+        previousPositions,
+        new Map([[`block:${{targetTip}}`, 'mempool:0']]),
+        new Set()
+      );
+      lastTipAnimationAt = performance.now();
+      confirmAnimationUntil = performance.now() + TIP_ANIMATION_MS + 120;
+      window.setTimeout(flushQueuedMempoolBlocks, TIP_ANIMATION_MS + 100);
+    }} else {{
+      flushQueuedMempoolBlocks();
+    }}
+
+    queueEdgeCheck();
+    if (targetTip < espoTip) {{
+      scheduleLatestTipRefresh(targetTip, false);
+    }}
   }}
 
   function connectEvents() {{
@@ -870,11 +1034,13 @@ fn block_carousel_inner(
       return;
     }}
     socket.addEventListener('open', () => {{
-      try {{
-        socket.send(JSON.stringify({{ action: 'want', data: ['mempool-blocks'] }}));
-        socket.send(JSON.stringify({{ 'refresh-mempool-blocks': true }}));
-      }} catch (_) {{}}
-      fetchMempoolBlocks();
+      if (MEMPOOL_BLOCKS_ENABLED) {{
+        try {{
+          socket.send(JSON.stringify({{ action: 'want', data: ['mempool-blocks'] }}));
+          socket.send(JSON.stringify({{ 'refresh-mempool-blocks': true }}));
+        }} catch (_) {{}}
+        fetchMempoolBlocks();
+      }}
     }});
     socket.addEventListener('message', (event) => {{
       let payload;
@@ -883,40 +1049,36 @@ fn block_carousel_inner(
       }} catch (_) {{
         return;
       }}
-      if (payload.type === 'hello' && payload.data && payload.data.mempool) {{
+      if (MEMPOOL_BLOCKS_ENABLED && payload.type === 'hello' && payload.data && payload.data.mempool) {{
         applyMempoolSnapshot(payload.data.mempool);
       }}
-      if (payload.type === 'mempool-blocks' && payload.data) {{
+      if (MEMPOOL_BLOCKS_ENABLED && payload.type === 'mempool-blocks' && payload.data) {{
         applyMempoolSnapshot(payload.data);
       }}
       if (payload.type === 'block') {{
         const nextTip = Number(payload.data && payload.data.height);
         const previousTip = espoTip;
-        const previousPositions = captureCarouselPositions();
         if (Number.isFinite(nextTip) && nextTip > espoTip) {{
-          confirmAnimationUntil = performance.now() + 2650;
+          const wasFollowingLatest = isFollowingLatest();
+          const shouldInsertNewTip =
+            wasFollowingLatest &&
+            (selectedMempoolIndex !== null ||
+              selectedConfirmedHeight === previousTip ||
+              selectedHeight === previousTip);
           espoTip = nextTip;
           root.dataset.espoTip = String(espoTip);
-          if (selectedConfirmedHeight === previousTip) {{
+          if (wasFollowingLatest && selectedConfirmedHeight === previousTip) {{
             selectedConfirmedHeight = nextTip;
             root.dataset.current = String(nextTip);
           }}
-        }}
-        window.setTimeout(() => fetchWindow(espoTip).then((batch) => {{
-          if (batch) {{
-            applyBlocks(batch);
-            render();
-            if (Number.isFinite(nextTip) && nextTip > previousTip) {{
-              animateCarouselFrom(
-                previousPositions,
-                new Map([[`block:${{nextTip}}`, 'mempool:0']]),
-                new Set()
-              );
-              window.setTimeout(flushQueuedMempoolBlocks, 2150);
-            }}
+          leftDepleted = maxH >= espoTip;
+          if (!shouldInsertNewTip) {{
+            updateResetButton();
             queueEdgeCheck();
+            return;
           }}
-        }}), 500);
+          scheduleLatestTipRefresh(previousTip, true);
+        }}
       }}
     }});
     socket.addEventListener('close', () => window.setTimeout(connectEvents, 2500));
@@ -934,7 +1096,7 @@ fn block_carousel_inner(
     }}
 
     const hasVisualBuffer = pendingLeft + bufferLeft > 0;
-    if (!hasVisualBuffer) {{
+    if (!hasVisualBuffer && !isUserScrollActive()) {{
       pendingLeft += expected;
       withStablePrepend(() => render());
     }}
@@ -950,7 +1112,7 @@ fn block_carousel_inner(
       }}
       loaded = true;
       added = batch ? applyBlocks(batch) : 0;
-      if (added < expected || end === espoTip) leftDepleted = end === espoTip;
+      if (added === 0 || added < expected || end === espoTip) leftDepleted = true;
     }} finally {{
       if (loaded) {{
         pendingLeft = Math.max(0, pendingLeft - expected);
@@ -974,7 +1136,7 @@ fn block_carousel_inner(
     }}
 
     const hasVisualBuffer = pendingRight + bufferRight > 0;
-    if (!hasVisualBuffer) {{
+    if (!hasVisualBuffer && !isUserScrollActive()) {{
       pendingRight += expected;
       render();
     }}
@@ -990,7 +1152,7 @@ fn block_carousel_inner(
       }}
       loaded = true;
       added = batch ? applyBlocks(batch) : 0;
-      if (added < expected || start === 0) rightDepleted = start === 0;
+      if (added === 0 || added < expected || start === 0) rightDepleted = true;
     }} finally {{
       if (loaded) {{
         pendingRight = Math.max(0, pendingRight - expected);
@@ -1045,6 +1207,24 @@ fn block_carousel_inner(
   }}
 
   scroller.addEventListener('scroll', queueEdgeCheck, {{ passive: true }});
+  scroller.addEventListener('wheel', markUserNavigated, {{ passive: true }});
+  scroller.addEventListener('touchstart', () => {{
+    touchActive = true;
+    touchMomentumUntil = performance.now() + 1200;
+    markUserNavigated();
+  }}, {{ passive: true }});
+  scroller.addEventListener('touchend', () => {{
+    touchActive = false;
+    touchMomentumUntil = performance.now() + 700;
+    queueEdgeCheck();
+    window.setTimeout(queueEdgeCheck, 720);
+  }}, {{ passive: true }});
+  scroller.addEventListener('touchcancel', () => {{
+    touchActive = false;
+    touchMomentumUntil = performance.now() + 700;
+    queueEdgeCheck();
+    window.setTimeout(queueEdgeCheck, 720);
+  }}, {{ passive: true }});
   refreshRelativeTimes();
   window.setInterval(refreshRelativeTimes, 60_000);
   if (resetButton) {{
@@ -1057,6 +1237,7 @@ fn block_carousel_inner(
 
   scroller.addEventListener('mousedown', (event) => {{
     if (event.button !== 0) return;
+    markUserNavigated();
     isDragging = true;
     dragStartX = event.clientX;
     dragStartScrollLeft = scroller.scrollLeft;
@@ -1092,7 +1273,7 @@ fn block_carousel_inner(
   }}, true);
 
   render();
-  fetchMempoolBlocks();
+  if (MEMPOOL_BLOCKS_ENABLED) fetchMempoolBlocks();
   connectEvents();
   fetchInitial();
 }})();
@@ -1102,7 +1283,9 @@ fn block_carousel_inner(
         ws_path_js = ws_path_js,
         mempool_slot_count = mempool_slot_count,
         selected_mempool_js = selected_mempool_js,
-        is_chinese = is_chinese
+        is_chinese = is_chinese,
+        runes_enabled_js = runes_enabled_js,
+        mempool_blocks_enabled_js = mempool_blocks_enabled_js
     ));
 
     html! {
