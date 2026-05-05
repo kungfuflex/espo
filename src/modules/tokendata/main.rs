@@ -7,7 +7,8 @@ use super::storage::{
 use crate::alkanes::trace::EspoBlock;
 use crate::config::{debug_enabled, get_electrum_like, get_espo_db, get_network};
 use crate::debug;
-use crate::modules::ammdata::consts::{AMOUNT_SCALE, PRICE_SCALE};
+use crate::modules::ammdata::config::AmmDataConfig;
+use crate::modules::ammdata::consts::{AMOUNT_SCALE, PRICE_SCALE, SATS_PER_BTC};
 use crate::modules::ammdata::main::pool_creator_spk_from_protostone;
 use crate::modules::ammdata::schemas::{ActivityKind, SchemaActivityV1, Timeframe};
 use crate::modules::ammdata::storage::{
@@ -27,6 +28,8 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Network, Transaction, Txid};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+
+const DIESEL_ALKANE_ID: SchemaAlkaneId = SchemaAlkaneId { block: 2, tx: 0 };
 
 pub struct TokenData {
     essentials_provider: Option<Arc<EssentialsProvider>>,
@@ -169,6 +172,7 @@ impl EspoModule for TokenData {
             &block,
             self.amm_provider(),
             &table,
+            blockhash,
             block_ts,
             &tx_meta,
             &mut ordinal,
@@ -398,6 +402,7 @@ fn index_mints(
     block: &EspoBlock,
     amm_provider: &AmmDataProvider,
     table: &super::storage::TokenDataTable<'_>,
+    blockhash: bitcoin::BlockHash,
     block_ts: u64,
     tx_meta: &HashMap<Txid, (Vec<u8>, bool)>,
     ordinal: &mut u32,
@@ -408,18 +413,33 @@ fn index_mints(
     mint_rows: &mut usize,
 ) -> Result<()> {
     let mut price_cache: HashMap<SchemaAlkaneId, MintPoolPriceSnapshot> = HashMap::new();
+    let btc_usd_price = amm_provider
+        .with_view_blockhash(Some(blockhash))
+        .get_btc_usd_price_at_or_before_height(block.height)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            AmmDataConfig::load_from_global_config()
+                .ok()
+                .map(|cfg| cfg.pre_ammdata_btc_usd_price)
+                .filter(|price| *price > 0)
+        });
+    let mut diesel_usd_weighted_sum = U256::ZERO;
+    let mut diesel_amount_sum = U256::ZERO;
     for chain in build_mint_chains(block, tx_meta)? {
         for (token, delta) in chain.deltas {
             let pool_prices = price_cache
                 .entry(token)
                 .or_insert_with(|| load_mint_pool_prices(amm_provider, token, block_ts));
+            let mint_price_paid_sats = scale_fee_price_sats(chain.fee_paid_sats, delta);
+            let mint_price_paid_usd = scale_fee_price_usd(mint_price_paid_sats, btc_usd_price);
             let row = SchemaTokenActivityV1 {
                 height: block.height,
                 timestamp: block_ts,
                 txid: chain.root_txid,
                 chain_txids: chain.chain_txids.clone(),
                 cpfp: chain.cpfp,
-                mint_price_paid_sats: scale_fee_price_sats(chain.fee_paid_sats, delta),
+                mint_price_paid_sats,
                 mint_price_pool_usd: pool_prices.usd_scaled,
                 mint_price_pool_frbtc_sats: pool_prices.frbtc_sats_scaled,
                 token,
@@ -432,6 +452,13 @@ fn index_mints(
                 address_spk: chain.display_address_spk.clone(),
                 success: chain.success,
             };
+            if token == DIESEL_ALKANE_ID && btc_usd_price.is_some() && delta > 0 {
+                let amount = U256::from(delta);
+                diesel_amount_sum = diesel_amount_sum.saturating_add(amount);
+                diesel_usd_weighted_sum = diesel_usd_weighted_sum.saturating_add(
+                    U256::from_be_bytes(mint_price_paid_usd).saturating_mul(amount),
+                );
+            }
             write_row(
                 table,
                 row,
@@ -444,6 +471,13 @@ fn index_mints(
             *ordinal = ordinal.saturating_add(1);
             *mint_rows = mint_rows.saturating_add(1);
         }
+    }
+    if !diesel_amount_sum.is_zero() && btc_usd_price.is_some() {
+        let avg = diesel_usd_weighted_sum / diesel_amount_sum;
+        puts.push((
+            table.diesel_avg_price_usd_by_height_key(block.height),
+            u256_to_be(avg).to_vec(),
+        ));
     }
     Ok(())
 }
@@ -737,6 +771,22 @@ fn scale_fee_price_sats(fee_paid_sats: u128, token_amount: u128) -> [u8; 32] {
         .saturating_mul(U256::from(PRICE_SCALE))
         / U256::from(token_amount);
     u256_to_be(price)
+}
+
+fn scale_fee_price_usd(
+    mint_price_paid_sats: [u8; 32],
+    btc_price_usd_scaled: Option<u128>,
+) -> [u8; 32] {
+    let Some(btc_price_usd_scaled) = btc_price_usd_scaled else {
+        return [0u8; 32];
+    };
+    let sats_scaled = U256::from_be_bytes(mint_price_paid_sats);
+    if sats_scaled.is_zero() {
+        return [0u8; 32];
+    }
+    let usd_scaled = sats_scaled.saturating_mul(U256::from(btc_price_usd_scaled))
+        / U256::from(PRICE_SCALE.saturating_mul(SATS_PER_BTC));
+    u256_to_be(usd_scaled)
 }
 
 fn u128_to_u256_be(value: u128) -> [u8; 32] {

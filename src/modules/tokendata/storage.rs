@@ -16,6 +16,7 @@ const ADDRESS_ACTIVITY_TS_ROOT: &[u8] = b"/address_activity/v3/";
 const ADDRESS_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/address_activity_amount/v3/";
 const ADDRESS_TOKEN_ACTIVITY_TS_ROOT: &[u8] = b"/address_token_activity/v3/";
 const ADDRESS_TOKEN_ACTIVITY_AMOUNT_ROOT: &[u8] = b"/address_token_activity_amount/v3/";
+const DIESEL_AVG_PRICE_USD_BY_HEIGHT_ROOT: &[u8] = b"/block_price/v2/diesel_avg_usd_by_height/";
 const PTR_V1_PREFIX: &[u8] = b"/ptr/v1/";
 const PTR_ENTITY_ACTIVITY_ROW: &[u8] = b"activity_row";
 const PTR_ENTITY_ACTIVITY_INDEX_CHUNK: &[u8] = b"activity_index_chunk";
@@ -62,6 +63,17 @@ impl<'a> TokenDataTable<'a> {
 
     pub fn index_height_key(&self) -> Vec<u8> {
         INDEX_HEIGHT_KEY.to_vec()
+    }
+
+    pub fn diesel_avg_price_usd_by_height_prefix(&self) -> Vec<u8> {
+        DIESEL_AVG_PRICE_USD_BY_HEIGHT_ROOT.to_vec()
+    }
+
+    pub fn diesel_avg_price_usd_by_height_key(&self, height: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(DIESEL_AVG_PRICE_USD_BY_HEIGHT_ROOT.len() + 4);
+        key.extend_from_slice(DIESEL_AVG_PRICE_USD_BY_HEIGHT_ROOT);
+        key.extend_from_slice(&height.to_be_bytes());
+        key
     }
 
     fn token_prefix(root: &[u8], scope: TokenActivityScope, token: &SchemaAlkaneId) -> Vec<u8> {
@@ -422,6 +434,47 @@ impl TokenDataProvider {
         self.mdb
             .put(&self.table().index_height_key(), &params.height.to_le_bytes())
             .map_err(|e| anyhow!("mdb.put failed: {e}"))
+    }
+
+    pub fn get_diesel_avg_price_paid_usd_by_height(&self, height: u32) -> Result<Option<[u8; 32]>> {
+        let Some(bytes) =
+            self.raw_get_at(&self.table().diesel_avg_price_usd_by_height_key(height), None)?
+        else {
+            return Ok(None);
+        };
+        if bytes.len() != 32 {
+            return Err(anyhow!("invalid diesel avg usd price length {}", bytes.len()));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(Some(out))
+    }
+
+    pub fn get_diesel_avg_price_paid_usd_points_through_height(
+        &self,
+        max_height: u32,
+    ) -> Result<Vec<(u32, [u8; 32])>> {
+        let table = self.table();
+        let prefix = table.diesel_avg_price_usd_by_height_prefix();
+        let entries = self.mdb.scan_prefix_entries(&prefix)?;
+        let mut out = Vec::new();
+        for (key, value) in entries {
+            let Some(height) = key.strip_prefix(prefix.as_slice()).and_then(decode_height_tail)
+            else {
+                continue;
+            };
+            if height > max_height {
+                continue;
+            }
+            if value.len() != 32 {
+                continue;
+            }
+            let mut price = [0u8; 32];
+            price.copy_from_slice(&value);
+            out.push((height, price));
+        }
+        out.sort_by_key(|(height, _)| *height);
+        Ok(out)
     }
 
     pub fn set_batch(&self, params: SetBatchParams) -> Result<()> {
@@ -1146,6 +1199,15 @@ pub struct GetTokenActivityPageParams {
     pub dir: SortDir,
     pub start_time: Option<u64>,
     pub end_time: Option<u64>,
+}
+
+fn decode_height_tail(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() != 4 {
+        return None;
+    }
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(bytes);
+    Some(u32::from_be_bytes(arr))
 }
 
 pub struct GetAddressActivityPageParams {

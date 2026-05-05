@@ -16,6 +16,7 @@ use crate::explorer::mining_pools::MiningPoolDisplay;
 use crate::explorer::pages::common::ALKANE_SCALE;
 use crate::explorer::paths::explorer_path;
 use crate::modules::ammdata::config::AmmDataConfig;
+use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::ammdata::storage::{
     AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
 };
@@ -26,6 +27,7 @@ use crate::modules::essentials::storage::{
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::modules::runes::main::{runes_enabled_from_global_config, runes_genesis_block};
 use crate::modules::runes::storage::{RuneEntry, RunesProvider, SchemaRuneId};
+use crate::modules::tokendata::storage::TokenDataProvider;
 use crate::runtime::mdb::Mdb;
 use crate::runtime::mempool::{
     current_mempool_compact_snapshot, get_mempool_block_transaction_ids, subscribe_mempool_events,
@@ -37,6 +39,7 @@ use alkanes_support::id::AlkaneId as SupportAlkaneId;
 use alkanes_support::proto::alkanes::{
     AlkaneId as ProtoAlkaneId, MessageContextParcel, SimulateResponse as SimulateProto,
 };
+use alloy_primitives::U256;
 use anyhow::Context;
 use bitcoin::blockdata::block::Header;
 use bitcoin::consensus::Encodable;
@@ -370,6 +373,12 @@ pub struct AddressChartQuery {
 pub struct AlkaneBalanceChartQuery {
     pub alkane: Option<String>,
     pub balance_alkane: Option<String>,
+    pub range: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct MintingPriceChartQuery {
+    pub kind: Option<String>,
     pub range: Option<String>,
 }
 
@@ -1440,6 +1449,79 @@ pub async fn alkane_balance_chart(
     Json(AddressChartResponse { ok: true, available, range, points, error: None })
 }
 
+pub async fn minting_price_chart(
+    Query(q): Query<MintingPriceChartQuery>,
+) -> Json<AddressChartResponse> {
+    let range = normalize_address_chart_range(q.range.as_deref());
+    let (lookback_blocks, range_interval) = address_chart_range_params(&range);
+    let Some((indexed_min, indexed_max)) =
+        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
+    else {
+        return Json(AddressChartResponse {
+            ok: true,
+            available: false,
+            range,
+            points: Vec::new(),
+            error: None,
+        });
+    };
+    let range_max = (get_espo_next_height().saturating_sub(1) as u32).min(indexed_max);
+    let range_min = match lookback_blocks {
+        Some(lookback) => range_max.saturating_sub(lookback).max(indexed_min),
+        None => indexed_min,
+    };
+    if range_min > range_max {
+        return Json(AddressChartResponse {
+            ok: true,
+            available: false,
+            range,
+            points: Vec::new(),
+            error: None,
+        });
+    }
+
+    let kind = q.kind.as_deref().unwrap_or("alkane").trim().to_ascii_lowercase();
+    let rows = match kind.as_str() {
+        "alkane" | "diesel" => {
+            let provider =
+                TokenDataProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"tokendata:")));
+            provider.get_diesel_avg_price_paid_usd_points_through_height(range_max)
+        }
+        "rune" | "ug" | "uncommon_goods" => {
+            if !runes_enabled_from_global_config() {
+                Ok(Vec::new())
+            } else {
+                let provider = RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:")));
+                provider.get_uncommon_goods_avg_price_paid_usd_points_through_height(range_max)
+            }
+        }
+        _ => {
+            return Json(AddressChartResponse {
+                ok: false,
+                available: false,
+                range,
+                points: Vec::new(),
+                error: Some("missing_or_invalid_kind".to_string()),
+            });
+        }
+    };
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(_) => {
+            return Json(AddressChartResponse {
+                ok: false,
+                available: false,
+                range,
+                points: Vec::new(),
+                error: Some("minting_price_read_failed".to_string()),
+            });
+        }
+    };
+    let points = forward_fill_price_points(rows, range_min, range_max, range_interval);
+    let available = !points.is_empty();
+    Json(AddressChartResponse { ok: true, available, range, points, error: None })
+}
+
 #[derive(Deserialize)]
 pub struct SimulateRequest {
     pub alkane: String,
@@ -2053,6 +2135,44 @@ fn address_chart_range_params(range: &str) -> (Option<u32>, u32) {
         "1m" => (Some(144 * 30), 30),
         _ => (None, 500),
     }
+}
+
+fn scaled_price_bytes_to_f64(bytes: [u8; 32]) -> f64 {
+    U256::from_be_bytes(bytes).to_string().parse::<f64>().unwrap_or(0.0) / (PRICE_SCALE as f64)
+}
+
+fn forward_fill_price_points(
+    rows: Vec<(u32, [u8; 32])>,
+    range_min: u32,
+    range_max: u32,
+    interval: u32,
+) -> Vec<AddressChartPoint> {
+    if rows.is_empty() || range_min > range_max {
+        return Vec::new();
+    }
+    let step = interval.max(1);
+    let mut idx = 0usize;
+    let mut current: Option<[u8; 32]> = None;
+    while idx < rows.len() && rows[idx].0 <= range_min {
+        current = Some(rows[idx].1);
+        idx += 1;
+    }
+    let mut height = range_min;
+    let mut points = Vec::new();
+    loop {
+        while idx < rows.len() && rows[idx].0 <= height {
+            current = Some(rows[idx].1);
+            idx += 1;
+        }
+        if let Some(price) = current {
+            points.push(AddressChartPoint { height, value: scaled_price_bytes_to_f64(price) });
+        }
+        if height == range_max {
+            break;
+        }
+        height = height.saturating_add(step).min(range_max);
+    }
+    points
 }
 
 fn alkane_id_str(id: &SchemaAlkaneId) -> String {

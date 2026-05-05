@@ -79,6 +79,7 @@ pub struct AmmDataTable<'a> {
     pub TOKEN_MCAP_USD_CANDLES: ListPointer<'a>,
     pub BTC_USD_PRICE: KvPointer<'a>,
     pub BTC_USD_LINE: ListPointer<'a>,
+    pub TOTAL_VOLUME_AMM: KvPointer<'a>,
     pub TOKEN_DERIVED_MCAP_USD_CANDLES: ListPointer<'a>,
     pub CHART_CHANGE_EVENTS: KvPointer<'a>,
     pub CHART_CHANGE_LATEST: KvPointer<'a>,
@@ -138,6 +139,7 @@ impl<'a> AmmDataTable<'a> {
             TOKEN_MCAP_USD_CANDLES: root.list_keyword("tmc1:"),
             BTC_USD_PRICE: root.keyword("/btc_usd_price/v1/"),
             BTC_USD_LINE: root.list_keyword("btu1:"),
+            TOTAL_VOLUME_AMM: root.keyword("/total_volume_amm/v1/"),
             TOKEN_DERIVED_MCAP_USD_CANDLES: root.list_keyword("tdmc1:"),
             CHART_CHANGE_EVENTS: root.keyword("/chart_change_events/v1/"),
             CHART_CHANGE_LATEST: root.keyword("/chart_change_latest/v1/"),
@@ -283,6 +285,36 @@ impl SearchIndexField {
             SearchIndexField::Marketcap
             | SearchIndexField::Volume7d
             | SearchIndexField::VolumeAllTime => 16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TotalVolumeAmmUnit {
+    Sats,
+    Usd,
+}
+
+impl TotalVolumeAmmUnit {
+    pub fn parse(raw: Option<&str>) -> Option<Self> {
+        match raw.unwrap_or("usd").trim().to_ascii_lowercase().as_str() {
+            "sats" | "sat" | "btc" => Some(Self::Sats),
+            "usd" | "dollars" => Some(Self::Usd),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sats => "sats",
+            Self::Usd => "usd",
+        }
+    }
+
+    pub fn scale(self) -> u128 {
+        match self {
+            Self::Sats => 1,
+            Self::Usd => PRICE_SCALE,
         }
     }
 }
@@ -524,6 +556,31 @@ impl<'a> AmmDataTable<'a> {
 
     pub fn parse_btc_usd_price_key(&self, key: &[u8]) -> Option<u64> {
         let prefix = self.btc_usd_price_prefix();
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 8 {
+            return None;
+        }
+        let mut height = [0u8; 8];
+        height.copy_from_slice(rest);
+        Some(u64::from_be_bytes(height))
+    }
+
+    pub fn total_volume_amm_prefix(&self, unit: TotalVolumeAmmUnit) -> Vec<u8> {
+        let suffix = format!("{}/", unit.as_str());
+        self.TOTAL_VOLUME_AMM.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn total_volume_amm_key(&self, unit: TotalVolumeAmmUnit, height: u64) -> Vec<u8> {
+        let mut k = self.total_volume_amm_prefix(unit);
+        k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    pub fn parse_total_volume_amm_key(&self, unit: TotalVolumeAmmUnit, key: &[u8]) -> Option<u64> {
+        let prefix = self.total_volume_amm_prefix(unit);
         if !key.starts_with(&prefix) {
             return None;
         }
@@ -1721,6 +1778,59 @@ impl AmmDataProvider {
             let fallback = AmmDataConfig::load_from_global_config()?.pre_ammdata_btc_usd_price;
             if fallback > 0 {
                 return Ok(Some(fallback));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn get_total_volume_amm_at_or_before_height(
+        &self,
+        unit: TotalVolumeAmmUnit,
+        height: u32,
+    ) -> Result<Option<(u64, u128)>> {
+        let table = self.table();
+        let rel_prefix = table.total_volume_amm_prefix(unit);
+        let end_exclusive = table.total_volume_amm_key(unit, u64::from(height).saturating_add(1));
+        let entries = self.raw_scan_range_entries_page_at(
+            &rel_prefix,
+            Some(&end_exclusive),
+            self.view_blockhash,
+            0,
+            16,
+            true,
+        )?;
+        for (k, v) in entries {
+            let Some(point_height) = table.parse_total_volume_amm_key(unit, &k) else {
+                continue;
+            };
+            if let Ok(value) = decode_u128_value(&v) {
+                return Ok(Some((point_height, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn get_latest_total_volume_amm(
+        &self,
+        unit: TotalVolumeAmmUnit,
+    ) -> Result<Option<(u64, u128)>> {
+        let table = self.table();
+        let rel_prefix = table.total_volume_amm_prefix(unit);
+        let end_exclusive = prefix_end_exclusive(&rel_prefix);
+        let entries = self.raw_scan_range_entries_page_at(
+            &rel_prefix,
+            end_exclusive.as_deref(),
+            self.view_blockhash,
+            0,
+            16,
+            true,
+        )?;
+        for (k, v) in entries {
+            let Some(point_height) = table.parse_total_volume_amm_key(unit, &k) else {
+                continue;
+            };
+            if let Ok(value) = decode_u128_value(&v) {
+                return Ok(Some((point_height, value)));
             }
         }
         Ok(None)
@@ -4044,6 +4154,81 @@ impl AmmDataProvider {
         };
         Ok(RpcGetBtcUsdPriceResult { value: out })
     }
+
+    pub fn rpc_get_total_volume_amm(
+        &self,
+        params: RpcGetTotalVolumeAmmParams,
+    ) -> Result<RpcGetTotalVolumeAmmResult> {
+        let Some(unit) = TotalVolumeAmmUnit::parse(params.unit.as_deref()) else {
+            return Ok(RpcGetTotalVolumeAmmResult {
+                value: json!({
+                    "ok": false,
+                    "error": "invalid_unit",
+                    "allowed": ["usd", "sats"]
+                }),
+            });
+        };
+
+        let table = self.table();
+        let start_height =
+            params.range_min.or(params.from_height).or(params.start_height).unwrap_or(0);
+        let max_height = params.range_max.or(params.to_height).or(params.end_height);
+        let limit = params.limit.unwrap_or(1000).clamp(1, 10_000) as usize;
+        let page = params.page.unwrap_or(1).max(1);
+        let offset = page.saturating_sub(1).saturating_mul(limit as u64) as usize;
+
+        let start_key = table.total_volume_amm_key(unit, start_height);
+        let end_key = max_height
+            .and_then(|h| h.checked_add(1).map(|end| table.total_volume_amm_key(unit, end)));
+        let prefix_end = if end_key.is_none() {
+            let prefix = table.total_volume_amm_prefix(unit);
+            prefix_end_exclusive(&prefix)
+        } else {
+            None
+        };
+        let end_exclusive = end_key.as_deref().or(prefix_end.as_deref());
+        let entries = self.raw_scan_range_entries_page_at(
+            &start_key,
+            end_exclusive,
+            self.view_blockhash,
+            offset,
+            limit,
+            false,
+        )?;
+
+        let mut points = Vec::new();
+        for (key, value) in entries {
+            let Some(height) = table.parse_total_volume_amm_key(unit, &key) else {
+                continue;
+            };
+            let Ok(total) = decode_u128_value(&value) else { continue };
+            points.push(json!({
+                "height": height,
+                "value": total.to_string()
+            }));
+        }
+
+        let latest = self.get_latest_total_volume_amm(unit)?.map(|(height, value)| {
+            json!({
+                "height": height,
+                "value": value.to_string()
+            })
+        });
+
+        Ok(RpcGetTotalVolumeAmmResult {
+            value: json!({
+                "ok": true,
+                "unit": unit.as_str(),
+                "scale": unit.scale().to_string(),
+                "page": page,
+                "limit": limit,
+                "range_min": start_height,
+                "range_max": max_height,
+                "latest": latest,
+                "points": points
+            }),
+        })
+    }
 }
 
 pub struct GetRawValueParams {
@@ -4730,6 +4915,22 @@ pub struct RpcGetBtcUsdPriceParams {
 }
 
 pub struct RpcGetBtcUsdPriceResult {
+    pub value: Value,
+}
+
+pub struct RpcGetTotalVolumeAmmParams {
+    pub unit: Option<String>,
+    pub range_min: Option<u64>,
+    pub range_max: Option<u64>,
+    pub from_height: Option<u64>,
+    pub to_height: Option<u64>,
+    pub start_height: Option<u64>,
+    pub end_height: Option<u64>,
+    pub limit: Option<u64>,
+    pub page: Option<u64>,
+}
+
+pub struct RpcGetTotalVolumeAmmResult {
     pub value: Value,
 }
 

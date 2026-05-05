@@ -151,6 +151,214 @@ fn alkane_tab_autoscroll_script() -> Markup {
     )
 }
 
+fn minting_price_chart_scripts() -> Markup {
+    PreEscaped(
+        r#"<script>
+(() => {
+  const card = document.querySelector('[data-minting-price-chart]');
+  if (!card) return;
+  const apiPath = '../api/minting-price-chart';
+  const kind = (card.dataset.mintingPriceKind || 'alkane').trim();
+  const root = card.querySelector('[data-minting-price-chart-root]');
+  const loading = card.querySelector('[data-minting-price-chart-loading]');
+  const loadingText = card.querySelector('[data-minting-price-chart-loading-text]');
+  const spinner = card.querySelector('[data-minting-price-chart-loading-spinner]');
+  const tabs = Array.from(card.querySelectorAll('[data-range]'));
+  let chart = null;
+  let canvas = null;
+  let tooltipEl = null;
+  let activeRange = (card.dataset.defaultRange || 'all').toLowerCase();
+  let inFlight = false;
+
+  const color = (name, fallback) =>
+    getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+  const setLoading = (message, spin) => {
+    if (!loading) return;
+    if (loadingText) loadingText.textContent = message;
+    else loading.textContent = message;
+    loading.dataset.spinning = spin ? '1' : '0';
+    if (spinner) spinner.style.display = spin ? '' : 'none';
+    loading.style.display = '';
+  };
+  const hideLoading = () => {
+    if (loading) loading.style.display = 'none';
+  };
+  const clearChart = () => {
+    if (chart) chart.destroy();
+    chart = null;
+    hideTooltip();
+    if (canvas) canvas.remove();
+    canvas = null;
+  };
+  const ensureScript = (src) => new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.loaded === '1') resolve();
+      else {
+        existing.addEventListener('load', resolve, { once: true });
+        existing.addEventListener('error', reject, { once: true });
+      }
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.addEventListener('load', () => {
+      script.dataset.loaded = '1';
+      resolve();
+    }, { once: true });
+    script.addEventListener('error', reject, { once: true });
+    document.head.appendChild(script);
+  });
+  const loadChartJs = async () => {
+    if (!window.Chart) {
+      await ensureScript('https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js');
+    }
+  };
+  const ensureCanvas = () => {
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      canvas.setAttribute('aria-label', 'Minting price history');
+      canvas.setAttribute('role', 'img');
+      if (loading && loading.parentNode === root) root.insertBefore(canvas, loading);
+      else root.appendChild(canvas);
+    }
+    return canvas.getContext('2d');
+  };
+  const usd = (v) =>
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 6 }).format(v || 0);
+  const unitLabel = kind === 'rune' || kind === 'ug' || kind === 'uncommon_goods' ? 'UG' : 'DIESEL';
+  const formatBlock = (height) => {
+    if (!Number.isFinite(height)) return 'Block';
+    return `Block ${new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(height)}`;
+  };
+  const ensureTooltip = () => {
+    if (!root) return null;
+    if (tooltipEl && tooltipEl.isConnected) return tooltipEl;
+    tooltipEl = document.createElement('div');
+    tooltipEl.className = 'address-balance-chart-tooltip';
+    tooltipEl.innerHTML = `
+      <div class="address-balance-chart-tooltip-title" data-minting-price-tooltip-title=""></div>
+      <div class="address-balance-chart-tooltip-row">
+        <span class="address-balance-chart-tooltip-value" data-minting-price-tooltip-value=""></span>
+      </div>
+    `;
+    root.appendChild(tooltipEl);
+    return tooltipEl;
+  };
+  const hideTooltip = () => {
+    if (!tooltipEl) return;
+    tooltipEl.dataset.visible = '0';
+    tooltipEl.style.opacity = '0';
+  };
+  const renderTooltip = (context) => {
+    const tooltip = context && context.tooltip ? context.tooltip : null;
+    const el = ensureTooltip();
+    if (!tooltip || !el) return;
+    if (tooltip.opacity === 0 || !tooltip.dataPoints || tooltip.dataPoints.length === 0) {
+      hideTooltip();
+      return;
+    }
+    const dataPoint = tooltip.dataPoints[0];
+    const rawHeight = Number(dataPoint ? dataPoint.label : NaN);
+    const rawValue = dataPoint && dataPoint.parsed && typeof dataPoint.parsed.y === 'number'
+      ? dataPoint.parsed.y
+      : NaN;
+    const titleEl = el.querySelector('[data-minting-price-tooltip-title]');
+    if (titleEl) titleEl.textContent = formatBlock(rawHeight);
+    const valueEl = el.querySelector('[data-minting-price-tooltip-value]');
+    if (valueEl) valueEl.textContent = `${usd(rawValue)} / ${unitLabel}`;
+    const padding = 8;
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    const maxLeft = Math.max(padding, root.clientWidth - width - padding);
+    const maxTop = Math.max(padding, root.clientHeight - height - padding);
+    const left = Math.min(Math.max(tooltip.caretX + 12, padding), maxLeft);
+    const top = Math.min(Math.max(tooltip.caretY + 12, padding), maxTop);
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+    el.dataset.visible = '1';
+    el.style.opacity = '1';
+  };
+  const render = (points) => {
+    const ctx = ensureCanvas();
+    const labels = points.map((p) => p.height);
+    const values = points.map((p) => p.value);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const span = Math.max(max - min, Math.abs(max) || 1);
+    const yMin = Math.max(0, min - span * 0.12);
+    const yMax = max + span * 0.12;
+    const line = color('--link', '#7db7ff');
+    const fill = 'rgba(125, 183, 255, 0.14)';
+    if (chart) {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = values;
+      chart.options.scales.y.min = yMin;
+      chart.options.scales.y.max = yMax;
+      chart.update('none');
+      return;
+    }
+    chart = new window.Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets: [{ data: values, borderColor: line, backgroundColor: fill, borderWidth: 3, pointRadius: 0, pointHoverRadius: 5, pointHoverBackgroundColor: line, pointHoverBorderColor: color('--text', '#ffffff'), pointHoverBorderWidth: 2, tension: 0.35, cubicInterpolationMode: 'monotone', fill: 'start' }] },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { enabled: false, external: renderTooltip }
+        },
+        interaction: { mode: 'index', intersect: false },
+        hover: { mode: 'index', intersect: false },
+        scales: { x: { display: false }, y: { display: false, min: yMin, max: yMax } }
+      }
+    });
+  };
+  const load = async (range) => {
+    if (inFlight) return;
+    inFlight = true;
+    setLoading('Loading chart...', true);
+    try {
+      const res = await fetch(`${apiPath}?${new URLSearchParams({ kind, range })}`, { headers: { Accept: 'application/json' } });
+      const data = await res.json();
+      const points = Array.isArray(data && data.points) ? data.points.slice().sort((a, b) => a.height - b.height) : [];
+      if (!data || !data.ok || points.length === 0) {
+        clearChart();
+        card.removeAttribute('data-tone');
+        setLoading('No chart data for this selection', false);
+        return;
+      }
+      await loadChartJs();
+      const first = Number(points[0].value);
+      const last = Number(points[points.length - 1].value);
+      card.dataset.tone = last >= first ? 'up' : 'down';
+      hideLoading();
+      render(points);
+    } catch (_) {
+      clearChart();
+      setLoading('Chart unavailable', false);
+    } finally {
+      inFlight = false;
+    }
+  };
+  const setActive = (range) => tabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.range === range));
+  tabs.forEach((tab) => tab.addEventListener('click', () => {
+    const range = (tab.dataset.range || 'all').toLowerCase();
+    if (range === activeRange) return;
+    activeRange = range;
+    setActive(range);
+    load(range);
+  }));
+  setActive(activeRange);
+  load(activeRange);
+})();
+</script>"#
+            .to_string(),
+    )
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActivityOrder {
     Timestamp,
@@ -332,6 +540,7 @@ pub async fn alkane_page(
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let alk_str = format!("{}:{}", alk.block, alk.tx);
+    let is_diesel = alk.block == 2 && alk.tx == 0;
     let mut kv_cache: AlkaneMetaCache = Default::default();
     let meta = alkane_meta(&alk, &mut kv_cache, &state.essentials_mdb);
     let display_name = meta.name.value.clone();
@@ -563,29 +772,33 @@ pub async fn alkane_page(
         }
     };
 
-    let (activity_total, activity_entries, activity_label) = match volume_kind {
-        VolumeKind::TransferVolume => {
-            let (total, entries) = get_transfer_volume_for_alkane(
-                StateAt::Latest,
-                &state.essentials_provider(),
-                alk,
-                page,
-                limit,
-            )
-            .unwrap_or((0, Vec::new()));
-            (total, entries, "Transfer volume")
+    let (activity_total, activity_entries, activity_label) = if tab == AlkaneTab::Volume {
+        match volume_kind {
+            VolumeKind::TransferVolume => {
+                let (total, entries) = get_transfer_volume_for_alkane(
+                    StateAt::Latest,
+                    &state.essentials_provider(),
+                    alk,
+                    page,
+                    limit,
+                )
+                .unwrap_or((0, Vec::new()));
+                (total, entries, "Transfer volume")
+            }
+            VolumeKind::TotalReceived => {
+                let (total, entries) = get_total_received_for_alkane(
+                    StateAt::Latest,
+                    &state.essentials_provider(),
+                    alk,
+                    page,
+                    limit,
+                )
+                .unwrap_or((0, Vec::new()));
+                (total, entries, "Total received")
+            }
         }
-        VolumeKind::TotalReceived => {
-            let (total, entries) = get_total_received_for_alkane(
-                StateAt::Latest,
-                &state.essentials_provider(),
-                alk,
-                page,
-                limit,
-            )
-            .unwrap_or((0, Vec::new()));
-            (total, entries, "Total received")
-        }
+    } else {
+        (0, Vec::new(), volume_kind.label())
     };
     let volume_query = volume_kind.query_value();
     let volume_dropdown = dropdown(DropdownProps {
@@ -993,6 +1206,31 @@ pub async fn alkane_page(
                 }
 
                 section class="alkane-section" {
+                    @if is_diesel {
+                        div
+                            class="card address-balance-chart-card"
+                            data-minting-price-chart=""
+                            data-minting-price-kind="alkane"
+                            data-default-range="all"
+                        {
+                            div class="address-balance-chart-head" {
+                                h2 class="h2 minting-price-title" { "Minting Price" }
+                            }
+                            div class="address-balance-chart-plot" data-minting-price-chart-root {
+                                div class="address-balance-chart-loading" data-minting-price-chart-loading="" data-spinning="1" {
+                                    span class="spinner address-balance-chart-spinner" data-minting-price-chart-loading-spinner="" aria-hidden="true" {}
+                                    span data-minting-price-chart-loading-text="" { "Loading chart..." }
+                                }
+                            }
+                            div class="address-balance-chart-tabs" {
+                                button type="button" class="address-balance-chart-tab" data-range="1d" { "1D" }
+                                button type="button" class="address-balance-chart-tab" data-range="1w" { "1W" }
+                                button type="button" class="address-balance-chart-tab" data-range="1m" { "1M" }
+                                button type="button" class="address-balance-chart-tab active" data-range="all" { (all_range_label) }
+                            }
+                        }
+                    }
+
                     h2 class="section-title" { "Alkane Balances" }
                     (balances_markup)
                     @if let Some(default_alkane) = default_balance_chart_alkane.as_ref() {
@@ -1293,6 +1531,9 @@ pub async fn alkane_page(
             (header_scripts())
             @if default_balance_chart_alkane.is_some() {
                 (alkane_balance_chart_scripts())
+            }
+            @if is_diesel {
+                (minting_price_chart_scripts())
             }
             @if tab == AlkaneTab::Inspect {
                 (inspect_scripts())

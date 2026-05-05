@@ -22,6 +22,7 @@ pub struct FinalizeStats {
     pub derived_search_index: usize,
     pub btc_usd_price: usize,
     pub btc_usd_line: usize,
+    pub total_volume_amm: usize,
     pub canonical_pools: usize,
     pub pool_name_index: usize,
     pub amm_factories: usize,
@@ -197,6 +198,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     let tdsi_cnt = state.derived_search_index_writes.len();
     let btc_cnt = state.btc_usd_price_writes.len();
     let btcl_cnt = state.btc_usd_line_writes.len();
+    let tva_cnt = state.total_volume_amm_writes.len();
     let cp_cnt = state.canonical_pool_writes.len();
     let pn_cnt = state.pool_name_index_writes.len();
     let af_cnt = state.amm_factory_writes.len();
@@ -244,6 +246,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         || !state.pool_metrics_index_deletes.is_empty()
         || !state.btc_usd_price_writes.is_empty()
         || !state.btc_usd_line_writes.is_empty()
+        || !state.total_volume_amm_writes.is_empty()
         || !state.canonical_pool_writes.is_empty()
         || !state.pool_name_index_writes.is_empty()
         || !state.amm_factory_writes.is_empty()
@@ -286,6 +289,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     puts.extend(std::mem::take(&mut state.derived_search_index_writes));
     puts.extend(std::mem::take(&mut state.btc_usd_price_writes));
     puts.extend(std::mem::take(&mut state.btc_usd_line_writes));
+    puts.extend(std::mem::take(&mut state.total_volume_amm_writes));
     puts.extend(std::mem::take(&mut state.canonical_pool_writes));
     puts.extend(std::mem::take(&mut state.pool_name_index_writes));
     puts.extend(std::mem::take(&mut state.amm_factory_writes));
@@ -340,6 +344,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         derived_search_index: tdsi_cnt,
         btc_usd_price: btc_cnt,
         btc_usd_line: btcl_cnt,
+        total_volume_amm: tva_cnt,
         canonical_pools: cp_cnt,
         pool_name_index: pn_cnt,
         amm_factories: af_cnt,

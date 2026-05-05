@@ -3,6 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use alloy_primitives::U256;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -21,6 +22,7 @@ use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_network,
 };
 use crate::explorer::components::block_carousel::{block_carousel, block_carousel_with_mempool};
+use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
 use crate::explorer::components::header::{
     HeaderPillTone, HeaderProps, HeaderSummaryItem, header, header_scripts,
 };
@@ -33,6 +35,7 @@ use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::common::format_fee_rate;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
+use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::essentials::storage::{
     AddressIndexListKind, AlkaneTxSummary, BalanceEntry, address_index_list_id_alkane_block_txs,
     get_address_index_list_len, get_address_index_list_range, load_tx_pointer_blob_v3_by_id,
@@ -43,6 +46,7 @@ use crate::modules::essentials::utils::balances::{
 };
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RunesProvider, SchemaRuneId};
+use crate::modules::tokendata::storage::TokenDataProvider;
 use crate::runtime::mempool::{
     MempoolBlockTx, get_mempool_block_detail, get_mempool_block_ordered_transactions,
     get_mempool_transactions,
@@ -58,6 +62,39 @@ fn format_with_commas(n: u64) -> String {
         i -= 3;
     }
     s
+}
+
+fn comma_decimal_digits(digits: &str) -> String {
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (idx, ch) in digits.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn format_scaled_usd_price(bytes: [u8; 32]) -> String {
+    let scale = U256::from(PRICE_SCALE);
+    let cents = (U256::from_be_bytes(bytes).saturating_mul(U256::from(100u64))
+        + (scale / U256::from(2u64)))
+        / scale;
+    let mut cents_str = cents.to_string();
+    if cents_str.len() < 3 {
+        cents_str = format!("{}{}", "0".repeat(3 - cents_str.len()), cents_str);
+    }
+    let split = cents_str.len().saturating_sub(2);
+    let whole = comma_decimal_digits(&cents_str[..split]);
+    let frac = &cents_str[split..];
+    format!("${whole}.{frac}")
+}
+
+fn price_summary_value(value: Option<[u8; 32]>) -> maud::Markup {
+    match value {
+        Some(bytes) => html! { span class="summary-value" { (format_scaled_usd_price(bytes)) } },
+        None => html! { span class="summary-value muted strong" { "Not Seen" } },
+    }
 }
 
 fn mempool_block_url(network: bitcoin::Network, block_hash: &BlockHash) -> Option<String> {
@@ -311,6 +348,10 @@ pub async fn block_page(
         .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
         .unwrap_or(false);
     let runes_provider = RunesProvider::new(Arc::new(state.runes_mdb.clone()));
+    let tokendata_provider = TokenDataProvider::new(Arc::new(crate::runtime::mdb::Mdb::from_db(
+        crate::config::get_espo_db(),
+        b"tokendata:",
+    )));
     let canonical_path = format!("/block/{height}");
 
     let block_hash = match rpc.get_block_hash(height) {
@@ -329,6 +370,14 @@ pub async fn block_page(
         }
     };
     let block_hash_hex = block_hash.to_string();
+    let diesel_avg_price_paid_usd = tokendata_provider
+        .get_diesel_avg_price_paid_usd_by_height(height as u32)
+        .ok()
+        .flatten();
+    let uncommon_goods_avg_price_paid_usd = runes_provider
+        .get_uncommon_goods_avg_price_paid_usd_by_height(height as u32)
+        .ok()
+        .flatten();
     let block_summary = essentials_provider
         .get_block_summary(crate::modules::essentials::storage::GetBlockSummaryParams {
             blockhash: StateAt::Latest,
@@ -803,6 +852,14 @@ pub async fn block_page(
             None => html! { span class="summary-value muted" { "—" } },
         },
     });
+    summary_items.push(HeaderSummaryItem {
+        label: "Avg Diesel".to_string(),
+        value: price_summary_value(diesel_avg_price_paid_usd),
+    });
+    summary_items.push(HeaderSummaryItem {
+        label: "Avg UG".to_string(),
+        value: price_summary_value(uncommon_goods_avg_price_paid_usd),
+    });
 
     let pill = confirmations
         .map(|c| (format!("{} confirmations", format_with_commas(c)), HeaderPillTone::Success))
@@ -815,6 +872,57 @@ pub async fn block_page(
         summary_items,
         cta: None,
         hero_class: None,
+    });
+    let tx_filter_label = match tx_filter {
+        TxFilter::All => "All Txs",
+        TxFilter::Action => "All Actions",
+        TxFilter::Alkane => "Only Alkanes",
+        TxFilter::Rune => "Only Runes",
+    };
+    let mut tx_filter_dropdown_items = vec![
+        DropdownItem {
+            label: "All Txs".to_string(),
+            href: explorer_path(&format!(
+                "/block/{height}?tab=txs&page=1&limit={limit}&txs=all&hide_diesel_mints={hide_diesel_param}"
+            )),
+            icon: None,
+            selected: tx_filter == TxFilter::All,
+        },
+        DropdownItem {
+            label: "Only Alkanes".to_string(),
+            href: explorer_path(&format!(
+                "/block/{height}?tab=txs&page=1&limit={limit}&txs=alkane&hide_diesel_mints={hide_diesel_param}"
+            )),
+            icon: None,
+            selected: tx_filter == TxFilter::Alkane,
+        },
+    ];
+    if runes_enabled {
+        tx_filter_dropdown_items.insert(
+            1,
+            DropdownItem {
+                label: "All Actions".to_string(),
+                href: explorer_path(&format!(
+                    "/block/{height}?tab=txs&page=1&limit={limit}&txs=actions&hide_diesel_mints={hide_diesel_param}"
+                )),
+                icon: None,
+                selected: tx_filter == TxFilter::Action,
+            },
+        );
+        tx_filter_dropdown_items.push(DropdownItem {
+            label: "Only Runes".to_string(),
+            href: explorer_path(&format!(
+                "/block/{height}?tab=txs&page=1&limit={limit}&txs=rune&hide_diesel_mints={hide_diesel_param}"
+            )),
+            icon: None,
+            selected: tx_filter == TxFilter::Rune,
+        });
+    }
+    let tx_filter_dropdown = dropdown(DropdownProps {
+        label: Some(tx_filter_label.to_string()),
+        selected_icon: None,
+        items: tx_filter_dropdown_items,
+        aria_label: Some("Transaction filter".to_string()),
     });
 
     layout_with_meta(
@@ -841,11 +949,11 @@ pub async fn block_page(
             }
 
             div class="card" {
-                div class="row" {
+                div class="row tx-filter-row" {
                     h2 class="h2" { "Transactions" }
                     @if espo_indexed {
                         div class="trace-toggle" {
-                            div class="segmented-control" role="group" aria-label="Transaction filter" {
+                            div class="tx-filter-segments segmented-control" role="group" aria-label="Transaction filter" {
                                 a class=(if tx_filter == TxFilter::All { "segment active" } else { "segment" })
                                     href=(explorer_path(&format!("/block/{height}?tab=txs&page=1&limit={limit}&txs=all&hide_diesel_mints={hide_diesel_param}"))) {
                                     "All Txs"
@@ -866,6 +974,9 @@ pub async fn block_page(
                                         "Only Runes"
                                     }
                                 }
+                            }
+                            div class="tx-filter-dropdown" {
+                                (tx_filter_dropdown)
                             }
                             form method="get" action=(explorer_path(&format!("/block/{height}"))) {
                                 input type="hidden" name="tab" value="txs";

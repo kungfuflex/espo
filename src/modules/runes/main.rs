@@ -16,13 +16,14 @@ use super::storage::{
     rune_tx_address_list_key, rune_tx_block_list_key, rune_tx_chunk_counter_key,
     rune_tx_pointer_count_key, rune_tx_pointer_key, rune_volume_entry_key,
     rune_volume_list_idx_key, rune_volume_list_len_key, script_to_address, seq_count_key, seq_key,
-    tx_io_key,
+    tx_io_key, uncommon_goods_avg_price_usd_by_height_key,
 };
 use super::transfer::{OutputRuneSheets, RuneSheet, RunestoneTransfer, TransferRules};
 use crate::alkanes::trace::EspoBlock;
 use crate::config::{
     debug_enabled, get_bitcoind_rpc_client, get_electrum_like, get_espo_db, get_network,
 };
+use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{PRICE_SCALE, SATS_PER_BTC};
 use crate::modules::ammdata::storage::AmmDataProvider;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
@@ -249,6 +250,8 @@ struct BlockRunesIndexer<'a> {
     action_block_pointer_ids: Vec<u64>,
     action_address_pointer_ids: HashMap<String, Vec<u64>>,
     action_candidates: BTreeMap<Txid, ActionCandidate>,
+    uncommon_goods_usd_weighted_sum: U256,
+    uncommon_goods_amount_sum: U256,
     puts: Vec<(Vec<u8>, Vec<u8>)>,
     deletes: HashSet<Vec<u8>>,
 }
@@ -296,6 +299,8 @@ impl<'a> BlockRunesIndexer<'a> {
             action_block_pointer_ids: Vec::new(),
             action_address_pointer_ids: HashMap::new(),
             action_candidates: BTreeMap::new(),
+            uncommon_goods_usd_weighted_sum: U256::ZERO,
+            uncommon_goods_amount_sum: U256::ZERO,
             puts: Vec::new(),
             deletes: HashSet::new(),
         }
@@ -318,6 +323,13 @@ impl<'a> BlockRunesIndexer<'a> {
         self.flush_address_balance_history()?;
         self.flush_action_tx_indexes()?;
         self.flush_tx_indexes()?;
+        if !self.uncommon_goods_amount_sum.is_zero() {
+            let avg = self.uncommon_goods_usd_weighted_sum / self.uncommon_goods_amount_sum;
+            self.puts.push((
+                uncommon_goods_avg_price_usd_by_height_key(self.height),
+                u256_to_be(avg).to_vec(),
+            ));
+        }
         let flush_elapsed = t_flush.elapsed();
         let delete_set = std::mem::take(&mut self.deletes);
         let mut puts = std::mem::take(&mut self.puts);
@@ -519,6 +531,15 @@ impl<'a> BlockRunesIndexer<'a> {
             let mint_price_paid_sats =
                 scale_rune_fee_price_sats(mint_fee_paid_sats, balance.amount, divisibility);
             let mint_price_paid_usd = scale_rune_fee_price_usd(mint_price_paid_sats, btc_usd_price);
+            if balance.id == GENESIS_RUNE_ID && btc_usd_price.is_some() && balance.amount > 0 {
+                let amount = U256::from(balance.amount);
+                self.uncommon_goods_amount_sum =
+                    self.uncommon_goods_amount_sum.saturating_add(amount);
+                self.uncommon_goods_usd_weighted_sum =
+                    self.uncommon_goods_usd_weighted_sum.saturating_add(
+                        U256::from_be_bytes(mint_price_paid_usd).saturating_mul(amount),
+                    );
+            }
             let activity = RuneMintActivity {
                 id: balance.id,
                 txid: txid.to_byte_array(),
@@ -655,7 +676,16 @@ impl<'a> BlockRunesIndexer<'a> {
             Arc::new(Mdb::from_db(get_espo_db(), b"ammdata:")),
             essentials_provider,
         );
-        amm_provider.get_btc_usd_price_at_or_before_height(self.height).ok().flatten()
+        amm_provider
+            .get_btc_usd_price_at_or_before_height(self.height)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                AmmDataConfig::load_from_global_config()
+                    .ok()
+                    .map(|cfg| cfg.pre_ammdata_btc_usd_price)
+                    .filter(|price| *price > 0)
+            })
     }
 
     fn queue_rune_activity(&mut self, activity: RuneActivity) -> Result<()> {

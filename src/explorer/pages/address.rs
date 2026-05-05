@@ -19,6 +19,7 @@ use crate::config::{get_bitcoind_rpc_client, get_electrum_like};
 use crate::explorer::components::alk_balances::{
     render_alkane_balance_cards, render_rune_balance_cards,
 };
+use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
 use crate::explorer::components::header::{HeaderProps, HeaderSummaryItem, header, header_scripts};
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
@@ -1092,6 +1093,55 @@ pub async fn address_page(
             mempool_url.is_some()
         ),
     );
+    let tx_filter_label = match tx_filter {
+        TxFilter::All => "All Txs",
+        TxFilter::Action => "All Actions",
+        TxFilter::Alkane => "Only Alkanes",
+        TxFilter::Rune => "Only Runes",
+    };
+    let mut tx_filter_dropdown_items = vec![
+        DropdownItem {
+            label: "All Txs".to_string(),
+            href: explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=all", address_str)),
+            icon: None,
+            selected: tx_filter == TxFilter::All,
+        },
+        DropdownItem {
+            label: "Only Alkanes".to_string(),
+            href: explorer_path(&format!(
+                "/address/{}?page=1&limit={limit}&txs=alkane",
+                address_str
+            )),
+            icon: None,
+            selected: tx_filter == TxFilter::Alkane,
+        },
+    ];
+    if runes_enabled {
+        tx_filter_dropdown_items.insert(
+            1,
+            DropdownItem {
+                label: "All Actions".to_string(),
+                href: explorer_path(&format!(
+                    "/address/{}?page=1&limit={limit}&txs=actions",
+                    address_str
+                )),
+                icon: None,
+                selected: tx_filter == TxFilter::Action,
+            },
+        );
+        tx_filter_dropdown_items.push(DropdownItem {
+            label: "Only Runes".to_string(),
+            href: explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=rune", address_str)),
+            icon: None,
+            selected: tx_filter == TxFilter::Rune,
+        });
+    }
+    let tx_filter_dropdown = dropdown(DropdownProps {
+        label: Some(tx_filter_label.to_string()),
+        selected_icon: None,
+        items: tx_filter_dropdown_items,
+        aria_label: Some("Transaction filter".to_string()),
+    });
     let layout_t0 = Instant::now();
     let page = layout_with_meta(
         &format!("Address {address_str}"),
@@ -1109,12 +1159,12 @@ pub async fn address_page(
             }
 
             @if !rune_balance_entries.is_empty() {
-                h2 class="h2" { "Rune Balances" }
+                h2 class="h2 address-subtitle" { "Rune Balances" }
                 (rune_balances_markup)
             }
 
             @if !balance_entries.is_empty() {
-                h2 class="h2" { "Alkane Balances" }
+                h2 class="h2 address-subtitle" { "Alkane Balances" }
                 (balances_markup)
             }
 
@@ -1128,7 +1178,7 @@ pub async fn address_page(
                     data-default-range="all"
                 {
                     div class="address-balance-chart-head" {
-                        h2 class="h2" { "Balance History" }
+                        h2 class="h2 address-subtitle" { "Balance History" }
                         div class="address-balance-chart-controls" {
                             div class="dropdown address-balance-dropdown" data-dropdown="" data-open="" data-address-chart-token="" {
                                 button
@@ -1229,10 +1279,10 @@ pub async fn address_page(
             }
 
             div class="card" {
-                div class="row" {
-                    h2 class="h2" { "Transactions" }
+                div class="row tx-filter-row" {
+                    h2 class="h2 address-subtitle" { "Transactions" }
                     div class="trace-toggle" {
-                        div class="segmented-control" role="group" aria-label="Transaction filter" {
+                        div class="tx-filter-segments segmented-control" role="group" aria-label="Transaction filter" {
                             a class=(if tx_filter == TxFilter::All { "segment active" } else { "segment" })
                                 href=(explorer_path(&format!("/address/{}?page=1&limit={limit}&txs=all", address_str))) {
                                 "All Txs"
@@ -1253,6 +1303,9 @@ pub async fn address_page(
                                     "Only Runes"
                                 }
                             }
+                        }
+                        div class="tx-filter-dropdown" {
+                            (tx_filter_dropdown)
                         }
                     }
                 }

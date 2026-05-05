@@ -509,6 +509,10 @@ a:hover {
 .h2 {
   font-size: 22px;
 }
+.address-subtitle,
+.minting-price-title {
+  font-size: 18px;
+}
 .muted {
   color: var(--muted);
 }
@@ -684,6 +688,9 @@ a:hover {
   color: var(--muted);
   font-weight: 500;
 }
+.summary-value.muted.strong {
+  font-weight: 700;
+}
 .summary-value,
 .summary-value.link {
   overflow: hidden;
@@ -707,6 +714,15 @@ a:hover {
 .summary-grid > :nth-child(4) {
   grid-column: 2;
   grid-row: 2;
+  margin-left: 10px;
+}
+.summary-grid > :nth-child(5) {
+  grid-column: 1;
+  grid-row: 3;
+}
+.summary-grid > :nth-child(6) {
+  grid-column: 2;
+  grid-row: 3;
   margin-left: 10px;
 }
 .summary-inline {
@@ -749,6 +765,16 @@ a:hover {
     margin-left: 0;
   }
   .summary-grid > :nth-child(4) {
+    grid-column: unset;
+    grid-row: unset;
+    margin-left: 0;
+  }
+  .summary-grid > :nth-child(5) {
+    grid-column: unset;
+    grid-row: unset;
+    margin-left: 0;
+  }
+  .summary-grid > :nth-child(6) {
     grid-column: unset;
     grid-row: unset;
     margin-left: 0;
@@ -1874,6 +1900,13 @@ a:hover {
   border-radius: 8px;
   background: var(--panel2);
 }
+.tx-filter-dropdown {
+  display: none;
+}
+.tx-filter-dropdown .dropdown-trigger {
+  min-width: 160px;
+  justify-content: space-between;
+}
 .segment {
   min-height: 30px;
   padding: 8px 12px;
@@ -1940,23 +1973,24 @@ a:hover {
   transform: translateX(20px);
 }
 @media (max-width: 720px) {
+  .tx-filter-row {
+    gap: 0;
+  }
   .trace-toggle {
     width: 100%;
     margin-left: 0;
     align-items: flex-start;
     justify-content: flex-start;
   }
-  .trace-toggle .segmented-control {
-    max-width: 100%;
-    overflow-x: auto;
-    gap: 2px;
-    padding: 2px;
+  .trace-toggle .tx-filter-segments {
+    display: none;
   }
-  .trace-toggle .segment {
-    min-height: 26px;
-    padding: 5px 7px;
-    font-size: 12px;
-    border-radius: 5px;
+  .trace-toggle .tx-filter-dropdown {
+    display: inline-flex;
+  }
+  .trace-toggle .tx-filter-dropdown .dropdown-trigger {
+    min-height: 36px;
+    padding: 8px 10px;
   }
 }
 .address-balance-chart-card {

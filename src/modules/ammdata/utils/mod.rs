@@ -8,6 +8,7 @@ pub mod index_pools;
 pub mod index_snapshot;
 pub mod index_state;
 pub mod index_tokens;
+pub mod index_total_volume_amm;
 pub mod live_reserves;
 pub mod pathfinder;
 pub mod reserves;

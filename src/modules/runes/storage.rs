@@ -15,6 +15,8 @@ use super::inscriptions::RuneIcon;
 const INDEX_HEIGHT_KEY: &[u8] = b"/index_height";
 const INDEX_BLOCK_HASH_KEY: &[u8] = b"/index_block_hash";
 const UNDO_PREFIX: &[u8] = b"/undo/";
+const UNCOMMON_GOODS_AVG_PRICE_USD_BY_HEIGHT_PREFIX: &[u8] =
+    b"/block_price/v2/uncommon_goods_avg_usd_by_height/";
 const TX_INDEX_INLINE_CAP: usize = 8;
 
 // Raw Runes writes bypass the versioned B+tree for speed, so every block stores
@@ -405,6 +407,47 @@ impl RunesProvider {
                 BlockHash::from_byte_array(arr)
             })
         }))
+    }
+
+    pub fn get_uncommon_goods_avg_price_paid_usd_by_height(
+        &self,
+        height: u32,
+    ) -> Result<Option<[u8; 32]>> {
+        let Some(bytes) = self.mdb.get(&uncommon_goods_avg_price_usd_by_height_key(height))? else {
+            return Ok(None);
+        };
+        if bytes.len() != 32 {
+            return Err(anyhow!("invalid uncommon goods avg usd price length {}", bytes.len()));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(Some(out))
+    }
+
+    pub fn get_uncommon_goods_avg_price_paid_usd_points_through_height(
+        &self,
+        max_height: u32,
+    ) -> Result<Vec<(u32, [u8; 32])>> {
+        let prefix = uncommon_goods_avg_price_usd_by_height_prefix();
+        let entries = self.mdb.scan_prefix_entries(&prefix)?;
+        let mut out = Vec::new();
+        for (key, value) in entries {
+            let Some(height) = key.strip_prefix(prefix.as_slice()).and_then(decode_height_tail)
+            else {
+                continue;
+            };
+            if height > max_height {
+                continue;
+            }
+            if value.len() != 32 {
+                continue;
+            }
+            let mut price = [0u8; 32];
+            price.copy_from_slice(&value);
+            out.push((height, price));
+        }
+        out.sort_by_key(|(height, _)| *height);
+        Ok(out)
     }
 
     pub fn set_index_height(&self, height: u32) -> Result<()> {
@@ -1892,6 +1935,26 @@ pub fn rune_icon_key(id: SchemaRuneId) -> Vec<u8> {
     let mut key = b"/rune/icon/".to_vec();
     key.extend_from_slice(&id_key_bytes(id));
     key
+}
+
+pub fn uncommon_goods_avg_price_usd_by_height_prefix() -> Vec<u8> {
+    UNCOMMON_GOODS_AVG_PRICE_USD_BY_HEIGHT_PREFIX.to_vec()
+}
+
+pub fn uncommon_goods_avg_price_usd_by_height_key(height: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(UNCOMMON_GOODS_AVG_PRICE_USD_BY_HEIGHT_PREFIX.len() + 4);
+    key.extend_from_slice(UNCOMMON_GOODS_AVG_PRICE_USD_BY_HEIGHT_PREFIX);
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
+fn decode_height_tail(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() != 4 {
+        return None;
+    }
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(bytes);
+    Some(u32::from_be_bytes(arr))
 }
 
 pub fn script_to_address(script: &ScriptBuf, network: bitcoin::Network) -> Option<String> {

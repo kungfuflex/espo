@@ -2,7 +2,9 @@ use crate::config::{
     get_block_source, // NEW: use BlockSource for full blocks
     get_metashrew,
     get_metashrew_sdb,
+    get_network,
 };
+use crate::consts::alkanes_genesis_block;
 use crate::core::blockfetcher::BlockSource;
 use crate::schemas::EspoOutpoint;
 use crate::schemas::SchemaAlkaneId;
@@ -669,19 +671,24 @@ pub fn get_espo_block_with_opts(
         selected.push((txid, tx));
     }
 
-    let canonical_traces = select_canonical_traces(block, &canonical_txids, &selected)?;
-    if !canonical_traces.recovered_txids.is_empty()
-        || !canonical_traces.missing_candidate_txids.is_empty()
-        || !canonical_traces.unexpected_height_trace_txids.is_empty()
-    {
-        eprintln!(
-            "[reorg] metashrew trace mismatch at block {}: recovered_missing_txids={} missing_candidate_txids={} unexpected_height_trace_txids={}",
-            block,
-            canonical_traces.recovered_txids.join(","),
-            canonical_traces.missing_candidate_txids.join(","),
-            canonical_traces.unexpected_height_trace_txids.join(",")
-        );
-    }
+    let canonical_traces = if h32 >= alkanes_genesis_block(get_network()) {
+        let canonical_traces = select_canonical_traces(block, &canonical_txids, &selected)?;
+        if !canonical_traces.recovered_txids.is_empty()
+            || !canonical_traces.missing_candidate_txids.is_empty()
+            || !canonical_traces.unexpected_height_trace_txids.is_empty()
+        {
+            eprintln!(
+                "[reorg] metashrew trace mismatch at block {}: recovered_missing_txids={} missing_candidate_txids={} unexpected_height_trace_txids={}",
+                block,
+                canonical_traces.recovered_txids.join(","),
+                canonical_traces.missing_candidate_txids.join(","),
+                canonical_traces.unexpected_height_trace_txids.join(",")
+            );
+        }
+        canonical_traces
+    } else {
+        CanonicalTraceSelection::default()
+    };
     eprintln!(
         "[TRACE::get_espo_block] built canonical traces_index for block={} ({} txs with traces)",
         block,

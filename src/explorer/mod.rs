@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use api::{
     address_chart, alkane_balance_chart, alkane_chart, carousel_blocks, explorer_events_ws,
-    mempool_blocks, search_guess, simulate_contract,
+    mempool_blocks, minting_price_chart, search_guess, simulate_contract,
 };
 use axum::Router;
 use axum::extract::Request;
@@ -63,6 +63,7 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/api/alkane/simulate", post(simulate_contract))
         .route("/api/alkane/chart", get(alkane_chart))
         .route("/api/alkane/balance-chart", get(alkane_balance_chart))
+        .route("/api/minting-price-chart", get(minting_price_chart))
         .route("/api/address/chart", get(address_chart));
     let mempool_cfg = &get_config().mempool;
     if mempool_cfg.websocket_enabled {

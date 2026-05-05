@@ -2,7 +2,7 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
     RpcGetBestMevSwapParams, RpcGetBtcUsdPriceParams, RpcGetCandlesParams,
     RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams, RpcGetPoolsParams,
-    RpcGetTokenActivityParams, RpcPingParams,
+    RpcGetTokenActivityParams, RpcGetTotalVolumeAmmParams, RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -383,6 +383,45 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         }
                     };
                     view.rpc_get_btc_usd_price(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_total_volume = reg.clone();
+    let mdb_total_volume = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_total_volume
+            .register("get_total_volume_amm", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_total_volume);
+                async move {
+                    let params = RpcGetTotalVolumeAmmParams {
+                        unit: payload.get("unit").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        range_min: payload.get("range_min").and_then(|v| v.as_u64()),
+                        range_max: payload.get("range_max").and_then(|v| v.as_u64()),
+                        from_height: payload.get("from_height").and_then(|v| v.as_u64()),
+                        to_height: payload.get("to_height").and_then(|v| v.as_u64()),
+                        start_height: payload.get("start_height").and_then(|v| v.as_u64()),
+                        end_height: payload.get("end_height").and_then(|v| v.as_u64()),
+                        limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        page: payload.get("page").and_then(|v| v.as_u64()),
+                    };
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_total_volume_amm(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }

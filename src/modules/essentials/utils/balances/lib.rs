@@ -28,7 +28,8 @@ use crate::modules::essentials::storage::{
     resolve_outpoint_spent_by_ids_batch_v2, resolve_tx_pointer_ids_batch_v2, spk_to_address_str,
 };
 use crate::modules::essentials::storage::{
-    EssentialsProvider, GetMultiValuesParams, GetRawValueParams, SetBatchParams,
+    EssentialsProvider, GetListEntriesDescParams, GetMultiValuesParams, GetRawValueParams,
+    SetBatchParams,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::state_at::StateAt;
@@ -1032,6 +1033,43 @@ fn sort_address_amount_entries(entries: &mut Vec<AddressAmountEntry>) {
         std::cmp::Ordering::Equal => a.address.cmp(&b.address),
         o => o,
     });
+}
+
+fn read_address_amount_prefix_page(
+    blockhash: StateAt,
+    provider: &EssentialsProvider,
+    prefix: Vec<u8>,
+    page: usize,
+    limit: usize,
+) -> Result<(usize, Vec<AddressAmountEntry>)> {
+    let entries = provider
+        .get_list_entries_desc(GetListEntriesDescParams { blockhash, prefix: prefix.clone() })?
+        .entries;
+    let mut all = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        let Some(address_raw) = key.strip_prefix(prefix.as_slice()) else {
+            continue;
+        };
+        let Ok(address) = std::str::from_utf8(address_raw).map(|s| s.to_string()) else {
+            continue;
+        };
+        let Ok(amount) = decode_u128_value(&value) else {
+            continue;
+        };
+        if amount == 0 {
+            continue;
+        }
+        all.push(AddressAmountEntry { address, amount });
+    }
+
+    sort_address_amount_entries(&mut all);
+    let total = all.len();
+    let p = page.max(1);
+    let l = limit.max(1);
+    let off = l.saturating_mul(p - 1);
+    let end = (off + l).min(total);
+    let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
+    Ok((total, slice))
 }
 
 /* ===========================================================
@@ -4583,63 +4621,13 @@ pub fn get_transfer_volume_for_alkane(
     limit: usize,
 ) -> Result<(usize, Vec<AddressAmountEntry>)> {
     let table = provider.table();
-    let len = provider
-        .get_raw_value(GetRawValueParams {
-            blockhash,
-            key: table.transfer_volume_list_len_key(&alk),
-        })?
-        .value
-        .and_then(|bytes| {
-            if bytes.len() == 4 {
-                let mut arr = [0u8; 4];
-                arr.copy_from_slice(&bytes);
-                Some(u32::from_le_bytes(arr))
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-    let mut all = Vec::new();
-    if len > 0 {
-        let mut idx_keys = Vec::with_capacity(len as usize);
-        for idx in 0..len {
-            idx_keys.push(table.transfer_volume_list_idx_key(&alk, idx));
-        }
-        let idx_vals = provider
-            .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
-            .values;
-        let mut addrs = Vec::new();
-        let mut value_keys = Vec::new();
-        for idx_val in idx_vals {
-            let Some(raw) = idx_val else { continue };
-            let Ok(addr) = std::str::from_utf8(&raw).map(|s| s.to_string()) else {
-                continue;
-            };
-            value_keys.push(table.transfer_volume_entry_key(&alk, &addr));
-            addrs.push(addr);
-        }
-        let vals = provider
-            .get_multi_values(GetMultiValuesParams { blockhash, keys: value_keys })?
-            .values;
-        for (address, value) in addrs.into_iter().zip(vals.into_iter()) {
-            let Some(bytes) = value else { continue };
-            let Ok(amount) = decode_u128_value(&bytes) else {
-                continue;
-            };
-            if amount == 0 {
-                continue;
-            }
-            all.push(AddressAmountEntry { address, amount });
-        }
-    }
-    sort_address_amount_entries(&mut all);
-    let total = all.len();
-    let p = page.max(1);
-    let l = limit.max(1);
-    let off = l.saturating_mul(p - 1);
-    let end = (off + l).min(total);
-    let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
-    Ok((total, slice))
+    read_address_amount_prefix_page(
+        blockhash,
+        provider,
+        table.transfer_volume_prefix(&alk),
+        page,
+        limit,
+    )
 }
 
 pub fn get_total_received_for_alkane(
@@ -4650,63 +4638,13 @@ pub fn get_total_received_for_alkane(
     limit: usize,
 ) -> Result<(usize, Vec<AddressAmountEntry>)> {
     let table = provider.table();
-    let len = provider
-        .get_raw_value(GetRawValueParams {
-            blockhash,
-            key: table.total_received_list_len_key(&alk),
-        })?
-        .value
-        .and_then(|bytes| {
-            if bytes.len() == 4 {
-                let mut arr = [0u8; 4];
-                arr.copy_from_slice(&bytes);
-                Some(u32::from_le_bytes(arr))
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-    let mut all = Vec::new();
-    if len > 0 {
-        let mut idx_keys = Vec::with_capacity(len as usize);
-        for idx in 0..len {
-            idx_keys.push(table.total_received_list_idx_key(&alk, idx));
-        }
-        let idx_vals = provider
-            .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
-            .values;
-        let mut addrs = Vec::new();
-        let mut value_keys = Vec::new();
-        for idx_val in idx_vals {
-            let Some(raw) = idx_val else { continue };
-            let Ok(addr) = std::str::from_utf8(&raw).map(|s| s.to_string()) else {
-                continue;
-            };
-            value_keys.push(table.total_received_entry_key(&alk, &addr));
-            addrs.push(addr);
-        }
-        let vals = provider
-            .get_multi_values(GetMultiValuesParams { blockhash, keys: value_keys })?
-            .values;
-        for (address, value) in addrs.into_iter().zip(vals.into_iter()) {
-            let Some(bytes) = value else { continue };
-            let Ok(amount) = decode_u128_value(&bytes) else {
-                continue;
-            };
-            if amount == 0 {
-                continue;
-            }
-            all.push(AddressAmountEntry { address, amount });
-        }
-    }
-    sort_address_amount_entries(&mut all);
-    let total = all.len();
-    let p = page.max(1);
-    let l = limit.max(1);
-    let off = l.saturating_mul(p - 1);
-    let end = (off + l).min(total);
-    let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
-    Ok((total, slice))
+    read_address_amount_prefix_page(
+        blockhash,
+        provider,
+        table.total_received_prefix(&alk),
+        page,
+        limit,
+    )
 }
 
 pub fn get_address_activity_for_address(
