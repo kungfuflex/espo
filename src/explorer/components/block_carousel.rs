@@ -102,6 +102,7 @@ fn block_carousel_inner(
   let latestTipRefreshInFlight = false;
   let latestTipRefreshAnimate = false;
   let latestTipRefreshFromTip = null;
+  let mempoolFetchInFlight = false;
   let lastTipAnimationAt = 0;
   let followLatest = selectedMempoolIndex !== null || current === espoTip;
   let suppressFollowScrollUntil = 0;
@@ -903,10 +904,13 @@ fn block_carousel_inner(
     }}
     updateResetButton();
     queueEdgeCheck();
+    if (MEMPOOL_BLOCKS_ENABLED) fetchMempoolBlocks();
   }}
 
   async function fetchMempoolBlocks() {{
     if (!MEMPOOL_BLOCKS_ENABLED) return;
+    if (mempoolFetchInFlight) return;
+    mempoolFetchInFlight = true;
     try {{
       const res = await fetch(`${{basePrefix}}/api/mempool/blocks`, {{
         headers: {{ Accept: 'application/json' }}
@@ -916,7 +920,10 @@ fn block_carousel_inner(
       if (data && Array.isArray(data.blocks)) {{
         applyMempoolSnapshot(data);
       }}
-    }} catch (_) {{}}
+    }} catch (_) {{
+    }} finally {{
+      mempoolFetchInFlight = false;
+    }}
   }}
 
   function applyMempoolSnapshot(snapshot, force = false) {{

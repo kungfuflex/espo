@@ -10,6 +10,7 @@ use crate::modules::essentials::storage::{
     RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams,
     RpcGetTransferVolumeParams, RpcPingParams,
 };
+use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -60,6 +61,20 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                         view.rpc_get_mempool_traces(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_mem_stats = reg.clone();
+        tokio::spawn(async move {
+            reg_mem_stats
+                .register("get_mempool_memory_stats", move |_cx, _payload| async move {
+                    match current_mempool_memory_stats() {
+                        Some(stats) => json!({"ok": true, "stats": stats}),
+                        None => json!({"ok": false, "error": "mempool_unavailable"}),
                     }
                 })
                 .await;

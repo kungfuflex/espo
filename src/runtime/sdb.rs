@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use rocksdb::{DB, Options};
+use rocksdb::{BlockBasedOptions, Cache, DB, Options};
 use rocksdb::{DBIteratorWithThreadMode, IteratorMode, ReadOptions};
 use std::{
     path::Path,
@@ -17,6 +17,9 @@ pub struct SDB {
     poller: Option<JoinHandle<()>>,
 }
 
+const SDB_BLOCK_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const SDB_MAX_OPEN_FILES: i32 = 1024;
+
 impl SDB {
     pub fn open<P: AsRef<Path>, S: AsRef<Path>>(
         primary_db_path: P,
@@ -25,6 +28,12 @@ impl SDB {
     ) -> Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(false);
+        opts.set_max_open_files(SDB_MAX_OPEN_FILES);
+        let cache = Cache::new_lru_cache(SDB_BLOCK_CACHE_BYTES);
+        let mut table = BlockBasedOptions::default();
+        table.set_block_cache(&cache);
+        table.set_cache_index_and_filter_blocks(true);
+        opts.set_block_based_table_factory(&table);
 
         let sdb = Arc::new(DB::open_as_secondary(
             &opts,

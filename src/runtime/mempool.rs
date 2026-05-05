@@ -41,7 +41,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -65,6 +65,8 @@ pub struct MempoolEntry {
     pub tx: Transaction,
     pub traces: Option<Vec<EspoTrace>>,
     pub rune_io: Option<TxRuneIo>,
+    pub has_alkane_action: bool,
+    pub has_rune_action: bool,
     pub first_seen: u64,
     pub position: Option<MempoolProjectedPosition>,
 }
@@ -93,7 +95,6 @@ pub struct MempoolProjectedPosition {
 #[derive(Clone, Debug)]
 pub struct MempoolTransactionStruct {
     pub txid: Txid,
-    pub raw_tx: Option<Vec<u8>>,
     pub tx: Option<Transaction>,
     pub protostones: Vec<Protostone>,
     pub fixed_trace: Option<Vec<EspoTrace>>,
@@ -233,6 +234,62 @@ pub struct MempoolCompactSnapshot {
     pub deltas: Vec<MempoolBlockDelta>,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MempoolTracePayloadStats {
+    pub tx_count: usize,
+    pub trace_count: usize,
+    pub trace_payload_bytes: usize,
+    pub sandshrew_trace_json_bytes: usize,
+    pub protobuf_encoded_bytes: usize,
+    pub storage_changes_payload_bytes: usize,
+    pub outpoint_borsh_bytes: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MempoolPayloadByteStats {
+    pub transactions_consensus_bytes: usize,
+    pub fixed_traces_payload_bytes: usize,
+    pub diesel_traces_payload_bytes: usize,
+    pub all_traces_payload_bytes: usize,
+    pub rune_io_borsh_bytes: usize,
+    pub templates_json_bytes: usize,
+    pub deltas_json_bytes: usize,
+    pub status_json_bytes: usize,
+    pub addresses_utf8_bytes: usize,
+    pub input_txid_bytes: usize,
+    pub spent_outpoint_bytes: usize,
+    pub template_txid_string_bytes: usize,
+    pub total_measured_payload_bytes: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MempoolPayloadCountStats {
+    pub tx_count: usize,
+    pub hydrated_tx_count: usize,
+    pub protostone_tx_count: usize,
+    pub protostone_count: usize,
+    pub fixed_trace_tx_count: usize,
+    pub diesel_trace_tx_count: usize,
+    pub rune_io_tx_count: usize,
+    pub address_count: usize,
+    pub input_txid_count: usize,
+    pub spent_outpoint_count: usize,
+    pub template_count: usize,
+    pub template_txid_count: usize,
+    pub delta_count: usize,
+    pub trace_queue_count: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MempoolMemoryStats {
+    pub updated_at: u64,
+    pub sequence: u64,
+    pub counts: MempoolPayloadCountStats,
+    pub bytes: MempoolPayloadByteStats,
+    pub fixed_traces: MempoolTracePayloadStats,
+    pub diesel_traces: MempoolTracePayloadStats,
+}
+
 #[derive(Default)]
 struct InMemoryMempool {
     txs: HashMap<Txid, MempoolTransactionStruct>,
@@ -286,6 +343,7 @@ struct MinerTx {
 static IN_MEMORY_MEMPOOL: OnceLock<Arc<RwLock<InMemoryMempool>>> = OnceLock::new();
 static TRACE_QUEUE: OnceLock<Arc<Mutex<VecDeque<Txid>>>> = OnceLock::new();
 static MEMPOOL_EVENTS: OnceLock<broadcast::Sender<String>> = OnceLock::new();
+static RECALCULATE_TEMPLATES_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static HYDRATION_RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn mempool_state() -> &'static Arc<RwLock<InMemoryMempool>> {
@@ -294,6 +352,10 @@ fn mempool_state() -> &'static Arc<RwLock<InMemoryMempool>> {
 
 fn trace_queue() -> &'static Arc<Mutex<VecDeque<Txid>>> {
     TRACE_QUEUE.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())))
+}
+
+fn recalculate_templates_lock() -> &'static Mutex<()> {
+    RECALCULATE_TEMPLATES_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 pub fn subscribe_mempool_events() -> broadcast::Receiver<String> {
@@ -310,6 +372,67 @@ fn mempool_event_sender() -> &'static broadcast::Sender<String> {
 fn publish_mempool_event(event: &Value) {
     if let Ok(encoded) = serde_json::to_string(event) {
         let _ = mempool_event_sender().send(encoded);
+    }
+}
+
+fn publish_mempool_entry_event(entry: &MempoolTransactionStruct, event: &str) {
+    let mempool_block = entry.position.as_ref().map(|position| position.block);
+    publish_mempool_event(&json!({
+        "type": "tx",
+        "data": {
+            "event": event,
+            "status": "mempool",
+            "txid": entry.txid.to_string(),
+            "mempool_block": mempool_block,
+            "addresses": entry.addresses,
+        }
+    }));
+
+    for address in &entry.addresses {
+        publish_mempool_event(&json!({
+            "type": "address-tx",
+            "data": {
+                "event": event,
+                "status": "mempool",
+                "address": address,
+                "txid": entry.txid.to_string(),
+                "mempool_block": mempool_block,
+            }
+        }));
+    }
+}
+
+pub fn publish_confirmed_tx_events(
+    height: u32,
+    txids: &[Txid],
+    address_txs: &HashMap<String, Vec<Txid>>,
+) {
+    publish_mempool_event(&json!({
+        "type": "tx",
+        "data": {
+            "event": "confirmed",
+            "status": "confirmed",
+            "height": height,
+            "txids": txids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }
+    }));
+
+    if !address_txs.is_empty() {
+        let addresses: HashMap<&String, Vec<String>> = address_txs
+            .iter()
+            .map(|(address, txids)| {
+                (address, txids.iter().map(ToString::to_string).collect::<Vec<_>>())
+            })
+            .collect();
+        publish_mempool_event(&json!({
+            "type": "address-tx",
+            "data": {
+                "event": "confirmed",
+                "status": "confirmed",
+                "height": height,
+                "addresses": addresses,
+            }
+        }));
     }
 }
 
@@ -792,12 +915,62 @@ fn combined_traces(entry: &MempoolTransactionStruct) -> Option<Vec<EspoTrace>> {
     entry.diesel_trace.clone().or_else(|| entry.fixed_trace.clone())
 }
 
+fn mempool_entry_from_state(entry: &MempoolTransactionStruct) -> Option<MempoolEntry> {
+    let tx = entry.tx.clone()?;
+    Some(MempoolEntry {
+        txid: entry.txid,
+        tx,
+        traces: combined_traces(entry),
+        rune_io: entry.rune_io.clone(),
+        has_alkane_action: entry_has_alkane_action(entry),
+        has_rune_action: entry_has_rune_action(entry),
+        first_seen: entry.first_seen,
+        position: entry.position.clone(),
+    })
+}
+
 fn entry_has_alkane_action(entry: &MempoolTransactionStruct) -> bool {
     !entry.protostones.is_empty()
+        || entry.fixed_trace.as_ref().map_or(false, |traces| !traces.is_empty())
+        || entry.diesel_trace.as_ref().map_or(false, |traces| !traces.is_empty())
 }
 
 fn entry_has_rune_action(entry: &MempoolTransactionStruct) -> bool {
     entry.rune_io.as_ref().map(rune_io_has_activity).unwrap_or(false)
+}
+
+fn entry_spends_live_outpoint(
+    entry: &MempoolTransactionStruct,
+    include_alkanes: bool,
+    include_runes: bool,
+    live_alkane_outpoints: &HashSet<(Txid, u32)>,
+    live_rune_outpoints: &HashSet<(Txid, u32)>,
+) -> bool {
+    entry.spent_outpoints.iter().any(|prev| {
+        let key = (prev.txid, prev.vout);
+        (include_alkanes && live_alkane_outpoints.contains(&key))
+            || (include_runes && live_rune_outpoints.contains(&key))
+    })
+}
+
+fn entry_spends_mempool_output_to_address(
+    entry: &MempoolTransactionStruct,
+    address: &str,
+    network: Network,
+    state: &InMemoryMempool,
+) -> bool {
+    entry.spent_outpoints.iter().any(|prev| {
+        let Some(parent) = state.txs.get(&prev.txid).and_then(|parent| parent.tx.as_ref()) else {
+            return false;
+        };
+        let Some(output) = parent.output.get(prev.vout as usize) else {
+            return false;
+        };
+        Address::from_script(output.script_pubkey.as_script(), network)
+            .ok()
+            .map(|addr| addr.to_string() == address)
+            .unwrap_or(false)
+    })
 }
 
 fn derive_readiness(entry: &MempoolTransactionStruct) -> MempoolTxReadiness {
@@ -850,6 +1023,173 @@ fn compact_snapshot_from_state(
         blocks: state.templates.iter().map(block_summary).collect(),
         deltas: if include_deltas { state.deltas.clone() } else { Vec::new() },
     }
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_encoded_len<T: Serialize>(value: &T) -> usize {
+    let mut writer = CountingWriter::default();
+    if serde_json::to_writer(&mut writer, value).is_ok() { writer.bytes } else { 0 }
+}
+
+fn consensus_encoded_len(tx: &Transaction) -> usize {
+    let mut encoded = Vec::new();
+    tx.consensus_encode(&mut encoded).ok().map(|_| encoded.len()).unwrap_or(0)
+}
+
+fn borsh_encoded_len<T: borsh::BorshSerialize>(value: &T) -> usize {
+    borsh::to_vec(value).ok().map(|encoded| encoded.len()).unwrap_or(0)
+}
+
+fn storage_changes_payload_len(storage: &crate::alkanes::trace::AlkaneStorageChanges) -> usize {
+    storage
+        .iter()
+        .map(|(_alkane_id, changes)| {
+            12usize.saturating_add(
+                changes
+                    .iter()
+                    .map(|(key, (_txid, value))| {
+                        key.len().saturating_add(32).saturating_add(value.len())
+                    })
+                    .sum::<usize>(),
+            )
+        })
+        .sum()
+}
+
+fn add_trace_payload_stats(stats: &mut MempoolTracePayloadStats, traces: &[EspoTrace]) {
+    stats.tx_count = stats.tx_count.saturating_add(1);
+    stats.trace_count = stats.trace_count.saturating_add(traces.len());
+    for trace in traces {
+        let sandshrew_bytes = json_encoded_len(&trace.sandshrew_trace);
+        let protobuf_bytes = trace.protobuf_trace.encoded_len();
+        let storage_bytes = storage_changes_payload_len(&trace.storage_changes);
+        let outpoint_bytes = borsh_encoded_len(&trace.outpoint);
+        stats.trace_payload_bytes = stats
+            .trace_payload_bytes
+            .saturating_add(sandshrew_bytes)
+            .saturating_add(protobuf_bytes)
+            .saturating_add(storage_bytes)
+            .saturating_add(outpoint_bytes);
+        stats.sandshrew_trace_json_bytes =
+            stats.sandshrew_trace_json_bytes.saturating_add(sandshrew_bytes);
+        stats.protobuf_encoded_bytes = stats.protobuf_encoded_bytes.saturating_add(protobuf_bytes);
+        stats.storage_changes_payload_bytes =
+            stats.storage_changes_payload_bytes.saturating_add(storage_bytes);
+        stats.outpoint_borsh_bytes = stats.outpoint_borsh_bytes.saturating_add(outpoint_bytes);
+    }
+}
+
+pub fn current_mempool_memory_stats() -> Option<MempoolMemoryStats> {
+    let state = mempool_state().read().ok()?;
+    let trace_queue_count = trace_queue().lock().ok().map(|queue| queue.len()).unwrap_or_default();
+    let mut stats = MempoolMemoryStats {
+        updated_at: state.updated_at,
+        sequence: state.sequence,
+        ..Default::default()
+    };
+    stats.counts.tx_count = state.txs.len();
+    stats.counts.template_count = state.templates.len();
+    stats.counts.delta_count = state.deltas.len();
+    stats.counts.trace_queue_count = trace_queue_count;
+
+    stats.bytes.templates_json_bytes = json_encoded_len(&state.templates);
+    stats.bytes.deltas_json_bytes = json_encoded_len(&state.deltas);
+    stats.bytes.status_json_bytes = json_encoded_len(&state.status);
+    stats.counts.template_txid_count =
+        state.templates.iter().map(|template| template.transaction_ids.len()).sum();
+    stats.bytes.template_txid_string_bytes = state
+        .templates
+        .iter()
+        .flat_map(|template| template.transaction_ids.iter())
+        .map(|txid| txid.len())
+        .sum();
+
+    for entry in state.txs.values() {
+        if let Some(tx) = entry.tx.as_ref() {
+            stats.counts.hydrated_tx_count = stats.counts.hydrated_tx_count.saturating_add(1);
+            stats.bytes.transactions_consensus_bytes = stats
+                .bytes
+                .transactions_consensus_bytes
+                .saturating_add(consensus_encoded_len(tx));
+        }
+        if !entry.protostones.is_empty() {
+            stats.counts.protostone_tx_count = stats.counts.protostone_tx_count.saturating_add(1);
+            stats.counts.protostone_count =
+                stats.counts.protostone_count.saturating_add(entry.protostones.len());
+        }
+        if let Some(traces) = entry.fixed_trace.as_ref() {
+            stats.counts.fixed_trace_tx_count = stats.counts.fixed_trace_tx_count.saturating_add(1);
+            add_trace_payload_stats(&mut stats.fixed_traces, traces);
+        }
+        if let Some(traces) = entry.diesel_trace.as_ref() {
+            stats.counts.diesel_trace_tx_count =
+                stats.counts.diesel_trace_tx_count.saturating_add(1);
+            add_trace_payload_stats(&mut stats.diesel_traces, traces);
+        }
+        if let Some(rune_io) = entry.rune_io.as_ref() {
+            stats.counts.rune_io_tx_count = stats.counts.rune_io_tx_count.saturating_add(1);
+            stats.bytes.rune_io_borsh_bytes =
+                stats.bytes.rune_io_borsh_bytes.saturating_add(borsh_encoded_len(rune_io));
+        }
+        stats.counts.address_count =
+            stats.counts.address_count.saturating_add(entry.addresses.len());
+        stats.bytes.addresses_utf8_bytes = stats
+            .bytes
+            .addresses_utf8_bytes
+            .saturating_add(entry.addresses.iter().map(|address| address.len()).sum::<usize>());
+        stats.counts.input_txid_count =
+            stats.counts.input_txid_count.saturating_add(entry.inputs.len());
+        stats.bytes.input_txid_bytes = stats
+            .bytes
+            .input_txid_bytes
+            .saturating_add(entry.inputs.len().saturating_mul(32));
+        stats.counts.spent_outpoint_count =
+            stats.counts.spent_outpoint_count.saturating_add(entry.spent_outpoints.len());
+        stats.bytes.spent_outpoint_bytes = stats
+            .bytes
+            .spent_outpoint_bytes
+            .saturating_add(entry.spent_outpoints.len().saturating_mul(36));
+    }
+
+    stats.bytes.fixed_traces_payload_bytes = stats.fixed_traces.trace_payload_bytes;
+    stats.bytes.diesel_traces_payload_bytes = stats.diesel_traces.trace_payload_bytes;
+    stats.bytes.all_traces_payload_bytes = stats
+        .bytes
+        .fixed_traces_payload_bytes
+        .saturating_add(stats.bytes.diesel_traces_payload_bytes);
+    stats.bytes.total_measured_payload_bytes = stats
+        .bytes
+        .transactions_consensus_bytes
+        .saturating_add(stats.bytes.all_traces_payload_bytes)
+        .saturating_add(stats.bytes.rune_io_borsh_bytes)
+        .saturating_add(stats.bytes.templates_json_bytes)
+        .saturating_add(stats.bytes.deltas_json_bytes)
+        .saturating_add(stats.bytes.status_json_bytes)
+        .saturating_add(stats.bytes.addresses_utf8_bytes)
+        .saturating_add(stats.bytes.input_txid_bytes)
+        .saturating_add(stats.bytes.spent_outpoint_bytes)
+        .saturating_add(stats.bytes.template_txid_string_bytes);
+
+    if let Ok(encoded) = serde_json::to_string(&stats) {
+        eprintln!("[mempool][memory_stats] {encoded}");
+    }
+
+    Some(stats)
 }
 
 pub fn current_mempool_snapshot() -> MempoolSnapshot {
@@ -1027,6 +1367,80 @@ pub fn get_mempool_block_ordered_transactions(index: usize) -> Option<Vec<Mempoo
             })
             .collect(),
     )
+}
+
+pub fn get_mempool_block_transactions_for_targets(
+    index: usize,
+    targets: &HashSet<Txid>,
+) -> Option<Vec<MempoolBlockTx>> {
+    if targets.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let Ok(state) = mempool_state().read() else {
+        return None;
+    };
+    let template = state.templates.iter().find(|template| template.index == index)?;
+    let ordered: Vec<Txid> = template
+        .transaction_ids
+        .iter()
+        .filter_map(|txid_str| Txid::from_str(txid_str).ok())
+        .collect();
+    let in_block: HashSet<Txid> = ordered.iter().copied().collect();
+    let mut needed: HashSet<Txid> =
+        targets.iter().copied().filter(|txid| in_block.contains(txid)).collect();
+    let mut stack: Vec<Txid> = needed.iter().copied().collect();
+
+    while let Some(txid) = stack.pop() {
+        let Some(entry) = state.txs.get(&txid) else {
+            continue;
+        };
+        for prev in &entry.spent_outpoints {
+            let parent = prev.txid;
+            if in_block.contains(&parent) && needed.insert(parent) {
+                stack.push(parent);
+            }
+        }
+    }
+
+    Some(
+        ordered
+            .iter()
+            .filter(|txid| needed.contains(*txid))
+            .filter_map(|txid| {
+                let entry = state.txs.get(txid)?;
+                let tx = entry.tx.clone()?;
+                Some(MempoolBlockTx {
+                    txid: *txid,
+                    tx,
+                    traces: combined_traces(entry),
+                    rune_io: entry.rune_io.clone(),
+                    fee_sat: entry.fee_sat,
+                    vsize: entry.vsize,
+                    fee_rate: entry.fee_rate,
+                    position: entry.position.clone(),
+                    readiness: derive_readiness(entry),
+                })
+            })
+            .collect(),
+    )
+}
+
+pub fn get_mempool_block_spenders(index: usize) -> Option<HashMap<(Txid, u32), Txid>> {
+    let Ok(state) = mempool_state().read() else {
+        return None;
+    };
+    let template = state.templates.iter().find(|template| template.index == index)?;
+    let mut out = HashMap::new();
+    for txid in template.transaction_ids.iter().filter_map(|txid| Txid::from_str(txid).ok()) {
+        let Some(entry) = state.txs.get(&txid) else {
+            continue;
+        };
+        for prev in &entry.spent_outpoints {
+            out.insert((prev.txid, prev.vout), txid);
+        }
+    }
+    Some(out)
 }
 
 pub fn publish_new_block_event(height: u32, txids: &[Txid]) {
@@ -1284,10 +1698,8 @@ fn prune_trace_queue(removed: &HashSet<Txid>) {
 fn build_memory_entry(
     txid: Txid,
     tx: Transaction,
-    raw_tx: Vec<u8>,
     verbose: Option<&VerboseMempoolEntry>,
     network: Network,
-    rpc: &CoreClient,
 ) -> MempoolTransactionStruct {
     let protostones = protostones_for_tx(&tx);
     let is_diesel_mint = is_diesel_mint_protostone(&protostones);
@@ -1318,10 +1730,8 @@ fn build_memory_entry(
         .filter_map(|o| Address::from_script(o.script_pubkey.as_script(), network).ok())
         .map(|addr| addr.to_string())
         .collect();
-    let _ = rpc;
     MempoolTransactionStruct {
         txid,
-        raw_tx: Some(raw_tx),
         tx: Some(tx),
         protostones,
         fixed_trace: None,
@@ -1360,7 +1770,6 @@ fn build_memory_metadata_entry(
     let inputs = verbose.depends.iter().filter_map(|s| Txid::from_str(s).ok()).collect();
     MempoolTransactionStruct {
         txid,
-        raw_tx: None,
         tx: None,
         protostones: Vec::new(),
         fixed_trace: None,
@@ -1387,6 +1796,7 @@ fn upsert_memory_entry(entry: MempoolTransactionStruct) {
     let Ok(mut state) = mempool_state().write() else { return };
     let mut should_enqueue = !entry.protostones.is_empty() && !entry.is_diesel_mint;
     let mut removed_conflicts = HashSet::new();
+    let mut tx_event = "seen";
     if !entry.spent_outpoints.is_empty() && entry.fee_sat > 0 {
         let spent: HashSet<OutPoint> = entry.spent_outpoints.iter().copied().collect();
         let conflicts: Vec<Txid> = state
@@ -1412,6 +1822,7 @@ fn upsert_memory_entry(entry: MempoolTransactionStruct) {
     }
     match state.txs.get_mut(&txid) {
         Some(existing) => {
+            tx_event = "updated";
             existing.first_seen = existing.first_seen.min(entry.first_seen);
             existing.weight = entry.weight;
             existing.vsize = entry.vsize.max(1);
@@ -1425,7 +1836,6 @@ fn upsert_memory_entry(entry: MempoolTransactionStruct) {
             }
             existing.template_index = entry.template_index;
             if entry.tx.is_some() {
-                existing.raw_tx = entry.raw_tx;
                 existing.tx = entry.tx;
                 existing.protostones = entry.protostones;
                 existing.addresses = entry.addresses;
@@ -1445,7 +1855,11 @@ fn upsert_memory_entry(entry: MempoolTransactionStruct) {
         }
     }
     state.updated_at = now_ts();
+    let event_entry = state.txs.get(&txid).cloned();
     drop(state);
+    if let Some(entry) = event_entry.as_ref() {
+        publish_mempool_entry_event(entry, tx_event);
+    }
     if !removed_conflicts.is_empty() {
         eprintln!(
             "[mempool] rbf removed {} conflicting txs replaced by {}",
@@ -1888,6 +2302,9 @@ fn calculate_template_deltas(
 }
 
 fn recalculate_memory_templates() {
+    let Ok(_recalculate_guard) = recalculate_templates_lock().try_lock() else {
+        return;
+    };
     let cfg = get_config().mempool.clone();
     let next_height = crate::config::get_espo_next_height() as u64;
     let template_input = {
@@ -1900,7 +2317,6 @@ fn recalculate_memory_templates() {
                     *txid,
                     MempoolTransactionStruct {
                         txid: *txid,
-                        raw_tx: None,
                         tx: None,
                         protostones: Vec::new(),
                         fixed_trace: None,
@@ -1924,24 +2340,47 @@ fn recalculate_memory_templates() {
             })
             .collect::<HashMap<_, _>>()
     };
-    let (template_txids, effective_rates) =
+    let (mut template_txids, effective_rates) =
         calculate_block_templates(&template_input, cfg.template_blocks, cfg.block_weight_units);
-    let Ok(mut state) = mempool_state().write() else { return };
-    let previous_templates = state.templates.clone();
 
-    for tx in state.txs.values_mut() {
+    let selected_txids: HashSet<Txid> =
+        template_txids.iter().flat_map(|txids| txids.iter().copied()).collect();
+    let mut template_state: HashMap<Txid, MempoolTransactionStruct> = {
+        let Ok(state) = mempool_state().read() else { return };
+        selected_txids
+            .iter()
+            .filter_map(|txid| state.txs.get(txid).map(|tx| (*txid, tx.clone())))
+            .collect()
+    };
+
+    for txids in &mut template_txids {
+        txids.retain(|txid| template_state.contains_key(txid));
+    }
+    template_txids.retain(|txids| !txids.is_empty());
+
+    for tx in template_state.values_mut() {
         tx.template_index = None;
         tx.diesel_trace = None;
         tx.rune_io = None;
         tx.position = None;
+        tx.readiness = derive_readiness(tx);
+    }
+
+    struct TemplateTxUpdate {
+        template_index: usize,
+        position: MempoolProjectedPosition,
+        diesel_trace: Option<Vec<EspoTrace>>,
+        rune_io: Option<TxRuneIo>,
     }
 
     let mut templates = Vec::with_capacity(template_txids.len());
+    let mut tx_updates: HashMap<Txid, TemplateTxUpdate> = HashMap::new();
     for (index, txids) in template_txids.iter().enumerate() {
-        let package_rates = package_effective_rates_for_block(txids, &state.txs, &effective_rates);
+        let package_rates =
+            package_effective_rates_for_block(txids, &template_state, &effective_rates);
         let diesel_mints: Vec<Txid> = txids
             .iter()
-            .filter(|txid| state.txs.get(*txid).map(|tx| tx.is_diesel_mint).unwrap_or(false))
+            .filter(|txid| template_state.get(*txid).map(|tx| tx.is_diesel_mint).unwrap_or(false))
             .copied()
             .collect();
         let per_mint = if diesel_mints.is_empty() {
@@ -1950,7 +2389,7 @@ fn recalculate_memory_templates() {
             block_subsidy_sats(next_height + index as u64) as u128 / diesel_mints.len() as u128
         };
         for txid in &diesel_mints {
-            if let Some(tx) = state.txs.get_mut(txid) {
+            if let Some(tx) = template_state.get_mut(txid) {
                 if let Some(transaction) = tx.tx.as_ref() {
                     let vout = shadow_base(transaction);
                     let input_balances = input_alkane_balances_for_tx(transaction);
@@ -1960,9 +2399,10 @@ fn recalculate_memory_templates() {
             }
         }
         if runes_enabled_from_global_config() {
-            let rune_ios = project_rune_io_for_block(txids, &state.txs, next_height + index as u64);
+            let rune_ios =
+                project_rune_io_for_block(txids, &template_state, next_height + index as u64);
             for (txid, io) in rune_ios {
-                if let Some(tx) = state.txs.get_mut(&txid) {
+                if let Some(tx) = template_state.get_mut(&txid) {
                     tx.rune_io = Some(io);
                 }
             }
@@ -1973,12 +2413,13 @@ fn recalculate_memory_templates() {
         let mut fees = 0u64;
         let mut trace_count = 0usize;
         for txid in txids {
-            if let Some(tx) = state.txs.get_mut(txid) {
-                tx.template_index = Some(index);
-                tx.position = Some(MempoolProjectedPosition {
+            if let Some(tx) = template_state.get_mut(txid) {
+                let position = MempoolProjectedPosition {
                     block: index,
                     vsize: vsize.saturating_add(tx.vsize / 2),
-                });
+                };
+                tx.template_index = Some(index);
+                tx.position = Some(position.clone());
                 weight = weight.saturating_add(tx.weight);
                 vsize = vsize.saturating_add(tx.vsize);
                 fees = fees.saturating_add(tx.fee_sat);
@@ -1986,10 +2427,19 @@ fn recalculate_memory_templates() {
                     trace_count = trace_count.saturating_add(1);
                 }
                 tx.readiness = derive_readiness(tx);
+                tx_updates.insert(
+                    *txid,
+                    TemplateTxUpdate {
+                        template_index: index,
+                        position,
+                        diesel_trace: tx.diesel_trace.clone(),
+                        rune_io: tx.rune_io.clone(),
+                    },
+                );
             }
         }
         let (median_fee_rate, min_fee_rate, max_fee_rate, fee_range) =
-            fee_stats_for_block(txids, &state.txs, &package_rates);
+            fee_stats_for_block(txids, &template_state, &package_rates);
         templates.push(MempoolBlockTemplate {
             index,
             tx_count: txids.len(),
@@ -2005,10 +2455,50 @@ fn recalculate_memory_templates() {
         });
     }
 
+    let Ok(mut state) = mempool_state().write() else { return };
+    let previous_templates = state.templates.clone();
     let templates_changed = previous_templates != templates;
+    let mut reset_txids: HashSet<Txid> = tx_updates.keys().copied().collect();
+    for template in &previous_templates {
+        for txid in &template.transaction_ids {
+            if let Ok(txid) = Txid::from_str(txid) {
+                reset_txids.insert(txid);
+            }
+        }
+    }
+
+    for txid in reset_txids {
+        if let Some(tx) = state.txs.get_mut(&txid) {
+            tx.template_index = None;
+            tx.diesel_trace = None;
+            tx.rune_io = None;
+            tx.position = None;
+            tx.readiness = derive_readiness(tx);
+        }
+    }
+
+    for (txid, update) in tx_updates {
+        if let Some(tx) = state.txs.get_mut(&txid) {
+            tx.template_index = Some(update.template_index);
+            tx.diesel_trace = update.diesel_trace;
+            tx.rune_io = update.rune_io;
+            tx.position = Some(update.position);
+            tx.readiness = derive_readiness(tx);
+        }
+    }
+
+    let mut updated_txids = Vec::new();
     if templates_changed {
         state.sequence = state.sequence.saturating_add(1);
         state.deltas = calculate_template_deltas(&previous_templates, &templates, state.sequence);
+        let mut seen = HashSet::new();
+        for delta in &state.deltas {
+            for txid in delta.added.iter().chain(delta.removed.iter()).chain(delta.changed.iter()) {
+                if seen.insert(txid.clone()) {
+                    updated_txids.push(txid.clone());
+                }
+            }
+        }
     } else {
         state.deltas.clear();
     }
@@ -2016,6 +2506,16 @@ fn recalculate_memory_templates() {
     state.updated_at = now_ts();
     let snapshot = compact_snapshot_from_state(&state, true);
     drop(state);
+    if !updated_txids.is_empty() {
+        publish_mempool_event(&json!({
+            "type": "tx",
+            "data": {
+                "event": "mempool_updated",
+                "status": "mempool",
+                "txids": updated_txids,
+            }
+        }));
+    }
     publish_mempool_event(&json!({ "type": "mempool-blocks", "data": snapshot }));
 }
 
@@ -2202,7 +2702,7 @@ fn start_mempool_hydration(network: Network) {
                             continue;
                         }
                     };
-                    let mem_entry = build_memory_entry(txid, tx, raw_tx, None, network, rpc);
+                    let mem_entry = build_memory_entry(txid, tx, None, network);
                     upsert_memory_entry(mem_entry);
                     let done = hydrated.fetch_add(1, Ordering::SeqCst) + 1;
                     if done % 1000 == 0 {
@@ -2248,12 +2748,17 @@ async fn trace_worker(http: Client, preview_url: String) {
             preview_traces_for_tx(&http, &preview_url, &txid, transaction, entry.protostones.len())
                 .await;
         if let Some(traces) = traces {
+            let mut event_entry = None;
             if let Ok(mut state) = mempool_state().write() {
                 if let Some(current) = state.txs.get_mut(&txid) {
                     current.fixed_trace = Some(traces);
                     current.readiness = derive_readiness(current);
+                    event_entry = Some(current.clone());
                     state.updated_at = now_ts();
                 }
+            }
+            if let Some(entry) = event_entry.as_ref() {
+                publish_mempool_entry_event(entry, "updated");
             }
             recalculate_memory_templates();
         }
@@ -2303,7 +2808,7 @@ fn ingest_zmq_rawtx(url: String, network: Network) {
             let txid = tx.compute_txid();
             let verbose: Option<VerboseMempoolEntry> =
                 rpc.call("getmempoolentry", &[json!(txid.to_string())]).ok();
-            let entry = build_memory_entry(txid, tx, body, verbose.as_ref(), network, &rpc);
+            let entry = build_memory_entry(txid, tx, verbose.as_ref(), network);
             upsert_memory_entry(entry);
             recalculate_memory_templates();
         }
@@ -2434,19 +2939,64 @@ fn normalize_zmq_url(raw: &str) -> Option<String> {
 pub fn get_tx_from_mempool(txid: &Txid) -> Option<MempoolEntry> {
     let state = mempool_state().read().ok()?;
     let entry = state.txs.get(txid)?;
-    let tx = entry.tx.clone()?;
-    Some(MempoolEntry {
-        txid: *txid,
-        tx,
-        traces: combined_traces(entry),
-        rune_io: entry.rune_io.clone(),
-        first_seen: entry.first_seen,
-        position: entry.position.clone(),
-    })
+    mempool_entry_from_state(entry)
 }
 
 pub fn pending_by_txid(txid: &Txid) -> Option<MempoolEntry> {
     get_tx_from_mempool(txid)
+}
+
+pub fn pending_action_entries() -> Vec<MempoolEntry> {
+    let Ok(state) = mempool_state().read() else {
+        return Vec::new();
+    };
+    let mut out: Vec<MempoolEntry> = state
+        .txs
+        .values()
+        .filter(|entry| entry_has_alkane_action(entry) || entry_has_rune_action(entry))
+        .filter_map(mempool_entry_from_state)
+        .collect();
+    out.sort_by(|a, b| b.first_seen.cmp(&a.first_seen).then_with(|| b.txid.cmp(&a.txid)));
+    out
+}
+
+pub fn pending_action_entries_for_address(
+    addr: &str,
+    network: Network,
+    include_alkanes: bool,
+    include_runes: bool,
+    live_alkane_outpoints: &HashSet<(Txid, u32)>,
+    live_rune_outpoints: &HashSet<(Txid, u32)>,
+) -> Vec<MempoolEntry> {
+    if !include_alkanes && !include_runes {
+        return Vec::new();
+    }
+
+    let Ok(state) = mempool_state().read() else {
+        return Vec::new();
+    };
+    let mut out: Vec<MempoolEntry> = state
+        .txs
+        .values()
+        .filter(|entry| {
+            (include_alkanes && entry_has_alkane_action(entry))
+                || (include_runes && entry_has_rune_action(entry))
+        })
+        .filter(|entry| {
+            entry.addresses.iter().any(|address| address == addr)
+                || entry_spends_live_outpoint(
+                    entry,
+                    include_alkanes,
+                    include_runes,
+                    live_alkane_outpoints,
+                    live_rune_outpoints,
+                )
+                || entry_spends_mempool_output_to_address(entry, addr, network, &state)
+        })
+        .filter_map(mempool_entry_from_state)
+        .collect();
+    out.sort_by(|a, b| b.first_seen.cmp(&a.first_seen).then_with(|| b.txid.cmp(&a.txid)));
+    out
 }
 
 pub fn pending_for_address(addr: &str) -> Vec<MempoolEntry> {
@@ -2455,19 +3005,9 @@ pub fn pending_for_address(addr: &str) -> Vec<MempoolEntry> {
         .txs
         .values()
         .filter(|entry| entry.addresses.iter().any(|a| a == addr))
-        .filter_map(|entry| {
-            let tx = entry.tx.clone()?;
-            Some(MempoolEntry {
-                txid: entry.txid,
-                tx,
-                traces: combined_traces(entry),
-                rune_io: entry.rune_io.clone(),
-                first_seen: entry.first_seen,
-                position: entry.position.clone(),
-            })
-        })
+        .filter_map(mempool_entry_from_state)
         .collect();
-    out.sort_by(|a, b| b.first_seen.cmp(&a.first_seen));
+    out.sort_by(|a, b| b.first_seen.cmp(&a.first_seen).then_with(|| b.txid.cmp(&a.txid)));
     out
 }
 

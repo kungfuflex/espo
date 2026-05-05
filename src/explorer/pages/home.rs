@@ -4,14 +4,14 @@ use axum::extract::State;
 use axum::response::Html;
 use bitcoin::Txid;
 use bitcoin::hashes::Hash;
-use bitcoincore_rpc::RpcApi;
 use borsh::BorshDeserialize;
 use maud::{Markup, html};
 use std::collections::HashMap;
 use std::str::FromStr;
 
 use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
-use crate::config::{get_bitcoind_rpc_client, get_espo_next_height, show_terminal_ad};
+use crate::config::{get_espo_next_height, show_terminal_ad};
+use crate::explorer::api::cached_bitcoin_chain_tip_height;
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::icon_right;
@@ -178,10 +178,10 @@ fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<A
 }
 
 pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
-    let rpc = get_bitcoind_rpc_client();
-    let tip = rpc.get_blockchain_info().map(|i| i.blocks).unwrap_or(0);
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
-    let latest_height = espo_tip.min(tip);
+    let latest_height = cached_bitcoin_chain_tip_height()
+        .map(|tip| espo_tip.min(tip))
+        .unwrap_or(espo_tip);
     let runes_enabled = runes_enabled_from_global_config();
     let top_alkanes = load_top_alkanes_by_holders(&state.essentials_mdb, 10);
     let alkanes_link = explorer_path("/alkanes");

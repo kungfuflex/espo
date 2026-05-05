@@ -9,6 +9,7 @@ use axum::response::IntoResponse;
 use bitcoin::{Address, BlockHash, Network, Transaction};
 use bitcoincore_rpc::RpcApi;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 use crate::config::{get_bitcoind_rpc_client, get_network};
 use crate::explorer::paths::explorer_path;
@@ -213,23 +214,28 @@ pub fn pool_icon_url(slug: &str) -> Option<String> {
 }
 
 pub(crate) fn bundled_pool_icon_svgs_json() -> String {
-    serde_json::json!({
-        "antpool": ANTPOOL_SVG,
-        "binancepool": BINANCEPOOL_SVG,
-        "braiinspool": BRAIINSPOOL_SVG,
-        "default": DEFAULT_SVG,
-        "f2pool": F2POOL_SVG,
-        "foundryusa": FOUNDRYUSA_SVG,
-        "luxor": LUXOR_SVG,
-        "marapool": MARAPOOL_SVG,
-        "ocean": OCEAN_SVG,
-        "sbicrypto": SBICRYPTO_SVG,
-        "secpool": SECPOOL_SVG,
-        "spiderpool": SPIDERPOOL_SVG,
-        "unknown": DEFAULT_SVG,
-        "viabtc": VIABTC_SVG,
-    })
-    .to_string()
+    static POOL_ICONS_JSON: OnceLock<String> = OnceLock::new();
+    POOL_ICONS_JSON
+        .get_or_init(|| {
+            serde_json::json!({
+                "antpool": ANTPOOL_SVG,
+                "binancepool": BINANCEPOOL_SVG,
+                "braiinspool": BRAIINSPOOL_SVG,
+                "default": DEFAULT_SVG,
+                "f2pool": F2POOL_SVG,
+                "foundryusa": FOUNDRYUSA_SVG,
+                "luxor": LUXOR_SVG,
+                "marapool": MARAPOOL_SVG,
+                "ocean": OCEAN_SVG,
+                "sbicrypto": SBICRYPTO_SVG,
+                "secpool": SECPOOL_SVG,
+                "spiderpool": SPIDERPOOL_SVG,
+                "unknown": DEFAULT_SVG,
+                "viabtc": VIABTC_SVG,
+            })
+            .to_string()
+        })
+        .clone()
 }
 
 fn mempool_pool_url(network: Network, slug: &str) -> Option<String> {

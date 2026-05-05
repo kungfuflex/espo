@@ -50,7 +50,8 @@
   },
   "modules": {
     "runes": {
-      "enable": false
+      "enable": false,
+      "load_live_outpoints": true
     }
   }
 }

@@ -59,7 +59,8 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration as StdDuration, Instant};
 use tokio::time::{Duration, interval};
 
 #[derive(Deserialize)]
@@ -107,11 +108,39 @@ fn block_summary_pool_to_display(pool: BlockSummaryPool) -> MiningPoolDisplay {
 }
 
 const MEMPOOL_BLOCKS_MAX_TIP_LAG: u64 = 12;
+const BITCOIN_CHAIN_TIP_CACHE_TTL: StdDuration = StdDuration::from_secs(15);
+
+#[derive(Clone, Copy)]
+struct CachedBitcoinChainTip {
+    height: u64,
+    fetched_at: Instant,
+}
+
+static BITCOIN_CHAIN_TIP_CACHE: OnceLock<Mutex<Option<CachedBitcoinChainTip>>> = OnceLock::new();
+
+pub(crate) fn cached_bitcoin_chain_tip_height() -> Option<u64> {
+    let cache = BITCOIN_CHAIN_TIP_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().ok()?;
+    let now = Instant::now();
+    if let Some(cached) = *guard {
+        if now.duration_since(cached.fetched_at) <= BITCOIN_CHAIN_TIP_CACHE_TTL {
+            return Some(cached.height);
+        }
+    }
+
+    match get_bitcoind_rpc_client().get_blockchain_info() {
+        Ok(info) => {
+            let height = info.blocks as u64;
+            *guard = Some(CachedBitcoinChainTip { height, fetched_at: Instant::now() });
+            Some(height)
+        }
+        Err(_) => guard.as_ref().map(|cached| cached.height),
+    }
+}
 
 pub(crate) fn mempool_blocks_visible_for_espo_tip(espo_tip: u64) -> bool {
-    get_bitcoind_rpc_client()
-        .get_blockchain_info()
-        .map(|info| espo_tip.saturating_add(MEMPOOL_BLOCKS_MAX_TIP_LAG) >= info.blocks as u64)
+    cached_bitcoin_chain_tip_height()
+        .map(|tip| espo_tip.saturating_add(MEMPOOL_BLOCKS_MAX_TIP_LAG) >= tip)
         .unwrap_or(false)
 }
 

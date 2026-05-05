@@ -5,7 +5,7 @@ use crate::{ESPO_HEIGHT, SAFE_TIP};
 use anyhow::{Context, Result};
 use clap::Parser;
 use electrum_client::Client;
-use rocksdb::{DB, Options};
+use rocksdb::{BlockBasedOptions, Cache, DB, Options};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -35,6 +35,18 @@ static BLOCK_SOURCE: OnceLock<BlkOrRpcBlockSource> = OnceLock::new();
 
 // NEW: Global bitcoin::Network
 static NETWORK: OnceLock<Network> = OnceLock::new();
+
+const ESPO_ROCKS_BLOCK_CACHE_BYTES: usize = 512 * 1024 * 1024;
+const ESPO_ROCKS_MAX_OPEN_FILES: i32 = 1024;
+
+fn configure_espo_rocksdb_options(opts: &mut Options) {
+    let cache = Cache::new_lru_cache(ESPO_ROCKS_BLOCK_CACHE_BYTES);
+    let mut table = BlockBasedOptions::default();
+    table.set_block_cache(&cache);
+    table.set_cache_index_and_filter_blocks(true);
+    opts.set_block_based_table_factory(&table);
+    opts.set_max_open_files(ESPO_ROCKS_MAX_OPEN_FILES);
+}
 
 fn parse_network(s: &str) -> Result<Network> {
     let normalized = s.trim().to_ascii_lowercase();
@@ -601,6 +613,7 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
     // --- init ESPO RocksDB once ---
     let mut espo_opts = Options::default();
+    configure_espo_rocksdb_options(&mut espo_opts);
     if !espo_read_only {
         espo_opts.create_if_missing(true);
     }

@@ -8,15 +8,16 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Network, Transaction, Txid};
 use bitcoincore_rpc::RpcApi;
-use maud::html;
+use maud::{Markup, PreEscaped, html};
 
 use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
     prettyify_protobuf_trace_json, traces_for_block_as_prost,
 };
 use crate::config::{
-    get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_metashrew,
+    get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_next_height, get_metashrew,
 };
+use crate::explorer::api::cached_bitcoin_chain_tip_height;
 use crate::explorer::components::block_carousel::{block_carousel, block_carousel_with_mempool};
 use crate::explorer::components::header::{
     HeaderCta, HeaderPillTone, HeaderProps, HeaderSummaryItem, header, header_scripts,
@@ -56,6 +57,133 @@ fn mempool_tx_url(network: Network, txid: &Txid) -> Option<String> {
         _ => "https://mempool.space",
     };
     Some(format!("{base}/tx/{txid}"))
+}
+
+fn tx_event_listener_script(txid: &Txid) -> Markup {
+    let base_path_js =
+        serde_json::to_string(&explorer_path("/")).unwrap_or_else(|_| "\"/\"".into());
+    let txid_js = serde_json::to_string(&txid.to_string()).unwrap_or_else(|_| "\"\"".into());
+    let mempool_cfg = &get_config().mempool;
+    let ws_path = mempool_cfg.websocket_path.as_deref().unwrap_or("/api/events/ws").to_string();
+    let ws_path_js =
+        serde_json::to_string(&ws_path).unwrap_or_else(|_| "\"/api/events/ws\"".into());
+    let ws_enabled_js = mempool_cfg.websocket_enabled;
+
+    PreEscaped(format!(
+        r#"
+<script>
+(() => {{
+  const txid = {txid_js};
+  const basePath = {base_path_js};
+  const eventsPath = {ws_path_js};
+  const eventsEnabled = {ws_enabled_js};
+  let reloadTimer = null;
+  let retryTimer = null;
+
+  const normalizedBase = basePath.endsWith('/') ? basePath.slice(0, -1) : basePath;
+  const wsPath = eventsPath.startsWith('/') ? `${{normalizedBase}}${{eventsPath}}` : `${{normalizedBase}}/${{eventsPath}}`;
+
+  const scheduleReload = () => {{
+    if (reloadTimer) return;
+    reloadTimer = window.setTimeout(() => window.location.reload(), 350);
+  }};
+
+  const arrayIncludesTxid = (value) => Array.isArray(value) && value.includes(txid);
+
+  const matchesTx = (payload) => {{
+    if (!payload || typeof payload !== 'object') return false;
+    const data = payload.data || {{}};
+    if (payload.type === 'tx') {{
+      return data.txid === txid || arrayIncludesTxid(data.txids);
+    }}
+    if (payload.type === 'block') {{
+      return arrayIncludesTxid(data.txids);
+    }}
+    return false;
+  }};
+
+  const connect = () => {{
+    if (!eventsEnabled || !window.WebSocket) return;
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let socket;
+    try {{
+      socket = new WebSocket(`${{protocol}}//${{window.location.host}}${{wsPath}}`);
+    }} catch (_) {{
+      return;
+    }}
+    socket.addEventListener('open', () => {{
+      try {{
+        socket.send(JSON.stringify({{ action: 'want', data: ['tx'], txid }}));
+      }} catch (_) {{}}
+    }});
+    socket.addEventListener('message', (event) => {{
+      let payload;
+      try {{
+        payload = JSON.parse(event.data);
+      }} catch (_) {{
+        return;
+      }}
+      if (matchesTx(payload)) scheduleReload();
+    }});
+    socket.addEventListener('close', () => {{
+      if (reloadTimer || retryTimer) return;
+      retryTimer = window.setTimeout(() => {{
+        retryTimer = null;
+        connect();
+      }}, 2500);
+    }});
+  }};
+
+  connect();
+}})();
+</script>
+"#
+    ))
+}
+
+fn render_waiting_tx_page(state: &ExplorerState, txid: &Txid, canonical_path: &str) -> Response {
+    let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
+    let txid_hex = txid.to_string();
+    let header_markup = header(HeaderProps {
+        title: "Transaction".to_string(),
+        id: Some(txid_hex.clone()),
+        show_copy: true,
+        pill: Some(("Watching".to_string(), HeaderPillTone::Neutral)),
+        summary_items: vec![
+            HeaderSummaryItem {
+                label: "Status".to_string(),
+                value: html! { span class="summary-value muted" { "Not found yet" } },
+            },
+            HeaderSummaryItem {
+                label: "Network".to_string(),
+                value: html! { span class="summary-value muted" { (format!("{:?}", state.network)) } },
+            },
+        ],
+        cta: None,
+        hero_class: None,
+    });
+
+    layout_with_meta(
+        &format!("Tx {txid}"),
+        canonical_path,
+        None,
+        html! {
+            div class="block-hero full-bleed" {
+                (block_carousel(None, espo_tip))
+            }
+            (header_markup)
+            div class="card tx-wait-card" data-tx-waiting="1" {
+                div class="tx-wait-copy" {
+                    h2 class="h2" { "Transaction not found" }
+                    p class="muted" { "Waiting for this transaction to reach the mempool." }
+                }
+                div class="tx-wait-spinner" aria-hidden="true" {}
+            }
+            (header_scripts())
+            (tx_event_listener_script(txid))
+        },
+    )
+    .into_response()
 }
 
 fn match_trace_outpoint(outpoint: &[u8], txid: &Txid) -> Option<(Vec<u8>, u32)> {
@@ -136,51 +264,39 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
     let electrum_like = get_electrum_like();
     let mempool_entry = pending_by_txid(&txid);
 
-    let tx: Transaction = match electrum_like.transaction_get_raw(&txid) {
-        Ok(bytes) => match deserialize(&bytes) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[tx_page] decode tx via electrum failed for {txid}: {e:?}");
-                match mempool_entry.as_ref() {
-                    Some(m) => m.tx.clone(),
-                    None => {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            layout_with_meta(
-                                "Transaction",
-                                &canonical_path,
-                                None,
-                                html! { p class="error" { (format!("Failed to decode tx: {e:?}")) } },
-                            ),
-                        )
-                            .into_response();
-                    }
-                }
-            }
-        },
-        Err(e) => {
-            eprintln!("[tx_page] electrum raw fetch failed for {txid}: {e:?}");
-            match mempool_entry.as_ref() {
-                Some(m) => m.tx.clone(),
-                None => {
+    let tx: Transaction = if let Some(entry) = mempool_entry.as_ref() {
+        entry.tx.clone()
+    } else {
+        match electrum_like.transaction_get_raw(&txid) {
+            Ok(bytes) => match deserialize(&bytes) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[tx_page] decode tx via electrum failed for {txid}: {e:?}");
                     return (
                         StatusCode::NOT_FOUND,
                         layout_with_meta(
                             "Transaction",
                             &canonical_path,
                             None,
-                            html! { p class="error" { (format!("Failed to fetch raw tx: {e:?}")) } },
+                            html! { p class="error" { (format!("Failed to decode tx: {e:?}")) } },
                         ),
                     )
                         .into_response();
                 }
+            },
+            Err(e) => {
+                let message = format!("{e:?}");
+                if !message.contains("404 Not Found") {
+                    eprintln!("[tx_page] electrum raw fetch failed for {txid}: {e:?}");
+                }
+                return render_waiting_tx_page(&state, &txid, &canonical_path);
             }
         }
     };
 
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let rpc = get_bitcoind_rpc_client();
-    let chain_tip = rpc.get_blockchain_info().ok().map(|i| i.blocks as u64);
+    let chain_tip = cached_bitcoin_chain_tip_height();
     let tx_info = rpc.get_raw_transaction_info(&txid, None).ok();
     let tx_block_info = tx_info
         .as_ref()
@@ -378,6 +494,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
             h2 class="h2" { "Inputs & Outputs" }
             (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, fee_rate, None, projected_rune_io, false))
             (header_scripts())
+            (tx_event_listener_script(&txid))
         },
     )
     .into_response()

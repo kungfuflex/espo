@@ -63,6 +63,12 @@ pub fn runes_genesis_block(network: Network) -> u32 {
 pub struct RunesConfig {
     #[serde(default)]
     pub enable: bool,
+    #[serde(default = "default_load_live_outpoints")]
+    pub load_live_outpoints: bool,
+}
+
+fn default_load_live_outpoints() -> bool {
+    true
 }
 
 pub fn runes_enabled_from_global_config() -> bool {
@@ -85,12 +91,33 @@ impl Runes {
             provider: None,
             index_height: Arc::new(RwLock::new(None)),
             live_outpoints: Arc::new(RwLock::new(HashSet::new())),
-            config: RunesConfig { enable: false },
+            config: RunesConfig {
+                enable: false,
+                load_live_outpoints: default_load_live_outpoints(),
+            },
         }
     }
 
     fn provider(&self) -> &RunesProvider {
         self.provider.as_ref().expect("ModuleRegistry must call set_mdb").as_ref()
+    }
+
+    fn reload_live_outpoints(&self, height: Option<u32>) -> Result<()> {
+        if height.is_none() || !self.config.enable {
+            self.live_outpoints.write().unwrap().clear();
+            return Ok(());
+        }
+
+        if !self.config.load_live_outpoints {
+            self.live_outpoints.write().unwrap().clear();
+            eprintln!("[RUNES] live rune outpoint preload disabled; using RocksDB point lookups");
+            return Ok(());
+        }
+
+        let live_outpoints = self.provider().get_live_outpoints()?;
+        eprintln!("[RUNES] preloaded {} live rune outpoints", live_outpoints.len());
+        *self.live_outpoints.write().unwrap() = live_outpoints;
+        Ok(())
     }
 }
 
@@ -137,22 +164,15 @@ impl EspoModule for Runes {
                     }
                 }
 
-                let live_outpoints = if height.is_some() {
-                    provider.get_live_outpoints().unwrap_or_else(|err| {
-                        eprintln!("[RUNES] failed to preload live outpoints: {err:?}");
-                        HashSet::new()
-                    })
-                } else {
-                    HashSet::new()
-                };
-                eprintln!("[RUNES] preloaded {} live rune outpoints", live_outpoints.len());
-                *self.live_outpoints.write().unwrap() = live_outpoints;
                 *self.index_height.write().unwrap() = height;
                 eprintln!("[RUNES] loaded index height: {:?}", height);
             }
             Err(e) => eprintln!("[RUNES] failed to load /index_height: {e:?}"),
         }
         self.provider = Some(provider);
+        if let Err(err) = self.reload_live_outpoints(*self.index_height.read().unwrap()) {
+            eprintln!("[RUNES] failed to initialize live outpoint mode: {err:?}");
+        }
     }
 
     fn get_genesis_block(&self, network: Network) -> u32 {
@@ -169,14 +189,24 @@ impl EspoModule for Runes {
                 return Ok(());
             }
         }
-        let mut live_outpoints = self.live_outpoints.write().unwrap();
-        let mut indexer = BlockRunesIndexer::new(
-            self.provider(),
-            block.height,
-            block.block_header.time,
-            &mut live_outpoints,
-        );
-        indexer.index_block(&block)?;
+        if self.config.load_live_outpoints {
+            let mut live_outpoints = self.live_outpoints.write().unwrap();
+            let mut indexer = BlockRunesIndexer::new(
+                self.provider(),
+                block.height,
+                block.block_header.time,
+                Some(&mut live_outpoints),
+            );
+            indexer.index_block(&block)?;
+        } else {
+            let mut indexer = BlockRunesIndexer::new(
+                self.provider(),
+                block.height,
+                block.block_header.time,
+                None,
+            );
+            indexer.index_block(&block)?;
+        }
         *self.index_height.write().unwrap() = Some(block.height);
         if debug_enabled() {
             eprintln!(
@@ -198,9 +228,7 @@ impl EspoModule for Runes {
         }
         self.provider().rollback_before_height(next_height)?;
         let height = self.provider().get_index_height()?;
-        let live_outpoints =
-            if height.is_some() { self.provider().get_live_outpoints()? } else { HashSet::new() };
-        *self.live_outpoints.write().unwrap() = live_outpoints;
+        self.reload_live_outpoints(height)?;
         *self.index_height.write().unwrap() = height;
         eprintln!("[RUNES] reorg rollback complete; index height: {:?}", height);
         Ok(())
@@ -213,7 +241,7 @@ impl EspoModule for Runes {
     }
 
     fn config_spec(&self) -> Option<&'static str> {
-        Some(r#"{ "enable": true }"#)
+        Some(r#"{ "enable": true, "load_live_outpoints": true }"#)
     }
 
     fn set_config(&mut self, config: &serde_json::Value) -> Result<()> {
@@ -224,7 +252,8 @@ impl EspoModule for Runes {
 
 struct BlockRunesIndexer<'a> {
     provider: &'a RunesProvider,
-    live_outpoints: &'a mut HashSet<(Txid, u32)>,
+    live_outpoints: Option<&'a mut HashSet<(Txid, u32)>>,
+    live_outpoint_cache: HashMap<(Txid, u32), Option<OutpointRuneBalances>>,
     height: u32,
     timestamp: u64,
     network: Network,
@@ -269,11 +298,12 @@ impl<'a> BlockRunesIndexer<'a> {
         provider: &'a RunesProvider,
         height: u32,
         timestamp: u32,
-        live_outpoints: &'a mut HashSet<(Txid, u32)>,
+        live_outpoints: Option<&'a mut HashSet<(Txid, u32)>>,
     ) -> Self {
         Self {
             provider,
             live_outpoints,
+            live_outpoint_cache: HashMap::new(),
             height,
             timestamp: timestamp as u64,
             network: get_network(),
@@ -304,6 +334,56 @@ impl<'a> BlockRunesIndexer<'a> {
             puts: Vec::new(),
             deletes: HashSet::new(),
         }
+    }
+
+    fn live_outpoints_contains(&self, outpoint: &(Txid, u32)) -> bool {
+        self.live_outpoints.as_ref().map(|set| set.contains(outpoint)).unwrap_or(false)
+    }
+
+    fn insert_live_outpoint(&mut self, outpoint: (Txid, u32)) {
+        if let Some(live_outpoints) = self.live_outpoints.as_deref_mut() {
+            live_outpoints.insert(outpoint);
+        }
+        self.live_outpoint_cache.remove(&outpoint);
+    }
+
+    fn remove_live_outpoint(&mut self, outpoint: (Txid, u32)) {
+        if let Some(live_outpoints) = self.live_outpoints.as_deref_mut() {
+            live_outpoints.remove(&outpoint);
+        }
+        self.live_outpoint_cache.remove(&outpoint);
+    }
+
+    fn get_point_lookup_outpoint(
+        &mut self,
+        outpoint: (Txid, u32),
+    ) -> Result<Option<OutpointRuneBalances>> {
+        if let Some(row) = self.live_outpoint_cache.get(&outpoint) {
+            return Ok(row.clone());
+        }
+        let row = self.provider.get_outpoint_balances(&outpoint.0, outpoint.1)?;
+        self.live_outpoint_cache.insert(outpoint, row.clone());
+        Ok(row)
+    }
+
+    fn take_point_lookup_outpoint(
+        &mut self,
+        outpoint: (Txid, u32),
+    ) -> Result<Option<OutpointRuneBalances>> {
+        if let Some(row) = self.live_outpoint_cache.remove(&outpoint) {
+            return Ok(row);
+        }
+        self.provider.get_outpoint_balances(&outpoint.0, outpoint.1)
+    }
+
+    fn has_rune_outpoint(&mut self, outpoint: (Txid, u32)) -> Result<bool> {
+        if self.ephem.contains_key(&outpoint) || self.live_outpoints_contains(&outpoint) {
+            return Ok(true);
+        }
+        if self.live_outpoints.is_some() {
+            return Ok(false);
+        }
+        Ok(self.get_point_lookup_outpoint(outpoint)?.is_some())
     }
 
     fn index_block(&mut self, block: &EspoBlock) -> Result<()> {
@@ -369,13 +449,13 @@ impl<'a> BlockRunesIndexer<'a> {
             self.ensure_genesis_rune(txid)?;
         }
         let has_runestone = tx_has_runestone_carrier(tx);
-        let has_rune_input = tx.input.iter().any(|input| {
-            self.ephem
-                .contains_key(&(input.previous_output.txid, input.previous_output.vout))
-                || self
-                    .live_outpoints
-                    .contains(&(input.previous_output.txid, input.previous_output.vout))
-        });
+        let mut has_rune_input = false;
+        for input in &tx.input {
+            if self.has_rune_outpoint((input.previous_output.txid, input.previous_output.vout))? {
+                has_rune_input = true;
+                break;
+            }
+        }
         if !has_runestone && !has_rune_input {
             return Ok(());
         }
@@ -491,7 +571,7 @@ impl<'a> BlockRunesIndexer<'a> {
                 balances: balances.clone(),
             };
             self.ephem.insert((txid, vout), row.clone());
-            self.live_outpoints.insert((txid, vout));
+            self.insert_live_outpoint((txid, vout));
             self.queue_put(outpoint_key(&txid, vout), encode(&row)?);
             if let Some(address) = address.as_ref() {
                 self.queue_put(address_outpoint_key(address, &txid, vout), Vec::new());
@@ -622,17 +702,22 @@ impl<'a> BlockRunesIndexer<'a> {
         let spending_txid = tx.compute_txid().to_byte_array();
         for (input_idx, input) in tx.input.iter().enumerate() {
             let prev = input.previous_output;
-            let row = if let Some(row) = self.ephem.remove(&(prev.txid, prev.vout)) {
+            let outpoint = (prev.txid, prev.vout);
+            let row = if let Some(row) = self.ephem.remove(&outpoint) {
                 Some(row)
-            } else if !self.live_outpoints.contains(&(prev.txid, prev.vout)) {
-                None
+            } else if self.live_outpoints.is_some() {
+                if !self.live_outpoints_contains(&outpoint) {
+                    None
+                } else {
+                    self.provider.get_outpoint_balances(&prev.txid, prev.vout)?
+                }
             } else {
-                self.provider.get_outpoint_balances(&prev.txid, prev.vout)?
+                self.take_point_lookup_outpoint(outpoint)?
             };
             let Some(row) = row else {
                 continue;
             };
-            self.live_outpoints.remove(&(prev.txid, prev.vout));
+            self.remove_live_outpoint(outpoint);
             self.queue_delete(outpoint_key(&prev.txid, prev.vout));
             io.inputs.insert(input_idx as u32, row.balances.clone());
             if let Some(address) = row.address.as_ref() {

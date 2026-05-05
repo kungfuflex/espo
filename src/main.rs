@@ -27,7 +27,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{DebugBackupConfig, get_block_source, init_block_source};
 //modules
@@ -62,16 +62,16 @@ use crate::{
     modules::defs::ModuleRegistry,
     runtime::mdb::Mdb,
     runtime::mempool::{
-        publish_new_block_event, purge_confirmed_from_chain, purge_confirmed_txids,
-        reset_mempool_store, run_mempool_service,
+        publish_confirmed_tx_events, publish_new_block_event, purge_confirmed_from_chain,
+        purge_confirmed_txids, reset_mempool_store, run_mempool_service,
     },
     runtime::rpc::run_rpc,
     runtime::shutdown::request_shutdown,
     runtime::state_at::StateAt,
     runtime::tree_db::get_global_tree_db,
 };
-use bitcoin::Txid;
 use bitcoin::hashes::Hash;
+use bitcoin::{Address, Txid};
 use bitcoincore_rpc::RpcApi;
 pub use espo::{ESPO_HEIGHT, SAFE_TIP};
 use rocksdb::checkpoint::Checkpoint;
@@ -93,6 +93,23 @@ impl MetashrewCanonicalityWaitKind {
             MetashrewCanonicalityWaitKind::MissingHash => "metashrew_missing_height_hash",
             MetashrewCanonicalityWaitKind::HashMismatch => "metashrew_hash_mismatch",
         }
+    }
+}
+
+struct AtomicFlagGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl AtomicFlagGuard {
+    fn new(flag: &Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Relaxed);
+        Self { flag: flag.clone() }
+    }
+}
+
+impl Drop for AtomicFlagGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Relaxed);
     }
 }
 
@@ -444,6 +461,52 @@ fn update_indexed_block_interaction_summary(
     Ok(())
 }
 
+fn block_output_address_txs(
+    block: &EspoBlock,
+    network: bitcoin::Network,
+) -> std::collections::HashMap<String, Vec<Txid>> {
+    let mut out: std::collections::HashMap<String, Vec<Txid>> = std::collections::HashMap::new();
+    let block_txs: std::collections::HashMap<Txid, &bitcoin::Transaction> = block
+        .transactions
+        .iter()
+        .map(|tx| (tx.transaction.compute_txid(), &tx.transaction))
+        .collect();
+    for tx in &block.transactions {
+        let txid = tx.transaction.compute_txid();
+        let mut seen_in_tx = std::collections::HashSet::new();
+        for input in &tx.transaction.input {
+            if input.previous_output.is_null() {
+                continue;
+            }
+            let Some(prev_tx) = block_txs.get(&input.previous_output.txid) else {
+                continue;
+            };
+            let Some(prevout) = prev_tx.output.get(input.previous_output.vout as usize) else {
+                continue;
+            };
+            let Ok(address) = Address::from_script(prevout.script_pubkey.as_script(), network)
+            else {
+                continue;
+            };
+            let address = address.to_string();
+            if seen_in_tx.insert(address.clone()) {
+                out.entry(address).or_default().push(txid);
+            }
+        }
+        for output in &tx.transaction.output {
+            let Ok(address) = Address::from_script(output.script_pubkey.as_script(), network)
+            else {
+                continue;
+            };
+            let address = address.to_string();
+            if seen_in_tx.insert(address.clone()) {
+                out.entry(address).or_default().push(txid);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -471,6 +534,7 @@ async fn run_indexer_loop(
     metashrew_sdb: std::sync::Arc<crate::runtime::sdb::SDB>,
     cfg: crate::config::AppConfig,
     shutdown_requested: Arc<AtomicBool>,
+    db_write_active: Arc<AtomicBool>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
     let genesis_height = alkanes_genesis_block(network);
@@ -640,8 +704,10 @@ async fn run_indexer_loop(
                         .iter()
                         .map(|t| t.transaction.compute_txid())
                         .collect();
+                    let block_address_txs = block_output_address_txs(&espo_block, network);
 
                     let block_hash = espo_block.block_header.block_hash();
+                    let db_write_guard = AtomicFlagGuard::new(&db_write_active);
 
                     if let Some(tree) = get_global_tree_db() {
                         if let Err(e) = tree.begin_block(
@@ -693,8 +759,6 @@ async fn run_indexer_loop(
                             next_height
                         ),
                     }
-                    publish_new_block_event(next_height, &block_txids);
-
                     if let Some(tree) = get_global_tree_db() {
                         if let Err(e) = tree.finish_block() {
                             eprintln!("[tree] failed to finish block {}: {e:?}", next_height);
@@ -723,6 +787,9 @@ async fn run_indexer_loop(
                             next_height
                         );
                     }
+                    publish_new_block_event(next_height, &block_txids);
+                    publish_confirmed_tx_events(next_height, &block_txids, &block_address_txs);
+                    drop(db_write_guard);
 
                     if let Some(backup) = cfg.debug_backup.as_ref() {
                         if debug_backup_remaining.remove(&next_height) {
@@ -854,29 +921,25 @@ async fn main() -> Result<()> {
         eprintln!("[cache] preloaded {} block summaries", loaded);
     }
 
+    let mut service_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // Start RPC server
     let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
     let rpc_router = mods.router.clone();
-    tokio::spawn(async move {
+    service_handles.push(tokio::spawn(async move {
         if let Err(e) = run_rpc(rpc_router, addr).await {
             eprintln!("[rpc] server error: {e:?}");
         }
-    });
+    }));
     eprintln!("[rpc] listening on {}", addr);
 
     // Optional SSR explorer server
     if let Some(explorer_addr) = cfg.explorer_host {
-        let explorer_handle = tokio::spawn(async move {
+        service_handles.push(tokio::spawn(async move {
             if let Err(e) = run_explorer(explorer_addr).await {
                 eprintln!("[explorer] server error: {e:?}");
             }
-        });
-        tokio::spawn(async move {
-            if let Err(err) = explorer_handle.await {
-                eprintln!("[explorer] task panicked: {err:?}");
-                std::process::abort();
-            }
-        });
+        }));
         eprintln!("[explorer] listening on {}", explorer_addr);
     }
 
@@ -915,13 +978,19 @@ async fn main() -> Result<()> {
             "[mode] view-only: explorer/RPC running; indexed height {}, next height {}",
             indexed_height, start_height
         );
-        loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+        wait_for_shutdown_signal().await?;
+        eprintln!("[PROCESS] exit signal received; stopping servers");
+        request_shutdown();
+        for handle in service_handles.drain(..) {
+            handle.abort();
         }
+        return Ok(());
     }
 
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_for_indexer = shutdown_requested.clone();
+    let db_write_active = Arc::new(AtomicBool::new(false));
+    let db_write_active_for_indexer = db_write_active.clone();
     let indexer_handle = std::thread::spawn(move || {
         let rt = TokioBuilder::new_multi_thread()
             .worker_threads(2)
@@ -936,6 +1005,7 @@ async fn main() -> Result<()> {
             metashrew_sdb,
             cfg,
             shutdown_for_indexer,
+            db_write_active_for_indexer,
         ));
     });
 
@@ -953,23 +1023,42 @@ async fn main() -> Result<()> {
         tokio::select! {
             result = &mut shutdown_signal => {
                 result?;
-                eprintln!("[PROCESS] exit signal received , waiting for modules");
+                eprintln!("[PROCESS] exit signal received; stopping servers");
                 request_shutdown();
                 shutdown_requested.store(true, Ordering::Relaxed);
+                for handle in service_handles.drain(..) {
+                    handle.abort();
+                }
                 break;
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
     }
 
-    let join_result = tokio::task::spawn_blocking(move || indexer_handle.join())
-        .await
-        .context("failed to await indexer thread join task")?;
-    if let Err(err) = join_result {
-        eprintln!("[indexer] thread panicked: {err:?}");
-        std::process::abort();
+    let shutdown_started = Instant::now();
+    let mut logged_db_wait = false;
+    loop {
+        if indexer_handle.is_finished() {
+            if let Err(err) = indexer_handle.join() {
+                eprintln!("[indexer] thread panicked: {err:?}");
+                std::process::abort();
+            }
+            return Ok(());
+        }
+
+        let db_active = db_write_active.load(Ordering::Relaxed);
+        if !db_active && shutdown_started.elapsed() >= Duration::from_secs(5) {
+            eprintln!(
+                "[PROCESS] forcing exit after shutdown grace; indexer is not in a db write section"
+            );
+            std::process::exit(130);
+        }
+        if db_active && !logged_db_wait {
+            eprintln!("[PROCESS] waiting for active block db write to finish before exit");
+            logged_db_wait = true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    Ok(())
 }
 
 // Dummy main for WASM builds (should never be called)

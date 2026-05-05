@@ -6,16 +6,16 @@ use bitcoin::address::AddressType;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Network, Transaction, Txid};
-use bitcoincore_rpc::RpcApi;
 use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
-use crate::config::{get_bitcoind_rpc_client, get_electrum_like};
+use crate::config::{get_config, get_electrum_like};
+use crate::explorer::api::cached_bitcoin_chain_tip_height;
 use crate::explorer::components::alk_balances::{
     render_alkane_balance_cards, render_rune_balance_cards,
 };
@@ -36,14 +36,20 @@ use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::essentials::storage::{
     AddressIndexListKind, AlkaneTxSummary, get_address_index_list_len,
-    get_address_index_list_range, load_tx_pointer_blob_v3_by_id, load_tx_summary_v2,
+    get_address_index_list_range, load_outpoint_pointer_blob_v3_by_id,
+    load_tx_pointer_blob_v3_by_id, load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_rows_batch,
+    project_tx_output_balances_from_traces,
 };
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RunesProvider, TxRuneIo};
-use crate::runtime::mempool::{MempoolEntry, pending_by_txid, pending_for_address};
+use crate::runtime::mempool::{
+    MempoolBlockTx, MempoolEntry, MempoolProjectedPosition, get_mempool_block_spenders,
+    get_mempool_block_transactions_for_targets, pending_action_entries_for_address,
+    pending_by_txid, pending_for_address,
+};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
 use crate::utils::electrum_like::{AddressHistoryEntry, ElectrumLikeBackend};
@@ -96,6 +102,7 @@ struct AddressTxRender {
     tx: Transaction,
     traces: Option<Vec<EspoTrace>>,
     rune_io: Option<TxRuneIo>,
+    position: Option<MempoolProjectedPosition>,
     confirmations: Option<u64>,
     is_mempool: bool,
 }
@@ -189,6 +196,89 @@ fn sandshrew_to_espo_trace(txid: &Txid, trace: &EspoSandshrewLikeTrace) -> Optio
         storage_changes: HashMap::new(),
         outpoint: EspoOutpoint { txid: trace_txid.to_byte_array().to_vec(), vout, tx_spent: None },
     })
+}
+
+fn live_alkane_outpoints_for_address(
+    provider: &crate::modules::essentials::storage::EssentialsProvider,
+    address: &str,
+) -> HashSet<(Txid, u32)> {
+    let outpoint_len = get_address_index_list_len(
+        provider,
+        StateAt::Latest,
+        AddressIndexListKind::OutpointIdx,
+        address,
+    )
+    .unwrap_or(0);
+    if outpoint_len == 0 {
+        return HashSet::new();
+    }
+    get_address_index_list_range(
+        provider,
+        StateAt::Latest,
+        AddressIndexListKind::OutpointIdx,
+        address,
+        0,
+        outpoint_len,
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|id| {
+        let blob = load_outpoint_pointer_blob_v3_by_id(provider, id)?;
+        Some((Txid::from_byte_array(blob.txid), blob.vout))
+    })
+    .collect()
+}
+
+fn aggregate_balances(
+    entries: &[BalanceEntry],
+    out: &mut BTreeMap<crate::schemas::SchemaAlkaneId, u128>,
+) {
+    for entry in entries {
+        if entry.amount == 0 {
+            continue;
+        }
+        *out.entry(entry.alkane).or_default() =
+            out.get(&entry.alkane).copied().unwrap_or(0).saturating_add(entry.amount);
+    }
+}
+
+fn mempool_projected_balances(
+    ordered_txs: &[MempoolBlockTx],
+    db_outpoints: &HashMap<(Txid, u32), OutpointLookup>,
+) -> HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> {
+    let mut projected_by_outpoint: HashMap<(Txid, u32), Vec<BalanceEntry>> = HashMap::new();
+    let mut projected_by_tx: HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> = HashMap::new();
+
+    for item in ordered_txs {
+        let mut input_totals: BTreeMap<crate::schemas::SchemaAlkaneId, u128> = BTreeMap::new();
+        for vin in &item.tx.input {
+            if vin.previous_output.is_null() {
+                continue;
+            }
+            let key = (vin.previous_output.txid, vin.previous_output.vout);
+            if let Some(entries) = projected_by_outpoint.get(&key) {
+                aggregate_balances(entries, &mut input_totals);
+            } else if let Some(lookup) = db_outpoints.get(&key) {
+                aggregate_balances(&lookup.balances, &mut input_totals);
+            }
+        }
+
+        let input_balances: Vec<BalanceEntry> = input_totals
+            .into_iter()
+            .map(|(alkane, amount)| BalanceEntry { alkane, amount })
+            .collect();
+        let traces = item.traces.as_deref().unwrap_or(&[]);
+        let projected = project_tx_output_balances_from_traces(&item.tx, traces, input_balances);
+        if projected.is_empty() {
+            continue;
+        }
+        for (vout, entries) in &projected {
+            projected_by_outpoint.insert((item.txid, *vout), entries.clone());
+        }
+        projected_by_tx.insert(item.txid, projected);
+    }
+
+    projected_by_tx
 }
 
 pub async fn address_page(
@@ -374,51 +464,58 @@ pub async fn address_page(
     );
 
     let chain_tip_t0 = Instant::now();
-    let chain_tip = get_bitcoind_rpc_client().get_blockchain_info().ok().map(|i| i.blocks as u64);
+    let chain_tip = cached_bitcoin_chain_tip_height();
     log_address_page_perf(
         &address_str,
-        "bitcoind.get_blockchain_info",
+        "bitcoin_chain_tip",
         chain_tip_t0,
         &format!("tip={:?}", chain_tip),
     );
 
     let off = limit.saturating_mul(page.saturating_sub(1));
     let pending_t0 = Instant::now();
-    let mut pending_entries: Vec<MempoolEntry> = pending_for_address(&address_str);
-    pending_entries.sort_by(|a, b| b.txid.cmp(&a.txid));
-    let pending_filtered: Vec<MempoolEntry> = pending_entries
-        .into_iter()
-        .filter(|e| match tx_filter {
-            TxFilter::All => true,
-            TxFilter::Action => {
-                e.traces.as_ref().map_or(false, |t| !t.is_empty())
-                    || e.rune_io.as_ref().map_or(false, |io| {
-                        !io.inputs.is_empty()
-                            || !io.outputs.is_empty()
-                            || !io.burned.is_empty()
-                            || !io.minted.is_empty()
-                            || io.etched.is_some()
-                    })
-                    || ordinals::Runestone::decipher(&e.tx).is_some()
-            }
-            TxFilter::Alkane => e.traces.as_ref().map_or(false, |t| !t.is_empty()),
-            TxFilter::Rune => {
-                e.rune_io.as_ref().map_or(false, |io| {
-                    !io.inputs.is_empty()
-                        || !io.outputs.is_empty()
-                        || !io.burned.is_empty()
-                        || !io.minted.is_empty()
-                        || io.etched.is_some()
-                }) || ordinals::Runestone::decipher(&e.tx).is_some()
-            }
-        })
-        .collect();
+    let live_alkane_outpoints = if matches!(tx_filter, TxFilter::Action | TxFilter::Alkane) {
+        live_alkane_outpoints_for_address(&state.essentials_provider(), &address_str)
+    } else {
+        HashSet::new()
+    };
+    let live_rune_outpoints: HashSet<(Txid, u32)> =
+        if runes_enabled && matches!(tx_filter, TxFilter::Action | TxFilter::Rune) {
+            runes_provider
+                .get_address_outpoints(&address_str)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(txid, vout, _)| (txid, vout))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+    let mut pending_filtered: Vec<MempoolEntry> = if tx_filter == TxFilter::All {
+        pending_for_address(&address_str)
+    } else {
+        pending_action_entries_for_address(
+            &address_str,
+            state.network,
+            matches!(tx_filter, TxFilter::Action | TxFilter::Alkane),
+            runes_enabled && matches!(tx_filter, TxFilter::Action | TxFilter::Rune),
+            &live_alkane_outpoints,
+            &live_rune_outpoints,
+        )
+    };
+    pending_filtered
+        .sort_by(|a, b| b.first_seen.cmp(&a.first_seen).then_with(|| b.txid.cmp(&a.txid)));
     let pending_total = pending_filtered.len();
     log_address_page_perf(
         &address_str,
         "mempool.pending_for_address",
         pending_t0,
-        &format!("pending_filtered={}", pending_total),
+        &format!(
+            "filter={:?} live_alkane_outpoints={} live_rune_outpoints={} pending_filtered={}",
+            tx_filter,
+            live_alkane_outpoints.len(),
+            live_rune_outpoints.len(),
+            pending_total
+        ),
     );
     let pending_set: HashSet<Txid> = pending_filtered.iter().map(|e| e.txid).collect();
 
@@ -440,6 +537,7 @@ pub async fn address_page(
             tx: entry.tx.clone(),
             traces: entry.traces.clone(),
             rune_io: entry.rune_io.clone(),
+            position: entry.position.clone(),
             confirmations: None,
             is_mempool: true,
         });
@@ -507,6 +605,7 @@ pub async fn address_page(
                     tx,
                     traces,
                     rune_io: None,
+                    position: None,
                     confirmations,
                     is_mempool: false,
                 });
@@ -608,6 +707,7 @@ pub async fn address_page(
                     tx,
                     traces,
                     rune_io: None,
+                    position: None,
                     confirmations,
                     is_mempool: false,
                 });
@@ -698,6 +798,7 @@ pub async fn address_page(
                     tx,
                     traces,
                     rune_io: None,
+                    position: None,
                     confirmations,
                     is_mempool: false,
                 });
@@ -796,6 +897,7 @@ pub async fn address_page(
                                 tx,
                                 traces,
                                 rune_io: None,
+                                position: None,
                                 confirmations,
                                 is_mempool: false,
                             });
@@ -954,6 +1056,24 @@ pub async fn address_page(
         );
     }
 
+    let mut mempool_targets_by_block: BTreeMap<usize, HashSet<Txid>> = BTreeMap::new();
+    for item in &tx_renders {
+        if let Some(position) = item.position.as_ref() {
+            mempool_targets_by_block.entry(position.block).or_default().insert(item.txid);
+        }
+    }
+    let mut projection_txs_for_balances: Vec<MempoolBlockTx> = Vec::new();
+    let mut seen_projection_txs: HashSet<Txid> = HashSet::new();
+    for (template_index, targets) in &mempool_targets_by_block {
+        if let Some(items) = get_mempool_block_transactions_for_targets(*template_index, targets) {
+            for item in items {
+                if seen_projection_txs.insert(item.txid) {
+                    projection_txs_for_balances.push(item);
+                }
+            }
+        }
+    }
+
     let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
     let mut input_outpoint_candidates = 0usize;
     let mut input_outpoints_selected = 0usize;
@@ -964,6 +1084,7 @@ pub async fn address_page(
         for vin in &item.tx.input {
             if !vin.previous_output.is_null() {
                 input_outpoint_candidates = input_outpoint_candidates.saturating_add(1);
+                all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
                 let Some(prev_tx) = prev_map.get(&vin.previous_output.txid) else {
                     continue;
                 };
@@ -979,6 +1100,13 @@ pub async fn address_page(
                     all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
                     input_outpoints_selected = input_outpoints_selected.saturating_add(1);
                 }
+            }
+        }
+    }
+    for item in &projection_txs_for_balances {
+        for vin in &item.tx.input {
+            if !vin.previous_output.is_null() {
+                all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
             }
         }
     }
@@ -1000,10 +1128,31 @@ pub async fn address_page(
             input_outpoints_selected
         ),
     );
+    let projected_balances_by_tx =
+        mempool_projected_balances(&projection_txs_for_balances, &outpoint_map);
+    let projected_balances_by_outpoint: HashMap<(Txid, u32), Vec<BalanceEntry>> =
+        projected_balances_by_tx
+            .iter()
+            .flat_map(|(txid, outputs)| {
+                outputs.iter().map(|(vout, balances)| ((*txid, *vout), balances.clone()))
+            })
+            .collect();
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
-        outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
+        let mut lookup = outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default();
+        if lookup.balances.is_empty() {
+            if let Some(projected) = projected_balances_by_outpoint.get(&(*txid, vout)) {
+                lookup.balances = projected.clone();
+            }
+        }
+        lookup
     };
     let outspends_map: std::collections::HashMap<Txid, Vec<Option<Txid>>> = {
+        let mut mempool_spenders: HashMap<(Txid, u32), Txid> = HashMap::new();
+        for template_index in mempool_targets_by_block.keys() {
+            if let Some(spenders) = get_mempool_block_spenders(*template_index) {
+                mempool_spenders.extend(spenders);
+            }
+        }
         let mut dedup = tx_renders.iter().map(|t| t.txid).collect::<Vec<_>>();
         dedup.sort();
         dedup.dedup();
@@ -1015,7 +1164,20 @@ pub async fn address_page(
             outspends_t0,
             &format!("txids={} rows={}", dedup.len(), fetched.len()),
         );
-        dedup.into_iter().zip(fetched.into_iter()).collect()
+        let mut map: HashMap<Txid, Vec<Option<Txid>>> =
+            dedup.into_iter().zip(fetched.into_iter()).collect();
+        for item in &tx_renders {
+            let entry = map.entry(item.txid).or_default();
+            if entry.len() < item.tx.output.len() {
+                entry.resize(item.tx.output.len(), None);
+            }
+            for vout in 0..item.tx.output.len() {
+                if let Some(spender) = mempool_spenders.get(&(item.txid, vout as u32)).copied() {
+                    entry[vout] = Some(spender);
+                }
+            }
+        }
+        map
     };
     let outspends_rows = outspends_map.len();
     let outspends_fn = move |txid: &Txid| -> Vec<Option<Txid>> {
@@ -1163,6 +1325,8 @@ pub async fn address_page(
         items: tx_filter_dropdown_items,
         aria_label: Some("Transaction filter".to_string()),
     });
+    let address_event_txids: Vec<String> =
+        tx_renders.iter().map(|item| item.txid.to_string()).collect();
     let layout_t0 = Instant::now();
     let page = layout_with_meta(
         &format!("Address {address_str}"),
@@ -1351,7 +1515,12 @@ pub async fn address_page(
                                 None
                             };
                             @let projected_rune_io = item.rune_io.as_ref();
-                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, None, projected_rune_io, true))
+                            @let projected_balances = if item.is_mempool {
+                                projected_balances_by_tx.get(&item.txid)
+                            } else {
+                                None
+                            };
+                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, projected_balances, projected_rune_io, true))
                         }
                     }
 
@@ -1398,6 +1567,7 @@ pub async fn address_page(
             }
 
             (header_scripts())
+            (address_event_listener_script(&address_str, &address_event_txids))
             (address_chart_scripts())
         },
     );
@@ -1408,6 +1578,104 @@ pub async fn address_page(
         &format!("total_ms={}", start_time.elapsed().as_millis()),
     );
     page.into_response()
+}
+
+fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
+    let base_path_js =
+        serde_json::to_string(&explorer_path("/")).unwrap_or_else(|_| "\"/\"".into());
+    let address_js = serde_json::to_string(address).unwrap_or_else(|_| "\"\"".into());
+    let txids_js = serde_json::to_string(txids).unwrap_or_else(|_| "[]".into());
+    let mempool_cfg = &get_config().mempool;
+    let ws_path = mempool_cfg.websocket_path.as_deref().unwrap_or("/api/events/ws").to_string();
+    let ws_path_js =
+        serde_json::to_string(&ws_path).unwrap_or_else(|_| "\"/api/events/ws\"".into());
+    let ws_enabled_js = mempool_cfg.websocket_enabled;
+
+    PreEscaped(format!(
+        r#"
+<script>
+(() => {{
+  const address = {address_js};
+  const trackedTxids = new Set({txids_js});
+  const basePath = {base_path_js};
+  const eventsPath = {ws_path_js};
+  const eventsEnabled = {ws_enabled_js};
+  let reloadTimer = null;
+  let retryTimer = null;
+
+  const normalizedBase = basePath.endsWith('/') ? basePath.slice(0, -1) : basePath;
+  const wsPath = eventsPath.startsWith('/') ? `${{normalizedBase}}${{eventsPath}}` : `${{normalizedBase}}/${{eventsPath}}`;
+
+  const scheduleReload = () => {{
+    if (reloadTimer) return;
+    reloadTimer = window.setTimeout(() => window.location.reload(), 450);
+  }};
+
+  const anyTrackedTxid = (txids) =>
+    Array.isArray(txids) && txids.some((txid) => trackedTxids.has(txid));
+
+  const addressMapContains = (value) => {{
+    if (!value || typeof value !== 'object') return false;
+    if (Array.isArray(value)) return value.includes(address);
+    return Object.prototype.hasOwnProperty.call(value, address);
+  }};
+
+  const matchesAddress = (payload) => {{
+    if (!payload || typeof payload !== 'object') return false;
+    const data = payload.data || {{}};
+    if (payload.type === 'address-tx') {{
+      return data.address === address || addressMapContains(data.addresses) || trackedTxids.has(data.txid);
+    }}
+    if (payload.type === 'tx') {{
+      return (
+        trackedTxids.has(data.txid) ||
+        anyTrackedTxid(data.txids) ||
+        (Array.isArray(data.addresses) && data.addresses.includes(address))
+      );
+    }}
+    if (payload.type === 'block') {{
+      return anyTrackedTxid(data.txids);
+    }}
+    return false;
+  }};
+
+  const connect = () => {{
+    if (!eventsEnabled || !window.WebSocket) return;
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let socket;
+    try {{
+      socket = new WebSocket(`${{protocol}}//${{window.location.host}}${{wsPath}}`);
+    }} catch (_) {{
+      return;
+    }}
+    socket.addEventListener('open', () => {{
+      try {{
+        socket.send(JSON.stringify({{ action: 'want', data: ['address'], address }}));
+      }} catch (_) {{}}
+    }});
+    socket.addEventListener('message', (event) => {{
+      let payload;
+      try {{
+        payload = JSON.parse(event.data);
+      }} catch (_) {{
+        return;
+      }}
+      if (matchesAddress(payload)) scheduleReload();
+    }});
+    socket.addEventListener('close', () => {{
+      if (reloadTimer || retryTimer) return;
+      retryTimer = window.setTimeout(() => {{
+        retryTimer = null;
+        connect();
+      }}, 2500);
+    }});
+  }};
+
+  connect();
+}})();
+</script>
+"#
+    ))
 }
 
 fn address_chart_scripts() -> Markup {

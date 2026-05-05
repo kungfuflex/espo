@@ -743,18 +743,64 @@ impl RunesProvider {
         desc: bool,
     ) -> Result<Vec<(RuneEntry, u64)>> {
         let mut rows = Vec::new();
-        for item in self.mdb.scan_prefix_entries(b"/rune/by_id/")? {
-            let (_key, value) = item;
-            let entry = RuneEntry::try_from_slice(&value)?;
-            let holders = self.get_holders_count(entry.id)?;
-            rows.push((entry, holders));
+        if limit == 0 {
+            return Ok(rows);
         }
-        rows.sort_by(|a, b| {
-            let ord = a.1.cmp(&b.1).then_with(|| b.0.number.cmp(&a.0.number));
+        let start = limit.saturating_mul(page.saturating_sub(1));
+        let end = start.saturating_add(limit);
+        let mut ranked: Vec<(SchemaRuneId, u64)> = Vec::new();
+        let mut counted = HashSet::new();
+        for (key, value) in self.mdb.scan_prefix_entries(&holders_count_prefix())? {
+            let Some(id) = decode_holders_count_key(&key) else {
+                continue;
+            };
+            let Some(holders) = decode_u64(&value) else {
+                continue;
+            };
+            counted.insert(id);
+            ranked.push((id, holders));
+        }
+        ranked.sort_by(|a, b| {
+            let ord =
+                a.1.cmp(&b.1)
+                    .then_with(|| b.0.block.cmp(&a.0.block))
+                    .then_with(|| b.0.tx.cmp(&a.0.tx));
             if desc { ord.reverse() } else { ord }
         });
-        let start = limit.saturating_mul(page.saturating_sub(1));
-        Ok(rows.into_iter().skip(start).take(limit).collect())
+
+        for (id, holders) in ranked.iter().skip(start).take(limit) {
+            if let Some(entry) = self.get_rune(*id)? {
+                rows.push((entry, *holders));
+            }
+        }
+
+        if rows.len() < limit && end > ranked.len() {
+            let zero_skip = start.saturating_sub(ranked.len());
+            let mut zero_rows = Vec::new();
+            for (_key, value) in self.mdb.scan_prefix_entries(b"/rune/by_id/")? {
+                let entry = RuneEntry::try_from_slice(&value)?;
+                if counted.contains(&entry.id) {
+                    continue;
+                }
+                zero_rows.push(entry);
+            }
+            zero_rows.sort_by(|a, b| {
+                let ord =
+                    a.id.block
+                        .cmp(&b.id.block)
+                        .then_with(|| a.id.tx.cmp(&b.id.tx))
+                        .then_with(|| a.number.cmp(&b.number));
+                if desc { ord } else { ord.reverse() }
+            });
+            for entry in zero_rows.into_iter().skip(zero_skip) {
+                if rows.len() >= limit {
+                    break;
+                }
+                rows.push((entry, 0));
+            }
+        }
+
+        Ok(rows)
     }
 
     pub fn get_runes_by_age(
@@ -1710,9 +1756,19 @@ pub fn holder_key(id: SchemaRuneId, address: &str) -> Vec<u8> {
 }
 
 pub fn holders_count_key(id: SchemaRuneId) -> Vec<u8> {
-    let mut key = b"/holder_count/".to_vec();
+    let mut key = holders_count_prefix();
     key.extend_from_slice(&id_key_bytes(id));
     key
+}
+
+pub fn holders_count_prefix() -> Vec<u8> {
+    b"/holder_count/".to_vec()
+}
+
+fn decode_holders_count_key(key: &[u8]) -> Option<SchemaRuneId> {
+    let prefix = holders_count_prefix();
+    let tail = key.strip_prefix(prefix.as_slice())?;
+    decode_id_key_tail(tail)
 }
 
 pub fn address_balance_prefix(address: &str) -> Vec<u8> {

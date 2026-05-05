@@ -21,6 +21,7 @@ use crate::alkanes::trace::{
 use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_network,
 };
+use crate::explorer::api::cached_bitcoin_chain_tip_height;
 use crate::explorer::components::block_carousel::{block_carousel, block_carousel_with_mempool};
 use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
 use crate::explorer::components::header::{
@@ -48,8 +49,8 @@ use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RunesProvider, SchemaRuneId};
 use crate::modules::tokendata::storage::TokenDataProvider;
 use crate::runtime::mempool::{
-    MempoolBlockTx, MempoolTxFilter, get_mempool_block_detail,
-    get_mempool_block_ordered_transactions, get_mempool_transactions,
+    MempoolBlockTx, MempoolTxFilter, get_mempool_block_detail, get_mempool_block_spenders,
+    get_mempool_block_transactions_for_targets, get_mempool_transactions,
 };
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
@@ -334,8 +335,8 @@ pub async fn block_page(
     let rpc = get_bitcoind_rpc_client();
     let electrum_like = get_electrum_like();
     let network = get_network();
-    let tip = rpc.get_blockchain_info().map(|i| i.blocks).unwrap_or(0);
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
+    let tip = cached_bitcoin_chain_tip_height().unwrap_or(espo_tip);
     let nav_tip = espo_tip.min(tip);
     let espo_indexed = height <= espo_tip;
     let essentials_provider = state.essentials_provider();
@@ -1142,8 +1143,10 @@ pub async fn mempool_block_page(
     let last_page = if tx_total > 0 { (tx_total + limit - 1) / limit } else { 1 };
     let tx_has_prev = page > 1 && off < tx_total;
     let tx_has_next = display_end < tx_total;
-    let projection_txs = get_mempool_block_ordered_transactions(template_index)
-        .unwrap_or_else(|| detail.txs.clone());
+    let page_txids: HashSet<Txid> = detail.txs.iter().map(|item| item.txid).collect();
+    let projection_txs_for_balances =
+        get_mempool_block_transactions_for_targets(template_index, &page_txids)
+            .unwrap_or_else(|| detail.txs.clone());
 
     let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
     for item in &detail.txs {
@@ -1156,7 +1159,7 @@ pub async fn mempool_block_page(
             }
         }
     }
-    for item in &projection_txs {
+    for item in &projection_txs_for_balances {
         for vin in &item.tx.input {
             if !vin.previous_output.is_null() {
                 all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
@@ -1171,20 +1174,13 @@ pub async fn mempool_block_page(
         &all_outpoints,
     )
     .unwrap_or_default();
-    let projected_balances_by_tx = mempool_block_projected_balances(&projection_txs, &outpoint_map);
+    let projected_balances_by_tx =
+        mempool_block_projected_balances(&projection_txs_for_balances, &outpoint_map);
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
         outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
     };
     let outspends_map: std::collections::HashMap<Txid, Vec<Option<Txid>>> = {
-        let mut mempool_spenders: HashMap<(Txid, u32), Txid> = HashMap::new();
-        for item in &projection_txs {
-            for vin in &item.tx.input {
-                if !vin.previous_output.is_null() {
-                    mempool_spenders
-                        .insert((vin.previous_output.txid, vin.previous_output.vout), item.txid);
-                }
-            }
-        }
+        let mempool_spenders = get_mempool_block_spenders(template_index).unwrap_or_default();
         let mut dedup: Vec<Txid> = detail.txs.iter().map(|t| t.txid).collect();
         dedup.sort();
         dedup.dedup();
