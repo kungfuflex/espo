@@ -48,8 +48,8 @@ use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RunesProvider, SchemaRuneId};
 use crate::modules::tokendata::storage::TokenDataProvider;
 use crate::runtime::mempool::{
-    MempoolBlockTx, get_mempool_block_detail, get_mempool_block_ordered_transactions,
-    get_mempool_transactions,
+    MempoolBlockTx, MempoolTxFilter, get_mempool_block_detail,
+    get_mempool_block_ordered_transactions, get_mempool_transactions,
 };
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
@@ -147,6 +147,15 @@ impl TxFilter {
             Self::Action => "actions",
             Self::Alkane => "alkane",
             Self::Rune => "rune",
+        }
+    }
+
+    fn mempool_filter(self) -> MempoolTxFilter {
+        match self {
+            Self::All => MempoolTxFilter::All,
+            Self::Action => MempoolTxFilter::Action,
+            Self::Alkane => MempoolTxFilter::Alkane,
+            Self::Rune => MempoolTxFilter::Rune,
         }
     }
 }
@@ -1019,7 +1028,7 @@ pub async fn block_page(
                     div class="list" {
                         @for item in tx_items {
                             @let traces: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), None, None, true))
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), None, None, None, true))
                         }
                     }
                 }
@@ -1083,26 +1092,36 @@ pub async fn mempool_block_page(
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
-    let traces_only = q
-        .traces
-        .as_deref()
-        .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
-        .unwrap_or(true);
+    let runes_enabled = runes_enabled_from_global_config();
+    let requested_filter = if runes_enabled && q.txs.is_none() && q.traces.is_none() {
+        TxFilter::Action
+    } else {
+        TxFilter::from_query(q.txs.as_deref(), q.traces.as_deref())
+    };
+    let tx_filter =
+        if !runes_enabled && matches!(requested_filter, TxFilter::Rune | TxFilter::Action) {
+            TxFilter::Alkane
+        } else {
+            requested_filter
+        };
     let hide_diesel_mints = q
         .hide_diesel_mints
         .as_deref()
         .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
         .unwrap_or(false);
-    let runes_enabled = runes_enabled_from_global_config();
-    let traces_param = if traces_only { "1" } else { "0" };
+    let txs_param = tx_filter.query_value();
     let hide_diesel_param = if hide_diesel_mints { "1" } else { "0" };
     let display_index = display_index.max(1);
     let template_index = display_index - 1;
     let canonical_path = format!("/mempool-block/{display_index}");
 
-    let Some(detail) =
-        get_mempool_block_detail(template_index, page, limit, traces_only, hide_diesel_mints)
-    else {
+    let Some(detail) = get_mempool_block_detail(
+        template_index,
+        page,
+        limit,
+        tx_filter.mempool_filter(),
+        hide_diesel_mints,
+    ) else {
         return (
             StatusCode::NOT_FOUND,
             layout_with_meta(
@@ -1157,11 +1176,33 @@ pub async fn mempool_block_page(
         outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
     };
     let outspends_map: std::collections::HashMap<Txid, Vec<Option<Txid>>> = {
+        let mut mempool_spenders: HashMap<(Txid, u32), Txid> = HashMap::new();
+        for item in &projection_txs {
+            for vin in &item.tx.input {
+                if !vin.previous_output.is_null() {
+                    mempool_spenders
+                        .insert((vin.previous_output.txid, vin.previous_output.vout), item.txid);
+                }
+            }
+        }
         let mut dedup: Vec<Txid> = detail.txs.iter().map(|t| t.txid).collect();
         dedup.sort();
         dedup.dedup();
         let fetched = electrum_like.batch_transaction_get_outspends(&dedup).unwrap_or_default();
-        dedup.into_iter().zip(fetched.into_iter()).collect()
+        let mut map: HashMap<Txid, Vec<Option<Txid>>> =
+            dedup.iter().copied().zip(fetched.into_iter()).collect();
+        for item in &detail.txs {
+            let entry = map.entry(item.txid).or_default();
+            if entry.len() < item.tx.output.len() {
+                entry.resize(item.tx.output.len(), None);
+            }
+            for vout in 0..item.tx.output.len() {
+                if let Some(spender) = mempool_spenders.get(&(item.txid, vout as u32)).copied() {
+                    entry[vout] = Some(spender);
+                }
+            }
+        }
+        map
     };
     let outspends_fn = move |txid: &Txid| -> Vec<Option<Txid>> {
         outspends_map.get(txid).cloned().unwrap_or_default()
@@ -1223,6 +1264,57 @@ pub async fn mempool_block_page(
         cta: None,
         hero_class: None,
     });
+    let tx_filter_label = match tx_filter {
+        TxFilter::All => "All Txs",
+        TxFilter::Action => "All Actions",
+        TxFilter::Alkane => "Only Alkanes",
+        TxFilter::Rune => "Only Runes",
+    };
+    let mut tx_filter_dropdown_items = vec![
+        DropdownItem {
+            label: "All Txs".to_string(),
+            href: explorer_path(&format!(
+                "/mempool-block/{display_index}?page=1&limit={limit}&txs=all&hide_diesel_mints={hide_diesel_param}"
+            )),
+            icon: None,
+            selected: tx_filter == TxFilter::All,
+        },
+        DropdownItem {
+            label: "Only Alkanes".to_string(),
+            href: explorer_path(&format!(
+                "/mempool-block/{display_index}?page=1&limit={limit}&txs=alkane&hide_diesel_mints={hide_diesel_param}"
+            )),
+            icon: None,
+            selected: tx_filter == TxFilter::Alkane,
+        },
+    ];
+    if runes_enabled {
+        tx_filter_dropdown_items.insert(
+            1,
+            DropdownItem {
+                label: "All Actions".to_string(),
+                href: explorer_path(&format!(
+                    "/mempool-block/{display_index}?page=1&limit={limit}&txs=actions&hide_diesel_mints={hide_diesel_param}"
+                )),
+                icon: None,
+                selected: tx_filter == TxFilter::Action,
+            },
+        );
+        tx_filter_dropdown_items.push(DropdownItem {
+            label: "Only Runes".to_string(),
+            href: explorer_path(&format!(
+                "/mempool-block/{display_index}?page=1&limit={limit}&txs=rune&hide_diesel_mints={hide_diesel_param}"
+            )),
+            icon: None,
+            selected: tx_filter == TxFilter::Rune,
+        });
+    }
+    let tx_filter_dropdown = dropdown(DropdownProps {
+        label: Some(tx_filter_label.to_string()),
+        selected_icon: None,
+        items: tx_filter_dropdown_items,
+        aria_label: Some("Transaction filter".to_string()),
+    });
 
     layout_with_meta(
         &format!("Mempool Block #{display_index}"),
@@ -1236,26 +1328,38 @@ pub async fn mempool_block_page(
             (header_markup)
 
             div class="card" {
-                div class="row" {
+                div class="row tx-filter-row" {
                     h2 class="h2" { "Transactions" }
                     div class="trace-toggle" {
-                        div class="segmented-control" role="group" aria-label="Transaction filter" {
-                            a class=(if traces_only { "segment" } else { "segment active" })
-                                href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&traces=0&hide_diesel_mints={hide_diesel_param}"))) {
+                        div class="tx-filter-segments segmented-control" role="group" aria-label="Transaction filter" {
+                            a class=(if tx_filter == TxFilter::All { "segment active" } else { "segment" })
+                                href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&txs=all&hide_diesel_mints={hide_diesel_param}"))) {
                                 "All Txs"
                             }
-                            a class=(if traces_only { "segment active" } else { "segment" })
-                                href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&traces=1&hide_diesel_mints={hide_diesel_param}"))) {
+                            @if runes_enabled {
+                                a class=(if tx_filter == TxFilter::Action { "segment active" } else { "segment" })
+                                    href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&txs=actions&hide_diesel_mints={hide_diesel_param}"))) {
+                                    "All Actions"
+                                }
+                            }
+                            a class=(if tx_filter == TxFilter::Alkane { "segment active" } else { "segment" })
+                                href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&txs=alkane&hide_diesel_mints={hide_diesel_param}"))) {
                                 "Only Alkanes"
                             }
                             @if runes_enabled {
-                                span class="segment disabled" aria-disabled="true" { "Only Runes" }
+                                a class=(if tx_filter == TxFilter::Rune { "segment active" } else { "segment" })
+                                    href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&txs=rune&hide_diesel_mints={hide_diesel_param}"))) {
+                                    "Only Runes"
+                                }
                             }
+                        }
+                        div class="tx-filter-dropdown" {
+                            (tx_filter_dropdown)
                         }
                         form method="get" action=(explorer_path(&format!("/mempool-block/{display_index}"))) {
                             input type="hidden" name="limit" value=(limit);
                             input type="hidden" name="page" value="1";
-                            input type="hidden" name="traces" value=(traces_param);
+                            input type="hidden" name="txs" value=(txs_param);
                             input type="hidden" name="hide_diesel_mints" value=(hide_diesel_param);
                             label class="switch" {
                                 span class="switch-label" {
@@ -1277,10 +1381,14 @@ pub async fn mempool_block_page(
                 }
 
                 @if tx_total == 0 {
-                    @if traces_only && hide_diesel_mints {
-                        p class="muted" { "No non-Diesel Alkanes transactions are projected for this mempool block yet." }
-                    } @else if traces_only {
+                    @if hide_diesel_mints {
+                        p class="muted" { "No non-mint transactions match the current filters." }
+                    } @else if tx_filter == TxFilter::Alkane {
                         p class="muted" { "No Alkanes transactions are projected for this mempool block yet." }
+                    } @else if tx_filter == TxFilter::Rune {
+                        p class="muted" { "No Runes transactions are projected for this mempool block yet." }
+                    } @else if tx_filter == TxFilter::Action {
+                        p class="muted" { "No action transactions are projected for this mempool block yet." }
                     } @else {
                         p class="muted" { "No transactions projected for this mempool block yet." }
                     }
@@ -1295,21 +1403,22 @@ pub async fn mempool_block_page(
                                 tone: TxPillTone::Danger,
                             };
                             @let projected_balances = projected_balances_by_tx.get(&item.txid);
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(status_pill), Some(item.fee_rate), projected_balances, true))
+                            @let projected_rune_io = item.rune_io.as_ref();
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(status_pill), Some(item.fee_rate), projected_balances, projected_rune_io, true))
                         }
                     }
                 }
 
                 div class="pager" {
                     @if tx_has_prev {
-                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}"))) aria-label="First page" {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page=1&limit={limit}&txs={txs_param}&hide_diesel_mints={hide_diesel_param}"))) aria-label="First page" {
                             (icon_pager_first())
                         }
                     } @else {
                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                     }
                     @if tx_has_prev {
-                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page - 1))) aria-label="Previous page" {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&txs={txs_param}&hide_diesel_mints={hide_diesel_param}", page - 1))) aria-label="Previous page" {
                             (icon_pager_left())
                         }
                     } @else {
@@ -1325,14 +1434,14 @@ pub async fn mempool_block_page(
                         (format_with_commas(tx_total as u64))
                     }
                     @if tx_has_next {
-                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page + 1))) aria-label="Next page" {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={}&limit={limit}&txs={txs_param}&hide_diesel_mints={hide_diesel_param}", page + 1))) aria-label="Next page" {
                             (icon_pager_right())
                         }
                     } @else {
                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                     }
                     @if tx_has_next {
-                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={last_page}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}"))) aria-label="Last page" {
+                        a class="pill iconbtn" href=(explorer_path(&format!("/mempool-block/{display_index}?page={last_page}&limit={limit}&txs={txs_param}&hide_diesel_mints={hide_diesel_param}"))) aria-label="Last page" {
                             (icon_pager_last())
                         }
                     } @else {

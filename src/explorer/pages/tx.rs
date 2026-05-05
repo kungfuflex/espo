@@ -30,7 +30,7 @@ use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_outpoint_balances_with_spent,
 };
-use crate::runtime::mempool::pending_by_txid;
+use crate::runtime::mempool::{get_mempool_outspends, pending_by_txid};
 use crate::runtime::state_at::StateAt;
 
 fn format_with_commas(n: u64) -> String {
@@ -241,7 +241,17 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
             .unwrap_or_default()
     };
     let outspends_fn = |txid: &Txid| -> Vec<Option<Txid>> {
-        electrum_like.transaction_get_outspends(txid).unwrap_or_default()
+        let mut outspends = electrum_like.transaction_get_outspends(txid).unwrap_or_default();
+        let mempool_outspends = get_mempool_outspends(txid, outspends.len());
+        if outspends.len() < mempool_outspends.len() {
+            outspends.resize(mempool_outspends.len(), None);
+        }
+        for (idx, spender) in mempool_outspends.into_iter().enumerate() {
+            if spender.is_some() {
+                outspends[idx] = spender;
+            }
+        }
+        outspends
     };
     let (fee_sat, fee_rate) = fee_and_rate(&tx, &prev_map);
     let mempool_url = mempool_tx_url(state.network, &txid);
@@ -279,6 +289,11 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
     let traces_ref: Option<&[EspoTrace]> = traces_for_tx.as_ref().map(|v| v.as_slice());
     let tx_pill = if tx_height.is_none() {
         Some(TxPill { label: "Unconfirmed".to_string(), tone: TxPillTone::Danger })
+    } else {
+        None
+    };
+    let projected_rune_io = if tx_height.is_none() {
+        mempool_entry.as_ref().and_then(|entry| entry.rune_io.as_ref())
     } else {
         None
     };
@@ -361,7 +376,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
                 }
             }
             h2 class="h2" { "Inputs & Outputs" }
-            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, fee_rate, None, false))
+            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, fee_rate, None, projected_rune_io, false))
             (header_scripts())
         },
     )

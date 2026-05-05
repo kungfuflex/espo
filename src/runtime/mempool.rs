@@ -3,26 +3,36 @@ use crate::alkanes::trace::{
     prettyify_protobuf_trace_json,
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
-use crate::config::{get_bitcoind_rpc_client, get_config, get_espo_db, get_metashrew_rpc_url};
+use crate::config::{
+    get_bitcoind_rpc_client, get_config, get_espo_db, get_metashrew_rpc_url, get_network,
+};
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider};
 use crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch;
+use crate::modules::runes::main::runes_enabled_from_global_config;
+use crate::modules::runes::storage::{
+    OutpointRuneBalances, RuneBalance, RunesProvider, SchemaRuneId, TxRuneIo,
+};
+use crate::modules::runes::transfer::{
+    OutputRuneSheets, RuneSheet, RunestoneTransfer, TransferRules,
+};
 use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result};
 use bitcoin::block::Version as BlockVersion;
 use bitcoin::blockdata::block::Header;
+use bitcoin::blockdata::script::Instruction;
 use bitcoin::blockdata::transaction::Version as TxVersion;
 use bitcoin::consensus::Encodable;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{
     Address, Amount, Block, CompactTarget, Network, OutPoint, Sequence, Transaction, TxIn,
-    TxMerkleNode, TxOut, Txid, Witness,
+    TxMerkleNode, TxOut, Txid, Witness, opcodes,
 };
 use bitcoincore_rpc::RpcApi;
 use futures::{StreamExt, stream};
-use ordinals::{Artifact, Runestone};
+use ordinals::{Artifact, Edict, RuneId, Runestone};
 use prost::Message;
 use protorune_support::proto::protorune;
 use protorune_support::protostone::Protostone;
@@ -47,11 +57,14 @@ pub const MEMPOOL_MAX_TXS: usize = 50_000;
 pub const MEMPOOL_MIN_FEE_RATE_SATS_VBYTE: f64 = 0.5;
 /// --- End tunables ---
 
+const UNCOMMON_GOODS_RUNE_ID: SchemaRuneId = SchemaRuneId { block: 1, tx: 0 };
+
 #[derive(Clone, Debug)]
 pub struct MempoolEntry {
     pub txid: Txid,
     pub tx: Transaction,
     pub traces: Option<Vec<EspoTrace>>,
+    pub rune_io: Option<TxRuneIo>,
     pub first_seen: u64,
     pub position: Option<MempoolProjectedPosition>,
 }
@@ -85,6 +98,7 @@ pub struct MempoolTransactionStruct {
     pub protostones: Vec<Protostone>,
     pub fixed_trace: Option<Vec<EspoTrace>>,
     pub diesel_trace: Option<Vec<EspoTrace>>,
+    pub rune_io: Option<TxRuneIo>,
     pub first_seen: u64,
     pub fee_sat: u64,
     pub weight: u64,
@@ -94,6 +108,7 @@ pub struct MempoolTransactionStruct {
     pub spent_outpoints: Vec<OutPoint>,
     pub addresses: Vec<String>,
     pub is_diesel_mint: bool,
+    pub is_ug_mint: bool,
     pub template_index: Option<usize>,
     pub position: Option<MempoolProjectedPosition>,
     pub readiness: MempoolTxReadiness,
@@ -132,6 +147,7 @@ pub struct MempoolBlockTx {
     pub txid: Txid,
     pub tx: Transaction,
     pub traces: Option<Vec<EspoTrace>>,
+    pub rune_io: Option<TxRuneIo>,
     pub fee_sat: u64,
     pub vsize: u64,
     pub fee_rate: f64,
@@ -144,6 +160,14 @@ pub struct MempoolBlockDetail {
     pub template: MempoolBlockTemplate,
     pub tx_total: usize,
     pub txs: Vec<MempoolBlockTx>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MempoolTxFilter {
+    All,
+    Action,
+    Alkane,
+    Rune,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -357,6 +381,41 @@ fn protostones_for_tx(tx: &Transaction) -> Vec<Protostone> {
     }
 }
 
+fn tx_has_runestone_carrier(tx: &Transaction) -> bool {
+    tx.output.iter().any(|output| {
+        let mut instructions = output.script_pubkey.instructions();
+        matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_RETURN))))
+            && matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_PUSHNUM_13))))
+    })
+}
+
+fn is_uncommon_goods_mint_tx(tx: &Transaction) -> bool {
+    if !tx_has_runestone_carrier(tx) {
+        return false;
+    }
+    Runestone::decipher(tx)
+        .as_ref()
+        .and_then(|artifact| artifact.mint())
+        .map(|id| SchemaRuneId::from(id) == UNCOMMON_GOODS_RUNE_ID)
+        .unwrap_or(false)
+}
+
+fn rune_io_has_activity(io: &TxRuneIo) -> bool {
+    !io.inputs.is_empty()
+        || !io.outputs.is_empty()
+        || !io.burned.is_empty()
+        || !io.minted.is_empty()
+        || io.etched.is_some()
+}
+
+fn mempool_runes_provider() -> &'static RunesProvider {
+    static PROVIDER: OnceLock<RunesProvider> = OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        let mdb = Arc::new(Mdb::from_db(get_espo_db(), b"runes:"));
+        RunesProvider::new(mdb)
+    })
+}
+
 fn btc_to_sat(value: f64) -> u64 {
     if !value.is_finite() || value <= 0.0 {
         return 0;
@@ -478,6 +537,203 @@ fn input_alkane_balances_for_tx(tx: &Transaction) -> Vec<BalanceEntry> {
         .collect()
 }
 
+fn add_rune_balances_to_sheet(
+    entries: impl IntoIterator<Item = RuneBalance>,
+    sheet: &mut RuneSheet<SchemaRuneId>,
+) {
+    for balance in entries {
+        if balance.amount == 0 {
+            continue;
+        }
+        let amount = sheet.entry(balance.id).or_default();
+        *amount = amount.saturating_add(balance.amount);
+    }
+}
+
+fn rune_balances_from_sheet(sheet: &RuneSheet<SchemaRuneId>) -> Vec<RuneBalance> {
+    sheet
+        .iter()
+        .filter_map(|(id, amount)| {
+            (*amount > 0).then_some(RuneBalance { id: *id, amount: *amount })
+        })
+        .collect()
+}
+
+fn projected_rune_output_row(
+    tx: &Transaction,
+    vout: u32,
+    balances: Vec<RuneBalance>,
+    network: Network,
+) -> Option<OutpointRuneBalances> {
+    let output = tx.output.get(vout as usize)?;
+    Some(OutpointRuneBalances {
+        address: Address::from_script(output.script_pubkey.as_script(), network)
+            .ok()
+            .map(|address| address.to_string()),
+        script_pubkey: output.script_pubkey.to_bytes(),
+        balances,
+    })
+}
+
+fn mempool_rune_mint_amount(
+    provider: &RunesProvider,
+    id: SchemaRuneId,
+    height: u64,
+    tx_index: u32,
+    minted_counts: &HashMap<SchemaRuneId, u128>,
+) -> Option<u128> {
+    if id == UNCOMMON_GOODS_RUNE_ID {
+        return Some(1);
+    }
+
+    let entry = provider.get_rune(id).ok().flatten()?;
+    let local_mints = minted_counts.get(&id).copied().unwrap_or_default();
+    let cap = entry.terms.as_ref().and_then(|terms| terms.cap).unwrap_or_default();
+    if entry.mints.saturating_add(local_mints) >= cap {
+        return None;
+    }
+    entry.mintable(height, tx_index)
+}
+
+fn project_rune_io_for_block(
+    txids: &[Txid],
+    txs: &HashMap<Txid, MempoolTransactionStruct>,
+    height: u64,
+) -> HashMap<Txid, TxRuneIo> {
+    let provider = mempool_runes_provider();
+    let rules = TransferRules::default();
+    let network = get_network();
+    let mut projected_outpoints: HashMap<(Txid, u32), OutpointRuneBalances> = HashMap::new();
+    let mut minted_counts: HashMap<SchemaRuneId, u128> = HashMap::new();
+    let mut out = HashMap::new();
+
+    for (tx_index, txid) in txids.iter().enumerate() {
+        let Some(tx) = txs.get(txid).and_then(|entry| entry.tx.as_ref()) else {
+            continue;
+        };
+        let artifact = tx_has_runestone_carrier(tx).then(|| Runestone::decipher(tx)).flatten();
+        let mut io = TxRuneIo::default();
+        let mut unallocated: RuneSheet<SchemaRuneId> = BTreeMap::new();
+
+        for (input_idx, input) in tx.input.iter().enumerate() {
+            if input.previous_output.is_null() {
+                continue;
+            }
+            let prev = input.previous_output;
+            let row = projected_outpoints
+                .remove(&(prev.txid, prev.vout))
+                .or_else(|| provider.get_outpoint_balances(&prev.txid, prev.vout).ok().flatten());
+            let Some(row) = row else {
+                continue;
+            };
+            io.inputs.insert(input_idx as u32, row.balances.clone());
+            add_rune_balances_to_sheet(row.balances, &mut unallocated);
+        }
+
+        if artifact.is_none() && unallocated.is_empty() {
+            continue;
+        }
+
+        let tx_index_u32 = tx_index.saturating_add(1).min(u32::MAX as usize) as u32;
+        let etched_id = match artifact.as_ref() {
+            Some(Artifact::Runestone(runestone)) if runestone.etching.is_some() => {
+                let id = SchemaRuneId { block: height, tx: tx_index_u32 };
+                io.etched = Some(id);
+                if let Some(premine) =
+                    runestone.etching.as_ref().and_then(|etching| etching.premine)
+                {
+                    *unallocated.entry(id).or_default() =
+                        unallocated.get(&id).copied().unwrap_or(0).saturating_add(premine);
+                }
+                Some(id)
+            }
+            Some(Artifact::Cenotaph(cenotaph)) if cenotaph.etching.is_some() => {
+                let id = SchemaRuneId { block: height, tx: tx_index_u32 };
+                io.etched = Some(id);
+                Some(id)
+            }
+            _ => None,
+        };
+
+        if let Some(artifact) = artifact.as_ref() {
+            if let Some(id) = artifact.mint() {
+                let id = SchemaRuneId::from(id);
+                if let Some(amount) =
+                    mempool_rune_mint_amount(provider, id, height, tx_index_u32, &minted_counts)
+                {
+                    *unallocated.entry(id).or_default() =
+                        unallocated.get(&id).copied().unwrap_or(0).saturating_add(amount);
+                    *minted_counts.entry(id).or_default() =
+                        minted_counts.get(&id).copied().unwrap_or(0).saturating_add(1);
+                    io.minted.push(RuneBalance { id, amount });
+                }
+            }
+        }
+
+        let mut allocated: OutputRuneSheets<SchemaRuneId> = BTreeMap::new();
+        if let Some(Artifact::Runestone(runestone)) = artifact.as_ref() {
+            for Edict { id, amount, output } in runestone.edicts.iter().copied() {
+                let resolved_id = if id == RuneId::default() {
+                    let Some(etched_id) = etched_id else {
+                        continue;
+                    };
+                    etched_id
+                } else {
+                    id.into()
+                };
+                rules.apply_edict(
+                    tx,
+                    &mut unallocated,
+                    &mut allocated,
+                    resolved_id,
+                    amount,
+                    output,
+                );
+            }
+        }
+
+        let burned = if matches!(artifact, Some(Artifact::Cenotaph(_))) {
+            unallocated
+        } else {
+            let pointer = match artifact.as_ref() {
+                Some(Artifact::Runestone(runestone)) => runestone.pointer,
+                _ => None,
+            };
+            rules.route_leftovers(tx, unallocated, &mut allocated, pointer)
+        };
+        io.burned = rune_balances_from_sheet(&burned);
+
+        for (vout, sheet) in allocated {
+            if sheet.is_empty() {
+                continue;
+            }
+            let balances = rune_balances_from_sheet(&sheet);
+            if balances.is_empty() {
+                continue;
+            }
+            if tx
+                .output
+                .get(vout as usize)
+                .map(|output| output.script_pubkey.is_op_return())
+                .unwrap_or(false)
+            {
+                io.burned.extend(balances);
+                continue;
+            }
+            if let Some(row) = projected_rune_output_row(tx, vout, balances.clone(), network) {
+                projected_outpoints.insert((*txid, vout), row);
+                io.outputs.insert(vout, balances);
+            }
+        }
+
+        if rune_io_has_activity(&io) {
+            out.insert(*txid, io);
+        }
+    }
+
+    out
+}
+
 fn diesel_trace_for_tx(
     txid: &Txid,
     tx: &Transaction,
@@ -534,6 +790,14 @@ fn diesel_trace_for_tx(
 
 fn combined_traces(entry: &MempoolTransactionStruct) -> Option<Vec<EspoTrace>> {
     entry.diesel_trace.clone().or_else(|| entry.fixed_trace.clone())
+}
+
+fn entry_has_alkane_action(entry: &MempoolTransactionStruct) -> bool {
+    !entry.protostones.is_empty()
+}
+
+fn entry_has_rune_action(entry: &MempoolTransactionStruct) -> bool {
+    entry.rune_io.as_ref().map(rune_io_has_activity).unwrap_or(false)
 }
 
 fn derive_readiness(entry: &MempoolTransactionStruct) -> MempoolTxReadiness {
@@ -631,11 +895,30 @@ pub fn get_mempool_transactions(txids: &[Txid]) -> HashMap<Txid, Transaction> {
         .collect()
 }
 
+pub fn get_mempool_outspends(txid: &Txid, output_count: usize) -> Vec<Option<Txid>> {
+    let mut out = vec![None; output_count];
+    let Ok(state) = mempool_state().read() else {
+        return out;
+    };
+    for entry in state.txs.values() {
+        for input in &entry.spent_outpoints {
+            if input.txid == *txid {
+                let idx = input.vout as usize;
+                if idx >= out.len() {
+                    out.resize(idx + 1, None);
+                }
+                out[idx] = Some(entry.txid);
+            }
+        }
+    }
+    out
+}
+
 pub fn get_mempool_block_detail(
     index: usize,
     page: usize,
     limit: usize,
-    traces_only: bool,
+    filter: MempoolTxFilter,
     hide_diesel_mints: bool,
 ) -> Option<MempoolBlockDetail> {
     let Ok(state) = mempool_state().read() else {
@@ -652,13 +935,17 @@ pub fn get_mempool_block_detail(
         let Some(entry) = state.txs.get(txid) else {
             return false;
         };
-        if traces_only && entry.protostones.is_empty() {
+        if hide_diesel_mints && (entry.is_diesel_mint || entry.is_ug_mint) {
             return false;
         }
-        if hide_diesel_mints && entry.is_diesel_mint {
-            return false;
+        match filter {
+            MempoolTxFilter::All => true,
+            MempoolTxFilter::Action => {
+                entry_has_alkane_action(entry) || entry_has_rune_action(entry)
+            }
+            MempoolTxFilter::Alkane => entry_has_alkane_action(entry),
+            MempoolTxFilter::Rune => entry_has_rune_action(entry),
         }
-        true
     });
     ordered.sort_by(|a, b| {
         let aa = state.txs.get(a);
@@ -694,6 +981,7 @@ pub fn get_mempool_block_detail(
                     txid: *txid,
                     tx,
                     traces: combined_traces(entry),
+                    rune_io: entry.rune_io.clone(),
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
@@ -729,6 +1017,7 @@ pub fn get_mempool_block_ordered_transactions(index: usize) -> Option<Vec<Mempoo
                     txid: *txid,
                     tx,
                     traces: combined_traces(entry),
+                    rune_io: entry.rune_io.clone(),
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
@@ -1002,6 +1291,7 @@ fn build_memory_entry(
 ) -> MempoolTransactionStruct {
     let protostones = protostones_for_tx(&tx);
     let is_diesel_mint = is_diesel_mint_protostone(&protostones);
+    let is_ug_mint = is_uncommon_goods_mint_tx(&tx);
     let readiness = if protostones.is_empty() {
         MempoolTxReadiness::Hydrated
     } else {
@@ -1036,6 +1326,7 @@ fn build_memory_entry(
         protostones,
         fixed_trace: None,
         diesel_trace: None,
+        rune_io: None,
         first_seen,
         fee_sat,
         weight,
@@ -1045,6 +1336,7 @@ fn build_memory_entry(
         spent_outpoints,
         addresses,
         is_diesel_mint,
+        is_ug_mint,
         template_index: None,
         position: None,
         readiness,
@@ -1073,6 +1365,7 @@ fn build_memory_metadata_entry(
         protostones: Vec::new(),
         fixed_trace: None,
         diesel_trace: None,
+        rune_io: None,
         first_seen,
         fee_sat,
         weight,
@@ -1082,6 +1375,7 @@ fn build_memory_metadata_entry(
         spent_outpoints: Vec::new(),
         addresses: Vec::new(),
         is_diesel_mint: false,
+        is_ug_mint: false,
         template_index: None,
         position: None,
         readiness: MempoolTxReadiness::MetadataOnly,
@@ -1136,6 +1430,8 @@ fn upsert_memory_entry(entry: MempoolTransactionStruct) {
                 existing.protostones = entry.protostones;
                 existing.addresses = entry.addresses;
                 existing.is_diesel_mint = entry.is_diesel_mint;
+                existing.is_ug_mint = entry.is_ug_mint;
+                existing.rune_io = None;
                 existing.readiness = derive_readiness(existing);
                 should_enqueue = !existing.protostones.is_empty()
                     && !existing.is_diesel_mint
@@ -1609,6 +1905,7 @@ fn recalculate_memory_templates() {
                         protostones: Vec::new(),
                         fixed_trace: None,
                         diesel_trace: None,
+                        rune_io: None,
                         first_seen: tx.first_seen,
                         fee_sat: tx.fee_sat,
                         weight: tx.weight,
@@ -1618,6 +1915,7 @@ fn recalculate_memory_templates() {
                         spent_outpoints: tx.spent_outpoints.clone(),
                         addresses: Vec::new(),
                         is_diesel_mint: tx.is_diesel_mint,
+                        is_ug_mint: tx.is_ug_mint,
                         template_index: None,
                         position: None,
                         readiness: tx.readiness.clone(),
@@ -1634,6 +1932,7 @@ fn recalculate_memory_templates() {
     for tx in state.txs.values_mut() {
         tx.template_index = None;
         tx.diesel_trace = None;
+        tx.rune_io = None;
         tx.position = None;
     }
 
@@ -1660,6 +1959,14 @@ fn recalculate_memory_templates() {
                 }
             }
         }
+        if runes_enabled_from_global_config() {
+            let rune_ios = project_rune_io_for_block(txids, &state.txs, next_height + index as u64);
+            for (txid, io) in rune_ios {
+                if let Some(tx) = state.txs.get_mut(&txid) {
+                    tx.rune_io = Some(io);
+                }
+            }
+        }
 
         let mut weight = 0u64;
         let mut vsize = 0u64;
@@ -1675,7 +1982,7 @@ fn recalculate_memory_templates() {
                 weight = weight.saturating_add(tx.weight);
                 vsize = vsize.saturating_add(tx.vsize);
                 fees = fees.saturating_add(tx.fee_sat);
-                if !tx.protostones.is_empty() {
+                if entry_has_alkane_action(tx) || entry_has_rune_action(tx) {
                     trace_count = trace_count.saturating_add(1);
                 }
                 tx.readiness = derive_readiness(tx);
@@ -2132,6 +2439,7 @@ pub fn get_tx_from_mempool(txid: &Txid) -> Option<MempoolEntry> {
         txid: *txid,
         tx,
         traces: combined_traces(entry),
+        rune_io: entry.rune_io.clone(),
         first_seen: entry.first_seen,
         position: entry.position.clone(),
     })
@@ -2153,6 +2461,7 @@ pub fn pending_for_address(addr: &str) -> Vec<MempoolEntry> {
                 txid: entry.txid,
                 tx,
                 traces: combined_traces(entry),
+                rune_io: entry.rune_io.clone(),
                 first_seen: entry.first_seen,
                 position: entry.position.clone(),
             })

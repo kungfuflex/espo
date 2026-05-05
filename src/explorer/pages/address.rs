@@ -42,7 +42,7 @@ use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_rows_batch,
 };
 use crate::modules::runes::main::runes_enabled_from_global_config;
-use crate::modules::runes::storage::RunesProvider;
+use crate::modules::runes::storage::{RunesProvider, TxRuneIo};
 use crate::runtime::mempool::{MempoolEntry, pending_by_txid, pending_for_address};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
@@ -95,6 +95,7 @@ struct AddressTxRender {
     txid: Txid,
     tx: Transaction,
     traces: Option<Vec<EspoTrace>>,
+    rune_io: Option<TxRuneIo>,
     confirmations: Option<u64>,
     is_mempool: bool,
 }
@@ -391,10 +392,25 @@ pub async fn address_page(
             TxFilter::All => true,
             TxFilter::Action => {
                 e.traces.as_ref().map_or(false, |t| !t.is_empty())
+                    || e.rune_io.as_ref().map_or(false, |io| {
+                        !io.inputs.is_empty()
+                            || !io.outputs.is_empty()
+                            || !io.burned.is_empty()
+                            || !io.minted.is_empty()
+                            || io.etched.is_some()
+                    })
                     || ordinals::Runestone::decipher(&e.tx).is_some()
             }
             TxFilter::Alkane => e.traces.as_ref().map_or(false, |t| !t.is_empty()),
-            TxFilter::Rune => ordinals::Runestone::decipher(&e.tx).is_some(),
+            TxFilter::Rune => {
+                e.rune_io.as_ref().map_or(false, |io| {
+                    !io.inputs.is_empty()
+                        || !io.outputs.is_empty()
+                        || !io.burned.is_empty()
+                        || !io.minted.is_empty()
+                        || io.etched.is_some()
+                }) || ordinals::Runestone::decipher(&e.tx).is_some()
+            }
         })
         .collect();
     let pending_total = pending_filtered.len();
@@ -423,6 +439,7 @@ pub async fn address_page(
             txid: entry.txid,
             tx: entry.tx.clone(),
             traces: entry.traces.clone(),
+            rune_io: entry.rune_io.clone(),
             confirmations: None,
             is_mempool: true,
         });
@@ -489,6 +506,7 @@ pub async fn address_page(
                     txid: *txid,
                     tx,
                     traces,
+                    rune_io: None,
                     confirmations,
                     is_mempool: false,
                 });
@@ -589,6 +607,7 @@ pub async fn address_page(
                     txid: *txid,
                     tx,
                     traces,
+                    rune_io: None,
                     confirmations,
                     is_mempool: false,
                 });
@@ -678,6 +697,7 @@ pub async fn address_page(
                     txid: *txid,
                     tx,
                     traces,
+                    rune_io: None,
                     confirmations,
                     is_mempool: false,
                 });
@@ -775,6 +795,7 @@ pub async fn address_page(
                                 txid: entry.txid,
                                 tx,
                                 traces,
+                                rune_io: None,
                                 confirmations,
                                 is_mempool: false,
                             });
@@ -1329,7 +1350,8 @@ pub async fn address_page(
                             } else {
                                 None
                             };
-                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, None, true))
+                            @let projected_rune_io = item.rune_io.as_ref();
+                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, None, projected_rune_io, true))
                         }
                     }
 

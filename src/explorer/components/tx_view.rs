@@ -938,13 +938,16 @@ pub fn render_tx(
     pill: Option<TxPill>,
     fee_rate_override: Option<f64>,
     projected_out_balances_override: Option<&HashMap<u32, Vec<BalanceEntry>>>,
+    projected_rune_io_override: Option<&TxRuneIo>,
     show_tx_title: bool,
 ) -> Markup {
     let mut alkane_meta_cache: AlkaneMetaCache = HashMap::new();
     let mut alkane_impl_cache: AlkaneImplCache = HashMap::new();
     let runes_provider =
         RunesProvider::new(Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"runes:")));
-    let tx_rune_io = runes_provider.get_tx_io(txid).ok().flatten();
+    let tx_rune_io = projected_rune_io_override
+        .cloned()
+        .or_else(|| runes_provider.get_tx_io(txid).ok().flatten());
     let vins_markup = render_vins(
         tx,
         network,
