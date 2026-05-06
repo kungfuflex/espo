@@ -1,7 +1,7 @@
 use crate::modules::ammdata::config::{DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE};
 use crate::modules::ammdata::price_feeds::{
-    PriceFeed, UniswapPriceFeed, get_historical_btc_usd_price,
+    EspoPricerPriceFeed, PriceFeed, get_historical_btc_usd_price,
 };
 use crate::modules::ammdata::schemas::{
     SchemaCandleV1, SchemaCanonicalPoolEntry, SchemaFullCandleV1, SchemaTokenMetricsV1, Timeframe,
@@ -240,7 +240,19 @@ pub fn derive_token_data(
     // ---------- btc/usd price ----------
     if state.has_trades {
         let mut price: Option<u128> = None;
-        if use_historical_backfill {
+        match EspoPricerPriceFeed::from_global_config() {
+            Ok(feed) => match feed.get_bitcoin_price_usd_at_block_height(height as u64) {
+                Ok(v) => price = Some(v),
+                Err(e) => {
+                    eprintln!("[AMMDATA] btc/usd espo pricer failed at height {height}: {e:?}");
+                }
+            },
+            Err(e) => {
+                eprintln!("[AMMDATA] btc/usd espo pricer init failed at height {height}: {e:?}")
+            }
+        }
+
+        if price.is_none() && use_historical_backfill {
             match get_historical_btc_usd_price(height as u64) {
                 Ok(Some(v)) => price = Some(v),
                 Ok(None) => {}
@@ -250,19 +262,6 @@ pub fn derive_token_data(
                     );
                 }
             }
-        }
-        if price.is_none() {
-            match UniswapPriceFeed::from_global_config() {
-                Ok(feed) => match feed.get_bitcoin_price_usd_at_block_height(height as u64) {
-                    Ok(v) => price = Some(v),
-                    Err(e) => {
-                        eprintln!("[AMMDATA] btc/usd price_feed failed at height {height}: {e:?}");
-                    }
-                },
-                Err(e) => {
-                    eprintln!("[AMMDATA] btc/usd price_feed init failed at height {height}: {e:?}")
-                }
-            };
         }
 
         if price.is_none() {

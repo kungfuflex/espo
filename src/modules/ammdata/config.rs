@@ -24,8 +24,7 @@ pub struct DerivedLiquidityConfig {
 
 #[derive(Clone, Debug)]
 pub struct AmmDataConfig {
-    pub eth_rpc: String,
-    pub eth_call_throttle_ms: u64,
+    pub espo_pricer_host: String,
     pub use_historical_backfill: bool,
     pub pre_ammdata_btc_usd_price: u128,
     pub search_index_enabled: bool,
@@ -38,33 +37,20 @@ pub struct AmmDataConfig {
 
 impl AmmDataConfig {
     pub fn spec() -> &'static str {
-        "{ \"eth_rpc\": \"<url>\", \"eth_call_throttle\": <ms>, \"use_historical_backfill\": <bool=true>, \"pre_ammdata_btc_usd_price\": <86500 or \"86500.12\">, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
+        "{ \"espo_pricer_host\": \"http://127.0.0.1:6901\", \"use_historical_backfill\": <bool=true>, \"pre_ammdata_btc_usd_price\": <86500 or \"86500.12\">, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
         let obj = value.as_object().ok_or_else(|| {
             anyhow!("ammdata config must be an object; expected: {}", Self::spec())
         })?;
-        let eth_rpc_val = obj
-            .get("eth_rpc")
-            .ok_or_else(|| anyhow!("ammdata.eth_rpc missing; expected: {}", Self::spec()))?;
-        let eth_call_throttle_val = obj.get("eth_call_throttle").ok_or_else(|| {
-            anyhow!("ammdata.eth_call_throttle missing; expected: {}", Self::spec())
+        let espo_pricer_host_val = obj.get("espo_pricer_host").ok_or_else(|| {
+            anyhow!("ammdata.espo_pricer_host missing; expected: {}", Self::spec())
         })?;
-        let eth_rpc = eth_rpc_val
-            .as_str()
-            .ok_or_else(|| anyhow!("ammdata.eth_rpc must be a string; expected: {}", Self::spec()))?
-            .trim()
-            .to_string();
-        if eth_rpc.is_empty() {
-            anyhow::bail!("ammdata.eth_rpc must be set; expected: {}", Self::spec());
-        }
-        let eth_call_throttle_ms = eth_call_throttle_val.as_u64().ok_or_else(|| {
-            anyhow!(
-                "ammdata.eth_call_throttle must be a non-negative integer; expected: {}",
-                Self::spec()
-            )
+        let espo_pricer_host_raw = espo_pricer_host_val.as_str().ok_or_else(|| {
+            anyhow!("ammdata.espo_pricer_host must be a string; expected: {}", Self::spec())
         })?;
+        let espo_pricer_host = normalize_espo_pricer_host(espo_pricer_host_raw)?;
         let use_historical_backfill =
             obj.get("use_historical_backfill").and_then(|v| v.as_bool()).unwrap_or(true);
         let pre_ammdata_btc_usd_price = obj
@@ -161,18 +147,8 @@ impl AmmDataConfig {
             }
         };
 
-        let parsed = reqwest::Url::parse(&eth_rpc)
-            .map_err(|e| anyhow!("ammdata.eth_rpc must be an absolute URL (http/https): {e}"))?;
-        if parsed.scheme() != "http" && parsed.scheme() != "https" {
-            anyhow::bail!(
-                "ammdata.eth_rpc must be an http/https URL; got scheme '{}'",
-                parsed.scheme()
-            );
-        }
-
         Ok(Self {
-            eth_rpc,
-            eth_call_throttle_ms,
+            espo_pricer_host,
             use_historical_backfill,
             pre_ammdata_btc_usd_price,
             search_index_enabled,
@@ -194,6 +170,25 @@ impl AmmDataConfig {
             })?;
         Self::from_value(value)
     }
+}
+
+fn normalize_espo_pricer_host(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("ammdata.espo_pricer_host must be set; expected: {}", AmmDataConfig::spec());
+    }
+    let with_scheme =
+        if trimmed.contains("://") { trimmed.to_string() } else { format!("http://{trimmed}") };
+    let parsed = reqwest::Url::parse(&with_scheme).map_err(|e| {
+        anyhow!("ammdata.espo_pricer_host must be an absolute URL or host:port: {e}")
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        anyhow::bail!(
+            "ammdata.espo_pricer_host must be an http/https URL; got scheme '{}'",
+            parsed.scheme()
+        );
+    }
+    Ok(with_scheme)
 }
 
 fn parse_alkane_id_str(raw: &str) -> Option<SchemaAlkaneId> {
