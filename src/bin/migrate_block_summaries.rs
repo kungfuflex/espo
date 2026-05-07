@@ -143,6 +143,12 @@ fn main() -> Result<()> {
             }
         };
 
+        let trace_count = old_summary.trace_count;
+        let interaction_count = if old_summary.interaction_count > 0 {
+            old_summary.interaction_count
+        } else {
+            trace_count
+        };
         let tx_count = if old_summary.tx_count > 0 {
             old_summary.tx_count
         } else {
@@ -151,6 +157,7 @@ fn main() -> Result<()> {
                 .map(|hdr| hdr.n_tx as u32)
                 .unwrap_or(0)
         };
+        let pool = old_summary.pool;
         let header = if old_summary.header.is_empty() {
             rpc.get_block_header(&blockhash)
                 .map(|hdr| {
@@ -172,14 +179,14 @@ fn main() -> Result<()> {
         let new_summary = BlockSummary {
             height,
             blockhash: blockhash.to_byte_array(),
-            trace_count: old_summary.trace_count,
-            interaction_count: old_summary.trace_count,
+            trace_count,
+            interaction_count,
             tx_count,
             header,
             fee_avg: fee_summary.avg,
             fee_median: fee_summary.median,
             fee_range: fee_summary.range.to_vec(),
-            pool: None,
+            pool,
         };
 
         if let Err(err) = provider.put_block_summary_indexes(&new_summary) {

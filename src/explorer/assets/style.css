@@ -244,11 +244,18 @@ a:hover {
   display: flex;
   align-items: center;
   gap: 10px;
+  width: 100%;
   padding: 8px 10px;
   border-radius: 6px;
+  border: 0;
+  background: transparent;
   color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
   font-weight: 600;
   text-decoration: none;
+  text-align: left;
+  cursor: pointer;
 }
 .dropdown-item:hover {
   background: var(--panel2);
@@ -256,6 +263,9 @@ a:hover {
 }
 .dropdown-item.selected {
   background: var(--panel3);
+}
+.dropdown-item:not(.selected) .dropdown-check-slot {
+  visibility: hidden;
 }
 .dropdown-icon {
   width: 20px;
@@ -537,6 +547,36 @@ a:hover {
 }
 .order-control .muted {
   font-weight: 600;
+}
+.holders-export-form {
+  margin: 0;
+}
+.holders-export-frame {
+  display: none;
+}
+.holders-export-button {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: cubic-bezier(0, 0, 0, 1) 600ms;
+  font-size: 15px;
+  font-family: var(--sans);
+  background: var(--link-dark);
+  font-weight: 600;
+  padding: 8px 12px;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  text-decoration: none !important;
+}
+.holders-export-button:hover,
+.holders-export-button:focus {
+  transition: none;
+  background-color: var(--link-dark2);
+  color: #fff;
+  text-decoration: none !important;
 }
 .tx-page-id {
   display: block;
@@ -2103,9 +2143,14 @@ a:hover {
   background: rgba(31, 34, 40, 0.3);
 }
 .address-balance-chart-spinner {
+  display: inline-block;
   width: 22px;
   height: 22px;
-  border-width: 3px;
+  border-radius: 999px;
+  border: 3px solid rgba(255, 255, 255, 0.14);
+  border-top-color: var(--accent);
+  animation: tx-wait-spin 0.85s linear infinite;
+  flex: 0 0 auto;
 }
 .address-balance-chart-loading[data-spinning="0"]
   .address-balance-chart-spinner {
@@ -2852,6 +2897,19 @@ button:hover {
 }
 .trace-status.failure {
   color: var(--danger);
+}
+.trace-status.pending {
+  color: var(--muted);
+  font-weight: 500;
+}
+.trace-status-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  border: 2px solid rgba(148, 163, 184, 0.28);
+  border-top-color: var(--muted);
+  animation: tx-wait-spin 0.85s linear infinite;
+  flex: 0 0 auto;
 }
 .trace-status-text {
   line-height: 1.4;

@@ -638,8 +638,16 @@ fn navigation_progress_script() -> Markup {
     if (shouldHandleLink(event, link)) start();
   });
 
+  const shouldHandleForm = (event, form) => {
+    if (!form || event.defaultPrevented) return false;
+    if (form.hasAttribute('data-download-form')) return false;
+    if (form.target && form.target.toLowerCase() !== '_self') return false;
+    return true;
+  };
+
   document.addEventListener('submit', (event) => {
-    if (!event.defaultPrevented) start();
+    const form = event.target && event.target.closest ? event.target.closest('form') : event.target;
+    if (shouldHandleForm(event, form)) start();
   });
 
   window.addEventListener('beforeunload', start);
@@ -992,10 +1000,28 @@ fn dropdown_scripts() -> Markup {
     closeAll();
   }, { passive: true });
   document.addEventListener('click', (event) => {
-    const item = event.target.closest && event.target.closest('[data-dropdown] a');
-    if (item) {
-      closeAll();
+    const item = event.target.closest && event.target.closest('[data-dropdown] a, [data-dropdown] button[data-dropdown-value]');
+    if (!item) return;
+    if (item.matches && item.matches('button[data-dropdown-value]')) {
+      event.preventDefault();
+      const dropdown = item.closest('[data-dropdown]');
+      const form = item.closest('form');
+      const inputName = item.getAttribute('data-dropdown-input') || '';
+      const value = item.getAttribute('data-dropdown-value') || '';
+      if (form && inputName) {
+        const input = Array.from(form.querySelectorAll('input')).find((node) => node.name === inputName);
+        if (input) input.value = value;
+      }
+      if (dropdown) {
+        const selectedLabel = item.getAttribute('data-dropdown-label') || item.textContent.trim();
+        const triggerLabel = dropdown.querySelector('[data-dropdown-selected-label]');
+        if (triggerLabel) triggerLabel.textContent = selectedLabel;
+        dropdown.querySelectorAll('button[data-dropdown-value]').forEach((node) => {
+          node.classList.toggle('selected', node === item);
+        });
+      }
     }
+    closeAll();
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {

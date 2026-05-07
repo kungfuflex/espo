@@ -1520,7 +1520,7 @@ pub async fn address_page(
                             } else {
                                 None
                             };
-                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, projected_balances, projected_rune_io, true))
+                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, projected_balances, projected_rune_io, true, false))
                         }
                     }
 

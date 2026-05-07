@@ -1029,7 +1029,7 @@ pub async fn block_page(
                     div class="list" {
                         @for item in tx_items {
                             @let traces: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), None, None, None, true))
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), None, None, None, true, false))
                         }
                     }
                 }
@@ -1400,7 +1400,7 @@ pub async fn mempool_block_page(
                             };
                             @let projected_balances = projected_balances_by_tx.get(&item.txid);
                             @let projected_rune_io = item.rune_io.as_ref();
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(status_pill), Some(item.fee_rate), projected_balances, projected_rune_io, true))
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(status_pill), Some(item.fee_rate), projected_balances, projected_rune_io, true, item.defer_alkane_trace_status))
                         }
                     }
                 }

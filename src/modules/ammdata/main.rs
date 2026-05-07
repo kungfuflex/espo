@@ -10,7 +10,8 @@ use crate::config::{debug_enabled, get_espo_db, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::{AmmDataConfig, DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
-    AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block, canonical_quotes,
+    AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block,
+    canonical_quotes_at_height,
 };
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
@@ -692,7 +693,7 @@ impl EspoModule for AmmData {
         debug::log_elapsed(module, "load_snapshot", timer);
 
         let network = get_network();
-        let canonical_quotes_list = canonical_quotes(network);
+        let canonical_quotes_list = canonical_quotes_at_height(network, height);
         let mut canonical_quote_units: HashMap<SchemaAlkaneId, CanonicalQuoteUnit> = HashMap::new();
         for cq in canonical_quotes_list.iter() {
             canonical_quote_units.insert(cq.id, cq.unit);

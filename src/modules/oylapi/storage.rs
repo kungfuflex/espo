@@ -2,7 +2,7 @@ use crate::config::{debug_enabled, get_config, get_electrum_like, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{
-    AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, canonical_quotes,
+    AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, canonical_quotes_at_height,
 };
 use crate::modules::ammdata::schemas::{
     ActivityKind, SchemaActivityV1, SchemaMarketDefs, SchemaPoolCreationInfoV1, SchemaPoolSnapshot,
@@ -12,9 +12,9 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, AmmHistoryEntry, GetActivityEntryParams, GetAddressPoolBurnsPageParams,
     GetAddressPoolCreationsPageParams, GetAddressPoolMintsPageParams,
     GetAddressPoolSwapsPageParams, GetAddressTokenSwapsPageParams, GetCanonicalPoolPricesParams,
-    GetFactoryPoolsParams, GetLatestBtcUsdPriceParams, GetLatestTokenUsdCloseParams,
-    GetListEntriesDescParams, GetPoolActivityEntriesParams, GetPoolCreationInfoParams,
-    GetPoolCreationsPageParams, GetPoolDefsParams, GetPoolFactoryParams,
+    GetFactoryPoolsParams, GetIndexHeightParams, GetLatestBtcUsdPriceParams,
+    GetLatestTokenUsdCloseParams, GetListEntriesDescParams, GetPoolActivityEntriesParams,
+    GetPoolCreationInfoParams, GetPoolCreationsPageParams, GetPoolDefsParams, GetPoolFactoryParams,
     GetPoolIdsByNamePrefixParams, GetPoolLpSupplyLatestParams, GetPoolMetricsParams,
     GetPoolMetricsV2Params, GetTokenDerivedMetricsByIdParams,
     GetTokenDerivedMetricsIndexCountParams, GetTokenDerivedMetricsIndexPageParams,
@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 
@@ -114,6 +114,55 @@ pub struct OylApiState {
     pub ammdata: Arc<AmmDataProvider>,
     pub subfrost: Arc<SubfrostProvider>,
     pub http_client: Client,
+    pub btc_usd_price_cache: Arc<BtcUsdPriceCache>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BtcUsdPriceCacheEntry {
+    pub tip_height: u32,
+    pub price_height: u64,
+    pub price: u128,
+}
+
+#[derive(Debug, Default)]
+pub struct BtcUsdPriceCache {
+    inner: RwLock<Option<BtcUsdPriceCacheEntry>>,
+}
+
+impl BtcUsdPriceCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self) -> Result<Option<BtcUsdPriceCacheEntry>> {
+        self.inner
+            .read()
+            .map(|guard| *guard)
+            .map_err(|_| anyhow!("btc/usd price cache lock poisoned"))
+    }
+
+    fn set(&self, entry: Option<BtcUsdPriceCacheEntry>) -> Result<()> {
+        *self.inner.write().map_err(|_| anyhow!("btc/usd price cache lock poisoned"))? = entry;
+        Ok(())
+    }
+}
+
+pub fn refresh_btc_usd_price_cache(
+    ammdata: &AmmDataProvider,
+    cache: &BtcUsdPriceCache,
+) -> Result<Option<BtcUsdPriceCacheEntry>> {
+    let Some(tip_height) = ammdata
+        .get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })?
+        .height
+    else {
+        cache.set(None)?;
+        return Ok(None);
+    };
+    let entry = ammdata
+        .get_btc_usd_price_entry_at_or_before_height(u64::from(tip_height))?
+        .map(|(price_height, price)| BtcUsdPriceCacheEntry { tip_height, price_height, price });
+    cache.set(entry)?;
+    Ok(entry)
 }
 
 pub struct GetAlkanesParams {
@@ -867,7 +916,7 @@ pub async fn get_address_positions(
 
     let mut positions: Vec<(Value, u128)> = Vec::new();
 
-    let mut details_ctx = PoolDetailsContext::new(true);
+    let mut details_ctx = PoolDetailsContext::new(state, true);
     for (pool_id, balance) in balances {
         if balance == 0 || !pool_set.contains(&pool_id) {
             continue;
@@ -1046,7 +1095,7 @@ pub async fn get_all_pools_details(
 
     let timer = debug::start_if(debug);
     let mut computed: Vec<PoolDetailsComputed> = Vec::new();
-    let mut details_ctx = PoolDetailsContext::new(true);
+    let mut details_ctx = PoolDetailsContext::new(state, true);
     let mut pools_scanned: usize = 0;
     let mut pools_kept: usize = 0;
     for pool in pools.into_iter() {
@@ -3178,7 +3227,20 @@ fn internal_error<E: std::fmt::Display>(err: E) -> Value {
 }
 
 fn btc_price_usd_cached(blockhash: StateAt, state: &OylApiState) -> Result<u128> {
-    // Read-paths must never call external ETH RPC. Use the latest indexed BTC/USD price.
+    // Read-paths must never call external price feeds. For latest reads, serve the cached
+    // tip-nearest BTC/USD point and lazily initialize it on first use.
+    if blockhash == StateAt::Latest {
+        if let Some(entry) = state.btc_usd_price_cache.get()? {
+            return Ok(entry.price);
+        }
+        return refresh_btc_usd_price_cache(
+            state.ammdata.as_ref(),
+            state.btc_usd_price_cache.as_ref(),
+        )?
+        .map(|entry| entry.price)
+        .ok_or_else(|| anyhow!("btc/usd price unavailable (ammdata index empty)"));
+    }
+
     state
         .ammdata
         .get_latest_btc_usd_price(GetLatestBtcUsdPriceParams { blockhash: blockhash.clone() })
@@ -3242,6 +3304,25 @@ fn alkane_id_json(alkane: &SchemaAlkaneId) -> Value {
     json!({ "block": alkane.block.to_string(), "tx": alkane.tx.to_string() })
 }
 
+fn canonical_quote_units_for_height(height: u32) -> HashMap<SchemaAlkaneId, CanonicalQuoteUnit> {
+    canonical_quotes_at_height(get_network(), height)
+        .into_iter()
+        .map(|quote| (quote.id, quote.unit))
+        .collect()
+}
+
+fn latest_canonical_quote_units(
+    state: &OylApiState,
+) -> HashMap<SchemaAlkaneId, CanonicalQuoteUnit> {
+    let height = state
+        .ammdata
+        .get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })
+        .ok()
+        .and_then(|res| res.height)
+        .unwrap_or(u32::MAX);
+    canonical_quote_units_for_height(height)
+}
+
 fn parse_alkane_id_str(raw: &str) -> Option<SchemaAlkaneId> {
     let mut parts = raw.split(':');
     let block = parts.next()?.parse::<u32>().ok()?;
@@ -3301,6 +3382,7 @@ fn canonical_pool_prices(
             blockhash: blockhash.clone(),
             token: *token,
             now_ts,
+            height: None,
         })
         .map(|res| (res.frbtc_price, res.busd_price))
 }
@@ -4627,14 +4709,10 @@ struct PoolDetailsContext {
 }
 
 impl PoolDetailsContext {
-    fn new(skip_factory_check: bool) -> Self {
-        let mut canonical_units: HashMap<SchemaAlkaneId, CanonicalQuoteUnit> = HashMap::new();
-        for quote in canonical_quotes(get_network()) {
-            canonical_units.insert(quote.id, quote.unit);
-        }
+    fn new(state: &OylApiState, skip_factory_check: bool) -> Self {
         Self {
             cache: PoolDetailsCache::default(),
-            canonical_units,
+            canonical_units: latest_canonical_quote_units(state),
             now_ts: now_ts(),
             skip_factory_check,
         }
@@ -4797,15 +4875,7 @@ fn build_pool_details(
     let mut token0_tvl_sats = token0_amount.saturating_mul(token0_price_sats) / AMOUNT_SCALE;
     let mut token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / AMOUNT_SCALE;
 
-    let local_units = if ctx.is_some() {
-        None
-    } else {
-        let mut map: HashMap<SchemaAlkaneId, CanonicalQuoteUnit> = HashMap::new();
-        for quote in canonical_quotes(get_network()) {
-            map.insert(quote.id, quote.unit);
-        }
-        Some(map)
-    };
+    let local_units = if ctx.is_some() { None } else { Some(latest_canonical_quote_units(state)) };
     let canonical_units = if let Some(ctx) = ctx.as_ref() {
         &ctx.canonical_units
     } else {

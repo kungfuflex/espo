@@ -736,7 +736,19 @@ fn summarize_contract_call(
     })
 }
 
-fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
+fn render_trace_status_waiting() -> Markup {
+    html! {
+        div class="trace-status pending" {
+            span class="trace-status-spinner trace-status-icon muted" aria-hidden="true" {}
+            span class="trace-status-text muted" { "Waiting for block confirmation..." }
+        }
+    }
+}
+
+fn render_trace_summary(
+    summary: &ContractCallSummary,
+    defer_status_until_confirmation: bool,
+) -> Markup {
     let is_factory_clone = summary.factory_template.is_some();
     let link_id = summary.link_id;
     let alkane_path = explorer_path(&format!("/alkane/{}:{}", link_id.block, link_id.tx));
@@ -807,9 +819,13 @@ fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
                     }
                 }
             }
-            div class=(format!("trace-status {}", status_class)) {
-                span class="trace-status-icon" aria-hidden="true" { (icon_arrow_bend_down_right()) }
-                span class="trace-status-text" { (status_text) }
+            @if defer_status_until_confirmation {
+                (render_trace_status_waiting())
+            } @else {
+                div class=(format!("trace-status {}", status_class)) {
+                    span class="trace-status-icon" aria-hidden="true" { (icon_arrow_bend_down_right()) }
+                    span class="trace-status-text" { (status_text) }
+                }
             }
         }
     }
@@ -828,7 +844,7 @@ pub fn render_trace_summaries(traces: &[EspoTrace], essentials_mdb: &Mdb) -> Mar
             @for trace in traces {
                 @let summary = summarize_contract_call(trace, &mut inspection_cache, &mut meta_cache, &mut impl_cache, essentials_mdb);
                 @if let Some(s) = summary {
-                    (render_trace_summary(&s))
+                    (render_trace_summary(&s, false))
                 }
             }
         }
@@ -940,6 +956,7 @@ pub fn render_tx(
     projected_out_balances_override: Option<&HashMap<u32, Vec<BalanceEntry>>>,
     projected_rune_io_override: Option<&TxRuneIo>,
     show_tx_title: bool,
+    defer_alkane_trace_status: bool,
 ) -> Markup {
     let mut alkane_meta_cache: AlkaneMetaCache = HashMap::new();
     let mut alkane_impl_cache: AlkaneImplCache = HashMap::new();
@@ -992,6 +1009,7 @@ pub fn render_tx(
         essentials_mdb,
         tx_rune_io.as_ref(),
         &runes_provider,
+        defer_alkane_trace_status,
     );
 
     html! {
@@ -1118,6 +1136,7 @@ fn render_vouts(
     essentials_mdb: &Mdb,
     tx_rune_io: Option<&TxRuneIo>,
     runes_provider: &RunesProvider,
+    defer_alkane_trace_status: bool,
 ) -> Markup {
     let tx_bytes = txid.to_byte_array();
     let tx_hex = txid.to_string();
@@ -1175,6 +1194,7 @@ fn render_vouts(
                                         alkane_meta_cache,
                                         alkane_impl_cache,
                                         essentials_mdb,
+                                        defer_alkane_trace_status,
                                     ))
                                 }
                                 None => {
@@ -1227,6 +1247,7 @@ fn render_op_return(
     meta_cache: &mut AlkaneMetaCache,
     impl_cache: &mut AlkaneImplCache,
     essentials_mdb: &Mdb,
+    defer_alkane_trace_status: bool,
 ) -> Markup {
     let fallback = opreturn_utf8(&payload.data);
     let is_decoded_message = is_protostone || is_runestone;
@@ -1286,15 +1307,20 @@ fn render_op_return(
                         @let summary = summarize_contract_call(*trace, inspection_cache, meta_cache, impl_cache, essentials_mdb);
                         div class="trace-view" {
                             @if let Some(s) = summary {
-                                (render_trace_summary(&s))
+                                (render_trace_summary(&s, defer_alkane_trace_status))
                             }
                             details class="opret-toggle" {
                                 summary class="opret-toggle-summary" {
                                     span class="opret-toggle-caret" aria-hidden="true" { (icon_caret_right()) }
                                     span class="opret-toggle-label" { (label) }
                                 }
-                                div class="opret-toggle-body" { (json_viewer(trace_parsed.as_ref(), trace_raw)) }
+                            div class="opret-toggle-body" { (json_viewer(trace_parsed.as_ref(), trace_raw)) }
                             }
+                        }
+                    }
+                    @if is_protostone && defer_alkane_trace_status && trace_views.is_empty() {
+                        div class="trace-view" {
+                            (render_trace_status_waiting())
                         }
                     }
                     @if is_protostone {

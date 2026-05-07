@@ -14,8 +14,8 @@ use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdow
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::rune_icon::rune_icon;
 use crate::explorer::components::svg_assets::{
-    icon_activity, icon_activity_mint, icon_pager_first, icon_pager_last, icon_pager_left,
-    icon_pager_right,
+    icon_activity, icon_activity_mint, icon_dropdown_caret, icon_dropdown_check, icon_pager_first,
+    icon_pager_last, icon_pager_left, icon_pager_right,
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::pages::common::{fmt_scaled_amount, format_integer};
@@ -65,6 +65,10 @@ impl RuneTab {
             Self::Activity => "activity",
         }
     }
+}
+
+fn holders_tab_url(rune_id: &str, page: usize, limit: usize) -> String {
+    explorer_path(&format!("/rune/{rune_id}?tab=holders&page={page}&limit={limit}"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -623,8 +627,12 @@ fn tab_link(entry: &RuneEntry, tab: RuneTab, active: RuneTab, limit: usize) -> M
         RuneTab::Activity => "Activity",
     };
     let class = if tab == active { "alkane-tab active" } else { "alkane-tab" };
+    let href = match tab {
+        RuneTab::Holders => holders_tab_url(&id, 1, limit),
+        _ => explorer_path(&format!("/rune/{id}?tab={}&page=1&limit={limit}", tab.as_query())),
+    };
     html! {
-        a class=(class) href=(explorer_path(&format!("/rune/{id}?tab={}&page=1&limit={limit}", tab.as_query()))) { (label) }
+        a class=(class) href=(href) { (label) }
     }
 }
 
@@ -646,6 +654,7 @@ fn tab_body(
             let rows = provider.get_holders(entry.id, page, limit).unwrap_or_default();
             let supply = entry.supply();
             let rows_len = rows.len();
+            let holder_export_action = explorer_path("/api/rune/holders/export");
             let rows = rows
                 .into_iter()
                 .map(|(address, amount)| {
@@ -662,11 +671,34 @@ fn tab_body(
                 })
                 .collect();
             html! {
+                form class="order-control holders-export-form" action=(holder_export_action) method="get" target="holders-export-download-frame" data-download-form="" {
+                    input type="hidden" name="rune" value=(id.clone());
+                    input type="hidden" name="format" value="json";
+                    span class="muted" { "Export to:" }
+                    div class="dropdown holders-export-dropdown" data-dropdown="" data-open="" {
+                        button class="dropdown-trigger" type="button" aria-label="Select holder export format" aria-haspopup="true" aria-expanded="false" data-dropdown-toggle="" {
+                            span class="dropdown-label" data-dropdown-selected-label="" { "JSON" }
+                            span class="dropdown-caret" { (icon_dropdown_caret()) }
+                        }
+                        div class="dropdown-panel" role="menu" aria-hidden="true" {
+                            button class="dropdown-item selected" type="button" role="menuitem" data-dropdown-value="json" data-dropdown-input="format" data-dropdown-label="JSON" {
+                                span class="dropdown-icon dropdown-check-slot" { (icon_dropdown_check()) }
+                                span class="dropdown-label" { "JSON" }
+                            }
+                            button class="dropdown-item" type="button" role="menuitem" data-dropdown-value="csv" data-dropdown-input="format" data-dropdown-label="CSV" {
+                                span class="dropdown-icon dropdown-check-slot" { (icon_dropdown_check()) }
+                                span class="dropdown-label" { "CSV" }
+                            }
+                        }
+                    }
+                    button class="holders-export-button" type="submit" { "Export" }
+                }
+                iframe class="holders-export-frame" name="holders-export-download-frame" title="Holder export download" aria-hidden="true" {}
                 div class="alkane-panel alkane-holders-card" {
                     (holders_table(&["Holder", "Balance", "Holding %"], rows))
                 }
                 (pager(holders_total, rows_len, page, limit, |target| {
-                    explorer_path(&format!("/rune/{id}?tab=holders&page={target}&limit={limit}"))
+                    holders_tab_url(&id, target, limit)
                 }))
             }
         }

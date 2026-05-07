@@ -1,13 +1,19 @@
 use crate::config::{debug_enabled, get_config, get_espo_db};
 use crate::debug;
-use crate::modules::ammdata::storage::AmmDataProvider;
+use crate::modules::ammdata::consts::ammdata_genesis_block;
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, GetIndexHeightParams as AmmDataGetIndexHeightParams,
+};
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
-use crate::modules::essentials::storage::EssentialsProvider;
+use crate::modules::essentials::storage::{
+    EssentialsProvider, GetIndexHeightParams as EssentialsGetIndexHeightParams,
+};
 use crate::modules::oylapi::config::OylApiConfig;
 use crate::modules::oylapi::server::run as run_oylapi;
-use crate::modules::oylapi::storage::OylApiState;
+use crate::modules::oylapi::storage::{BtcUsdPriceCache, OylApiState, refresh_btc_usd_price_cache};
 use crate::modules::subfrost::storage::SubfrostProvider;
 use crate::runtime::mdb::Mdb;
+use crate::runtime::state_at::StateAt;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
 use std::net::SocketAddr;
@@ -18,11 +24,18 @@ pub struct OylApi {
     essentials: Option<Arc<EssentialsProvider>>,
     ammdata: Option<Arc<AmmDataProvider>>,
     subfrost: Option<Arc<SubfrostProvider>>,
+    btc_usd_price_cache: Arc<BtcUsdPriceCache>,
 }
 
 impl OylApi {
     pub fn new() -> Self {
-        Self { config: None, essentials: None, ammdata: None, subfrost: None }
+        Self {
+            config: None,
+            essentials: None,
+            ammdata: None,
+            subfrost: None,
+            btc_usd_price_cache: Arc::new(BtcUsdPriceCache::new()),
+        }
     }
 }
 
@@ -49,11 +62,15 @@ impl EspoModule for OylApi {
         self.subfrost = Some(subfrost);
     }
 
-    fn get_genesis_block(&self, _network: Network) -> u32 {
-        u32::MAX
+    fn get_genesis_block(&self, network: Network) -> u32 {
+        ammdata_genesis_block(network)
     }
 
     fn index_block(&self, block: crate::alkanes::trace::EspoBlock) -> Result<()> {
+        if !block.is_latest {
+            return Ok(());
+        }
+
         let t0 = std::time::Instant::now();
         let debug = debug_enabled();
         let module = self.get_name();
@@ -77,6 +94,20 @@ impl EspoModule for OylApi {
         let timer = debug::start_if(debug);
         let _state = (has_config, has_essentials, has_ammdata, has_subfrost);
         debug::log_elapsed(module, "finalize", timer);
+
+        if let Some(ammdata) = self.ammdata.as_ref() {
+            match refresh_btc_usd_price_cache(ammdata.as_ref(), self.btc_usd_price_cache.as_ref()) {
+                Ok(Some(entry)) if debug => eprintln!(
+                    "[oylapi] refreshed btc/usd cache tip={} price_height={} price_scaled={}",
+                    entry.tip_height, entry.price_height, entry.price
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "[oylapi] failed to refresh btc/usd cache at height {}: {e:?}",
+                    block.height
+                ),
+            }
+        }
         eprintln!(
             "[indexer] module={} height={} index_block done in {:?}",
             self.get_name(),
@@ -87,7 +118,22 @@ impl EspoModule for OylApi {
     }
 
     fn get_index_height(&self) -> Option<u32> {
-        None
+        if let Some(ammdata) = self.ammdata.as_ref() {
+            if let Ok(result) =
+                ammdata.get_index_height(AmmDataGetIndexHeightParams { blockhash: StateAt::Latest })
+            {
+                if result.height.is_some() {
+                    return result.height;
+                }
+            }
+        }
+
+        self.essentials.as_ref().and_then(|essentials| {
+            essentials
+                .get_index_height(EssentialsGetIndexHeightParams { blockhash: StateAt::Latest })
+                .ok()
+                .and_then(|result| result.height)
+        })
     }
 
     fn register_rpc(&self, _reg: &RpcNsRegistrar) {
@@ -103,6 +149,15 @@ impl EspoModule for OylApi {
             self.ammdata.as_ref().expect("oylapi module missing ammdata provider").clone();
         let subfrost =
             self.subfrost.as_ref().expect("oylapi module missing subfrost provider").clone();
+        let btc_usd_price_cache = self.btc_usd_price_cache.clone();
+        match refresh_btc_usd_price_cache(ammdata.as_ref(), btc_usd_price_cache.as_ref()) {
+            Ok(Some(entry)) => eprintln!(
+                "[oylapi] loaded btc/usd cache tip={} price_height={} price_scaled={}",
+                entry.tip_height, entry.price_height, entry.price
+            ),
+            Ok(None) => eprintln!("[oylapi] btc/usd cache empty (ammdata price index empty)"),
+            Err(e) => eprintln!("[oylapi] failed to load btc/usd cache: {e:?}"),
+        }
 
         let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
             .parse()
@@ -114,6 +169,7 @@ impl EspoModule for OylApi {
             ammdata,
             subfrost,
             http_client: reqwest::Client::new(),
+            btc_usd_price_cache,
         };
 
         tokio::spawn(async move {

@@ -234,7 +234,7 @@ fn block_carousel_inner(
     const compact = Math.abs(numeric) >= 1000;
     const displayValue = compact ? numeric / 1000 : numeric;
     const amount = new Intl.NumberFormat('en-US', {{
-      minimumFractionDigits: 0,
+      minimumFractionDigits: 2,
       maximumFractionDigits: 2
     }}).format(displayValue) + (compact ? 'k' : '');
     if (!includeUnit) return amount;

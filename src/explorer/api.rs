@@ -1,8 +1,10 @@
 use crate::runtime::state_at::StateAt;
 use axum::Json;
+use axum::body::Body;
 use axum::extract::Query;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::response::Response;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -13,7 +15,7 @@ use crate::config::{
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
 use crate::explorer::mining_pools::MiningPoolDisplay;
-use crate::explorer::pages::common::ALKANE_SCALE;
+use crate::explorer::pages::common::{ALKANE_SCALE, fmt_alkane_amount, fmt_scaled_amount};
 use crate::explorer::paths::explorer_path;
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::PRICE_SCALE;
@@ -22,8 +24,10 @@ use crate::modules::ammdata::storage::{
 };
 use crate::modules::essentials::storage::{
     BlockSummaryPool, EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
-    GetListEntriesDescParams, HoldersCountEntry, get_cached_block_summary, load_creation_record,
+    GetListEntriesDescParams, HolderEntry, HolderId, HoldersCountEntry, get_cached_block_summary,
+    load_creation_record,
 };
+use crate::modules::essentials::utils::balances::get_holders_for_alkane;
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::modules::runes::main::{runes_enabled_from_global_config, runes_genesis_block};
 use crate::modules::runes::storage::{RuneEntry, RunesProvider, SchemaRuneId};
@@ -370,6 +374,18 @@ pub struct AlkaneChartQuery {
     pub range: Option<String>,
     pub source: Option<String>,
     pub quote: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AlkaneHoldersExportQuery {
+    pub alkane: Option<String>,
+    pub format: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct RuneHoldersExportQuery {
+    pub rune: Option<String>,
+    pub format: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -959,6 +975,76 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     }
 
     Json(SearchGuessResponse { query, groups })
+}
+
+pub async fn alkane_holders_export(Query(q): Query<AlkaneHoldersExportQuery>) -> Response {
+    let Some(raw_alkane) = q.alkane.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
+    };
+    let Some(alkane) = parse_alkane_id(raw_alkane) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
+    };
+    let format = match q.format.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+        Some(format) if format == "csv" => "csv",
+        Some(format) if format == "json" => "json",
+        Some(_) => return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_format"),
+        None => "json",
+    };
+
+    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_provider = EssentialsProvider::new(essentials_mdb);
+    let Ok((total, supply, holders)) =
+        get_holders_for_alkane(StateAt::Latest, &essentials_provider, alkane, 1, usize::MAX)
+    else {
+        return text_response(StatusCode::INTERNAL_SERVER_ERROR, "holders_export_failed");
+    };
+
+    let filename = format!("alkane-{}-{}-holders.{format}", alkane.block, alkane.tx);
+    let body = if format == "csv" {
+        holders_csv(supply, holders)
+    } else {
+        holders_json(&alkane, total, supply, holders)
+    };
+    let content_type =
+        if format == "csv" { "text/csv; charset=utf-8" } else { "application/json; charset=utf-8" };
+    download_response(content_type, &filename, body)
+}
+
+pub async fn rune_holders_export(Query(q): Query<RuneHoldersExportQuery>) -> Response {
+    if !runes_enabled_from_global_config() {
+        return text_response(StatusCode::NOT_FOUND, "runes_disabled");
+    }
+
+    let Some(raw_rune) = q.rune.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_rune");
+    };
+    let format = match q.format.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+        Some(format) if format == "csv" => "csv",
+        Some(format) if format == "json" => "json",
+        Some(_) => return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_format"),
+        None => "json",
+    };
+
+    let provider = RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:")));
+    let Ok(Some(entry)) = provider.get_rune_by_query(raw_rune) else {
+        return text_response(StatusCode::NOT_FOUND, "rune_not_found");
+    };
+    let holders = match provider.get_holders(entry.id, 1, usize::MAX) {
+        Ok(holders) => holders,
+        Err(_) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, "holders_export_failed"),
+    };
+    let total = provider.get_holders_count(entry.id).unwrap_or(holders.len() as u64) as usize;
+    let supply = entry.supply();
+
+    let filename = format!("rune-{}-{}-holders.{format}", entry.id.block, entry.id.tx);
+    let body = if format == "csv" {
+        rune_holders_csv(&entry, supply, holders)
+    } else {
+        rune_holders_json(&entry, total, supply, holders)
+    };
+    let content_type =
+        if format == "csv" { "text/csv; charset=utf-8" } else { "application/json; charset=utf-8" };
+    download_response(content_type, &filename, body)
 }
 
 pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChartResponse> {
@@ -2206,6 +2292,153 @@ fn forward_fill_price_points(
 
 fn alkane_id_str(id: &SchemaAlkaneId) -> String {
     format!("{}:{}", id.block, id.tx)
+}
+
+fn holder_export_identity(holder: &HolderId) -> (&'static str, String) {
+    match holder {
+        HolderId::Address(address) => ("address", address.clone()),
+        HolderId::Alkane(id) => ("alkane", alkane_id_str(id)),
+    }
+}
+
+fn holder_export_percent(amount: u128, supply: u128) -> String {
+    if supply == 0 {
+        return "0.00".to_string();
+    }
+    format!("{:.2}", (amount as f64) * 100.0 / (supply as f64))
+}
+
+fn holders_json(
+    alkane: &SchemaAlkaneId,
+    total: usize,
+    supply: u128,
+    holders: Vec<HolderEntry>,
+) -> String {
+    let rows: Vec<Value> = holders
+        .into_iter()
+        .enumerate()
+        .map(|(idx, holder)| {
+            let (holder_type, holder_id) = holder_export_identity(&holder.holder);
+            json!({
+                "rank": idx + 1,
+                "holder_type": holder_type,
+                "holder": holder_id,
+                "balance_raw": holder.amount.to_string(),
+                "balance": fmt_alkane_amount(holder.amount),
+                "holding_percent": holder_export_percent(holder.amount, supply),
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&json!({
+        "alkane": alkane_id_str(alkane),
+        "total": total,
+        "supply_raw": supply.to_string(),
+        "supply": fmt_alkane_amount(supply),
+        "holders": rows,
+    }))
+    .unwrap_or_else(|_| "{\"holders\":[]}".to_string())
+}
+
+fn holders_csv(supply: u128, holders: Vec<HolderEntry>) -> String {
+    let mut out = String::from("rank,holder_type,holder,balance_raw,balance,holding_percent\n");
+    for (idx, holder) in holders.into_iter().enumerate() {
+        let (holder_type, holder_id) = holder_export_identity(&holder.holder);
+        push_csv_row(
+            &mut out,
+            &[
+                (idx + 1).to_string(),
+                holder_type.to_string(),
+                holder_id,
+                holder.amount.to_string(),
+                fmt_alkane_amount(holder.amount),
+                holder_export_percent(holder.amount, supply),
+            ],
+        );
+    }
+    out
+}
+
+fn rune_holders_json(
+    entry: &RuneEntry,
+    total: usize,
+    supply: u128,
+    holders: Vec<(String, u128)>,
+) -> String {
+    let rows: Vec<Value> = holders
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (address, amount))| {
+            json!({
+                "rank": idx + 1,
+                "holder": address,
+                "balance_raw": amount.to_string(),
+                "balance": fmt_scaled_amount(amount, entry.divisibility),
+                "holding_percent": holder_export_percent(amount, supply),
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&json!({
+        "rune": entry.id.to_string(),
+        "name": entry.name,
+        "spaced_name": entry.spaced_name,
+        "symbol": entry.symbol.as_deref(),
+        "divisibility": entry.divisibility,
+        "total": total,
+        "supply_raw": supply.to_string(),
+        "supply": fmt_scaled_amount(supply, entry.divisibility),
+        "holders": rows,
+    }))
+    .unwrap_or_else(|_| "{\"holders\":[]}".to_string())
+}
+
+fn rune_holders_csv(entry: &RuneEntry, supply: u128, holders: Vec<(String, u128)>) -> String {
+    let mut out = String::from("rank,holder,balance_raw,balance,holding_percent\n");
+    for (idx, (address, amount)) in holders.into_iter().enumerate() {
+        push_csv_row(
+            &mut out,
+            &[
+                (idx + 1).to_string(),
+                address,
+                amount.to_string(),
+                fmt_scaled_amount(amount, entry.divisibility),
+                holder_export_percent(amount, supply),
+            ],
+        );
+    }
+    out
+}
+
+fn push_csv_row(out: &mut String, cells: &[String]) {
+    for (idx, cell) in cells.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&csv_escape_cell(cell));
+    }
+    out.push('\n');
+}
+
+fn csv_escape_cell(raw: &str) -> String {
+    if raw.contains(',') || raw.contains('"') || raw.contains('\n') || raw.contains('\r') {
+        format!("\"{}\"", raw.replace('"', "\"\""))
+    } else {
+        raw.to_string()
+    }
+}
+
+fn download_response(content_type: &'static str, filename: &str, body: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\""))
+        .body(Body::from(body))
+        .unwrap_or_else(|_| text_response(StatusCode::INTERNAL_SERVER_ERROR, "response_failed"))
+}
+
+fn text_response(status: StatusCode, body: &'static str) -> Response {
+    (status, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
 }
 
 fn rpc_get_candles_value(

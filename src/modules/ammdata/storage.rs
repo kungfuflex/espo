@@ -7,7 +7,7 @@ use crate::config::get_network;
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block,
-    canonical_quotes,
+    canonical_quotes_at_height,
 };
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
@@ -1713,6 +1713,16 @@ impl AmmDataProvider {
         &self,
         params: GetLatestBtcUsdPriceParams,
     ) -> Result<Option<(u64, u128)>> {
+        if let Some(height) = self
+            .get_index_height(GetIndexHeightParams { blockhash: params.blockhash })?
+            .height
+        {
+            return self.get_btc_usd_price_entry_at_or_before_height_at(
+                u64::from(height),
+                params.blockhash.resolve(self.view_blockhash),
+            );
+        }
+
         let table = self.table();
         let resolved_blockhash = params.blockhash.resolve(self.view_blockhash);
         let rel_prefix = table.btc_usd_price_prefix();
@@ -1754,33 +1764,65 @@ impl AmmDataProvider {
         Ok(None)
     }
 
-    pub fn get_btc_usd_price_at_or_before_height(&self, height: u32) -> Result<Option<u128>> {
+    pub fn get_btc_usd_price_entry_at_or_before_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<(u64, u128)>> {
+        self.get_btc_usd_price_entry_at_or_before_height_at(height, self.view_blockhash)
+    }
+
+    fn get_btc_usd_price_entry_at_or_before_height_at(
+        &self,
+        height: u64,
+        blockhash: Option<BlockHash>,
+    ) -> Result<Option<(u64, u128)>> {
         let table = self.table();
         let rel_prefix = table.btc_usd_price_prefix();
-        let end_exclusive = table.btc_usd_price_key(u64::from(height).saturating_add(1));
-        let entries = self.raw_scan_range_entries_page_at(
-            &rel_prefix,
-            Some(&end_exclusive),
-            self.view_blockhash,
-            0,
-            16,
-            true,
-        )?;
-        for (_k, v) in entries {
-            if let Ok(price) = decode_u128_value(&v) {
-                if price > 0 {
-                    return Ok(Some(price));
+        let end_exclusive = table.btc_usd_price_key(height.saturating_add(1));
+        let page_limit = 256usize;
+        let mut offset = 0usize;
+        loop {
+            let entries = self.raw_scan_range_entries_page_at(
+                &rel_prefix,
+                Some(&end_exclusive),
+                blockhash,
+                offset,
+                page_limit,
+                true,
+            )?;
+            if entries.is_empty() {
+                break;
+            }
+            let entries_len = entries.len();
+            for (k, v) in entries {
+                let Some(point_height) = table.parse_btc_usd_price_key(&k) else {
+                    continue;
+                };
+                if let Ok(price) = decode_u128_value(&v) {
+                    if price > 0 {
+                        return Ok(Some((point_height, price)));
+                    }
                 }
             }
+            if entries_len < page_limit {
+                break;
+            }
+            offset = offset.saturating_add(entries_len);
         }
 
-        if height < ammdata_genesis_block(get_network()) {
+        if height < u64::from(ammdata_genesis_block(get_network())) {
             let fallback = AmmDataConfig::load_from_global_config()?.pre_ammdata_btc_usd_price;
             if fallback > 0 {
-                return Ok(Some(fallback));
+                return Ok(Some((height, fallback)));
             }
         }
         Ok(None)
+    }
+
+    pub fn get_btc_usd_price_at_or_before_height(&self, height: u32) -> Result<Option<u128>> {
+        Ok(self
+            .get_btc_usd_price_entry_at_or_before_height(u64::from(height))?
+            .map(|(_height, price)| price))
     }
 
     pub fn get_total_volume_amm_at_or_before_height(
@@ -2094,6 +2136,19 @@ impl AmmDataProvider {
     ) -> Result<GetCanonicalPoolsResult> {
         crate::debug_timer_log!("get_canonical_pools");
         let table = self.table();
+        let canonical_height = params
+            .height
+            .or_else(|| {
+                self.get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })
+                    .ok()
+                    .and_then(|res| res.height)
+            })
+            .unwrap_or(u32::MAX);
+        let canonical_quote_ids: HashSet<SchemaAlkaneId> =
+            canonical_quotes_at_height(get_network(), canonical_height)
+                .into_iter()
+                .map(|quote| quote.id)
+                .collect();
         let prefix = table.canonical_pool_token_prefix(&params.token);
         let keys = self
             .get_list_keys_by_prefix(GetListKeysByPrefixParams {
@@ -2121,6 +2176,9 @@ impl AmmDataProvider {
             let Some(quote_id) = decode_alkane_id_be(&key[prefix.len()..]) else {
                 continue;
             };
+            if !canonical_quote_ids.contains(&quote_id) {
+                continue;
+            }
             let Some(raw) = value else {
                 continue;
             };
@@ -3035,14 +3093,23 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_canonical_pool_prices");
         let mut frbtc_price = 0u128;
         let mut busd_price = 0u128;
+        let canonical_height = params
+            .height
+            .or_else(|| {
+                self.get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })
+                    .ok()
+                    .and_then(|res| res.height)
+            })
+            .unwrap_or(u32::MAX);
         let mut unit_map: HashMap<SchemaAlkaneId, CanonicalQuoteUnit> = HashMap::new();
-        for cq in canonical_quotes(get_network()) {
+        for cq in canonical_quotes_at_height(get_network(), canonical_height) {
             unit_map.insert(cq.id, cq.unit);
         }
         let pools = self
             .get_canonical_pools(GetCanonicalPoolsParams {
                 blockhash: StateAt::Latest,
                 token: params.token,
+                height: Some(canonical_height),
             })?
             .pools;
         for entry in pools {
@@ -4119,9 +4186,7 @@ impl AmmDataProvider {
                     "price": price.to_string(),
                     "source": "ammdata_index"
                 }),
-                None => match self.get_latest_btc_usd_price_entry(GetLatestBtcUsdPriceParams {
-                    blockhash: StateAt::Latest,
-                })? {
+                None => match self.get_btc_usd_price_entry_at_or_before_height(height)? {
                     Some((fallback_height, price)) => json!({
                         "ok": true,
                         "height": fallback_height,
@@ -4325,6 +4390,7 @@ pub struct GetCanonicalPoolsParams {
     pub blockhash: StateAt,
 
     pub token: SchemaAlkaneId,
+    pub height: Option<u32>,
 }
 
 pub struct GetCanonicalPoolsResult {
@@ -4791,6 +4857,7 @@ pub struct GetCanonicalPoolPricesParams {
 
     pub token: SchemaAlkaneId,
     pub now_ts: u64,
+    pub height: Option<u32>,
 }
 
 pub struct GetCanonicalPoolPricesResult {

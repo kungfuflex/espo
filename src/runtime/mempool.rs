@@ -154,6 +154,7 @@ pub struct MempoolBlockTx {
     pub fee_rate: f64,
     pub position: Option<MempoolProjectedPosition>,
     pub readiness: MempoolTxReadiness,
+    pub defer_alkane_trace_status: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -935,6 +936,10 @@ fn entry_has_alkane_action(entry: &MempoolTransactionStruct) -> bool {
         || entry.diesel_trace.as_ref().map_or(false, |traces| !traces.is_empty())
 }
 
+fn entry_defers_alkane_trace_status(entry: &MempoolTransactionStruct) -> bool {
+    entry_has_alkane_action(entry) && !entry.is_diesel_mint
+}
+
 fn entry_has_rune_action(entry: &MempoolTransactionStruct) -> bool {
     entry.rune_io.as_ref().map(rune_io_has_activity).unwrap_or(false)
 }
@@ -1327,6 +1332,7 @@ pub fn get_mempool_block_detail(
                     fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
                     position: entry.position.clone(),
                     readiness: derive_readiness(entry),
+                    defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
                 })
             })
             .collect()
@@ -1363,6 +1369,7 @@ pub fn get_mempool_block_ordered_transactions(index: usize) -> Option<Vec<Mempoo
                     fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
                     position: entry.position.clone(),
                     readiness: derive_readiness(entry),
+                    defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
                 })
             })
             .collect(),
@@ -1420,6 +1427,7 @@ pub fn get_mempool_block_transactions_for_targets(
                     fee_rate: entry.fee_rate,
                     position: entry.position.clone(),
                     readiness: derive_readiness(entry),
+                    defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
                 })
             })
             .collect(),

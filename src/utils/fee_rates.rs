@@ -75,7 +75,6 @@ pub fn compute_fee_rate_summary(txs: Vec<FeeRateEntry>) -> BlockFeeRateSummary {
         sorted_txs[idx].rate
     };
 
-    let p1 = percentile_rate(1);
     let p10 = percentile_rate(10);
     let p25 = percentile_rate(25);
     let p50 = percentile_rate(50);
@@ -83,22 +82,15 @@ pub fn compute_fee_rate_summary(txs: Vec<FeeRateEntry>) -> BlockFeeRateSummary {
     let p90 = percentile_rate(90);
     let p99 = percentile_rate(99);
 
-    let tail_start = ((txs.len() as f64) * 49.0 / 50.0).ceil() as usize;
-    let tail_min = txs
-        .iter()
-        .skip(tail_start.min(txs.len()))
-        .map(|tx| tx.rate)
-        .fold(f64::INFINITY, f64::min);
-    let min_fee = p1.min(tail_min);
+    let min_fee = txs.last().map(|tx| tx.rate).unwrap_or(0.0);
 
     let head_len = txs.len() / 50;
     let max_fee = txs.iter().take(head_len).map(|tx| tx.rate).fold(p99, f64::max);
 
-    const BLOCK_WEIGHT_UNITS: f64 = 4_000_000.0;
-    let half_width = BLOCK_WEIGHT_UNITS / 800.0;
-    let left_bound = (BLOCK_WEIGHT_UNITS / 2.0 - half_width).floor();
-    let right_bound = (BLOCK_WEIGHT_UNITS / 2.0 + half_width).ceil();
-    let mut weight_count = BLOCK_WEIGHT_UNITS - total_weight;
+    let half_width = (total_weight / 800.0).max(1.0);
+    let left_bound = (total_weight / 2.0 - half_width).floor().max(0.0);
+    let right_bound = (total_weight / 2.0 + half_width).ceil().min(total_weight);
+    let mut weight_count = 0.0;
     let mut median_fee = 0.0;
     let mut median_weight = 0.0;
     for tx in &sorted_txs {
@@ -116,7 +108,46 @@ pub fn compute_fee_rate_summary(txs: Vec<FeeRateEntry>) -> BlockFeeRateSummary {
         }
         weight_count += tx.weight;
     }
-    let median = if median_weight > 0.0 { median_fee / (median_weight / 4.0) } else { 0.0 };
+    let median = if median_weight > 0.0 { median_fee / (median_weight / 4.0) } else { p50 };
 
     BlockFeeRateSummary { avg, median, range: [min_fee, p10, p25, p50, p75, p90, max_fee] }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(rate: f64) -> FeeRateEntry {
+        FeeRateEntry { weight: 400.0, rate }
+    }
+
+    #[test]
+    fn fee_rate_entry_keeps_zero_fee_transactions() {
+        let entry = fee_rate_entry_from_weight_and_btc_fee(617, Some(0.0))
+            .expect("zero-fee non-coinbase transaction should be included");
+
+        assert_eq!(entry.rate, 0.0);
+    }
+
+    #[test]
+    fn fee_rate_range_uses_last_transaction_as_lower_bound() {
+        let mut txs: Vec<FeeRateEntry> =
+            (0..3_400).map(|idx| entry(10.0 - (idx as f64 / 400.0))).collect();
+        txs[1_778] = entry(0.102_376_6);
+        txs[2_000] = entry(0.883_720_93);
+        txs.push(entry(1.006_681_51));
+
+        let summary = compute_fee_rate_summary(txs);
+
+        assert_eq!(summary.range[0], 1.006_681_51);
+    }
+
+    #[test]
+    fn fee_rate_median_uses_actual_transaction_weight() {
+        let txs = vec![entry(1.0), entry(2.0), entry(3.0)];
+
+        let summary = compute_fee_rate_summary(txs);
+
+        assert_eq!(summary.median, 2.0);
+    }
 }

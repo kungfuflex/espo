@@ -428,9 +428,9 @@ fn index_mints(
     let mut diesel_amount_sum = U256::ZERO;
     for chain in build_mint_chains(block, tx_meta)? {
         for (token, delta) in chain.deltas {
-            let pool_prices = price_cache
-                .entry(token)
-                .or_insert_with(|| load_mint_pool_prices(amm_provider, token, block_ts));
+            let pool_prices = price_cache.entry(token).or_insert_with(|| {
+                load_mint_pool_prices(amm_provider, token, block_ts, block.height)
+            });
             let mint_price_paid_sats = scale_fee_price_sats(chain.fee_paid_sats, delta);
             let mint_price_paid_usd = scale_fee_price_usd(mint_price_paid_sats, btc_usd_price);
             let row = SchemaTokenActivityV1 {
@@ -733,12 +733,14 @@ fn load_mint_pool_prices(
     amm_provider: &AmmDataProvider,
     token: SchemaAlkaneId,
     now_ts: u64,
+    height: u32,
 ) -> MintPoolPriceSnapshot {
     let canonical = amm_provider
         .get_canonical_pool_prices(GetCanonicalPoolPricesParams {
             blockhash: StateAt::Latest,
             token,
             now_ts,
+            height: Some(height),
         })
         .ok();
     let frbtc_price = canonical.as_ref().map(|res| res.frbtc_price).unwrap_or(0);

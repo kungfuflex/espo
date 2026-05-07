@@ -13,8 +13,8 @@ use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
     icon_activity, icon_activity_add_liquidity, icon_activity_mint, icon_activity_pool_create,
     icon_activity_remove_liquidity, icon_activity_trade_buy, icon_activity_trade_sell,
-    icon_caret_right, icon_dropdown_caret, icon_pager_first, icon_pager_last, icon_pager_left,
-    icon_pager_right,
+    icon_caret_right, icon_dropdown_caret, icon_dropdown_check, icon_pager_first, icon_pager_last,
+    icon_pager_left, icon_pager_right,
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
@@ -115,6 +115,10 @@ impl VolumeKind {
             Self::TotalReceived => "Total Received",
         }
     }
+}
+
+fn holders_tab_url(alk_str: &str, page: usize, limit: usize) -> String {
+    explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={page}&limit={limit}"))
 }
 
 fn activity_tab_url(
@@ -771,6 +775,7 @@ pub async fn alkane_page(
             }
         }
     };
+    let holder_export_action = explorer_path("/api/alkane/holders/export");
 
     let (activity_total, activity_entries, activity_label) = if tab == AlkaneTab::Volume {
         match volume_kind {
@@ -1320,7 +1325,7 @@ pub async fn alkane_page(
                                 }
                             }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Holders { " active" } else { "" }))
-                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page=1&limit={limit}"))) { "Holders" }
+                                href=(holders_tab_url(&alk_str, 1, limit)) { "Holders" }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Volume { " active" } else { "" }))
                                 href=(explorer_path(&format!("/alkane/{alk_str}?tab=volume&volume={volume_query}&page=1&limit={limit}"))) { "Volume" }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Inspect { " active" } else { "" }))
@@ -1328,17 +1333,40 @@ pub async fn alkane_page(
                         }
                         div class="alkane-tab-panel" {
                             @if tab == AlkaneTab::Holders {
+                                form class="order-control holders-export-form" action=(holder_export_action) method="get" target="holders-export-download-frame" data-download-form="" {
+                                    input type="hidden" name="alkane" value=(alk_str.clone());
+                                    input type="hidden" name="format" value="json";
+                                    span class="muted" { "Export to:" }
+                                    div class="dropdown holders-export-dropdown" data-dropdown="" data-open="" {
+                                        button class="dropdown-trigger" type="button" aria-label="Select holder export format" aria-haspopup="true" aria-expanded="false" data-dropdown-toggle="" {
+                                            span class="dropdown-label" data-dropdown-selected-label="" { "JSON" }
+                                            span class="dropdown-caret" { (icon_dropdown_caret()) }
+                                        }
+                                        div class="dropdown-panel" role="menu" aria-hidden="true" {
+                                            button class="dropdown-item selected" type="button" role="menuitem" data-dropdown-value="json" data-dropdown-input="format" data-dropdown-label="JSON" {
+                                                span class="dropdown-icon dropdown-check-slot" { (icon_dropdown_check()) }
+                                                span class="dropdown-label" { "JSON" }
+                                            }
+                                            button class="dropdown-item" type="button" role="menuitem" data-dropdown-value="csv" data-dropdown-input="format" data-dropdown-label="CSV" {
+                                                span class="dropdown-icon dropdown-check-slot" { (icon_dropdown_check()) }
+                                                span class="dropdown-label" { "CSV" }
+                                            }
+                                        }
+                                    }
+                                    button class="holders-export-button" type="submit" { "Export" }
+                                }
+                                iframe class="holders-export-frame" name="holders-export-download-frame" title="Holder export download" aria-hidden="true" {}
                                 (table_markup)
                                 div class="pager" {
                                     @if has_prev {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page=1&limit={limit}"))) aria-label="First page" {
+                                        a class="pill iconbtn" href=(holders_tab_url(&alk_str, 1, limit)) aria-label="First page" {
                                             (icon_pager_first())
                                         }
                                     } @else {
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                                     }
                                     @if has_prev {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={}&limit={limit}", page - 1))) aria-label="Previous page" {
+                                        a class="pill iconbtn" href=(holders_tab_url(&alk_str, page - 1, limit)) aria-label="Previous page" {
                                             (icon_pager_left())
                                         }
                                     } @else {
@@ -1354,14 +1382,14 @@ pub async fn alkane_page(
                                         (format_integer(total as u128))
                                     }
                                     @if has_next {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={}&limit={limit}", page + 1))) aria-label="Next page" {
+                                        a class="pill iconbtn" href=(holders_tab_url(&alk_str, page + 1, limit)) aria-label="Next page" {
                                             (icon_pager_right())
                                         }
                                     } @else {
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                                     }
                                     @if has_next {
-                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab=holders&page={}&limit={limit}", last_page))) aria-label="Last page" {
+                                        a class="pill iconbtn" href=(holders_tab_url(&alk_str, last_page, limit)) aria-label="Last page" {
                                             (icon_pager_last())
                                         }
                                     } @else {
