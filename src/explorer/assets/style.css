@@ -2503,23 +2503,24 @@ a:hover {
 .alkane-market-price-subtitle {
   color: var(--muted2);
   font-size: 15px;
-  font-weight: 700;
+  font-weight: 600;
   line-height: 1.15;
   margin-bottom: 8px;
 }
 .alkane-market-price-value,
 .alkane-market-price-change {
   color: var(--text);
-  font-weight: 800;
   line-height: 1.15;
   overflow-wrap: anywhere;
 }
 .alkane-market-price-value {
   font-size: 24px;
+  font-weight: 600;
   margin-bottom: 4px;
 }
 .alkane-market-price-change {
   font-size: 15px;
+  font-weight: 800;
 }
 .alkane-market-price-card[data-tone="up"] .alkane-market-price-change {
   color: var(--chart-green);

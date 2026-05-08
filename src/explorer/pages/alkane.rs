@@ -1253,7 +1253,7 @@ pub async fn alkane_page(
                                         div class="alkane-market-price-card" data-tone=(summary.tone) {
                                             div class="alkane-market-price-copy" {
                                                 span class="alkane-market-price-subtitle" { "Price" }
-                                                div class="alkane-market-price-value mono" { (summary.price_usd) }
+                                                div class="alkane-market-price-value" { (summary.price_usd) }
                                                 div class="alkane-market-price-change mono" { (summary.change_text) }
                                             }
                                             a class="alkane-method-btn alkane-market-buy-btn" href=(buy_url.clone()) target="_blank" rel="noopener noreferrer" {
