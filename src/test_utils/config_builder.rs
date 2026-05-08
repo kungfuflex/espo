@@ -39,6 +39,7 @@ impl TestConfigBuilder {
             explorer_host: None,
             explorer_base_path: "/".to_string(),
             explorer_pizza_tv_endpoint: "https://tv.pizza.fun".to_string(),
+            explorer_amm_prefix: "https://www.oyl.io/swap".to_string(),
             network: Network::Regtest, // Default to regtest
             metashrew_db_label: None,
             strict_mode: None,

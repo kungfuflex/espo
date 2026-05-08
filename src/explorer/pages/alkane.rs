@@ -6,6 +6,7 @@ use hex;
 use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 
+use crate::config::get_explorer_amm_prefix;
 use crate::explorer::components::alk_balances::render_alkane_balance_cards;
 use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
 use crate::explorer::components::header::header_scripts;
@@ -13,8 +14,8 @@ use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
     icon_activity, icon_activity_add_liquidity, icon_activity_mint, icon_activity_pool_create,
     icon_activity_remove_liquidity, icon_activity_trade_buy, icon_activity_trade_sell,
-    icon_caret_right, icon_dropdown_caret, icon_dropdown_check, icon_pager_first, icon_pager_last,
-    icon_pager_left, icon_pager_right,
+    icon_arrow_up_right_thick, icon_caret_right, icon_dropdown_caret, icon_dropdown_check,
+    icon_pager_first, icon_pager_last, icon_pager_left, icon_pager_right,
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
@@ -25,9 +26,10 @@ use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{PRICE_SCALE, SATS_PER_BTC};
-use crate::modules::ammdata::schemas::Timeframe;
+use crate::modules::ammdata::schemas::{SchemaTokenMetricsV1, Timeframe};
 use crate::modules::ammdata::storage::{
     AmmDataProvider, AmmDataTable, GetLatestBtcUsdPriceParams, GetListKeysByPrefixParams,
+    GetTokenDerivedMetricsParams, GetTokenMetricsParams, parse_change_basis_points,
 };
 use crate::modules::essentials::storage::{
     BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
@@ -498,6 +500,98 @@ struct TokenActivityRenderEntry {
     counter: Option<(SchemaAlkaneId, i128)>,
 }
 
+struct AlkaneMarketSummary {
+    price_usd: String,
+    change_text: String,
+    tone: &'static str,
+}
+
+fn format_scaled_usd_abs(value: u128) -> String {
+    if value == 0 {
+        return "$0.00".to_string();
+    }
+    let decimals = if value >= PRICE_SCALE {
+        2usize
+    } else if value >= PRICE_SCALE / 100 {
+        4usize
+    } else {
+        8usize
+    };
+    let factor = 10u128.saturating_pow(decimals as u32);
+    let divisor = PRICE_SCALE / factor;
+    let rounded = value.saturating_add(divisor / 2).saturating_div(divisor);
+    if value > 0 && rounded == 0 {
+        return format!("<$0.{:0width$}1", 0, width = decimals.saturating_sub(1));
+    }
+    let whole = rounded / factor;
+    let frac = rounded % factor;
+    format!("${}.{:0width$}", format_integer(whole), frac, width = decimals)
+}
+
+fn format_signed_percent(change_bp: i64) -> String {
+    let value = change_bp as f64 / 10_000.0;
+    if change_bp > 0 { format!("+{value:.2}%") } else { format!("{value:.2}%") }
+}
+
+fn format_signed_scaled_usd(value: i128) -> String {
+    if value == 0 {
+        return "$0.00".to_string();
+    }
+    let sign = if value > 0 { "+" } else { "-" };
+    let mag = value.unsigned_abs();
+    let formatted = format_scaled_usd_abs(mag);
+    if let Some(rest) = formatted.strip_prefix('<') {
+        format!("<{sign}{rest}")
+    } else {
+        format!("{sign}{formatted}")
+    }
+}
+
+fn scaled_usd_delta_from_change(price_usd: u128, change_bp: i64) -> Option<i128> {
+    let denom = 1_000_000i128.saturating_add(change_bp as i128);
+    if denom <= 0 {
+        return None;
+    }
+    let prev = price_usd
+        .saturating_mul(1_000_000)
+        .saturating_add((denom as u128) / 2)
+        .saturating_div(denom as u128);
+
+    let mag = if price_usd >= prev { price_usd - prev } else { prev - price_usd };
+    let capped = mag.min(i128::MAX as u128) as i128;
+    if price_usd >= prev { Some(capped) } else { Some(-capped) }
+}
+
+fn format_market_change_text(price_usd: u128, change_bp: i64) -> Option<String> {
+    let usd_delta = scaled_usd_delta_from_change(price_usd, change_bp)?;
+    Some(format!("{} ({})", format_signed_scaled_usd(usd_delta), format_signed_percent(change_bp)))
+}
+
+fn alkane_market_summary_from_metrics(
+    metrics: &SchemaTokenMetricsV1,
+) -> Option<AlkaneMarketSummary> {
+    if metrics.price_usd == 0 {
+        return None;
+    }
+
+    let change_bp = parse_change_basis_points(&metrics.change_1d);
+    let change_text = format_market_change_text(metrics.price_usd, change_bp)?;
+
+    let tone = if change_bp < 0 {
+        "down"
+    } else if change_bp > 0 {
+        "up"
+    } else {
+        "flat"
+    };
+
+    Some(AlkaneMarketSummary {
+        price_usd: format_scaled_usd_abs(metrics.price_usd),
+        change_text,
+        tone,
+    })
+}
+
 fn token_fallback_letter(label: &str, fallback: &str) -> String {
     label
         .chars()
@@ -633,6 +727,33 @@ pub async fn alkane_page(
     let holders_count = total;
     let supply_f64 = circulating_supply as f64;
 
+    let derived_quotes: Vec<SchemaAlkaneId> = AmmDataConfig::load_from_global_config()
+        .ok()
+        .and_then(|c| c.derived_liquidity)
+        .map(|dl| dl.derived_quotes.into_iter().map(|q| q.alkane).collect())
+        .unwrap_or_default();
+    let is_derived_quote_token = is_diesel;
+    let has_prefix = |rel_prefix: Vec<u8>| -> bool {
+        amm_provider
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+                blockhash: StateAt::Latest,
+                prefix: rel_prefix,
+            })
+            .map(|res| !res.keys.is_empty())
+            .unwrap_or(false)
+    };
+    let market_quote = if is_derived_quote_token {
+        None
+    } else {
+        derived_quotes.iter().copied().find(|quote| {
+            has_prefix(amm_table.token_derived_mcusd_candle_ns_prefix(&alk, quote, Timeframe::D1))
+        })
+    };
+    let has_market_chart = if is_derived_quote_token {
+        has_prefix(amm_table.token_usd_candle_ns_prefix(&alk, Timeframe::D1))
+    } else {
+        market_quote.is_some()
+    };
     let tv_iframe_src: Option<String> = {
         let series_id = {
             let pizzafun_mdb = Arc::new(Mdb::from_db(Arc::clone(&db), b"pizzafun:"));
@@ -647,48 +768,36 @@ pub async fn alkane_page(
                 .map(|e| e.series_id)
         };
 
-        let has_market_chart = {
-            // Special-case: 2:0 is the derived liquidity quote token itself, so it won't have
-            // token-derived series. Show its chart if the plain 2:0-usd candle series exists.
-            let is_derived_quote_token = alk.block == 2 && alk.tx == 0;
-
-            let derived_quotes: Vec<SchemaAlkaneId> = AmmDataConfig::load_from_global_config()
-                .ok()
-                .and_then(|c| c.derived_liquidity)
-                .map(|dl| dl.derived_quotes.into_iter().map(|q| q.alkane).collect())
-                .unwrap_or_default();
-
-            let has_prefix = |rel_prefix: Vec<u8>| -> bool {
-                amm_provider
-                    .get_list_keys_by_prefix(GetListKeysByPrefixParams {
-                        blockhash: StateAt::Latest,
-                        prefix: rel_prefix,
-                    })
-                    .map(|res| !res.keys.is_empty())
-                    .unwrap_or(false)
-            };
-
-            if is_derived_quote_token {
-                has_prefix(amm_table.token_usd_candle_ns_prefix(&alk, Timeframe::D1))
-            } else if derived_quotes.is_empty() {
-                false
-            } else {
-                derived_quotes.iter().any(|quote| {
-                    has_prefix(amm_table.token_derived_mcusd_candle_ns_prefix(
-                        &alk,
-                        quote,
-                        Timeframe::D1,
-                    ))
-                })
-            }
-        };
-
         match (series_id, has_market_chart) {
             (Some(series_id), true) => Some(pizza_tv_iframe_src(&series_id)),
             _ => None,
         }
     };
+    let market_summary = if tv_iframe_src.is_some() {
+        if is_derived_quote_token {
+            amm_provider
+                .get_token_metrics(GetTokenMetricsParams { blockhash: StateAt::Latest, token: alk })
+                .ok()
+                .and_then(|res| alkane_market_summary_from_metrics(&res.metrics))
+        } else {
+            market_quote.and_then(|quote| {
+                amm_provider
+                    .get_token_derived_metrics(GetTokenDerivedMetricsParams {
+                        blockhash: StateAt::Latest,
+                        token: alk,
+                        quote,
+                    })
+                    .ok()
+                    .and_then(|res| res.metrics)
+                    .and_then(|metrics| alkane_market_summary_from_metrics(&metrics))
+            })
+        }
+    } else {
+        None
+    };
     let chart_hidden = if tv_iframe_src.is_some() { "0" } else { "1" };
+    let market_has_summary = if market_summary.is_some() { "1" } else { "0" };
+    let buy_url = alkane_buy_url(&alk_str);
 
     let inspection = creation_record.as_ref().and_then(|r| r.inspection.as_ref());
     let mut inspect_source = inspection.cloned();
@@ -1139,9 +1248,24 @@ pub async fn alkane_page(
                         @if let Some(src) = tv_iframe_src.as_ref() {
                             div class="alkane-market-pane" {
                                 h2 class="section-title alkane-market-title" { "Market" }
-                                div class="alkane-market-card alkane-market-tv" {
-                                    iframe class="alkane-market-iframe" src=(src) title="Market chart" {
-                                        "Market chart"
+                                div class="alkane-market-stack" data-has-summary=(market_has_summary) {
+                                    @if let Some(summary) = market_summary.as_ref() {
+                                        div class="alkane-market-price-card" data-tone=(summary.tone) {
+                                            div class="alkane-market-price-copy" {
+                                                span class="alkane-market-price-subtitle" { "Price" }
+                                                div class="alkane-market-price-value mono" { (summary.price_usd) }
+                                                div class="alkane-market-price-change mono" { (summary.change_text) }
+                                            }
+                                            a class="alkane-method-btn alkane-market-buy-btn" href=(buy_url.clone()) target="_blank" rel="noopener noreferrer" {
+                                                span { "Trade" }
+                                                (icon_arrow_up_right_thick())
+                                            }
+                                        }
+                                    }
+                                    div class="alkane-market-card alkane-market-tv" {
+                                        iframe class="alkane-market-iframe" src=(src) title="Market chart" {
+                                            "Market chart"
+                                        }
                                     }
                                 }
                             }
@@ -1633,8 +1757,14 @@ fn pizza_tv_iframe_src(series_id: &str) -> String {
     let symbol = url_escape_component(series_id);
     let base = crate::config::get_explorer_pizza_tv_endpoint().trim_end_matches('/');
     format!(
-        "{base}/?symbol={symbol}&timeframe=1d&type=mcap&pool=all&quote=usd&metaprotocol=alkanes&theme=espo"
+        "{base}/?symbol={symbol}&timeframe=1d&type=price&pool=all&quote=usd&metaprotocol=alkanes&theme=espo"
     )
+}
+
+fn alkane_buy_url(alkane_id: &str) -> String {
+    let prefix = get_explorer_amm_prefix().trim().trim_end_matches('?').trim_end_matches('&');
+    let separator = if prefix.contains('?') { "&" } else { "?" };
+    format!("{prefix}{separator}from=btc&to={alkane_id}")
 }
 
 fn fmt_activity_amount(raw: u128) -> String {

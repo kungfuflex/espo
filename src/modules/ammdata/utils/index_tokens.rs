@@ -10,9 +10,9 @@ use crate::modules::ammdata::schemas::{
 use crate::modules::ammdata::storage::{
     AmmDataProvider, GetListEntriesDescParams, GetRawValueParams, SchemaChartChangeSetV1,
     SchemaChartChangeValueV1, SearchIndexField, TokenMetricsIndexField, decode_candle_v1,
-    decode_chart_change_set_v1, decode_full_candle_v1, decode_token_metrics, decode_u128_value,
-    encode_alkane_id_be, encode_candle_v1, encode_chart_change_set_v1, encode_token_metrics,
-    encode_u128_value, parse_change_basis_points,
+    decode_chart_change_set_v1, decode_full_candle_v1, decode_token_metrics, encode_alkane_id_be,
+    encode_candle_v1, encode_chart_change_set_v1, encode_token_metrics, encode_u128_value,
+    parse_change_basis_points,
 };
 use crate::modules::ammdata::utils::candles::bucket_start_for;
 use crate::modules::ammdata::utils::index_state::IndexState;
@@ -252,33 +252,24 @@ pub fn derive_token_data(
             }
         }
 
-        if price.is_none() && use_historical_backfill {
-            match get_historical_btc_usd_price(height as u64) {
-                Ok(Some(v)) => price = Some(v),
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!(
-                        "[AMMDATA] btc/usd historical backfill failed at height {height}: {e:?}"
-                    );
-                }
-            }
+        if price.is_none() {
+            price = provider
+                .get_btc_usd_price_entry_at_or_before_height(height as u64)?
+                .map(|(_price_height, price)| price);
         }
 
+        // The JSON file is only a bootstrap backfill. Once the ammdata index has a price,
+        // carry forward that indexed value instead of replacing it with historical JSON.
         if price.is_none() {
-            let key = table.btc_usd_price_key(height as u64);
-            price = provider
-                .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
-                .value
-                .and_then(|raw| decode_u128_value(&raw).ok());
-        }
-        if price.is_none() {
-            let prefix = table.btc_usd_price_prefix();
-            if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams {
-                blockhash: StateAt::Latest,
-                prefix,
-            }) {
-                if let Some((_k, v)) = resp.entries.into_iter().next() {
-                    price = decode_u128_value(&v).ok();
+            if use_historical_backfill {
+                match get_historical_btc_usd_price(height as u64) {
+                    Ok(Some(v)) => price = Some(v),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "[AMMDATA] btc/usd historical backfill failed at height {height}: {e:?}"
+                        );
+                    }
                 }
             }
         }

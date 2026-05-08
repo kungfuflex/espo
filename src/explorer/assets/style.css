@@ -2440,6 +2440,9 @@ a:hover {
   flex: 1;
   height: auto;
 }
+.alkane-market-pane .alkane-market-stack {
+  flex: 1;
+}
 .alkane-overview-grid[data-chart-hidden="1"] {
   grid-template-columns: minmax(0, 1fr);
   grid-template-areas: "overview";
@@ -2470,6 +2473,62 @@ a:hover {
 }
 .alkane-market-title {
   margin: 0;
+}
+.alkane-market-stack {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.alkane-market-price-card {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 8px 8px 0 0;
+  background: var(--panel);
+  box-shadow: 0 0px 4px rgba(0, 0, 0, 0.12);
+}
+.alkane-market-price-copy {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 0;
+}
+.alkane-market-price-subtitle {
+  color: var(--muted2);
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.15;
+  margin-bottom: 8px;
+}
+.alkane-market-price-value,
+.alkane-market-price-change {
+  color: var(--text);
+  font-weight: 800;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+.alkane-market-price-value {
+  font-size: 24px;
+  margin-bottom: 4px;
+}
+.alkane-market-price-change {
+  font-size: 15px;
+}
+.alkane-market-price-card[data-tone="up"] .alkane-market-price-change {
+  color: var(--chart-green);
+}
+.alkane-market-price-card[data-tone="down"] .alkane-market-price-change {
+  color: var(--chart-red);
+}
+.alkane-market-stack[data-has-summary="1"] .alkane-market-card.alkane-market-tv {
+  border-radius: 0 0 8px 8px;
 }
 .alkane-market-content {
   position: relative;
@@ -2754,10 +2813,39 @@ button {
 .alkane-method-btn {
   margin-top: 15px;
 }
+a.alkane-method-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: cubic-bezier(0, 0, 0, 1) 600ms;
+  font-size: 15px;
+  font-family: var(--sans);
+  background: var(--link-dark);
+  font-weight: 600;
+  line-height: normal;
+  padding: 8px 12px;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  text-decoration: none;
+}
+.alkane-market-buy-btn {
+  flex: 0 0 auto;
+  gap: 6px;
+  margin-left: auto;
+  margin-top: 0;
+}
 button:hover {
   transition: none;
 
   background-color: var(--link-dark2);
+}
+a.alkane-method-btn:hover {
+  transition: none;
+  background-color: var(--link-dark2);
+  color: #fff;
+  text-decoration: none;
 }
 
 .alkane-panel-empty {

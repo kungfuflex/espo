@@ -157,6 +157,14 @@ pub fn icon_arrow_up_right() -> Markup {
         }
     }
 }
+pub fn icon_arrow_up_right_thick() -> Markup {
+    html! {
+        svg class="icon" width="16" height="16" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {
+            line x1="64" y1="192" x2="192" y2="64" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+            polyline points="88 64 192 64 192 168" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="24" {}
+        }
+    }
+}
 pub fn icon_activity() -> Markup {
     html! {
         svg class="icon" width="16" height="16" viewBox="0 0 256 256" fill="currentColor" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {

@@ -109,6 +109,10 @@ fn default_explorer_pizza_tv_endpoint() -> String {
     "https://tv.pizza.fun".to_string()
 }
 
+fn default_explorer_amm_prefix() -> String {
+    "https://www.oyl.io/swap".to_string()
+}
+
 fn default_network() -> String {
     "mainnet".to_string()
 }
@@ -338,6 +342,8 @@ pub struct ConfigFile {
     pub explorer_base_path: String,
     #[serde(default = "default_explorer_pizza_tv_endpoint")]
     pub explorer_pizza_tv_endpoint: String,
+    #[serde(default = "default_explorer_amm_prefix")]
+    pub explorer_amm_prefix: String,
     #[serde(default = "default_network")]
     pub network: String,
     #[serde(default)]
@@ -389,6 +395,7 @@ pub struct AppConfig {
     pub explorer_host: Option<SocketAddr>,
     pub explorer_base_path: String,
     pub explorer_pizza_tv_endpoint: String,
+    pub explorer_amm_prefix: String,
     pub network: Network,
     pub metashrew_db_label: Option<String>,
     pub strict_mode: Option<StrictModeConfig>,
@@ -433,6 +440,8 @@ impl AppConfig {
         let explorer_pizza_tv_endpoint =
             normalize_optional_string(Some(file.explorer_pizza_tv_endpoint))
                 .unwrap_or_else(default_explorer_pizza_tv_endpoint);
+        let explorer_amm_prefix = normalize_optional_string(Some(file.explorer_amm_prefix))
+            .unwrap_or_else(default_explorer_amm_prefix);
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
         let google_analytics_tag = normalize_optional_string(file.google_analytics_tag);
         let debug_backup = file.debug_backup;
@@ -455,6 +464,7 @@ impl AppConfig {
             explorer_host: file.explorer_host,
             explorer_base_path,
             explorer_pizza_tv_endpoint,
+            explorer_amm_prefix,
             network,
             metashrew_db_label: normalize_optional_string(file.metashrew_db_label),
             strict_mode: file.strict_mode,
@@ -778,6 +788,10 @@ pub fn get_explorer_base_path() -> &'static str {
 
 pub fn get_explorer_pizza_tv_endpoint() -> &'static str {
     &get_config().explorer_pizza_tv_endpoint
+}
+
+pub fn get_explorer_amm_prefix() -> &'static str {
+    &get_config().explorer_amm_prefix
 }
 
 pub fn get_explorer_networks() -> Option<&'static ExplorerNetworks> {

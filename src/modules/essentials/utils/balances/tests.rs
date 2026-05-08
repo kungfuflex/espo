@@ -27,6 +27,7 @@ fn init_test_config_from_run_sh() {
         explorer_host: Some("0.0.0.0:5779".parse().expect("parse explorer_host")),
         explorer_base_path: "/".to_string(),
         explorer_pizza_tv_endpoint: "https://tv.pizza.fun".to_string(),
+        explorer_amm_prefix: "https://www.oyl.io/swap".to_string(),
         network: bitcoin::Network::Bitcoin,
         metashrew_db_label: None,
         strict_mode: None,
