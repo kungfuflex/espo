@@ -1,13 +1,27 @@
 use crate::runtime::state_at::StateAt;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use crate::config::get_metashrew;
 use crate::modules::ammdata::schemas::{SchemaMarketDefs, SchemaPoolSnapshot};
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetAmmFactoriesParams, GetFactoryPoolsParams, GetPoolDefsParams,
+    AmmDataProvider, GetAmmFactoriesParams, GetFactoryPoolsParams, GetIndexHeightParams,
+    GetPoolDefsParams,
 };
 use crate::schemas::SchemaAlkaneId;
+
+#[derive(Clone)]
+struct LiveReservesCache {
+    index_height: Option<u32>,
+    pools: HashMap<SchemaAlkaneId, SchemaPoolSnapshot>,
+}
+
+static LIVE_RESERVES_CACHE: OnceLock<Mutex<Option<LiveReservesCache>>> = OnceLock::new();
+
+fn live_reserves_cache() -> &'static Mutex<Option<LiveReservesCache>> {
+    LIVE_RESERVES_CACHE.get_or_init(|| Mutex::new(None))
+}
 
 /// Fetch real-time reserves for all pools in `pools` by querying Metashrew balances:
 /// - base_reserve = balance of {what = base_id} held by {who = pool_alkane_id}
@@ -50,6 +64,17 @@ pub fn fetch_latest_reserves_for_pools(
 pub fn fetch_all_pools(
     provider: &AmmDataProvider,
 ) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
+    let index_height = provider
+        .get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })
+        .ok()
+        .and_then(|res| res.height);
+    let mut cache = live_reserves_cache().lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(cached) = cache.as_ref() {
+        if cached.index_height == index_height {
+            return Ok(cached.pools.clone());
+        }
+    }
+
     let factories = provider
         .get_amm_factories(GetAmmFactoriesParams { blockhash: StateAt::Latest })?
         .factories;
@@ -76,5 +101,7 @@ pub fn fetch_all_pools(
         }
     }
 
-    fetch_latest_reserves_for_pools(&pools)
+    let live_pools = fetch_latest_reserves_for_pools(&pools)?;
+    *cache = Some(LiveReservesCache { index_height, pools: live_pools.clone() });
+    Ok(live_pools)
 }
