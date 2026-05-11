@@ -2,15 +2,18 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
 };
 use crate::config::{
-    get_address_index_chunk_size, get_bitcoind_rpc_client, get_electrum_like, get_metashrew,
-    get_network,
+    get_address_index_chunk_size, get_bitcoind_rpc_client, get_electrum_like, get_espo_db,
+    get_metashrew, get_network,
 };
 use crate::modules::essentials::utils::balances::{
     SignedU128, get_address_activity_for_address, get_alkane_balances,
     get_alkane_balances_at_or_before, get_balance_for_address, get_holders_for_alkane,
-    get_outpoint_address, get_total_received_for_alkane, get_transfer_volume_for_alkane,
+    get_outpoint_address, get_outpoint_balances_with_spent_batch, get_total_received_for_alkane,
+    get_transfer_volume_for_alkane,
 };
 use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
+use crate::modules::runes::main::runes_enabled_from_global_config;
+use crate::modules::runes::storage::{RuneBalance, RunesProvider};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListNonMutatePointer, ListPointer};
 use crate::runtime::state_at::StateAt;
@@ -29,7 +32,7 @@ use serde_json::{Value, json, map::Map};
 use crate::runtime::mempool::{
     MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
 };
-use crate::utils::electrum_like::AddressHistoryEntry;
+use crate::utils::electrum_like::{AddressHistoryEntry, AddressUtxo, ElectrumLikeBackend};
 pub use crate::utils::fee_rates::{BlockFeeRateSummary, compute_block_fee_rate_summary};
 use anyhow::{Result, anyhow};
 use hex;
@@ -4046,6 +4049,271 @@ impl EssentialsProvider {
         })
     }
 
+    pub fn rpc_get_address_spendable_outpoints(
+        &self,
+        params: RpcGetAddressSpendableOutpointsParams,
+    ) -> Result<RpcGetAddressSpendableOutpointsResult> {
+        let omit_raw_tx = params.omit_raw_tx.unwrap_or(true);
+        let Some(address_raw) = params.address.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return Ok(RpcGetAddressSpendableOutpointsResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_address"}),
+            });
+        };
+        let Some(address_norm) = normalize_address(address_raw) else {
+            return Ok(RpcGetAddressSpendableOutpointsResult {
+                value: json!({"ok": false, "error": "invalid_address_format"}),
+            });
+        };
+        let network = get_network();
+        let address =
+            match Address::from_str(&address_norm).and_then(|a| a.require_network(network)) {
+                Ok(a) => a,
+                Err(_) => {
+                    return Ok(RpcGetAddressSpendableOutpointsResult {
+                        value: json!({"ok": false, "error": "invalid_address_format"}),
+                    });
+                }
+            };
+
+        let electrum = get_electrum_like();
+        if electrum.backend() != ElectrumLikeBackend::EsploraHttp {
+            return Ok(RpcGetAddressSpendableOutpointsResult {
+                value: json!({
+                    "ok": false,
+                    "error": "unsupported_backend",
+                    "detail": "essentials.get_address_spendable_outpoints requires electrs_esplora_url; electrum_rpc_url is not supported"
+                }),
+            });
+        }
+
+        let utxos = match electrum.address_utxos(&address) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(RpcGetAddressSpendableOutpointsResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "electrs_utxo_fetch_failed",
+                        "detail": e.to_string()
+                    }),
+                });
+            }
+        };
+
+        let tip_height = self
+            .get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })
+            .ok()
+            .and_then(|r| r.height)
+            .or_else(|| electrum.tip_height().ok())
+            .unwrap_or(0);
+
+        let mut utxo_by_outpoint: BTreeMap<(Txid, u32), AddressUtxo> = BTreeMap::new();
+        for utxo in utxos {
+            utxo_by_outpoint.insert((utxo.txid, utxo.vout), utxo);
+        }
+        let spendable_outpoints: Vec<(Txid, u32)> = utxo_by_outpoint.keys().copied().collect();
+        let spendable_outpoint_set: HashSet<(Txid, u32)> =
+            spendable_outpoints.iter().copied().collect();
+
+        let mut indexed_balances_by_outpoint: BTreeMap<(Txid, u32), Vec<BalanceEntry>> =
+            BTreeMap::new();
+        let indexed_len = get_address_index_list_len(
+            self,
+            StateAt::Latest,
+            AddressIndexListKind::OutpointIdx,
+            &address_norm,
+        )
+        .unwrap_or(0);
+        if indexed_len > 0 {
+            let ids = get_address_index_list_range(
+                self,
+                StateAt::Latest,
+                AddressIndexListKind::OutpointIdx,
+                &address_norm,
+                0,
+                indexed_len,
+            )
+            .unwrap_or_default();
+            for id in ids {
+                if resolve_outpoint_spent_by_id_v2(self, StateAt::Latest, id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    continue;
+                }
+                let Some(blob) = load_outpoint_pointer_blob_v3_by_id(self, id) else {
+                    continue;
+                };
+                indexed_balances_by_outpoint
+                    .insert((Txid::from_byte_array(blob.txid), blob.vout), blob.balances);
+            }
+        }
+
+        let direct_lookups = match get_outpoint_balances_with_spent_batch(
+            StateAt::Latest,
+            self,
+            &spendable_outpoints,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(RpcGetAddressSpendableOutpointsResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "alkane_outpoint_lookup_failed",
+                        "detail": e.to_string()
+                    }),
+                });
+            }
+        };
+
+        let mut runes_by_outpoint: HashMap<(Txid, u32), Vec<Value>> = HashMap::new();
+        if runes_enabled_from_global_config() && !spendable_outpoint_set.is_empty() {
+            let runes_provider = spendable_outpoints_runes_provider();
+            match runes_provider.get_address_outpoints(&address_norm) {
+                Ok(rows) => {
+                    for (txid, vout, row) in rows {
+                        if spendable_outpoint_set.contains(&(txid, vout)) {
+                            runes_by_outpoint
+                                .insert((txid, vout), rune_balances_to_json(&row.balances));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Ok(RpcGetAddressSpendableOutpointsResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "rune_outpoint_lookup_failed",
+                            "detail": e.to_string()
+                        }),
+                    });
+                }
+            }
+        }
+
+        let unique_txids: Vec<Txid> = {
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for (txid, _) in &spendable_outpoints {
+                if seen.insert(*txid) {
+                    out.push(*txid);
+                }
+            }
+            out
+        };
+        let raw_txs = match electrum.batch_transaction_get_raw(&unique_txids) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(RpcGetAddressSpendableOutpointsResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "raw_tx_fetch_failed",
+                        "detail": e.to_string()
+                    }),
+                });
+            }
+        };
+        let mut tx_by_txid: HashMap<Txid, (Transaction, String)> = HashMap::new();
+        for (txid, raw) in unique_txids.iter().copied().zip(raw_txs.into_iter()) {
+            if raw.is_empty() {
+                return Ok(RpcGetAddressSpendableOutpointsResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "raw_tx_fetch_failed",
+                        "txid": txid.to_string()
+                    }),
+                });
+            }
+            let tx: Transaction = match deserialize(&raw) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    return Ok(RpcGetAddressSpendableOutpointsResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "raw_tx_decode_failed",
+                            "txid": txid.to_string(),
+                            "detail": e.to_string()
+                        }),
+                    });
+                }
+            };
+            let raw_hex = if omit_raw_tx { "0".to_string() } else { hex::encode(raw) };
+            tx_by_txid.insert(txid, (tx, raw_hex));
+        }
+
+        let mut outpoints = Vec::with_capacity(spendable_outpoints.len());
+        for (txid, vout) in spendable_outpoints {
+            let Some(utxo) = utxo_by_outpoint.get(&(txid, vout)) else {
+                continue;
+            };
+            let Some((tx, raw_hex)) = tx_by_txid.get(&txid) else {
+                continue;
+            };
+            let Some(txout) = tx.output.get(vout as usize) else {
+                return Ok(RpcGetAddressSpendableOutpointsResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "missing_vout_in_raw_tx",
+                        "outpoint": format!("{}:{}", txid, vout)
+                    }),
+                });
+            };
+
+            let mut balances: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
+            if let Some(entries) = indexed_balances_by_outpoint.get(&(txid, vout)) {
+                for entry in entries {
+                    balances.insert(entry.alkane, entry.amount);
+                }
+            }
+            if let Some(lookup) = direct_lookups.get(&(txid, vout)) {
+                for entry in &lookup.balances {
+                    balances.insert(entry.alkane, entry.amount);
+                }
+            }
+            let alkanes: Vec<Value> = balances
+                .into_iter()
+                .filter(|(_, amount)| *amount > 0)
+                .map(|(alkane, amount)| {
+                    json!({
+                        "alkane": format!("{}:{}", alkane.block, alkane.tx),
+                        "amount": amount.to_string()
+                    })
+                })
+                .collect();
+            let runes = runes_by_outpoint.remove(&(txid, vout)).unwrap_or_default();
+
+            let block_height = utxo.block_height;
+            let confirmations = if utxo.confirmed {
+                block_height
+                    .map(|h| (tip_height as u64).saturating_sub(h).saturating_add(1))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            outpoints.push(json!({
+                "outpoint": format!("{}:{}", txid, vout),
+                "value": utxo.value,
+                "script_pubkey_hex": hex::encode(txout.script_pubkey.as_bytes()),
+                "block_height": block_height,
+                "confirmations": confirmations,
+                "coinbase": tx.is_coinbase(),
+                "alkanes": alkanes,
+                "runes": runes,
+                "raw_tx_hex": raw_hex
+            }));
+        }
+
+        Ok(RpcGetAddressSpendableOutpointsResult {
+            value: json!({
+                "ok": true,
+                "address": address_norm,
+                "height": tip_height,
+                "length": outpoints.len(),
+                "outpoints": outpoints
+            }),
+        })
+    }
+
     pub fn rpc_get_alkane_tx_summary(
         &self,
         params: RpcGetAlkaneTxSummaryParams,
@@ -5097,6 +5365,15 @@ pub struct RpcGetAddressOutpointsParams {
 }
 
 pub struct RpcGetAddressOutpointsResult {
+    pub value: Value,
+}
+
+pub struct RpcGetAddressSpendableOutpointsParams {
+    pub address: Option<String>,
+    pub omit_raw_tx: Option<bool>,
+}
+
+pub struct RpcGetAddressSpendableOutpointsResult {
     pub value: Value,
 }
 
@@ -6588,6 +6865,28 @@ fn mem_entry_to_json(entry: &MempoolEntry) -> Value {
         "first_seen": entry.first_seen,
         "traces": traces_json,
     })
+}
+
+fn spendable_outpoints_runes_provider() -> &'static RunesProvider {
+    static PROVIDER: OnceLock<RunesProvider> = OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        let mdb = Arc::new(Mdb::from_db(get_espo_db(), b"runes:"));
+        RunesProvider::new(mdb)
+    })
+}
+
+fn rune_balances_to_json(balances: &[RuneBalance]) -> Vec<Value> {
+    balances
+        .iter()
+        .filter(|balance| balance.amount > 0)
+        .map(|balance| {
+            json!({
+                "id": balance.id.to_string(),
+                "rune": balance.id.to_string(),
+                "amount": balance.amount.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn normalize_address(s: &str) -> Option<String> {

@@ -1,7 +1,8 @@
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::storage::{
     EssentialsProvider, RpcGetAddressActivityParams, RpcGetAddressBalancesParams,
-    RpcGetAddressOutpointsParams, RpcGetAddressTransactionsParams, RpcGetAlkaneAddressTxsParams,
+    RpcGetAddressOutpointsParams, RpcGetAddressSpendableOutpointsParams,
+    RpcGetAddressTransactionsParams, RpcGetAlkaneAddressTxsParams,
     RpcGetAlkaneBalanceMetashrewParams, RpcGetAlkaneBalanceTxsByTokenParams,
     RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams, RpcGetAlkaneBlockTxsParams,
     RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams, RpcGetAlkaneTxSummaryParams,
@@ -599,6 +600,30 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.to_string()),
                         };
                         view.rpc_get_address_outpoints(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_addr_spendable_ops = reg.clone();
+        let mdb_addr_spendable_ops = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_addr_spendable_ops
+                .register("get_address_spendable_outpoints", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_addr_spendable_ops);
+                    async move {
+                        let params = RpcGetAddressSpendableOutpointsParams {
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            omit_raw_tx: payload.get("omit_raw_tx").and_then(|v| v.as_bool()),
+                        };
+                        mdb.rpc_get_address_spendable_outpoints(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }

@@ -39,8 +39,18 @@ pub struct AddressHistoryPage {
     pub has_more: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct AddressUtxo {
+    pub txid: Txid,
+    pub vout: u32,
+    pub value: u64,
+    pub block_height: Option<u64>,
+    pub confirmed: bool,
+}
+
 /// Minimal interface needed by ammdata for fetching raw transactions.
 pub trait ElectrumLike: Send + Sync {
+    fn backend(&self) -> ElectrumLikeBackend;
     fn batch_transaction_get_raw(&self, txids: &[Txid]) -> Result<Vec<Vec<u8>>>;
     fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>>;
     fn tip_height(&self) -> Result<u32>;
@@ -60,6 +70,7 @@ pub trait ElectrumLike: Send + Sync {
         cursor: Option<&Txid>,
         limit: usize,
     ) -> Result<AddressHistoryPage>;
+    fn address_utxos(&self, address: &Address) -> Result<Vec<AddressUtxo>>;
 }
 
 /// Thin wrapper over the native Electrum RPC client.
@@ -74,6 +85,10 @@ impl ElectrumRpcClient {
 }
 
 impl ElectrumLike for ElectrumRpcClient {
+    fn backend(&self) -> ElectrumLikeBackend {
+        ElectrumLikeBackend::ElectrumRpc
+    }
+
     fn batch_transaction_get_raw(&self, txids: &[Txid]) -> Result<Vec<Vec<u8>>> {
         self.client
             .batch_transaction_get_raw(txids)
@@ -176,6 +191,12 @@ impl ElectrumLike for ElectrumRpcClient {
         _limit: usize,
     ) -> Result<AddressHistoryPage> {
         Err(anyhow::anyhow!("electrum cursor pagination not supported"))
+    }
+
+    fn address_utxos(&self, _address: &Address) -> Result<Vec<AddressUtxo>> {
+        Err(anyhow::anyhow!(
+            "address UTXO fetch requires an electrs/esplora HTTP backend; electrum RPC is not supported"
+        ))
     }
 }
 
@@ -323,6 +344,10 @@ impl EsploraElectrumLike {
 }
 
 impl ElectrumLike for EsploraElectrumLike {
+    fn backend(&self) -> ElectrumLikeBackend {
+        ElectrumLikeBackend::EsploraHttp
+    }
+
     fn batch_transaction_get_raw(&self, txids: &[Txid]) -> Result<Vec<Vec<u8>>> {
         if txids.is_empty() {
             return Ok(Vec::new());
@@ -566,6 +591,26 @@ impl ElectrumLike for EsploraElectrumLike {
             Ok(AddressHistoryPage { entries: out, total, has_more })
         })
     }
+
+    fn address_utxos(&self, address: &Address) -> Result<Vec<AddressUtxo>> {
+        let addr = address.to_string();
+        self.block_on_result(async {
+            let utxos = self.fetch_address_utxos(&addr).await?;
+            let mut out = Vec::with_capacity(utxos.len());
+            for utxo in utxos {
+                let txid = Txid::from_str(&utxo.txid)
+                    .with_context(|| format!("invalid txid in esplora utxo: {}", utxo.txid))?;
+                out.push(AddressUtxo {
+                    txid,
+                    vout: utxo.vout,
+                    value: utxo.value,
+                    block_height: utxo.status.block_height,
+                    confirmed: utxo.status.confirmed,
+                });
+            }
+            Ok(out)
+        })
+    }
 }
 
 fn extract_height(resp: &serde_json::Value) -> Option<u64> {
@@ -590,12 +635,16 @@ struct EsploraAddressChainStats {
 
 #[derive(Deserialize)]
 struct EsploraUtxo {
+    txid: String,
+    vout: u32,
+    value: u64,
     status: EsploraUtxoStatus,
 }
 
 #[derive(Deserialize)]
 struct EsploraUtxoStatus {
     confirmed: bool,
+    block_height: Option<u64>,
 }
 
 #[derive(Deserialize)]
