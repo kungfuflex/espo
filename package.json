@@ -1,1 +1,7 @@
-{}
+{
+  "name": "espo-staging",
+  "private": true,
+  "scripts": {
+    "watch:espo-rpc": "node scripts/espo_rpc_watchdog.js"
+  }
+}

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use axum::extract::{Path, State};
@@ -25,13 +25,18 @@ use crate::explorer::components::header::{
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::icon_arrow_up_right;
 use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
+use crate::explorer::pages::block::mempool_block_projected_balances;
 use crate::explorer::pages::common::format_fee_rate;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
+use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::essentials::utils::balances::{
-    OutpointLookup, get_outpoint_balances_with_spent,
+    OutpointLookup, get_outpoint_balances_with_spent, get_outpoint_balances_with_spent_batch,
 };
-use crate::runtime::mempool::{get_mempool_outspends, pending_by_txid};
+use crate::runtime::mempool::{
+    get_mempool_block_spenders, get_mempool_block_transactions_for_targets, get_mempool_outspends,
+    pending_by_txid,
+};
 use crate::runtime::state_at::StateAt;
 
 fn format_with_commas(n: u64) -> String {
@@ -71,21 +76,148 @@ fn tx_event_listener_script(txid: &Txid) -> Markup {
 
     PreEscaped(format!(
         r#"
-<script>
+<script data-tx-event-listener="">
 (() => {{
   const txid = {txid_js};
   const basePath = {base_path_js};
   const eventsPath = {ws_path_js};
   const eventsEnabled = {ws_enabled_js};
-  let reloadTimer = null;
+  let refreshTimer = null;
+  let refreshInFlight = false;
   let retryTimer = null;
+  let pollTimer = null;
 
   const normalizedBase = basePath.endsWith('/') ? basePath.slice(0, -1) : basePath;
   const wsPath = eventsPath.startsWith('/') ? `${{normalizedBase}}${{eventsPath}}` : `${{normalizedBase}}/${{eventsPath}}`;
 
-  const scheduleReload = () => {{
-    if (reloadTimer) return;
-    reloadTimer = window.setTimeout(() => window.location.reload(), 350);
+  const initHeaderInteractions = () => {{
+    document.querySelectorAll('[data-copy-btn]').forEach((btn) => {{
+      if (btn.dataset.copyBound === '1') return;
+      btn.dataset.copyBound = '1';
+      const label = btn.querySelector('[data-copy-label]');
+      const value = btn.dataset.copyValue || '';
+      if (!value) return;
+      const markCopied = () => {{
+        btn.dataset.copied = '1';
+        if (label) label.textContent = 'Copied';
+        setTimeout(() => {{
+          btn.dataset.copied = '';
+          if (label) label.textContent = 'Copy';
+        }}, 1000);
+      }};
+      btn.addEventListener('click', async () => {{
+        try {{
+          if (navigator.clipboard && navigator.clipboard.writeText) {{
+            await navigator.clipboard.writeText(value);
+            markCopied();
+            return;
+          }}
+        }} catch (_) {{}}
+        const ta = document.createElement('textarea');
+        ta.value = value;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try {{
+          document.execCommand('copy');
+          markCopied();
+        }} catch (_) {{
+          btn.dataset.error = '1';
+        }}
+        ta.remove();
+      }});
+    }});
+
+    const formatRel = (ts) => {{
+      const diff = Math.max(0, Date.now() / 1000 - ts);
+      const mins = Math.floor(diff / 60);
+      const hrs = Math.floor(mins / 60);
+      const days = Math.floor(hrs / 24);
+      if (days > 365) return `${{Math.floor(days / 365)}}y ago`;
+      if (days > 30) return `${{Math.floor(days / 30)}}mo ago`;
+      if (days > 0) return `${{days}}d ago`;
+      if (hrs > 0) return `${{hrs}}h ago`;
+      if (mins > 0) return `${{mins}}m ago`;
+      return 'just now';
+    }};
+    document.querySelectorAll('[data-ts-group]').forEach((group) => {{
+      const tsNode = group.querySelector('[data-header-ts]');
+      if (!tsNode) return;
+      const raw = Number(tsNode.dataset.headerTs);
+      if (!Number.isFinite(raw)) return;
+      const date = new Date(raw * 1000);
+      const formatter = new Intl.DateTimeFormat(undefined, {{ dateStyle: 'medium', timeStyle: 'short' }});
+      const formattedDate = formatter.format(date);
+      tsNode.textContent = formattedDate;
+      const relNode = group.querySelector('[data-header-ts-rel]');
+      if (relNode) {{
+        relNode.textContent = relNode.hasAttribute('data-rel-only')
+          ? formatRel(raw)
+          : `(${{formatRel(raw)}})`;
+        relNode.title = formattedDate;
+      }}
+    }});
+  }};
+
+  const executeMainScripts = (main) => {{
+    main.querySelectorAll('script').forEach((oldScript) => {{
+      if (oldScript.hasAttribute('data-tx-event-listener')) return;
+      const script = document.createElement('script');
+      for (const attr of oldScript.attributes) {{
+        script.setAttribute(attr.name, attr.value);
+      }}
+      script.textContent = oldScript.textContent;
+      oldScript.replaceWith(script);
+    }});
+  }};
+
+  const syncHead = (doc) => {{
+    if (doc.title) document.title = doc.title;
+    ['description'].forEach((name) => {{
+      const next = doc.head.querySelector(`meta[name="${{name}}"]`);
+      const current = document.head.querySelector(`meta[name="${{name}}"]`);
+      if (next && current) current.setAttribute('content', next.getAttribute('content') || '');
+    }});
+    ['canonical', 'alternate'].forEach((rel) => {{
+      const current = Array.from(document.head.querySelectorAll(`link[rel="${{rel}}"]`));
+      const next = Array.from(doc.head.querySelectorAll(`link[rel="${{rel}}"]`));
+      current.forEach((node, idx) => {{
+        if (next[idx]) node.setAttribute('href', next[idx].getAttribute('href') || '');
+      }});
+    }});
+  }};
+
+  const refreshDom = async () => {{
+    if (refreshInFlight) return;
+    refreshInFlight = true;
+    try {{
+      const res = await fetch(window.location.href, {{
+        cache: 'no-store',
+        headers: {{ 'Accept': 'text/html' }}
+      }});
+      if (!res.ok) return;
+      const text = await res.text();
+      const doc = new DOMParser().parseFromString(text, 'text/html');
+      const nextMain = doc.querySelector('main.app');
+      const currentMain = document.querySelector('main.app');
+      if (!nextMain || !currentMain) return;
+      syncHead(doc);
+      currentMain.replaceWith(nextMain);
+      executeMainScripts(nextMain);
+      initHeaderInteractions();
+    }} catch (_) {{
+    }} finally {{
+      refreshInFlight = false;
+    }}
+  }};
+
+  const scheduleRefresh = () => {{
+    if (refreshTimer) return;
+    refreshTimer = window.setTimeout(() => {{
+      refreshTimer = null;
+      refreshDom();
+    }}, 350);
   }};
 
   const arrayIncludesTxid = (value) => Array.isArray(value) && value.includes(txid);
@@ -123,10 +255,10 @@ fn tx_event_listener_script(txid: &Txid) -> Markup {
       }} catch (_) {{
         return;
       }}
-      if (matchesTx(payload)) scheduleReload();
+      if (matchesTx(payload)) scheduleRefresh();
     }});
     socket.addEventListener('close', () => {{
-      if (reloadTimer || retryTimer) return;
+      if (refreshTimer || retryTimer) return;
       retryTimer = window.setTimeout(() => {{
         retryTimer = null;
         connect();
@@ -135,6 +267,14 @@ fn tx_event_listener_script(txid: &Txid) -> Markup {
   }};
 
   connect();
+
+  if (document.querySelector('[data-tx-waiting="1"]')) {{
+    pollTimer = window.setInterval(async () => {{
+      if (refreshTimer || refreshInFlight) return;
+      await refreshDom();
+      if (!document.querySelector('[data-tx-waiting="1"]')) window.clearInterval(pollTimer);
+    }}, 5000);
+  }}
 }})();
 </script>
 "#
@@ -352,13 +492,107 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
         }
     }
 
-    let outpoint_fn = |txid: &Txid, vout: u32| -> OutpointLookup {
-        get_outpoint_balances_with_spent(StateAt::Latest, &state.essentials_provider(), txid, vout)
-            .unwrap_or_default()
+    let (fee_sat, fee_rate) = fee_and_rate(&tx, &prev_map);
+    let mempool_url = mempool_tx_url(state.network, &txid);
+
+    let mempool_entry = pending_by_txid(&txid);
+    let selected_mempool_index = if tx_height.is_none() {
+        mempool_entry
+            .as_ref()
+            .and_then(|entry| entry.position.as_ref().map(|pos| pos.block))
+    } else {
+        None
     };
-    let outspends_fn = |txid: &Txid| -> Vec<Option<Txid>> {
-        let mut outspends = electrum_like.transaction_get_outspends(txid).unwrap_or_default();
-        let mempool_outspends = get_mempool_outspends(txid, outspends.len());
+    let mut mempool_projected_balances_by_tx: HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> =
+        HashMap::new();
+    let mut mempool_projected_rune_io =
+        mempool_entry.as_ref().and_then(|entry| entry.rune_io.clone());
+    let mut render_fee_rate = fee_rate;
+    let mut defer_alkane_trace_status = tx_height
+        .is_none()
+        .then(|| {
+            mempool_entry
+                .as_ref()
+                .map(|entry| entry.defer_alkane_trace_status)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let mempool_block_spenders = if let Some(template_index) = selected_mempool_index {
+        let targets: HashSet<Txid> = [txid].into_iter().collect();
+        if let Some(projection_txs) =
+            get_mempool_block_transactions_for_targets(template_index, &targets)
+        {
+            let mut projection_outpoints: Vec<(Txid, u32)> = Vec::new();
+            for item in &projection_txs {
+                for vin in &item.tx.input {
+                    if !vin.previous_output.is_null() {
+                        projection_outpoints
+                            .push((vin.previous_output.txid, vin.previous_output.vout));
+                    }
+                }
+            }
+            projection_outpoints.sort();
+            projection_outpoints.dedup();
+            let projection_outpoint_map = get_outpoint_balances_with_spent_batch(
+                StateAt::Latest,
+                &state.essentials_provider(),
+                &projection_outpoints,
+            )
+            .unwrap_or_default();
+            mempool_projected_balances_by_tx =
+                mempool_block_projected_balances(&projection_txs, &projection_outpoint_map);
+            if let Some(item) = projection_txs.iter().find(|item| item.txid == txid) {
+                mempool_projected_rune_io = item.rune_io.clone();
+                render_fee_rate = Some(item.fee_rate);
+                defer_alkane_trace_status = item.defer_alkane_trace_status;
+            }
+        }
+        get_mempool_block_spenders(template_index).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let projected_balances = mempool_projected_balances_by_tx.get(&txid);
+    let outpoint_fn = |lookup_txid: &Txid, vout: u32| -> OutpointLookup {
+        let mut lookup = get_outpoint_balances_with_spent(
+            StateAt::Latest,
+            &state.essentials_provider(),
+            lookup_txid,
+            vout,
+        )
+        .unwrap_or_default();
+        if lookup.balances.is_empty() {
+            if let Some(projected) = mempool_projected_balances_by_tx
+                .get(lookup_txid)
+                .and_then(|tx_outputs| tx_outputs.get(&vout))
+            {
+                lookup.balances = projected.clone();
+            }
+        }
+        lookup
+    };
+    let outspends_fn = |lookup_txid: &Txid| -> Vec<Option<Txid>> {
+        let mut outspends =
+            electrum_like.transaction_get_outspends(lookup_txid).unwrap_or_default();
+        let mempool_outspends = if selected_mempool_index.is_some() {
+            let output_count = prev_map
+                .get(lookup_txid)
+                .map(|prev_tx| prev_tx.output.len())
+                .or_else(|| (lookup_txid == &txid).then_some(tx.output.len()))
+                .unwrap_or(outspends.len());
+            let mut block_outspends = vec![None; output_count];
+            for ((spent_txid, spent_vout), spender) in &mempool_block_spenders {
+                if spent_txid == lookup_txid {
+                    let idx = *spent_vout as usize;
+                    if idx >= block_outspends.len() {
+                        block_outspends.resize(idx + 1, None);
+                    }
+                    block_outspends[idx] = Some(*spender);
+                }
+            }
+            block_outspends
+        } else {
+            get_mempool_outspends(lookup_txid, outspends.len())
+        };
         if outspends.len() < mempool_outspends.len() {
             outspends.resize(mempool_outspends.len(), None);
         }
@@ -369,10 +603,6 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
         }
         outspends
     };
-    let (fee_sat, fee_rate) = fee_and_rate(&tx, &prev_map);
-    let mempool_url = mempool_tx_url(state.network, &txid);
-
-    let mempool_entry = pending_by_txid(&txid);
     let traces_for_tx: Option<Vec<EspoTrace>> = if let Some(h) = tx_height {
         match fetch_traces_for_tx(h, &txid, &tx) {
             Ok(v) if !v.is_empty() => Some(v),
@@ -408,11 +638,8 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
     } else {
         None
     };
-    let projected_rune_io = if tx_height.is_none() {
-        mempool_entry.as_ref().and_then(|entry| entry.rune_io.as_ref())
-    } else {
-        None
-    };
+    let projected_rune_io =
+        if tx_height.is_none() { mempool_projected_rune_io.as_ref() } else { None };
 
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
     summary_items.push(HeaderSummaryItem {
@@ -443,7 +670,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
     });
     summary_items.push(HeaderSummaryItem {
         label: "Fee rate".to_string(),
-        value: match fee_rate {
+        value: match render_fee_rate {
             Some(rate) => html! { span class="summary-value" { (format_fee_rate(rate)) } },
             None => html! { span class="summary-value muted" { "—" } },
         },
@@ -462,14 +689,6 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
         cta,
         hero_class: None,
     });
-    let selected_mempool_index = if tx_height.is_none() {
-        mempool_entry
-            .as_ref()
-            .and_then(|entry| entry.position.as_ref().map(|pos| pos.block))
-    } else {
-        None
-    };
-
     layout_with_meta(
         &format!("Tx {txid}"),
         &format!("/tx/{txid}"),
@@ -492,7 +711,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
                 }
             }
             h2 class="h2" { "Inputs & Outputs" }
-            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, fee_rate, None, projected_rune_io, false, false))
+            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, render_fee_rate, projected_balances, projected_rune_io, false, defer_alkane_trace_status))
             (header_scripts())
             (tx_event_listener_script(&txid))
         },

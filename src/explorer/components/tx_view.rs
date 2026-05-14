@@ -1255,9 +1255,9 @@ fn render_op_return(
         && tx_rune_io
             .map(|io| io.etched.is_some() || !io.minted.is_empty())
             .unwrap_or(false);
-    let trace_views: Vec<(String, Option<Value>)> = traces
+    let trace_views: Vec<(&EspoTrace, String, Option<Value>)> = traces
         .iter()
-        .map(|t| {
+        .filter_map(|t| {
             let raw = if t.protobuf_trace.events.is_empty() {
                 serde_json::to_string_pretty(&t.sandshrew_trace.events)
                     .unwrap_or_else(|_| "[]".to_string())
@@ -1266,7 +1266,15 @@ fn render_op_return(
                     .unwrap_or_else(|_| "[]".to_string())
             };
             let parsed = serde_json::from_str::<Value>(&raw).ok();
-            (raw, parsed)
+            if parsed
+                .as_ref()
+                .and_then(|value| value.as_array())
+                .map_or(false, |a| a.is_empty())
+            {
+                None
+            } else {
+                Some((*t, raw, parsed))
+            }
         })
         .collect();
 
@@ -1302,7 +1310,7 @@ fn render_op_return(
                             (render_runestone_toggle(runestone_json, &fallback))
                         }
                     }
-                    @for (idx, ((trace_raw, trace_parsed), trace)) in trace_views.iter().zip(traces.iter()).enumerate() {
+                    @for (idx, (trace, trace_raw, trace_parsed)) in trace_views.iter().enumerate() {
                         @let label = format!("Alkanes Trace #{}", idx + 1);
                         @let summary = summarize_contract_call(*trace, inspection_cache, meta_cache, impl_cache, essentials_mdb);
                         div class="trace-view" {
@@ -1318,7 +1326,7 @@ fn render_op_return(
                             }
                         }
                     }
-                    @if is_protostone && defer_alkane_trace_status && trace_views.is_empty() {
+                    @if is_protostone && defer_alkane_trace_status && traces.is_empty() {
                         div class="trace-view" {
                             (render_trace_status_waiting())
                         }

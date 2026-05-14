@@ -1593,22 +1593,148 @@ fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
 
     PreEscaped(format!(
         r#"
-<script>
+<script data-address-event-listener="">
 (() => {{
   const address = {address_js};
   const trackedTxids = new Set({txids_js});
   const basePath = {base_path_js};
   const eventsPath = {ws_path_js};
   const eventsEnabled = {ws_enabled_js};
-  let reloadTimer = null;
+  let refreshTimer = null;
+  let refreshInFlight = false;
   let retryTimer = null;
 
   const normalizedBase = basePath.endsWith('/') ? basePath.slice(0, -1) : basePath;
   const wsPath = eventsPath.startsWith('/') ? `${{normalizedBase}}${{eventsPath}}` : `${{normalizedBase}}/${{eventsPath}}`;
 
-  const scheduleReload = () => {{
-    if (reloadTimer) return;
-    reloadTimer = window.setTimeout(() => window.location.reload(), 450);
+  const initHeaderInteractions = () => {{
+    document.querySelectorAll('[data-copy-btn]').forEach((btn) => {{
+      if (btn.dataset.copyBound === '1') return;
+      btn.dataset.copyBound = '1';
+      const label = btn.querySelector('[data-copy-label]');
+      const value = btn.dataset.copyValue || '';
+      if (!value) return;
+      const markCopied = () => {{
+        btn.dataset.copied = '1';
+        if (label) label.textContent = 'Copied';
+        setTimeout(() => {{
+          btn.dataset.copied = '';
+          if (label) label.textContent = 'Copy';
+        }}, 1000);
+      }};
+      btn.addEventListener('click', async () => {{
+        try {{
+          if (navigator.clipboard && navigator.clipboard.writeText) {{
+            await navigator.clipboard.writeText(value);
+            markCopied();
+            return;
+          }}
+        }} catch (_) {{}}
+        const ta = document.createElement('textarea');
+        ta.value = value;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try {{
+          document.execCommand('copy');
+          markCopied();
+        }} catch (_) {{
+          btn.dataset.error = '1';
+        }}
+        ta.remove();
+      }});
+    }});
+
+    const formatRel = (ts) => {{
+      const diff = Math.max(0, Date.now() / 1000 - ts);
+      const mins = Math.floor(diff / 60);
+      const hrs = Math.floor(mins / 60);
+      const days = Math.floor(hrs / 24);
+      if (days > 365) return `${{Math.floor(days / 365)}}y ago`;
+      if (days > 30) return `${{Math.floor(days / 30)}}mo ago`;
+      if (days > 0) return `${{days}}d ago`;
+      if (hrs > 0) return `${{hrs}}h ago`;
+      if (mins > 0) return `${{mins}}m ago`;
+      return 'just now';
+    }};
+    document.querySelectorAll('[data-ts-group]').forEach((group) => {{
+      const tsNode = group.querySelector('[data-header-ts]');
+      if (!tsNode) return;
+      const raw = Number(tsNode.dataset.headerTs);
+      if (!Number.isFinite(raw)) return;
+      const date = new Date(raw * 1000);
+      const formatter = new Intl.DateTimeFormat(undefined, {{ dateStyle: 'medium', timeStyle: 'short' }});
+      const formattedDate = formatter.format(date);
+      tsNode.textContent = formattedDate;
+      const relNode = group.querySelector('[data-header-ts-rel]');
+      if (relNode) {{
+        relNode.textContent = relNode.hasAttribute('data-rel-only')
+          ? formatRel(raw)
+          : `(${{formatRel(raw)}})`;
+        relNode.title = formattedDate;
+      }}
+    }});
+  }};
+
+  const executeMainScripts = (main) => {{
+    main.querySelectorAll('script').forEach((oldScript) => {{
+      if (oldScript.hasAttribute('data-address-event-listener')) return;
+      const script = document.createElement('script');
+      for (const attr of oldScript.attributes) {{
+        script.setAttribute(attr.name, attr.value);
+      }}
+      script.textContent = oldScript.textContent;
+      oldScript.replaceWith(script);
+    }});
+  }};
+
+  const syncHead = (doc) => {{
+    if (doc.title) document.title = doc.title;
+    ['description'].forEach((name) => {{
+      const next = doc.head.querySelector(`meta[name="${{name}}"]`);
+      const current = document.head.querySelector(`meta[name="${{name}}"]`);
+      if (next && current) current.setAttribute('content', next.getAttribute('content') || '');
+    }});
+    ['canonical', 'alternate'].forEach((rel) => {{
+      const current = Array.from(document.head.querySelectorAll(`link[rel="${{rel}}"]`));
+      const next = Array.from(doc.head.querySelectorAll(`link[rel="${{rel}}"]`));
+      current.forEach((node, idx) => {{
+        if (next[idx]) node.setAttribute('href', next[idx].getAttribute('href') || '');
+      }});
+    }});
+  }};
+
+  const refreshDom = async () => {{
+    if (refreshInFlight) return;
+    refreshInFlight = true;
+    try {{
+      const res = await fetch(window.location.href, {{
+        cache: 'no-store',
+        headers: {{ 'Accept': 'text/html' }}
+      }});
+      if (!res.ok) return;
+      const text = await res.text();
+      const doc = new DOMParser().parseFromString(text, 'text/html');
+      const nextMain = doc.querySelector('main.app');
+      const currentMain = document.querySelector('main.app');
+      if (!nextMain || !currentMain) return;
+      syncHead(doc);
+      currentMain.replaceWith(nextMain);
+      executeMainScripts(nextMain);
+      initHeaderInteractions();
+    }} catch (_) {{
+    }} finally {{
+      refreshInFlight = false;
+    }}
+  }};
+
+  const scheduleRefresh = () => {{
+    if (refreshTimer) return;
+    refreshTimer = window.setTimeout(() => {{
+      refreshTimer = null;
+      refreshDom();
+    }}, 450);
   }};
 
   const anyTrackedTxid = (txids) =>
@@ -1660,10 +1786,10 @@ fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
       }} catch (_) {{
         return;
       }}
-      if (matchesAddress(payload)) scheduleReload();
+      if (matchesAddress(payload)) scheduleRefresh();
     }});
     socket.addEventListener('close', () => {{
-      if (reloadTimer || retryTimer) return;
+      if (refreshTimer || retryTimer) return;
       retryTimer = window.setTimeout(() => {{
         retryTimer = null;
         connect();

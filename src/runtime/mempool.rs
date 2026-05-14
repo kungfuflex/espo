@@ -67,6 +67,7 @@ pub struct MempoolEntry {
     pub rune_io: Option<TxRuneIo>,
     pub has_alkane_action: bool,
     pub has_rune_action: bool,
+    pub defer_alkane_trace_status: bool,
     pub first_seen: u64,
     pub position: Option<MempoolProjectedPosition>,
 }
@@ -98,6 +99,7 @@ pub struct MempoolTransactionStruct {
     pub tx: Option<Transaction>,
     pub protostones: Vec<Protostone>,
     pub fixed_trace: Option<Vec<EspoTrace>>,
+    pub fixed_trace_context: Option<Vec<Txid>>,
     pub diesel_trace: Option<Vec<EspoTrace>>,
     pub rune_io: Option<TxRuneIo>,
     pub first_seen: u64,
@@ -925,6 +927,7 @@ fn mempool_entry_from_state(entry: &MempoolTransactionStruct) -> Option<MempoolE
         rune_io: entry.rune_io.clone(),
         has_alkane_action: entry_has_alkane_action(entry),
         has_rune_action: entry_has_rune_action(entry),
+        defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
         first_seen: entry.first_seen,
         position: entry.position.clone(),
     })
@@ -1473,7 +1476,7 @@ fn encode_outpoint_hex(txid: &Txid, vout: u32) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
-fn build_preview_block_hex(tx: &Transaction) -> Result<String> {
+fn build_preview_block_hex(txs_to_preview: &[Transaction]) -> Result<String> {
     let coinbase = Transaction {
         version: TxVersion::TWO,
         lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
@@ -1489,9 +1492,9 @@ fn build_preview_block_hex(tx: &Transaction) -> Result<String> {
         }],
     };
 
-    let mut txs = Vec::with_capacity(2);
+    let mut txs = Vec::with_capacity(txs_to_preview.len().saturating_add(1));
     txs.push(coinbase);
-    txs.push(tx.clone());
+    txs.extend(txs_to_preview.iter().cloned());
 
     let txids: Vec<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
     let merkle_root_txid =
@@ -1529,17 +1532,66 @@ fn decode_trace_hex(data_hex: &str, txid: &Txid, tx: &Transaction, vout: u32) ->
     Ok(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })
 }
 
+fn preview_context_for_tx(txid: &Txid) -> Option<(Vec<Txid>, Vec<Transaction>)> {
+    let state = mempool_state().read().ok()?;
+    let entry = state.txs.get(txid)?;
+    let fallback_tx = entry.tx.clone()?;
+    let Some(template_index) = entry.template_index else {
+        return Some((vec![*txid], vec![fallback_tx]));
+    };
+    let template = state.templates.iter().find(|template| template.index == template_index)?;
+    let ordered: Vec<Txid> = template
+        .transaction_ids
+        .iter()
+        .filter_map(|txid_str| Txid::from_str(txid_str).ok())
+        .collect();
+    let context_txids = dependency_context_txids(txid, &ordered, &state.txs);
+    let context_txs: Option<Vec<Transaction>> = context_txids
+        .iter()
+        .map(|context_txid| state.txs.get(context_txid).and_then(|entry| entry.tx.clone()))
+        .collect();
+    context_txs
+        .filter(|txs| !txs.is_empty())
+        .map(|txs| (context_txids, txs))
+        .or_else(|| Some((vec![*txid], vec![fallback_tx])))
+}
+
+fn dependency_context_txids(
+    target: &Txid,
+    ordered: &[Txid],
+    txs: &HashMap<Txid, MempoolTransactionStruct>,
+) -> Vec<Txid> {
+    let in_block: HashSet<Txid> = ordered.iter().copied().collect();
+    let mut needed: HashSet<Txid> = HashSet::from([*target]);
+    let mut stack = vec![*target];
+
+    while let Some(txid) = stack.pop() {
+        let Some(entry) = txs.get(&txid) else {
+            continue;
+        };
+        for prev in &entry.spent_outpoints {
+            let parent = prev.txid;
+            if in_block.contains(&parent) && needed.insert(parent) {
+                stack.push(parent);
+            }
+        }
+    }
+
+    ordered.iter().filter(|txid| needed.contains(*txid)).copied().collect()
+}
+
 async fn preview_traces_for_tx(
     http: &Client,
     preview_url: &str,
     txid: &Txid,
     tx: &Transaction,
     protostone_count: usize,
+    preview_txs: &[Transaction],
 ) -> Option<Vec<EspoTrace>> {
     if protostone_count == 0 {
         return None;
     }
-    let block_hex = match build_preview_block_hex(tx) {
+    let block_hex = match build_preview_block_hex(preview_txs) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("[mempool] build preview block failed for {}: {e:?}", txid);
@@ -1743,6 +1795,7 @@ fn build_memory_entry(
         tx: Some(tx),
         protostones,
         fixed_trace: None,
+        fixed_trace_context: None,
         diesel_trace: None,
         rune_io: None,
         first_seen,
@@ -1781,6 +1834,7 @@ fn build_memory_metadata_entry(
         tx: None,
         protostones: Vec::new(),
         fixed_trace: None,
+        fixed_trace_context: None,
         diesel_trace: None,
         rune_io: None,
         first_seen,
@@ -2328,6 +2382,7 @@ fn recalculate_memory_templates() {
                         tx: None,
                         protostones: Vec::new(),
                         fixed_trace: None,
+                        fixed_trace_context: None,
                         diesel_trace: None,
                         rune_io: None,
                         first_seen: tx.first_seen,
@@ -2365,6 +2420,22 @@ fn recalculate_memory_templates() {
         txids.retain(|txid| template_state.contains_key(txid));
     }
     template_txids.retain(|txids| !txids.is_empty());
+
+    let mut stale_trace_contexts: HashMap<Txid, Vec<Txid>> = HashMap::new();
+    for txids in &template_txids {
+        for txid in txids {
+            let Some(tx) = template_state.get(txid) else {
+                continue;
+            };
+            if tx.is_diesel_mint || tx.protostones.is_empty() {
+                continue;
+            }
+            let context = dependency_context_txids(txid, txids, &template_state);
+            if tx.fixed_trace.is_none() || tx.fixed_trace_context.as_ref() != Some(&context) {
+                stale_trace_contexts.insert(*txid, context);
+            }
+        }
+    }
 
     for tx in template_state.values_mut() {
         tx.template_index = None;
@@ -2484,6 +2555,12 @@ fn recalculate_memory_templates() {
             tx.readiness = derive_readiness(tx);
         }
     }
+    let mut trace_requeue: Vec<Txid> = Vec::new();
+    for txid in stale_trace_contexts.keys().copied() {
+        if state.txs.contains_key(&txid) {
+            trace_requeue.push(txid);
+        }
+    }
 
     for (txid, update) in tx_updates {
         if let Some(tx) = state.txs.get_mut(&txid) {
@@ -2525,6 +2602,9 @@ fn recalculate_memory_templates() {
         }));
     }
     publish_mempool_event(&json!({ "type": "mempool-blocks", "data": snapshot }));
+    for txid in trace_requeue {
+        enqueue_trace(txid);
+    }
 }
 
 async fn refresh_memory_mempool(rpc: &CoreClient, network: Network) -> Result<()> {
@@ -2746,20 +2826,33 @@ async fn trace_worker(http: Client, preview_url: String) {
         };
         let entry = mempool_state().read().ok().and_then(|state| state.txs.get(&txid).cloned());
         let Some(entry) = entry else { continue };
-        if entry.is_diesel_mint || entry.protostones.is_empty() || entry.fixed_trace.is_some() {
+        if entry.is_diesel_mint || entry.protostones.is_empty() {
             continue;
         }
         let Some(transaction) = entry.tx.as_ref() else {
             continue;
         };
-        let traces =
-            preview_traces_for_tx(&http, &preview_url, &txid, transaction, entry.protostones.len())
-                .await;
+        let (trace_context, preview_txs) = preview_context_for_tx(&txid)
+            .unwrap_or_else(|| (vec![txid], vec![transaction.clone()]));
+        if entry.fixed_trace.is_some() && entry.fixed_trace_context.as_ref() == Some(&trace_context)
+        {
+            continue;
+        }
+        let traces = preview_traces_for_tx(
+            &http,
+            &preview_url,
+            &txid,
+            transaction,
+            entry.protostones.len(),
+            &preview_txs,
+        )
+        .await;
         if let Some(traces) = traces {
             let mut event_entry = None;
             if let Ok(mut state) = mempool_state().write() {
                 if let Some(current) = state.txs.get_mut(&txid) {
                     current.fixed_trace = Some(traces);
+                    current.fixed_trace_context = Some(trace_context);
                     current.readiness = derive_readiness(current);
                     event_entry = Some(current.clone());
                     state.updated_at = now_ts();

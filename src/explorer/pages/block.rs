@@ -287,7 +287,7 @@ fn aggregate_balances(
     }
 }
 
-fn mempool_block_projected_balances(
+pub(crate) fn mempool_block_projected_balances(
     ordered_txs: &[MempoolBlockTx],
     db_outpoints: &HashMap<(Txid, u32), OutpointLookup>,
 ) -> HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> {
