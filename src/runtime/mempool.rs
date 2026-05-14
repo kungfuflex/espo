@@ -2562,13 +2562,27 @@ fn recalculate_memory_templates() {
         }
     }
 
+    let mut projected_updated_txids: Vec<String> = Vec::new();
     for (txid, update) in tx_updates {
         if let Some(tx) = state.txs.get_mut(&txid) {
+            let old_template_index = tx.template_index;
+            let old_position = tx.position.as_ref().map(|pos| (pos.block, pos.vsize));
+            let old_diesel_trace_len = tx.diesel_trace.as_ref().map(|traces| traces.len());
+            let old_rune_io = tx.rune_io.clone();
             tx.template_index = Some(update.template_index);
             tx.diesel_trace = update.diesel_trace;
             tx.rune_io = update.rune_io;
             tx.position = Some(update.position);
             tx.readiness = derive_readiness(tx);
+            let new_position = tx.position.as_ref().map(|pos| (pos.block, pos.vsize));
+            let new_diesel_trace_len = tx.diesel_trace.as_ref().map(|traces| traces.len());
+            if old_template_index != tx.template_index
+                || old_position != new_position
+                || old_diesel_trace_len != new_diesel_trace_len
+                || old_rune_io != tx.rune_io
+            {
+                projected_updated_txids.push(txid.to_string());
+            }
         }
     }
 
@@ -2598,6 +2612,16 @@ fn recalculate_memory_templates() {
                 "event": "mempool_updated",
                 "status": "mempool",
                 "txids": updated_txids,
+            }
+        }));
+    }
+    if !projected_updated_txids.is_empty() {
+        publish_mempool_event(&json!({
+            "type": "tx",
+            "data": {
+                "event": "mempool_projection_updated",
+                "status": "mempool",
+                "txids": projected_updated_txids,
             }
         }));
     }
@@ -2858,10 +2882,10 @@ async fn trace_worker(http: Client, preview_url: String) {
                     state.updated_at = now_ts();
                 }
             }
+            recalculate_memory_templates();
             if let Some(entry) = event_entry.as_ref() {
                 publish_mempool_entry_event(entry, "updated");
             }
-            recalculate_memory_templates();
         }
     }
 }
