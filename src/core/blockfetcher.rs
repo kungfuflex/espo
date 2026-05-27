@@ -21,7 +21,8 @@ use crate::config::{get_bitcoind_rpc_client, get_espo_db};
 use crate::consts::alkanes_genesis_block;
 use crate::runtime::mdb::Mdb;
 use crate::utils::fee_rates::{
-    BlockFeeRateSummary, compute_fee_rate_summary, fee_rate_entry_from_weight_and_btc_fee,
+    BLOCK_FEE_RPC_VERBOSITY, BlockFeeRateSummary, compute_fee_rate_summary,
+    fee_rate_entry_from_weight_and_btc_fee,
 };
 
 /// === Tuning ==================================================================
@@ -308,37 +309,22 @@ impl BlkOrRpcBlockSource {
     }
 
     /// Verify a decoded block against Core:
-    /// - It must be **in the active chain** (confirmations > 0).
-    /// - If decode was from disk and we suspect mismatch, we could fetch RPC body (kept as hook).
+    /// - It must be in the active chain (confirmations > 0).
+    /// - Header lookup failure is not accepted as "probably active"; callers can fall back to
+    ///   fetching the already-resolved canonical hash by RPC.
     fn verify_block_active_via_rpc(&self, h: &BlockHash, blk: &Block) -> Result<Option<Block>> {
         match self.rpc.get_block_header_info(h) {
             Ok(info) => {
                 if info.confirmations <= 0 {
-                    // Not in active chain → do not cache this body.
                     eprintln!(
                         "[BLOCKFETCHER] skip cache: {} is not in active chain (confs={})",
                         h, info.confirmations
                     );
                     return Ok(None);
                 }
-                // Optional: if you want extra paranoia, you could refetch and compare merkle.
-                // Here we trust the file decode for active blocks; keep RPC fallback hook:
                 Ok(Some(blk.clone()))
             }
-            Err(e) => {
-                eprintln!(
-                    "[BLOCKFETCHER] header({}) not known ({}). Trying RPC get_block as fallback…",
-                    h, e
-                );
-                // If Core is pruned and lacks the header, or some transient issue — best effort.
-                match self.rpc.get_block(h) {
-                    Ok(b) => Ok(Some(b)),
-                    Err(e2) => {
-                        eprintln!("[BLOCKFETCHER] RPC get_block({}) failed: {:?}", h, e2);
-                        Ok(None)
-                    }
-                }
-            }
+            Err(e) => Err(anyhow!("active-chain header verification failed for {h}: {e}")),
         }
     }
 
@@ -664,52 +650,42 @@ impl BlkOrRpcBlockSource {
 
         if &h != hash {
             eprintln!(
-                "[BLOCKFETCHER] WARNING: payload hash {} != expected {}; trying RPC fallback…",
+                "[BLOCKFETCHER] payload hash {} != expected {}; rejecting local body",
                 h, hash
             );
+            return Err(anyhow!("blk payload hash mismatch: expected {hash} got {h}"));
         }
 
         // Verify via RPC (active chain). If accepted, also insert into cache for future calls.
-        if let Some(verified) = self.verify_block_active_via_rpc(hash, &blk_from_file)? {
-            self.decoded_cache.lock().unwrap().blocks.insert(*hash, verified.clone());
+        if let Some(verified) = self.verify_block_active_via_rpc(&h, &blk_from_file)? {
+            self.decoded_cache.lock().unwrap().blocks.insert(h, verified.clone());
             return Ok(verified);
         }
 
-        if self.mode == BlockFetchMode::BlkOnly {
-            return Err(anyhow!(
-                "blk-only mode: block {} failed active-chain verification; RPC fallback disabled",
-                hash
-            ));
-        }
-
-        // As a last resort (e.g., pruned header lookup oddity), try direct RPC get_block
-        eprintln!(
-            "[BLOCKFETCHER] read_block_from_loc: disk body not verified; using RPC get_block({})",
-            hash
-        );
-        let blk = self
-            .rpc
-            .get_block(hash)
-            .with_context(|| format!("bitcoind: getblock({hash})"))?;
-        // Don’t cache here unless you want to (it’s okay to cache — it’s active by virtue of height lookup)
-        self.decoded_cache.lock().unwrap().blocks.insert(*hash, blk.clone());
-        Ok(blk)
+        Err(anyhow!("block {hash} failed active-chain verification"))
     }
 
     fn get_block_result_from_rpc(&self, hash: &BlockHash) -> Result<BlockFetchResult> {
         let verbose: VerboseRpcBlock = match self
             .rpc
-            .call("getblock", &[json!(hash.to_string()), json!(3)])
+            .call("getblock", &[json!(hash.to_string()), json!(BLOCK_FEE_RPC_VERBOSITY)])
         {
             Ok(block) => block,
             Err(err) => {
                 eprintln!(
-                    "[BLOCKFETCHER] verbose getblock({hash}, 3) failed; falling back to raw block without fee range: {err:?}"
+                    "[BLOCKFETCHER] verbose getblock({hash}, {BLOCK_FEE_RPC_VERBOSITY}) failed; falling back to raw block without fee range: {err:?}"
                 );
                 let block = self
                     .rpc
                     .get_block(hash)
                     .with_context(|| format!("bitcoind: getblock({hash})"))?;
+                if block.block_hash() != *hash {
+                    return Err(anyhow!(
+                        "raw getblock hash mismatch: expected {} got {}",
+                        hash,
+                        block.block_hash()
+                    ));
+                }
                 return Ok(BlockFetchResult { block, fee_summary: None });
             }
         };
@@ -788,27 +764,27 @@ impl BlockSource for BlkOrRpcBlockSource {
             return Ok(result);
         }
 
-        // 0) First: consult the preloaded height→hash map (already filtered to active chain)
-        if let Some(h) = self.height_to_hash.lock().unwrap().get(&height).cloned() {
-            if let Some(loc) = self.index_get(&h)? {
-                eprintln!(
-                    "[BLOCKFETCHER] height={} (preloaded map) using BLK (file={}, off={}, len={})",
-                    height, loc.file_no, loc.offset, loc.len
-                );
-                let blk = self.read_block_from_loc(&h, &loc)?;
-                eprintln!("[BLOCKFETCHER] height={} BLK ok in {:.2?}", height, t0.elapsed());
-                return Ok(BlockFetchResult { block: blk, fee_summary: None });
-            }
-            // If the map has the hash but location is missing (shouldn't happen), fall through.
-        }
-
-        // 1) height → hash via RPC (canonical)
+        // 1) height → hash via RPC. The in-memory height map is only a hint; Core is the
+        // canonical source before we serve any block body.
         let hash: BlockHash = self
             .rpc
             .get_block_hash(height as u64)
             .with_context(|| format!("bitcoind: getblockhash({height})"))?;
-        // Opportunistically cache this mapping for subsequent calls in the same run.
-        self.height_to_hash.lock().unwrap().insert(height, hash);
+        {
+            let mut height_map = self.height_to_hash.lock().unwrap();
+            if height_map.get(&height).copied().is_some_and(|cached| cached != hash) {
+                eprintln!(
+                    "[BLOCKFETCHER] canonical hash changed at height {}: cached={} core={}; clearing decoded cache",
+                    height,
+                    height_map.get(&height).copied().unwrap(),
+                    hash
+                );
+                let mut decoded = self.decoded_cache.lock().unwrap();
+                decoded.blocks.clear();
+                decoded.file_no = None;
+            }
+            height_map.insert(height, hash);
+        }
 
         // Near-tip guard: direct RPC (avoid tail races on a file being appended)
         if self.mode != BlockFetchMode::BlkOnly
@@ -826,7 +802,27 @@ impl BlockSource for BlkOrRpcBlockSource {
                 "[BLOCKFETCHER] height={} hash={} using BLK (file={}, off={}, len={})",
                 height, hash, loc.file_no, loc.offset, loc.len
             );
-            let blk = self.read_block_from_loc(&hash, &loc)?;
+            let blk = match self.read_block_from_loc(&hash, &loc) {
+                Ok(blk) => blk,
+                Err(e) if self.mode != BlockFetchMode::BlkOnly => {
+                    eprintln!(
+                        "[BLOCKFETCHER] height={} BLK read failed for canonical hash {}; falling back to RPC: {e:?}",
+                        height, hash
+                    );
+                    let result = self.get_block_result_from_rpc(&hash)?;
+                    eprintln!("[BLOCKFETCHER] height={} RPC ok in {:.2?}", height, t0.elapsed());
+                    return Ok(result);
+                }
+                Err(e) => return Err(e),
+            };
+            if blk.block_hash() != hash {
+                return Err(anyhow!(
+                    "block fetch hash mismatch at height {}: expected {} got {}",
+                    height,
+                    hash,
+                    blk.block_hash()
+                ));
+            }
             eprintln!("[BLOCKFETCHER] height={} BLK ok in {:.2?}", height, t0.elapsed());
             return Ok(BlockFetchResult { block: blk, fee_summary: None });
         }
@@ -839,7 +835,31 @@ impl BlockSource for BlkOrRpcBlockSource {
                     "[BLOCKFETCHER] height={} found after indexing → BLK (file={}, off={}, len={})",
                     height, loc.file_no, loc.offset, loc.len
                 );
-                let blk = self.read_block_from_loc(&hash, &loc)?;
+                let blk = match self.read_block_from_loc(&hash, &loc) {
+                    Ok(blk) => blk,
+                    Err(e) if self.mode != BlockFetchMode::BlkOnly => {
+                        eprintln!(
+                            "[BLOCKFETCHER] height={} BLK read failed for canonical hash {}; falling back to RPC: {e:?}",
+                            height, hash
+                        );
+                        let result = self.get_block_result_from_rpc(&hash)?;
+                        eprintln!(
+                            "[BLOCKFETCHER] height={} RPC ok in {:.2?}",
+                            height,
+                            t0.elapsed()
+                        );
+                        return Ok(result);
+                    }
+                    Err(e) => return Err(e),
+                };
+                if blk.block_hash() != hash {
+                    return Err(anyhow!(
+                        "block fetch hash mismatch at height {}: expected {} got {}",
+                        height,
+                        hash,
+                        blk.block_hash()
+                    ));
+                }
                 eprintln!("[BLOCKFETCHER] height={} BLK ok in {:.2?}", height, t0.elapsed());
                 return Ok(BlockFetchResult { block: blk, fee_summary: None });
             }

@@ -471,6 +471,7 @@ impl RunesProvider {
         &self,
         puts: Vec<(Vec<u8>, Vec<u8>)>,
         deletes: Vec<Vec<u8>>,
+        known_preimages: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         index_height: u32,
         block_hash: &BlockHash,
     ) -> Result<()> {
@@ -479,13 +480,23 @@ impl RunesProvider {
         let delete_count = deletes.len();
         let put_bytes: usize = puts.iter().map(|(key, value)| key.len() + value.len()).sum();
         let delete_bytes: usize = deletes.iter().map(|key| key.len()).sum();
+        let touched_keys: HashSet<Vec<u8>> =
+            puts.iter().map(|(key, _)| key.clone()).chain(deletes.iter().cloned()).collect();
+        let known_preimages: BTreeMap<Vec<u8>, Option<Vec<u8>>> = known_preimages
+            .into_iter()
+            .filter(|(key, _)| touched_keys.contains(key))
+            .collect();
         let mut read_keys = HashSet::new();
         let mut append_only_put_keys = Vec::new();
         for key in &deletes {
-            read_keys.insert(key.clone());
+            if !known_preimages.contains_key(key) {
+                read_keys.insert(key.clone());
+            }
         }
         for (key, _) in &puts {
-            if runes_put_key_requires_preimage(key) {
+            if known_preimages.contains_key(key) {
+                continue;
+            } else if runes_put_key_requires_preimage(key) {
                 read_keys.insert(key.clone());
             } else {
                 append_only_put_keys.push(key.clone());
@@ -500,11 +511,16 @@ impl RunesProvider {
         let t_read = Instant::now();
         let previous_values = self.mdb.multi_get(&read_keys)?;
         let read_elapsed = t_read.elapsed();
-        let mut changes = read_keys
+        let mut changes = known_preimages
             .into_iter()
-            .zip(previous_values)
             .map(|(key, previous)| RuneUndoChange { key, previous })
             .collect::<Vec<_>>();
+        changes.extend(
+            read_keys
+                .into_iter()
+                .zip(previous_values)
+                .map(|(key, previous)| RuneUndoChange { key, previous }),
+        );
         changes.extend(
             append_only_put_keys
                 .into_iter()
@@ -560,6 +576,50 @@ impl RunesProvider {
 
     pub fn has_undo_for_height(&self, height: u32) -> Result<bool> {
         Ok(self.mdb.get(&undo_key(height))?.is_some())
+    }
+
+    pub fn preflight_rollback_before_height(&self, next_height: u32) -> Result<()> {
+        let target_height = next_height.checked_sub(1);
+        let mut simulated_height = self.get_index_height()?;
+        let mut simulated_hash = self.get_index_block_hash()?.map(|hash| hash.to_byte_array());
+
+        while let Some(current_height) = simulated_height {
+            if let Some(target_height) = target_height {
+                if current_height <= target_height {
+                    return Ok(());
+                }
+            }
+
+            let key = undo_key(current_height);
+            let Some(undo_bytes) = self.mdb.get(&key)? else {
+                return Err(anyhow!(
+                    "runes rollback missing undo journal for height {current_height}; full runes reindex required"
+                ));
+            };
+            let undo = RunesBlockUndo::try_from_slice(&undo_bytes).map_err(|e| {
+                anyhow!("failed to decode runes undo journal at {current_height}: {e}")
+            })?;
+            if undo.height != current_height {
+                return Err(anyhow!(
+                    "runes rollback journal height mismatch: key height {current_height}, record height {}",
+                    undo.height
+                ));
+            }
+            if let Some(current_hash) = simulated_hash {
+                if current_hash != undo.block_hash {
+                    return Err(anyhow!(
+                        "runes rollback journal hash mismatch at height {current_height}: index hash {}, journal hash {}",
+                        BlockHash::from_byte_array(current_hash),
+                        BlockHash::from_byte_array(undo.block_hash)
+                    ));
+                }
+            }
+
+            simulated_height = undo.prev_index_height;
+            simulated_hash = undo.prev_index_block_hash;
+        }
+
+        Ok(())
     }
 
     pub fn rollback_before_height(&self, next_height: u32) -> Result<()> {
@@ -1393,15 +1453,19 @@ pub fn append_rune_tx_index_values(
     list_key: Vec<u8>,
     values: &[u64],
     next_chunk_id: &mut u64,
+    preimages: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<u64> {
     if values.is_empty() {
         return Ok(0);
     }
-    let current = provider
-        .mdb()
-        .get(&list_key)?
-        .map(|raw| RuneTxIndexList::try_from_slice(&raw))
+    let current_raw = provider.mdb().get(&list_key)?;
+    if current_raw.is_some() {
+        preimages.entry(list_key.clone()).or_insert_with(|| current_raw.clone());
+    }
+    let current = current_raw
+        .as_deref()
+        .map(RuneTxIndexList::try_from_slice)
         .transpose()?
         .unwrap_or_else(|| RuneTxIndexList::Inline { items: Vec::new() });
 
@@ -1440,11 +1504,9 @@ pub fn append_rune_tx_index_values(
                 if rem > 0 {
                     let last_chunk_id = *chunk_ids.last().unwrap_or(&0);
                     let last_key = rune_tx_chunk_key(kind, last_chunk_id);
-                    let mut last_items = provider
-                        .mdb()
-                        .get(&last_key)?
-                        .map(|raw| decode_u64_chunk(&raw))
-                        .unwrap_or_default();
+                    let last_raw = provider.mdb().get(&last_key)?;
+                    let mut last_items =
+                        last_raw.as_deref().map(decode_u64_chunk).unwrap_or_default();
                     if last_items.len() > chunk_size_usize {
                         last_items.truncate(chunk_size_usize);
                     }
@@ -1452,6 +1514,7 @@ pub fn append_rune_tx_index_values(
                     let take = free.min(pending.len());
                     if take > 0 {
                         last_items.extend_from_slice(&pending[..take]);
+                        preimages.entry(last_key.clone()).or_insert(last_raw);
                         puts.push((last_key, encode_u64_chunk(&last_items)?));
                         pending = &pending[take..];
                     }
@@ -1579,24 +1642,26 @@ fn runes_put_key_requires_preimage(key: &[u8]) -> bool {
         || key == b"/tx_index/actions/pointer/count"
         || key == b"/rune/seq/count"
         || key.starts_with(b"/tx_index/chunk_count/")
-        || key.starts_with(b"/tx_index/chunk/")
-        || key.starts_with(b"/tx_index/address/")
-        || key.starts_with(b"/tx_index/actions/block/")
-        || key.starts_with(b"/tx_index/actions/address/")
         || key.starts_with(b"/rune/by_id/")
         || key.starts_with(b"/holder/")
         || key.starts_with(b"/holder_count/")
         || key.starts_with(b"/address/")
-        || key.starts_with(b"/address_balance_height/")
-        || key.starts_with(b"/address_balance_height_idx/")
+        || address_balance_history_list_key_requires_preimage(key)
         || key.starts_with(b"/volume/")
-        || key.starts_with(b"/volume_idx/")
-        || key.starts_with(b"/tx_index/chunk/address/")
+        || volume_index_key_requires_preimage(key)
     {
         return true;
     }
 
     false
+}
+
+fn address_balance_history_list_key_requires_preimage(key: &[u8]) -> bool {
+    key.starts_with(b"/address_balance_height_idx/") && key.ends_with(b"/len")
+}
+
+fn volume_index_key_requires_preimage(key: &[u8]) -> bool {
+    key.starts_with(b"/volume_idx/") && key.ends_with(b"/len")
 }
 
 pub fn encode_u128(value: u128) -> Vec<u8> {
@@ -2035,10 +2100,22 @@ mod tests {
         let h2 = BlockHash::from_byte_array([2; 32]);
 
         provider
-            .set_block_batch(vec![(b"/a".to_vec(), b"one".to_vec())], Vec::new(), 1, &h1)
+            .set_block_batch(
+                vec![(b"/a".to_vec(), b"one".to_vec())],
+                Vec::new(),
+                BTreeMap::new(),
+                1,
+                &h1,
+            )
             .expect("write block 1");
         provider
-            .set_block_batch(vec![(b"/b".to_vec(), b"two".to_vec())], vec![b"/a".to_vec()], 2, &h2)
+            .set_block_batch(
+                vec![(b"/b".to_vec(), b"two".to_vec())],
+                vec![b"/a".to_vec()],
+                BTreeMap::new(),
+                2,
+                &h2,
+            )
             .expect("write block 2");
 
         provider.rollback_before_height(2).expect("rollback block 2");
@@ -2052,5 +2129,30 @@ mod tests {
         assert_eq!(provider.get_index_height().expect("height"), None);
         assert_eq!(provider.get_index_block_hash().expect("hash"), None);
         assert_eq!(provider.mdb().get(b"/a").expect("a"), None);
+    }
+
+    #[test]
+    fn rollback_preflight_rejects_missing_undo_without_mutation() {
+        let (_dir, provider) = test_provider();
+        let h1 = BlockHash::from_byte_array([1; 32]);
+
+        provider
+            .set_block_batch(
+                vec![(b"/a".to_vec(), b"one".to_vec())],
+                Vec::new(),
+                BTreeMap::new(),
+                1,
+                &h1,
+            )
+            .expect("write block 1");
+        provider.mdb().delete(&undo_key(1)).expect("delete undo 1");
+
+        let err = provider
+            .preflight_rollback_before_height(1)
+            .expect_err("missing undo should fail preflight");
+        assert!(err.to_string().contains("missing undo journal"));
+        assert_eq!(provider.get_index_height().expect("height"), Some(1));
+        assert_eq!(provider.get_index_block_hash().expect("hash"), Some(h1));
+        assert_eq!(provider.mdb().get(b"/a").expect("a"), Some(b"one".to_vec()));
     }
 }

@@ -129,6 +129,10 @@ fn default_address_index_chunk_size() -> u32 {
     512
 }
 
+fn default_trace_read_workers() -> u16 {
+    8
+}
+
 fn default_mempool_enabled() -> bool {
     true
 }
@@ -364,6 +368,8 @@ pub struct ConfigFile {
     pub compact_tx_trace_rows: bool,
     #[serde(default = "default_address_index_chunk_size")]
     pub address_index_chunk_size: u32,
+    #[serde(default = "default_trace_read_workers")]
+    pub trace_read_workers: u16,
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
     #[serde(default)]
@@ -406,6 +412,7 @@ pub struct AppConfig {
     pub block_source_mode: BlockFetchMode,
     pub compact_tx_trace_rows: bool,
     pub address_index_chunk_size: u32,
+    pub trace_read_workers: u16,
     pub explorer_networks: Option<ExplorerNetworks>,
     pub google_analytics_tag: Option<String>,
     pub misc: MiscConfig,
@@ -475,6 +482,7 @@ impl AppConfig {
             block_source_mode,
             compact_tx_trace_rows: file.compact_tx_trace_rows,
             address_index_chunk_size: file.address_index_chunk_size,
+            trace_read_workers: file.trace_read_workers,
             explorer_networks,
             google_analytics_tag,
             misc: file.misc,
@@ -548,6 +556,9 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
     }
     if cfg.address_index_chunk_size == 0 {
         anyhow::bail!("address_index_chunk_size must be greater than 0");
+    }
+    if cfg.trace_read_workers == 0 {
+        anyhow::bail!("trace_read_workers must be greater than 0");
     }
 
     cfg.explorer_base_path = normalize_explorer_base_path(&cfg.explorer_base_path)?;
@@ -734,6 +745,14 @@ pub fn compact_tx_trace_rows_enabled() -> bool {
 
 pub fn get_address_index_chunk_size() -> usize {
     get_config().address_index_chunk_size.max(1) as usize
+}
+
+pub fn get_trace_read_workers() -> usize {
+    std::env::var("ESPO_TRACE_READ_WORKERS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|workers| *workers > 0)
+        .unwrap_or_else(|| get_config().trace_read_workers.max(1) as usize)
 }
 
 pub fn is_strict_mode() -> bool {

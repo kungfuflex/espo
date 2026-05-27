@@ -1,7 +1,8 @@
 use super::schemas::{ActivityKind, SchemaCandleV1, SchemaMarketDefs, Timeframe};
 use super::storage::{
-    AmmDataProvider, GetListEntriesDescParams, GetPoolDefsParams, GetRawValueParams,
-    GetTokenPoolsParams, SetBatchParams,
+    AmmDataProvider, GetListEntriesDescParams, GetListEntriesDescRangeParams,
+    GetMultiValuesParams as AmmGetMultiValuesParams, GetPoolDefsParams, GetTokenPoolsParams,
+    SetBatchParams,
 };
 use super::utils::activity::decode_activity_v1;
 use crate::alkanes::trace::EspoBlock;
@@ -42,6 +43,7 @@ use super::rpc::register_rpc;
 const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
 const AMM_FACTORY_OPCODES: [u128; 14] = [0, 1, 2, 3, 4, 7, 10, 11, 12, 13, 14, 21, 29, 50];
 const KV_KEY_BEACON: &[u8] = b"/beacon";
+const TRADE_WINDOW_RANGE_PAGE_LIMIT: usize = 4096;
 
 fn is_amm_factory_metadata(meta: &StoredInspectionMetadata) -> bool {
     let has_opcodes = AMM_FACTORY_OPCODES
@@ -340,6 +342,54 @@ fn trade_index_prefix(pool: &SchemaAlkaneId) -> Vec<u8> {
     format!("activity:idx:v1:{}:{}:trades:ts:", pool.block, pool.tx).into_bytes()
 }
 
+fn trade_index_key_at_or_after(prefix: &[u8], ts: u64) -> Vec<u8> {
+    let mut k = prefix.to_vec();
+    k.extend_from_slice(&ts.to_be_bytes());
+    k.extend_from_slice(&0u32.to_be_bytes());
+    k
+}
+
+fn trade_index_key_after_ts(prefix: &[u8], ts: u64) -> Option<Vec<u8>> {
+    let mut k = prefix.to_vec();
+    k.extend_from_slice(&ts.checked_add(1)?.to_be_bytes());
+    Some(k)
+}
+
+fn recent_trade_index_entries(
+    provider: &AmmDataProvider,
+    prefix: &[u8],
+    start_ts: u64,
+    end_ts: u64,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let start_inclusive = trade_index_key_at_or_after(prefix, start_ts);
+    let mut end_exclusive = trade_index_key_after_ts(prefix, end_ts);
+    let mut out = Vec::new();
+
+    loop {
+        let page = provider
+            .get_list_entries_desc_range(GetListEntriesDescRangeParams {
+                blockhash: StateAt::Latest,
+                start_inclusive: start_inclusive.clone(),
+                end_exclusive: end_exclusive.clone(),
+                limit: TRADE_WINDOW_RANGE_PAGE_LIMIT,
+            })?
+            .entries;
+        if page.is_empty() {
+            break;
+        }
+
+        let page_len = page.len();
+        end_exclusive = page.last().map(|(key, _value)| key.clone());
+        out.extend(page);
+
+        if page_len < TRADE_WINDOW_RANGE_PAGE_LIMIT {
+            break;
+        }
+    }
+
+    Ok(out)
+}
+
 pub(crate) fn pool_trade_windows(
     provider: &AmmDataProvider,
     pool: &SchemaAlkaneId,
@@ -362,53 +412,69 @@ pub(crate) fn pool_trade_windows(
     let prefix_len = prefix.len();
     let mut out = PoolTradeWindows::default();
 
-    for (k, v) in provider
-        .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest,
-            prefix: prefix.clone(),
-        })?
-        .entries
-    {
-        let Some((ts, seq)) = decode_ts_seq_from_index(prefix_len, &k, &v) else {
+    let entries = if full_history {
+        provider
+            .get_list_entries_desc(GetListEntriesDescParams {
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })?
+            .entries
+    } else {
+        recent_trade_index_entries(provider, &prefix, start_30d, now_ts)?
+    };
+
+    let mut activity_refs: Vec<(u64, u32)> = Vec::with_capacity(entries.len());
+    for (k, v) in &entries {
+        if !k.starts_with(&prefix) {
+            continue;
+        }
+        let Some((ts, seq)) = decode_ts_seq_from_index(prefix_len, k, v) else {
             continue;
         };
         if !full_history && ts < start_30d {
             break;
         }
+        activity_refs.push((ts, seq));
+    }
 
-        let key = activity_key_for(pool, ts, seq);
-        let Some(raw) = provider
-            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
-            .value
-        else {
-            continue;
-        };
-        let activity = match decode_activity_v1(&raw) {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        if !matches!(activity.kind, ActivityKind::TradeBuy | ActivityKind::TradeSell) {
-            continue;
-        }
+    for chunk in activity_refs.chunks(TRADE_WINDOW_RANGE_PAGE_LIMIT) {
+        let keys: Vec<Vec<u8>> =
+            chunk.iter().map(|(ts, seq)| activity_key_for(pool, *ts, *seq)).collect();
+        let values = provider
+            .get_multi_values(AmmGetMultiValuesParams { blockhash: StateAt::Latest, keys })?
+            .values;
 
-        let base_abs = abs_i128(activity.base_delta);
-        let quote_abs = abs_i128(activity.quote_delta);
+        for ((ts, _seq), raw) in chunk.iter().zip(values.into_iter()) {
+            let Some(raw) = raw else {
+                continue;
+            };
+            let activity = match decode_activity_v1(&raw) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            if !matches!(activity.kind, ActivityKind::TradeBuy | ActivityKind::TradeSell) {
+                continue;
+            }
 
-        if ts >= start_30d {
-            out.token0_30d = out.token0_30d.saturating_add(base_abs);
-            out.token1_30d = out.token1_30d.saturating_add(quote_abs);
-        }
-        if ts >= start_7d {
-            out.token0_7d = out.token0_7d.saturating_add(base_abs);
-            out.token1_7d = out.token1_7d.saturating_add(quote_abs);
-        }
-        if ts >= start_1d {
-            out.token0_1d = out.token0_1d.saturating_add(base_abs);
-            out.token1_1d = out.token1_1d.saturating_add(quote_abs);
-        }
-        if full_history {
-            out.token0_all = out.token0_all.saturating_add(base_abs);
-            out.token1_all = out.token1_all.saturating_add(quote_abs);
+            let base_abs = abs_i128(activity.base_delta);
+            let quote_abs = abs_i128(activity.quote_delta);
+
+            if *ts >= start_30d {
+                out.token0_30d = out.token0_30d.saturating_add(base_abs);
+                out.token1_30d = out.token1_30d.saturating_add(quote_abs);
+            }
+            if *ts >= start_7d {
+                out.token0_7d = out.token0_7d.saturating_add(base_abs);
+                out.token1_7d = out.token1_7d.saturating_add(quote_abs);
+            }
+            if *ts >= start_1d {
+                out.token0_1d = out.token0_1d.saturating_add(base_abs);
+                out.token1_1d = out.token1_1d.saturating_add(quote_abs);
+            }
+            if full_history {
+                out.token0_all = out.token0_all.saturating_add(base_abs);
+                out.token1_all = out.token1_all.saturating_add(quote_abs);
+            }
         }
     }
 
@@ -868,6 +934,16 @@ impl EspoModule for AmmData {
 
     fn get_index_height(&self) -> Option<u32> {
         *self.index_height.read().unwrap()
+    }
+
+    fn handle_reorg(&self, next_height: u32) -> Result<()> {
+        let height = self.load_index_height()?;
+        *self.index_height.write().unwrap() = height;
+        eprintln!(
+            "[AMMDATA] reorg rollback complete; next_height={}, index height: {:?}",
+            next_height, height
+        );
+        Ok(())
     }
 
     fn register_rpc(&self, reg: &RpcNsRegistrar) {

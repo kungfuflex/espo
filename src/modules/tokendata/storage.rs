@@ -615,8 +615,15 @@ impl TokenDataProvider {
                             .raw_blob_get(&last_key)?
                             .map(|raw| decode_u64_chunk(&raw))
                             .unwrap_or_default();
-                        if last_items.len() > chunk_size_usize {
-                            last_items.truncate(chunk_size_usize);
+                        if last_items.len() > rem {
+                            last_items.truncate(rem);
+                        }
+                        if last_items.len() < rem {
+                            return Err(anyhow!(
+                                "token activity index chunk {} is shorter than canonical length {}",
+                                last_chunk_id,
+                                rem
+                            ));
                         }
                         if last_items.len() < chunk_size_usize {
                             let free = chunk_size_usize.saturating_sub(last_items.len());
@@ -1333,4 +1340,74 @@ fn push_spk(dst: &mut Vec<u8>, spk: &[u8]) {
     let len = spk.len().min(u16::MAX as usize) as u16;
     dst.extend_from_slice(&len.to_be_bytes());
     dst.extend_from_slice(&spk[..len as usize]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn new_provider_with_tempdb() -> TokenDataProvider {
+        let dir = TempDir::new().expect("tempdir");
+        let mdb = Arc::new(Mdb::open(dir.path(), b"tokendata_test:").expect("open mdb"));
+        // Keep tempdir alive for process lifetime in tests.
+        std::mem::forget(dir);
+        TokenDataProvider::new(mdb)
+    }
+
+    #[test]
+    fn activity_index_append_truncates_stale_tail_from_blob_chunk() {
+        let provider = new_provider_with_tempdb();
+        let table = provider.table();
+        let prefix = b"/test/activity".to_vec();
+        let meta_key = table.activity_index_meta_key(&prefix);
+        let chunk_id = 11u64;
+        let chunk_key = table.activity_index_chunk_blob_key(chunk_id);
+
+        provider
+            .set_blob_batch(SetBlobBatchParams {
+                puts: vec![(
+                    chunk_key.clone(),
+                    encode_u64_chunk(vec![10, 11, 99, 100]).expect("encode chunk"),
+                )],
+            })
+            .expect("write stale chunk");
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![(
+                    meta_key.clone(),
+                    encode_activity_index_state(&InlineOrExternalU64V1::External {
+                        chunk_ids: vec![chunk_id],
+                        len: 2,
+                        chunk_size: 4,
+                    })
+                    .expect("encode state"),
+                )],
+                deletes: Vec::new(),
+            })
+            .expect("write meta");
+
+        let mut next_chunk_id = 12u64;
+        let mut puts = Vec::new();
+        let mut blob_puts = Vec::new();
+        let new_len = provider
+            .append_activity_index_values(
+                meta_key,
+                &[12, 13],
+                &mut next_chunk_id,
+                &mut puts,
+                &mut blob_puts,
+            )
+            .expect("append");
+
+        assert_eq!(new_len, 4);
+        assert_eq!(next_chunk_id, 12);
+        let (_, rewritten_chunk) = blob_puts
+            .iter()
+            .find(|(key, _)| key == &chunk_key)
+            .expect("rewritten last chunk");
+        assert_eq!(decode_u64_chunk(rewritten_chunk), vec![10, 11, 12, 13]);
+    }
 }

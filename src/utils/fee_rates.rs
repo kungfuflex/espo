@@ -18,6 +18,10 @@ pub struct FeeRateEntry {
     pub rate: f64,
 }
 
+/// Verbosity 2 includes every tx with hex, weight, and fee. Verbosity 3 adds
+/// prevouts, which are much larger and are not used for fee ranges.
+pub const BLOCK_FEE_RPC_VERBOSITY: u8 = 2;
+
 #[derive(Deserialize)]
 struct VerboseBlockTxsForFees {
     tx: Vec<VerboseBlockTxForFees>,
@@ -45,8 +49,10 @@ pub fn fee_rate_entry_from_weight_and_btc_fee(
 pub fn compute_block_fee_rate_summary(blockhash: &BlockHash) -> Result<BlockFeeRateSummary> {
     let rpc = get_bitcoind_rpc_client();
     let block: VerboseBlockTxsForFees = rpc
-        .call("getblock", &[json!(blockhash.to_string()), json!(3)])
-        .map_err(|e| anyhow!("bitcoind getblock({blockhash}, 3) failed: {e}"))?;
+        .call("getblock", &[json!(blockhash.to_string()), json!(BLOCK_FEE_RPC_VERBOSITY)])
+        .map_err(|e| {
+            anyhow!("bitcoind getblock({blockhash}, {BLOCK_FEE_RPC_VERBOSITY}) failed: {e}")
+        })?;
     Ok(compute_fee_rate_summary(
         block
             .tx

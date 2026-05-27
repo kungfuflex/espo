@@ -24,7 +24,7 @@ use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use protorune_support::utils::decode_varint_list;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::Cursor;
@@ -208,6 +208,112 @@ pub fn extract_alkane_storage(
     Ok(out)
 }
 
+fn trace_id_to_short_id(id: Option<&alkanes::AlkaneId>) -> EspoSandshrewLikeTraceShortId {
+    EspoSandshrewLikeTraceShortId {
+        block: id
+            .and_then(|x| x.block.as_ref())
+            .map(fmt_u128_hex)
+            .unwrap_or_else(|| "0x0".to_string()),
+        tx: id
+            .and_then(|x| x.tx.as_ref())
+            .map(fmt_u128_hex)
+            .unwrap_or_else(|| "0x0".to_string()),
+    }
+}
+
+fn trace_transfer_to_espo(transfer: &alkanes::AlkaneTransfer) -> EspoSandshrewLikeTraceTransfer {
+    EspoSandshrewLikeTraceTransfer {
+        id: trace_id_to_short_id(transfer.id.as_ref()),
+        value: transfer.value.as_ref().map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
+    }
+}
+
+pub fn protobuf_trace_events(trace: &AlkanesTrace) -> Result<Vec<EspoSandshrewLikeTraceEvent>> {
+    let mut out: Vec<EspoSandshrewLikeTraceEvent> = Vec::with_capacity(trace.events.len());
+
+    for ev in &trace.events {
+        if let Some(event) = &ev.event {
+            use alkanes::alkanes_trace_event::Event;
+            match event {
+                Event::EnterContext(enter) => {
+                    let typ = match enter.call_type() {
+                        alkanes::AlkanesTraceCallType::Call => "call",
+                        alkanes::AlkanesTraceCallType::Delegatecall => "delegatecall",
+                        alkanes::AlkanesTraceCallType::Staticcall => "staticcall",
+                        _ => "unknown",
+                    };
+
+                    let ctx = enter.context.as_ref().context("enter.context missing")?;
+                    let inner = ctx.inner.as_ref().context("enter.context.inner missing")?;
+
+                    out.push(EspoSandshrewLikeTraceEvent::Invoke(
+                        EspoSandshrewLikeTraceInvokeData {
+                            typ: typ.to_string(),
+                            context: EspoSandshrewLikeTraceInvokeContext {
+                                myself: trace_id_to_short_id(inner.myself.as_ref()),
+                                caller: trace_id_to_short_id(inner.caller.as_ref()),
+                                inputs: inner.inputs.iter().map(fmt_u128_hex).collect(),
+                                incoming_alkanes: inner
+                                    .incoming_alkanes
+                                    .iter()
+                                    .map(trace_transfer_to_espo)
+                                    .collect(),
+                                vout: inner.vout,
+                            },
+                            fuel: ctx.fuel,
+                        },
+                    ));
+                }
+
+                Event::ExitContext(exit) => {
+                    let status = match exit.status() {
+                        alkanes::AlkanesTraceStatusFlag::Failure => {
+                            EspoSandshrewLikeTraceStatus::Failure
+                        }
+                        _ => EspoSandshrewLikeTraceStatus::Success,
+                    };
+
+                    let response = if let Some(resp) = exit.response.as_ref() {
+                        EspoSandshrewLikeTraceReturnResponse {
+                            alkanes: resp.alkanes.iter().map(trace_transfer_to_espo).collect(),
+                            data: fmt_bytes_hex(&resp.data),
+                            storage: resp
+                                .storage
+                                .iter()
+                                .map(|kv| EspoSandshrewLikeTraceStorageKV {
+                                    key: bytes_to_string_or_hex(&kv.key),
+                                    value: fmt_bytes_hex(&kv.value),
+                                })
+                                .collect(),
+                        }
+                    } else {
+                        EspoSandshrewLikeTraceReturnResponse {
+                            alkanes: Vec::new(),
+                            data: "0x".to_string(),
+                            storage: Vec::new(),
+                        }
+                    };
+
+                    out.push(EspoSandshrewLikeTraceEvent::Return(
+                        EspoSandshrewLikeTraceReturnData { status, response },
+                    ));
+                }
+
+                Event::CreateAlkane(create) => {
+                    out.push(EspoSandshrewLikeTraceEvent::Create(trace_id_to_short_id(
+                        create.new_alkane.as_ref(),
+                    )));
+                }
+
+                Event::ReceiveIntent(_) => {}
+                Event::ValueTransfer(_) => {}
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 fn fmt_u128_hex(u: &alkanes::Uint128) -> String {
     let v = ((u.hi as u128) << 64) | (u.lo as u128);
     format!("0x{:x}", v)
@@ -231,148 +337,8 @@ fn bytes_to_string_or_hex(b: &[u8]) -> String {
 }
 
 pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
-    let mut out: Vec<Value> = Vec::with_capacity(trace.events.len() as usize);
-
-    for ev in &trace.events {
-        if let Some(event) = &ev.event {
-            use alkanes::alkanes_trace_event::Event;
-            match event {
-                Event::EnterContext(enter) => {
-                    let typ = match enter.call_type() {
-                        alkanes::AlkanesTraceCallType::Call => "call",
-                        alkanes::AlkanesTraceCallType::Delegatecall => "delegatecall",
-                        alkanes::AlkanesTraceCallType::Staticcall => "staticcall",
-                        _ => "unknown",
-                    };
-
-                    let ctx = enter.context.as_ref().context("enter.context missing")?;
-                    let inner = ctx.inner.as_ref().context("enter.context.inner missing")?;
-
-                    let myself = inner.myself.as_ref();
-                    let caller = inner.caller.as_ref();
-
-                    let my_block = myself.and_then(|m| m.block.as_ref());
-                    let my_tx = myself.and_then(|m| m.tx.as_ref());
-                    let caller_block = caller.and_then(|c| c.block.as_ref());
-                    let caller_tx = caller.and_then(|c| c.tx.as_ref());
-
-                    let inputs_hex: Vec<String> = inner.inputs.iter().map(fmt_u128_hex).collect();
-
-                    let incoming_alkanes: Vec<Value> = inner
-                        .incoming_alkanes
-                        .iter()
-                        .map(|t| {
-                            let id = t.id.as_ref();
-                            json!({
-                                "id": {
-                                    "block": id.and_then(|x| x.block.as_ref()).map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                    "tx":    id.and_then(|x| x.tx.as_ref()).map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                },
-                                "value": t.value.as_ref().map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                            })
-                        })
-                        .collect();
-
-                    out.push(json!({
-                        "event": "invoke",
-                        "data": {
-                            "type": typ,
-                            "context": {
-                                "myself": {
-                                    "block": my_block.map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                    "tx":    my_tx.map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                },
-                                "caller": {
-                                    "block": caller_block.map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                    "tx":    caller_tx.map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                },
-                                "inputs": inputs_hex,
-                                "incomingAlkanes": incoming_alkanes,
-                                "vout": inner.vout,
-                            },
-                            "fuel": ctx.fuel,
-                        }
-                    }));
-                }
-
-                Event::ExitContext(exit) => {
-                    let status = match exit.status() {
-                        alkanes::AlkanesTraceStatusFlag::Failure => "failure",
-                        _ => "success",
-                    };
-
-                    let resp = exit.response.as_ref();
-
-                    let alkanes_list: Vec<Value> = resp
-                        .map(|r| {
-                            r.alkanes
-                                .iter()
-                                .map(|t| {
-                                    let id = t.id.as_ref();
-                                    json!({
-                                        "id": {
-                                            "block": id.and_then(|x| x.block.as_ref()).map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                            "tx":    id.and_then(|x| x.tx.as_ref()).map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                        },
-                                        "value": t.value.as_ref().map(fmt_u128_hex).unwrap_or_else(|| "0x0".to_string()),
-                                    })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    let storage_list: Vec<Value> = resp
-                        .map(|r| {
-                            r.storage
-                                .iter()
-                                .map(|kv| {
-                                    let k = bytes_to_string_or_hex(&kv.key);
-                                    let v = fmt_bytes_hex(&kv.value);
-                                    json!({ "key": k, "value": v })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    let data_hex =
-                        resp.map(|r| fmt_bytes_hex(&r.data)).unwrap_or_else(|| "0x".to_string());
-
-                    out.push(json!({
-                        "event": "return",
-                        "data": {
-                            "status": status,
-                            "response": {
-                                "alkanes": alkanes_list,
-                                "data": data_hex,
-                                "storage": storage_list,
-                            }
-                        }
-                    }));
-                }
-
-                Event::CreateAlkane(create) => {
-                    let id: Option<&alkanes::AlkaneId> = create.new_alkane.as_ref();
-                    let block_hex = id
-                        .and_then(|x| x.block.as_ref())
-                        .map(fmt_u128_hex)
-                        .unwrap_or_else(|| "0x0".to_string());
-                    let tx_hex = id
-                        .and_then(|x| x.tx.as_ref())
-                        .map(fmt_u128_hex)
-                        .unwrap_or_else(|| "0x0".to_string());
-                    out.push(json!({
-                        "event": "create",
-                        "data": { "block": block_hex, "tx": tx_hex }
-                    }));
-                }
-
-                Event::ReceiveIntent(_) => {}
-                Event::ValueTransfer(_) => {}
-            }
-        }
-    }
-
-    Ok(serde_json::to_string(&out).context("serialize normalized events")?)
+    Ok(serde_json::to_string(&protobuf_trace_events(trace)?)
+        .context("serialize normalized events")?)
 }
 
 fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
@@ -383,6 +349,7 @@ fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
     format!("{}:{}", hex::encode(txid_be), vout)
 }
 
+#[cfg(test)]
 fn tx_has_alkanes_protocol(tx: &Transaction) -> bool {
     let Some(Artifact::Runestone(ref runestone)) = Runestone::decipher(tx) else {
         return false;
@@ -420,37 +387,51 @@ pub fn traces_for_block_as_json_str(block: u64) -> Result<String> {
     Ok(final_json)
 }
 
-/// Build a map { txid_display_hex => Vec<(vout, PartialEspoTrace)> } for quick attach later.
+fn match_trace_outpoint_txid(
+    outpoint: &[u8],
+    allow_txids: Option<&HashSet<Txid>>,
+) -> Option<(Txid, u32)> {
+    if outpoint.len() < 36 {
+        return None;
+    }
+    let (txid_bytes, vout_le) = outpoint.split_at(32);
+    let vout = u32::from_le_bytes(vout_le[..4].try_into().ok()?);
+
+    let direct = Txid::from_slice(txid_bytes).ok();
+
+    let mut reversed = [0u8; 32];
+    reversed.copy_from_slice(txid_bytes);
+    reversed.reverse();
+    let reversed = Txid::from_slice(&reversed).ok();
+
+    if let Some(allow) = allow_txids {
+        if let Some(txid) = direct {
+            if allow.contains(&txid) {
+                return Some((txid, vout));
+            }
+        }
+        if let Some(txid) = reversed {
+            if allow.contains(&txid) {
+                return Some((txid, vout));
+            }
+        }
+        return None;
+    }
+
+    reversed.or(direct).map(|txid| (txid, vout))
+}
+
+/// Build a map { canonical txid => Vec<(vout, PartialEspoTrace)> } for quick attach later.
 fn partial_traces_indexed(
     partials: Vec<PartialEspoTrace>,
-    allow_txids: Option<&HashSet<String>>,
-) -> Result<HashMap<String, Vec<(u32, PartialEspoTrace)>>> {
-    let mut map: HashMap<String, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
+    allow_txids: Option<&HashSet<Txid>>,
+) -> Result<HashMap<Txid, Vec<(u32, PartialEspoTrace)>>> {
+    let mut map: HashMap<Txid, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
     for p in partials {
-        if p.outpoint.len() < 36 {
+        let Some((txid, vout)) = match_trace_outpoint_txid(&p.outpoint, allow_txids) else {
             continue;
-        }
-        let (txid_le, vout_le) = p.outpoint.split_at(32);
-        let vout = u32::from_le_bytes(vout_le[..4].try_into().expect("vout 4 bytes"));
-
-        let txid_native_hex = hex::encode(txid_le);
-        let mut txid_display_bytes = txid_le.to_vec();
-        txid_display_bytes.reverse();
-        let txid_display_hex = hex::encode(&txid_display_bytes);
-
-        let txid_hex = if let Some(allow) = allow_txids {
-            if allow.contains(&txid_display_hex) {
-                txid_display_hex
-            } else if allow.contains(&txid_native_hex) {
-                txid_native_hex
-            } else {
-                continue;
-            }
-        } else {
-            txid_display_hex
         };
-
-        map.entry(txid_hex).or_default().push((vout, p));
+        map.entry(txid).or_default().push((vout, p));
     }
 
     for v in map.values_mut() {
@@ -461,16 +442,34 @@ fn partial_traces_indexed(
 
 #[derive(Debug, Default)]
 struct CanonicalTraceSelection {
-    traces_by_txid: HashMap<String, Vec<(u32, PartialEspoTrace)>>,
+    traces_by_txid: HashMap<Txid, Vec<(u32, PartialEspoTrace)>>,
     recovered_txids: Vec<String>,
     missing_candidate_txids: Vec<String>,
     unexpected_height_trace_txids: Vec<String>,
 }
 
+fn trace_txid_key_variants(txid: &Txid) -> [[u8; 32]; 2] {
+    let direct = *txid.as_byte_array();
+    let mut reversed = direct;
+    reversed.reverse();
+    [direct, reversed]
+}
+
+fn trace_txid_allow_set(selected: &[(Txid, Transaction)]) -> HashSet<[u8; 32]> {
+    let mut out = HashSet::with_capacity(selected.len().saturating_mul(2));
+    for (txid, _) in selected {
+        for key in trace_txid_key_variants(txid) {
+            out.insert(key);
+        }
+    }
+    out
+}
+
 fn select_canonical_traces(
     block: u64,
-    canonical_txids: &HashSet<String>,
+    canonical_txids: &HashSet<Txid>,
     selected: &[(Txid, Transaction)],
+    alkane_protocol_txids: &HashSet<Txid>,
 ) -> Result<CanonicalTraceSelection> {
     if std::env::var_os("ESPO_SKIP_CANONICAL_TRACES").is_some() {
         return Ok(CanonicalTraceSelection::default());
@@ -488,40 +487,50 @@ fn select_canonical_traces(
         .ensure_canonical_height_with_db(metashrew_sdb.as_ref(), block_u32)
         .with_context(|| format!("metashrew not canonical at block {block}"))?;
 
+    let allow_txids = trace_txid_allow_set(selected);
     let height_partials = metashrew
-        .traces_for_block_as_prost_with_db_uncaught(metashrew_sdb.as_ref(), block)
+        .traces_for_block_as_prost_with_db_uncaught_filtered(
+            metashrew_sdb.as_ref(),
+            block,
+            Some(&allow_txids),
+        )
         .with_context(|| format!("failed traces_for_block_as_prost_with_db_uncaught({block})"))?;
-    let height_index = partial_traces_indexed(height_partials, None)?;
 
-    let mut traces_by_txid: HashMap<String, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
+    let mut traces_by_txid: HashMap<Txid, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
     let mut recovered_txids: Vec<String> = Vec::new();
-    let missing_candidate_txids: Vec<String> = Vec::new();
+    let mut missing_candidate_txids: Vec<String> = Vec::new();
+    let txid_fallback_enabled = std::env::var_os("ESPO_ENABLE_TXID_TRACE_FALLBACK").is_some();
+    let selected_txids: HashSet<Txid> = selected.iter().map(|(txid, _)| *txid).collect();
 
-    for (txid, tx) in selected {
-        let txid_hex = txid.to_string();
-        if let Some(vouts_partials) = height_index.get(&txid_hex) {
-            traces_by_txid.insert(txid_hex, vouts_partials.clone());
+    let mut height_index = partial_traces_indexed(height_partials, Some(&selected_txids))?;
+
+    for (txid, _tx) in selected {
+        if let Some(vouts_partials) = height_index.remove(txid) {
+            traces_by_txid.insert(*txid, vouts_partials);
             continue;
         }
 
-        if !tx_has_alkanes_protocol(tx) {
+        if !alkane_protocol_txids.contains(txid) {
             continue;
         }
 
-        let fallback_partials = metashrew
-            .traces_for_tx_with_db_uncaught(metashrew_sdb.as_ref(), txid)
-            .with_context(|| format!("failed traces_for_tx_with_db_uncaught({txid})"))?;
-        let allow = HashSet::from([txid_hex.clone()]);
-        let fallback_index = partial_traces_indexed(fallback_partials, Some(&allow))?;
-        if let Some(vouts_partials) = fallback_index.get(&txid_hex) {
-            traces_by_txid.insert(txid_hex.clone(), vouts_partials.clone());
-            recovered_txids.push(txid_hex);
+        if txid_fallback_enabled {
+            let fallback_partials = metashrew
+                .traces_for_tx_with_db_uncaught(metashrew_sdb.as_ref(), txid)
+                .with_context(|| format!("failed traces_for_tx_with_db_uncaught({txid})"))?;
+            let allow = HashSet::from([*txid]);
+            let mut fallback_index = partial_traces_indexed(fallback_partials, Some(&allow))?;
+            if let Some(vouts_partials) = fallback_index.remove(txid) {
+                traces_by_txid.insert(*txid, vouts_partials);
+                recovered_txids.push(txid.to_string());
+                continue;
+            }
         }
+
+        missing_candidate_txids.push(txid.to_string());
     }
 
-    if !missing_candidate_txids.is_empty()
-        && std::env::var_os("ESPO_STRICT_CANONICAL_TRACES").is_some()
-    {
+    if !missing_candidate_txids.is_empty() {
         let listed = missing_candidate_txids.join(", ");
         anyhow::bail!(
             "canonical trace set incomplete at block {}: missing traces for canonical txids [{}]",
@@ -533,7 +542,7 @@ fn select_canonical_traces(
     let unexpected_height_trace_txids: Vec<String> = height_index
         .keys()
         .filter(|txid| !canonical_txids.contains(*txid))
-        .cloned()
+        .map(ToString::to_string)
         .collect();
 
     Ok(CanonicalTraceSelection {
@@ -578,7 +587,7 @@ pub fn get_espo_block_with_opts(
 
     // Header from block source
     let block_header: Header = full_block.header.clone();
-    let host_function_values = {
+    let (host_function_values, alkane_protocol_txids) = {
         let mut header_bytes = Vec::new();
         full_block
             .header
@@ -600,6 +609,7 @@ pub fn get_espo_block_with_opts(
         let total_fees_bytes = total_fees.to_le_bytes().to_vec();
 
         let mut diesel_mints: u128 = 0;
+        let mut alkane_protocol_txids: HashSet<Txid> = HashSet::new();
         for (tx_idx, tx) in full_block.txdata.iter().enumerate() {
             if let Some(Artifact::Runestone(ref runestone)) = Runestone::decipher(tx) {
                 let protostones = match Protostone::from_runestone(runestone) {
@@ -614,15 +624,17 @@ pub fn get_espo_block_with_opts(
                         continue;
                     }
                 };
+                let mut has_alkane_protocol = false;
                 for protostone in protostones {
                     if protostone.protocol_tag != 1 {
                         continue;
                     }
-                    let calldata: Vec<u8> =
-                        protostone.message.iter().flat_map(|v| v.to_be_bytes()).collect();
-                    if calldata.is_empty() {
+                    if protostone.message.is_empty() {
                         continue;
                     }
+                    has_alkane_protocol = true;
+                    let calldata: Vec<u8> =
+                        protostone.message.iter().flat_map(|v| v.to_be_bytes()).collect();
                     let varint_list = match decode_varint_list(&mut Cursor::new(calldata)) {
                         Ok(list) => list,
                         Err(err) => {
@@ -648,31 +660,38 @@ pub fn get_espo_block_with_opts(
                         }
                     }
                 }
+                if has_alkane_protocol {
+                    alkane_protocol_txids.insert(tx.compute_txid());
+                }
             }
         }
         let diesel_mints_bytes = diesel_mints.to_le_bytes().to_vec();
 
-        (header_bytes, coinbase_bytes, diesel_mints_bytes, total_fees_bytes)
+        (
+            (header_bytes, coinbase_bytes, diesel_mints_bytes, total_fees_bytes),
+            alkane_protocol_txids,
+        )
     };
 
     let (page_start, page_end) =
         opts.as_ref().map(|o| o.page_range(total_txs)).unwrap_or((0, total_txs));
 
     // Select only the requested page of transactions
-    let mut canonical_txids: HashSet<String> = HashSet::with_capacity(total_txs);
+    let mut canonical_txids: HashSet<Txid> = HashSet::with_capacity(total_txs);
     let mut selected: Vec<(Txid, Transaction)> =
         Vec::with_capacity(page_end.saturating_sub(page_start));
     for (idx, tx) in full_block.txdata.into_iter().enumerate() {
         let txid = tx.compute_txid();
-        canonical_txids.insert(txid.to_string());
+        canonical_txids.insert(txid);
         if idx < page_start || idx >= page_end {
             continue;
         }
         selected.push((txid, tx));
     }
 
-    let canonical_traces = if h32 >= alkanes_genesis_block(get_network()) {
-        let canonical_traces = select_canonical_traces(block, &canonical_txids, &selected)?;
+    let mut canonical_traces = if h32 >= alkanes_genesis_block(get_network()) {
+        let canonical_traces =
+            select_canonical_traces(block, &canonical_txids, &selected, &alkane_protocol_txids)?;
         if !canonical_traces.recovered_txids.is_empty()
             || !canonical_traces.missing_candidate_txids.is_empty()
             || !canonical_traces.unexpected_height_trace_txids.is_empty()
@@ -698,30 +717,23 @@ pub fn get_espo_block_with_opts(
     // Build transactions
     let mut txs: Vec<EspoAlkanesTransaction> = Vec::with_capacity(selected.len());
     for (txid, tx) in selected.into_iter() {
-        let txid_hex = txid.to_string();
-
         let traces_opt: Option<Vec<EspoTrace>> =
-            if let Some(vouts_partials) = canonical_traces.traces_by_txid.get(&txid_hex) {
+            if let Some(vouts_partials) = canonical_traces.traces_by_txid.remove(&txid) {
+                let txid_hex = txid.to_string();
                 let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
-                for (vout, partial) in vouts_partials.iter() {
-                    let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
-                    let events: Vec<EspoSandshrewLikeTraceEvent> =
-                        serde_json::from_str(&events_json_str)
-                            .context("deserialize sandshrew-like events")?;
+                for (vout, partial) in vouts_partials {
+                    let events = protobuf_trace_events(&partial.protobuf_trace)?;
 
                     let sandshrew_trace =
                         EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
 
                     let storage_changes = extract_alkane_storage(&partial.protobuf_trace, &tx)?;
-                    let outpoint = EspoOutpoint {
-                        txid: txid.as_byte_array().to_vec(),
-                        vout: *vout,
-                        tx_spent: None,
-                    };
+                    let outpoint =
+                        EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout, tx_spent: None };
 
                     traces_vec.push(EspoTrace {
                         sandshrew_trace,
-                        protobuf_trace: partial.protobuf_trace.clone(),
+                        protobuf_trace: partial.protobuf_trace,
                         storage_changes,
                         outpoint,
                     });
@@ -786,10 +798,9 @@ mod tests {
     fn partial_traces_indexed_accepts_le_outpoints_with_be_allow_list() {
         let tx = sample_tx(1);
         let txid = tx.compute_txid();
-        let allow = HashSet::from([txid.to_string()]);
-        let indexed = partial_traces_indexed(vec![sample_partial(&txid, 2)], Some(&allow))
+        let indexed = partial_traces_indexed(vec![sample_partial(&txid, 2)], None)
             .expect("index partial traces");
-        let entries = indexed.get(&txid.to_string()).expect("entry for txid");
+        let entries = indexed.get(&txid).expect("entry for txid");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, 2);
     }

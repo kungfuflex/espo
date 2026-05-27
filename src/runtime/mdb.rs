@@ -430,12 +430,8 @@ impl Mdb {
             let Some(root) = tree.root_for_blockhash(block_hash)? else {
                 return Ok(vec![None; keys.len()]);
             };
-            let mut out = Vec::with_capacity(keys.len());
-            for key in keys {
-                let prefixed = self.prefixed(key);
-                out.push(tree.get_at_root(root, &prefixed)?);
-            }
-            return Ok(out);
+            let prefixed: Vec<Vec<u8>> = keys.iter().map(|key| self.prefixed(key)).collect();
+            return tree.multi_get_at_root(root, &prefixed);
         }
         self.multi_get(keys)
     }

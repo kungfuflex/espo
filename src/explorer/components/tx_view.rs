@@ -1485,7 +1485,7 @@ pub(crate) fn alkane_meta(
     meta
 }
 
-fn json_viewer(value: Option<&Value>, raw: &str) -> Markup {
+pub fn json_viewer(value: Option<&Value>, raw: &str) -> Markup {
     match value {
         Some(v) => {
             let mut buf = String::new();

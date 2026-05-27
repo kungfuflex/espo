@@ -1,6 +1,9 @@
 use crate::alkanes::defs::AlkaneMessageContext;
 use crate::alkanes::trace::PartialEspoTrace;
-use crate::config::{get_bitcoind_rpc_client, get_metashrew_sdb, strict_check_trace_mismatches};
+use crate::config::{
+    get_bitcoind_rpc_client, get_metashrew_sdb, get_trace_read_workers,
+    strict_check_trace_mismatches,
+};
 use crate::runtime::sdb::SDB;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_cli_common::alkanes_pb::{AlkanesTrace, AlkanesTraceEvent};
@@ -20,6 +23,7 @@ use protorune_support::balance_sheet::ProtoruneRuneId;
 use protorune_support::utils::consensus_encode;
 use rocksdb::{Direction, IteratorMode};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -355,6 +359,17 @@ impl<'a> TraceTablesNative<'a> {
         let traces = root.keyword("/trace/");
         TraceTablesNative { TRACES_NATIVE: traces.clone(), TRACES_BY_HEIGHT_NATIVE: traces }
     }
+}
+
+fn trace_read_worker_count(item_count: usize) -> usize {
+    if item_count < 512 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .unwrap_or(NonZeroUsize::MIN)
+        .get()
+        .min(get_trace_read_workers())
+        .max(1)
 }
 
 pub struct MetashrewAdapter {
@@ -897,10 +912,11 @@ impl MetashrewAdapter {
         self.traces_for_block_as_prost_with_db(db.as_ref(), block)
     }
 
-    pub(crate) fn traces_for_block_as_prost_with_db_uncaught(
+    pub(crate) fn traces_for_block_as_prost_with_db_uncaught_filtered(
         &self,
         db: &SDB,
         block: u64,
+        allow_txids: Option<&HashSet<[u8; 32]>>,
     ) -> Result<Vec<PartialEspoTrace>> {
         let root = self.root_ptr(db);
         let traces = TraceTablesNative::new(&root);
@@ -911,6 +927,7 @@ impl MetashrewAdapter {
         let mut bad_pointers = 0usize;
         let mut final_traces: Vec<PartialEspoTrace> = Vec::new();
         let mut seen_outpoints: HashSet<Vec<u8>> = HashSet::new();
+        let mut unique_outpoints: Vec<Vec<u8>> = Vec::with_capacity(outpoints.len());
 
         for outpoint_arc in outpoints {
             let mut outpoint = outpoint_arc.as_ref().clone();
@@ -925,16 +942,63 @@ impl MetashrewAdapter {
                 bad_pointers = bad_pointers.saturating_add(1);
                 continue;
             }
+            if let Some(allow_txids) = allow_txids {
+                let mut outpoint_txid = [0u8; 32];
+                outpoint_txid.copy_from_slice(&outpoint[..32]);
+                if !allow_txids.contains(&outpoint_txid) {
+                    continue;
+                }
+            }
             if !seen_outpoints.insert(outpoint.clone()) {
                 continue;
             }
+            unique_outpoints.push(outpoint);
+        }
 
-            let trace_bytes = traces.TRACES_NATIVE.select(&outpoint).get();
-            if trace_bytes.is_empty() {
-                missing_trace_blobs = missing_trace_blobs.saturating_add(1);
-                continue;
-            }
-            if let Some(protobuf_trace) = decode_trace_blob(&trace_bytes) {
+        let worker_count = trace_read_worker_count(unique_outpoints.len());
+        let traces_with_outpoints: Vec<(Vec<u8>, Option<AlkanesTrace>)> = if worker_count == 1 {
+            unique_outpoints
+                .into_iter()
+                .map(|outpoint| {
+                    let trace_bytes = traces.TRACES_NATIVE.select(&outpoint).get();
+                    let trace =
+                        if trace_bytes.is_empty() { None } else { decode_trace_blob(&trace_bytes) };
+                    (outpoint, trace)
+                })
+                .collect()
+        } else {
+            let chunk_size = unique_outpoints.len().div_ceil(worker_count);
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for chunk in unique_outpoints.chunks(chunk_size) {
+                    handles.push(scope.spawn(move || {
+                        let root = self.root_ptr(db);
+                        let traces = TraceTablesNative::new(&root);
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for outpoint in chunk {
+                            let outpoint = outpoint.clone();
+                            let trace_bytes = traces.TRACES_NATIVE.select(&outpoint).get();
+                            let trace = if trace_bytes.is_empty() {
+                                None
+                            } else {
+                                decode_trace_blob(&trace_bytes)
+                            };
+                            out.push((outpoint, trace));
+                        }
+                        out
+                    }));
+                }
+
+                let mut out = Vec::new();
+                for handle in handles {
+                    out.extend(handle.join().expect("trace read worker panicked"));
+                }
+                out
+            })
+        };
+
+        for (outpoint, trace) in traces_with_outpoints {
+            if let Some(protobuf_trace) = trace {
                 final_traces.push(PartialEspoTrace { protobuf_trace, outpoint });
             } else {
                 missing_trace_blobs = missing_trace_blobs.saturating_add(1);
@@ -964,6 +1028,14 @@ impl MetashrewAdapter {
         }
 
         Ok(final_traces)
+    }
+
+    pub(crate) fn traces_for_block_as_prost_with_db_uncaught(
+        &self,
+        db: &SDB,
+        block: u64,
+    ) -> Result<Vec<PartialEspoTrace>> {
+        self.traces_for_block_as_prost_with_db_uncaught_filtered(db, block, None)
     }
 
     pub fn traces_for_block_as_prost_with_db(

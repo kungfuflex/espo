@@ -11,8 +11,8 @@ use bitcoincore_rpc::RpcApi;
 use maud::{Markup, PreEscaped, html};
 
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
-    prettyify_protobuf_trace_json, traces_for_block_as_prost,
+    EspoSandshrewLikeTrace, EspoTrace, extract_alkane_storage, protobuf_trace_events,
+    traces_for_block_as_prost,
 };
 use crate::config::{
     get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_next_height, get_metashrew,
@@ -608,7 +608,9 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
             Ok(v) if !v.is_empty() => Some(v),
             Ok(_) => mempool_entry.as_ref().and_then(|m| m.traces.clone()),
             Err(e) => {
-                eprintln!("[tx_page] failed to fetch traces for {txid}: {e}");
+                if !is_metashrew_missing_stored_block_hash(&e) {
+                    eprintln!("[tx_page] failed to fetch traces for {txid}: {e}");
+                }
                 mempool_entry.as_ref().and_then(|m| m.traces.clone())
             }
         }
@@ -733,8 +735,7 @@ fn fetch_traces_for_tx(
         let Some((txid_be, vout)) = match_trace_outpoint(&partial.outpoint, txid) else {
             continue;
         };
-        let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
-        let events: Vec<EspoSandshrewLikeTraceEvent> = serde_json::from_str(&events_json_str)?;
+        let events = protobuf_trace_events(&partial.protobuf_trace)?;
 
         let sandshrew_trace =
             EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
@@ -751,6 +752,11 @@ fn fetch_traces_for_tx(
     Ok(out)
 }
 
+fn is_metashrew_missing_stored_block_hash(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("metashrew missing stored block hash at height "))
+}
+
 fn fetch_traces_for_tx_noheight(txid: &Txid, tx: &Transaction) -> anyhow::Result<Vec<EspoTrace>> {
     let partials = get_metashrew().traces_for_tx(txid)?;
     let mut out: Vec<EspoTrace> = Vec::new();
@@ -760,8 +766,7 @@ fn fetch_traces_for_tx_noheight(txid: &Txid, tx: &Transaction) -> anyhow::Result
         let Some((txid_be, vout)) = match_trace_outpoint(&partial.outpoint, txid) else {
             continue;
         };
-        let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
-        let events: Vec<EspoSandshrewLikeTraceEvent> = serde_json::from_str(&events_json_str)?;
+        let events = protobuf_trace_events(&partial.protobuf_trace)?;
 
         let sandshrew_trace =
             EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };

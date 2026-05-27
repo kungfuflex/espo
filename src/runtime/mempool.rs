@@ -1,10 +1,11 @@
 use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
-    prettyify_protobuf_trace_json,
+    protobuf_trace_events,
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use crate::config::{
-    get_bitcoind_rpc_client, get_config, get_espo_db, get_metashrew_rpc_url, get_network,
+    get_bitcoind_rpc_client, get_config, get_espo_db, get_last_safe_tip, get_metashrew_rpc_url,
+    get_network,
 };
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider};
 use crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch;
@@ -19,17 +20,11 @@ use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result};
-use bitcoin::block::Version as BlockVersion;
-use bitcoin::blockdata::block::Header;
 use bitcoin::blockdata::script::Instruction;
-use bitcoin::blockdata::transaction::Version as TxVersion;
 use bitcoin::consensus::Encodable;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
-use bitcoin::{
-    Address, Amount, Block, CompactTarget, Network, OutPoint, Sequence, Transaction, TxIn,
-    TxMerkleNode, TxOut, Txid, Witness, opcodes,
-};
+use bitcoin::{Address, Network, OutPoint, Transaction, Txid, opcodes};
 use bitcoincore_rpc::RpcApi;
 use futures::{StreamExt, stream};
 use ordinals::{Artifact, Edict, RuneId, Runestone};
@@ -50,8 +45,7 @@ use tokio::sync::broadcast;
 
 /// --- Tunables (edit as needed) ---
 pub const MEMPOOL_POLL_SECS: u64 = 5;
-pub const MEMPOOL_PREVIEW_BATCH_SIZE: usize = 10;
-pub const MEMPOOL_PREVIEW_TX_CONCURRENCY: usize = 6;
+pub const MEMPOOL_VIEW_BATCH_SIZE: usize = 10;
 pub const MEMPOOL_LOG_STEP: usize = 100;
 pub const MEMPOOL_MAX_TXS: usize = 50_000;
 pub const MEMPOOL_MIN_FEE_RATE_SATS_VBYTE: f64 = 0.5;
@@ -1468,213 +1462,140 @@ fn shadow_base(tx: &Transaction) -> u32 {
     tx.output.len() as u32 + 1
 }
 
-fn encode_outpoint_hex(txid: &Txid, vout: u32) -> String {
+fn encode_outpoint_hex(txid: &Txid, vout: u32, height: u32) -> String {
     let mut outpoint = protorune::Outpoint::default();
     outpoint.txid = txid.to_byte_array().to_vec();
     outpoint.vout = vout;
-    let bytes = outpoint.encode_to_vec();
+    let mut bytes = Vec::with_capacity(4 + outpoint.encoded_len());
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(&outpoint.encode_to_vec());
     format!("0x{}", hex::encode(bytes))
 }
 
-fn build_preview_block_hex(txs_to_preview: &[Transaction]) -> Result<String> {
-    let coinbase = Transaction {
-        version: TxVersion::TWO,
-        lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: bitcoin::OutPoint::null(),
-            script_sig: bitcoin::ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::from_slice(&[vec![0u8; 32]]),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(50_00000000),
-            script_pubkey: bitcoin::ScriptBuf::new(),
-        }],
-    };
-
-    let mut txs = Vec::with_capacity(txs_to_preview.len().saturating_add(1));
-    txs.push(coinbase);
-    txs.extend(txs_to_preview.iter().cloned());
-
-    let txids: Vec<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
-    let merkle_root_txid =
-        bitcoin::merkle_tree::calculate_root(txids.into_iter()).unwrap_or_else(Txid::all_zeros);
-
-    let header = Header {
-        version: BlockVersion::TWO,
-        prev_blockhash: bitcoin::BlockHash::all_zeros(),
-        merkle_root: TxMerkleNode::from(merkle_root_txid),
-        time: now_ts() as u32,
-        bits: CompactTarget::from_consensus(0x1d00ffff),
-        nonce: 0,
-    };
-
-    let block = Block { header, txdata: txs };
-
-    let mut buf = Vec::new();
-    block.consensus_encode(&mut buf)?;
-    Ok(hex::encode(buf))
-}
-
-fn decode_trace_hex(data_hex: &str, txid: &Txid, tx: &Transaction, vout: u32) -> Result<EspoTrace> {
+fn decode_trace_hex(
+    data_hex: &str,
+    txid: &Txid,
+    tx: &Transaction,
+    vout: u32,
+) -> Result<Option<EspoTrace>> {
     let trimmed = data_hex.strip_prefix("0x").unwrap_or(data_hex);
     let bytes = hex::decode(trimmed)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
     let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::decode(bytes.as_slice())
-        .with_context(|| "failed to decode preview trace protobuf")?;
-    let events_json_str = prettyify_protobuf_trace_json(&protobuf_trace)?;
-    let events: Vec<EspoSandshrewLikeTraceEvent> =
-        serde_json::from_str(&events_json_str).context("deserialize preview trace events")?;
+        .with_context(|| "failed to decode view trace protobuf")?;
+    let events = protobuf_trace_events(&protobuf_trace)?;
 
     let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events };
     let storage_changes = extract_alkane_storage(&protobuf_trace, tx)?;
     let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
 
-    Ok(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })
+    Ok(Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }))
 }
 
-fn preview_context_for_tx(txid: &Txid) -> Option<(Vec<Txid>, Vec<Transaction>)> {
-    let state = mempool_state().read().ok()?;
-    let entry = state.txs.get(txid)?;
-    let fallback_tx = entry.tx.clone()?;
-    let Some(template_index) = entry.template_index else {
-        return Some((vec![*txid], vec![fallback_tx]));
-    };
-    let template = state.templates.iter().find(|template| template.index == template_index)?;
-    let ordered: Vec<Txid> = template
-        .transaction_ids
-        .iter()
-        .filter_map(|txid_str| Txid::from_str(txid_str).ok())
-        .collect();
-    let context_txids = dependency_context_txids(txid, &ordered, &state.txs);
-    let context_txs: Option<Vec<Transaction>> = context_txids
-        .iter()
-        .map(|context_txid| state.txs.get(context_txid).and_then(|entry| entry.tx.clone()))
-        .collect();
-    context_txs
-        .filter(|txs| !txs.is_empty())
-        .map(|txs| (context_txids, txs))
-        .or_else(|| Some((vec![*txid], vec![fallback_tx])))
-}
-
-fn dependency_context_txids(
-    target: &Txid,
-    ordered: &[Txid],
-    txs: &HashMap<Txid, MempoolTransactionStruct>,
-) -> Vec<Txid> {
-    let in_block: HashSet<Txid> = ordered.iter().copied().collect();
-    let mut needed: HashSet<Txid> = HashSet::from([*target]);
-    let mut stack = vec![*target];
-
-    while let Some(txid) = stack.pop() {
-        let Some(entry) = txs.get(&txid) else {
-            continue;
-        };
-        for prev in &entry.spent_outpoints {
-            let parent = prev.txid;
-            if in_block.contains(&parent) && needed.insert(parent) {
-                stack.push(parent);
-            }
-        }
-    }
-
-    ordered.iter().filter(|txid| needed.contains(*txid)).copied().collect()
-}
-
-async fn preview_traces_for_tx(
+async fn view_traces_for_tx(
     http: &Client,
-    preview_url: &str,
+    view_url: &str,
     txid: &Txid,
     tx: &Transaction,
     protostone_count: usize,
-    preview_txs: &[Transaction],
 ) -> Option<Vec<EspoTrace>> {
     if protostone_count == 0 {
         return None;
     }
-    let block_hex = match build_preview_block_hex(preview_txs) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("[mempool] build preview block failed for {}: {e:?}", txid);
-            return None;
-        }
-    };
     let base = shadow_base(tx);
+    let input_height = get_last_safe_tip().unwrap_or_default();
     let mut jobs: Vec<(u32, String)> = Vec::with_capacity(protostone_count);
     for idx in 0..protostone_count {
         let vout = base + idx as u32;
-        jobs.push((vout, encode_outpoint_hex(txid, vout)));
+        jobs.push((vout, encode_outpoint_hex(txid, vout, input_height)));
     }
 
     let mut traces: Vec<EspoTrace> = Vec::new();
-    for batch in jobs.chunks(MEMPOOL_PREVIEW_BATCH_SIZE) {
+    let mut had_error = false;
+    for batch in jobs.chunks(MEMPOOL_VIEW_BATCH_SIZE) {
         let owned_batch: Vec<(u32, String)> = batch.to_vec();
         let futs = stream::iter(owned_batch.into_iter().map(|(vout, input_hex)| {
             let body = json!({
                 "jsonrpc": "2.0",
                 "id": format!("{}:{}", txid, vout),
-                "method": "metashrew_preview",
+                "method": "metashrew_view",
                 "params": [
-                    block_hex,
                     "trace",
                     input_hex,
                     "latest",
                 ]
             });
             let http = http.clone();
-            let preview_url = preview_url.to_string();
+            let view_url = view_url.to_string();
             let txid = *txid;
             async move {
-                let resp_json: Value = match http.post(&preview_url).json(&body).send().await {
+                let resp_json: Value = match http.post(&view_url).json(&body).send().await {
                     Ok(r) => match r.error_for_status() {
                         Ok(ok) => match ok.json().await {
                             Ok(v) => v,
                             Err(e) => {
                                 eprintln!(
-                                    "[mempool] preview decode failed for {}@{}: {:?}",
+                                    "[mempool] view response decode failed for {}@{}: {:?}",
                                     txid, vout, e
                                 );
-                                return None;
+                                return Err(());
                             }
                         },
                         Err(e) => {
-                            eprintln!(
-                                "[mempool] preview HTTP error for {}@{}: {:?}",
-                                txid, vout, e
-                            );
-                            return None;
+                            eprintln!("[mempool] view HTTP error for {}@{}: {:?}", txid, vout, e);
+                            return Err(());
                         }
                     },
                     Err(e) => {
-                        eprintln!("[mempool] preview POST failed for {}@{}: {:?}", txid, vout, e);
-                        return None;
+                        eprintln!("[mempool] view POST failed for {}@{}: {:?}", txid, vout, e);
+                        return Err(());
                     }
                 };
 
+                if let Some(error) = resp_json.get("error") {
+                    eprintln!(
+                        "[mempool] metashrew_view trace error for {}@{}: {}",
+                        txid, vout, error
+                    );
+                    return Err(());
+                }
                 let result_hex = resp_json.get("result").and_then(|v| v.as_str()).or_else(|| {
                     resp_json.get("result").and_then(|v| v.get("trace")).and_then(|v| v.as_str())
                 });
                 let Some(result_hex) = result_hex else {
-                    return None;
+                    eprintln!(
+                        "[mempool] metashrew_view trace missing result for {}@{}",
+                        txid, vout
+                    );
+                    return Err(());
                 };
                 match decode_trace_hex(result_hex, &txid, tx, vout) {
-                    Ok(trace) => Some(trace),
+                    Ok(trace) => Ok(trace),
                     Err(e) => {
-                        eprintln!(
-                            "[mempool] decode preview trace {}@{} failed: {:?}",
-                            txid, vout, e
-                        );
-                        None
+                        eprintln!("[mempool] decode view trace {}@{} failed: {:?}", txid, vout, e);
+                        Err(())
                     }
                 }
             }
         }))
-        .buffer_unordered(MEMPOOL_PREVIEW_BATCH_SIZE);
+        .buffer_unordered(MEMPOOL_VIEW_BATCH_SIZE);
 
         futures::pin_mut!(futs);
         while let Some(res) = futs.next().await {
-            if let Some(t) = res {
-                traces.push(t);
+            match res {
+                Ok(Some(t)) => {
+                    traces.push(t);
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    had_error = true;
+                }
             }
+        }
+        if had_error {
+            return None;
         }
     }
 
@@ -2421,7 +2342,7 @@ fn recalculate_memory_templates() {
     }
     template_txids.retain(|txids| !txids.is_empty());
 
-    let mut stale_trace_contexts: HashMap<Txid, Vec<Txid>> = HashMap::new();
+    let mut stale_trace_txids: HashSet<Txid> = HashSet::new();
     for txids in &template_txids {
         for txid in txids {
             let Some(tx) = template_state.get(txid) else {
@@ -2430,9 +2351,8 @@ fn recalculate_memory_templates() {
             if tx.is_diesel_mint || tx.protostones.is_empty() {
                 continue;
             }
-            let context = dependency_context_txids(txid, txids, &template_state);
-            if tx.fixed_trace.is_none() || tx.fixed_trace_context.as_ref() != Some(&context) {
-                stale_trace_contexts.insert(*txid, context);
+            if tx.fixed_trace.is_none() {
+                stale_trace_txids.insert(*txid);
             }
         }
     }
@@ -2556,7 +2476,7 @@ fn recalculate_memory_templates() {
         }
     }
     let mut trace_requeue: Vec<Txid> = Vec::new();
-    for txid in stale_trace_contexts.keys().copied() {
+    for txid in stale_trace_txids.iter().copied() {
         if state.txs.contains_key(&txid) {
             trace_requeue.push(txid);
         }
@@ -2841,7 +2761,7 @@ fn start_mempool_hydration(network: Network) {
     });
 }
 
-async fn trace_worker(http: Client, preview_url: String) {
+async fn trace_worker(http: Client, view_url: String) {
     loop {
         let next = trace_queue().lock().ok().and_then(|mut queue| queue.pop_front());
         let Some(txid) = next else {
@@ -2856,27 +2776,17 @@ async fn trace_worker(http: Client, preview_url: String) {
         let Some(transaction) = entry.tx.as_ref() else {
             continue;
         };
-        let (trace_context, preview_txs) = preview_context_for_tx(&txid)
-            .unwrap_or_else(|| (vec![txid], vec![transaction.clone()]));
-        if entry.fixed_trace.is_some() && entry.fixed_trace_context.as_ref() == Some(&trace_context)
-        {
+        if entry.fixed_trace.is_some() {
             continue;
         }
-        let traces = preview_traces_for_tx(
-            &http,
-            &preview_url,
-            &txid,
-            transaction,
-            entry.protostones.len(),
-            &preview_txs,
-        )
-        .await;
+        let traces =
+            view_traces_for_tx(&http, &view_url, &txid, transaction, entry.protostones.len()).await;
         if let Some(traces) = traces {
             let mut event_entry = None;
             if let Ok(mut state) = mempool_state().write() {
                 if let Some(current) = state.txs.get_mut(&txid) {
                     current.fixed_trace = Some(traces);
-                    current.fixed_trace_context = Some(trace_context);
+                    current.fixed_trace_context = Some(vec![txid]);
                     current.readiness = derive_readiness(current);
                     event_entry = Some(current.clone());
                     state.updated_at = now_ts();
@@ -3006,7 +2916,7 @@ fn ingest_zmq_sequence(url: String) {
 
 pub async fn run_mempool_service(network: Network) -> Result<()> {
     let rpc = get_bitcoind_rpc_client();
-    let preview_url = get_metashrew_rpc_url().to_string();
+    let view_url = get_metashrew_rpc_url().to_string();
     let http = Client::new();
     let cfg = get_config().mempool.clone();
 
@@ -3016,8 +2926,8 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     }
 
     eprintln!(
-        "[mempool] service starting (raw_poll={}s, template_poll={}s, preview_url={})",
-        cfg.raw_poll_secs, cfg.template_poll_secs, preview_url
+        "[mempool] service starting (raw_poll={}s, template_poll={}s, view_url={})",
+        cfg.raw_poll_secs, cfg.template_poll_secs, view_url
     );
 
     eprintln!("[mempool] startup getrawmempool refresh");
@@ -3033,7 +2943,7 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     }
 
     for _ in 0..cfg.trace_workers.max(1) {
-        tokio::spawn(trace_worker(http.clone(), preview_url.clone()));
+        tokio::spawn(trace_worker(http.clone(), view_url.clone()));
     }
 
     let template_poll = Duration::from_secs(cfg.template_poll_secs.max(1));

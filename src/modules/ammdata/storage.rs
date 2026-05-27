@@ -2020,6 +2020,36 @@ impl AmmDataProvider {
         })
     }
 
+    pub(crate) fn get_list_entries_desc_range(
+        &self,
+        params: GetListEntriesDescRangeParams,
+    ) -> Result<GetListEntriesDescResult> {
+        let entries = self.raw_scan_range_entries_page_at(
+            &params.start_inclusive,
+            params.end_exclusive.as_deref(),
+            params.blockhash.resolve(self.view_blockhash),
+            0,
+            params.limit,
+            true,
+        )?;
+        Ok(GetListEntriesDescResult { entries })
+    }
+
+    pub(crate) fn get_list_entries_asc_range(
+        &self,
+        params: GetListEntriesAscRangeParams,
+    ) -> Result<GetListEntriesDescResult> {
+        let entries = self.raw_scan_range_entries_page_at(
+            &params.start_inclusive,
+            params.end_exclusive.as_deref(),
+            params.blockhash.resolve(self.view_blockhash),
+            0,
+            params.limit,
+            false,
+        )?;
+        Ok(GetListEntriesDescResult { entries })
+    }
+
     pub fn set_raw_value(&self, params: SetRawValueParams) -> Result<()> {
         self.set_batch(SetBatchParams {
             blockhash: params.blockhash,
@@ -4348,6 +4378,22 @@ pub struct GetListEntriesDescCursorResult {
     pub entries: Vec<(Vec<u8>, Vec<u8>)>,
     pub next_cursor: Option<Vec<u8>>,
     pub has_more: bool,
+}
+
+pub(crate) struct GetListEntriesDescRangeParams {
+    pub blockhash: StateAt,
+
+    pub start_inclusive: Vec<u8>,
+    pub end_exclusive: Option<Vec<u8>>,
+    pub limit: usize,
+}
+
+pub(crate) struct GetListEntriesAscRangeParams {
+    pub blockhash: StateAt,
+
+    pub start_inclusive: Vec<u8>,
+    pub end_exclusive: Option<Vec<u8>>,
+    pub limit: usize,
 }
 
 pub struct SetRawValueParams {

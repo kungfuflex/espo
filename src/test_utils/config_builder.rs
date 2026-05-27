@@ -50,6 +50,7 @@ impl TestConfigBuilder {
             block_source_mode: BlockFetchMode::RpcOnly,
             compact_tx_trace_rows: true,
             address_index_chunk_size: 512,
+            trace_read_workers: 8,
             explorer_networks: None,
             google_analytics_tag: None,
             misc: MiscConfig::default(),

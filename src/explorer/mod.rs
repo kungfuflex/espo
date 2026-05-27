@@ -26,6 +26,7 @@ use pages::address::address_page;
 use pages::alkane::alkane_page;
 use pages::alkanes::alkanes_page;
 use pages::block::{block_page, mempool_block_page};
+use pages::docs::docs_page;
 use pages::home::home_page;
 use pages::rune::{rune_icon_asset, rune_page};
 use pages::runes::runes_page;
@@ -51,7 +52,8 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/tx/{txid}", get(tx_page))
         .route("/address/{address}", get(address_page))
         .route("/alkane/{alkane}", get(alkane_page))
-        .route("/alkanes", get(alkanes_page));
+        .route("/alkanes", get(alkanes_page))
+        .route("/docs", get(docs_page));
     if runes_enabled {
         pages = pages.route("/rune/{rune}", get(rune_page)).route("/runes", get(runes_page));
     }
@@ -145,8 +147,14 @@ async fn sitemap_xml() -> impl IntoResponse {
 
     let tip = get_espo_next_height().saturating_sub(1) as u64;
     let latest_start = tip.saturating_sub(49);
-    let mut paths: Vec<String> =
-        vec!["/".to_string(), "/zh".to_string(), "/alkanes".to_string(), "/zh/alkanes".to_string()];
+    let mut paths: Vec<String> = vec![
+        "/".to_string(),
+        "/zh".to_string(),
+        "/alkanes".to_string(),
+        "/zh/alkanes".to_string(),
+        "/docs".to_string(),
+        "/zh/docs".to_string(),
+    ];
     if runes_enabled_from_global_config() {
         paths.push("/runes".to_string());
         paths.push("/zh/runes".to_string());

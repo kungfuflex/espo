@@ -1,5 +1,5 @@
 use super::consts::KEY_INDEX_HEIGHT;
-use super::schemas::SchemaWrapEventV1;
+use super::schemas::{SchemaUnwrapRequestV1, SchemaWrapEventV1};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
@@ -7,7 +7,7 @@ use crate::runtime::tree_db::get_global_tree_db;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
 use borsh::{BorshDeserialize, BorshSerialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[allow(non_snake_case)]
@@ -19,6 +19,9 @@ pub struct SubfrostTable<'a> {
     pub WRAP_EVENTS_BY_ADDRESS: ListPointer<'a>,
     pub UNWRAP_EVENTS_ALL: ListPointer<'a>,
     pub UNWRAP_EVENTS_BY_ADDRESS: ListPointer<'a>,
+    pub UNWRAP_REQUESTS_ALL: ListPointer<'a>,
+    pub UNWRAP_REQUESTS_BY_ADDRESS: ListPointer<'a>,
+    pub UNWRAP_REQUEST_PENDING_OUTPOINT: KvPointer<'a>,
     pub UNWRAP_TOTAL_LATEST: KvPointer<'a>,
     pub UNWRAP_TOTAL_BY_HEIGHT: KvPointer<'a>,
     pub UNWRAP_TOTAL_LATEST_SUCCESS: KvPointer<'a>,
@@ -37,6 +40,9 @@ impl<'a> SubfrostTable<'a> {
             WRAP_EVENTS_BY_ADDRESS: root.list_keyword("/wrap_events_by_address/v2/"),
             UNWRAP_EVENTS_ALL: root.list_keyword("/unwrap_events_all/v2/"),
             UNWRAP_EVENTS_BY_ADDRESS: root.list_keyword("/unwrap_events_by_address/v2/"),
+            UNWRAP_REQUESTS_ALL: root.list_keyword("/unwrap_requests_all/v1/"),
+            UNWRAP_REQUESTS_BY_ADDRESS: root.list_keyword("/unwrap_requests_by_address/v1/"),
+            UNWRAP_REQUEST_PENDING_OUTPOINT: root.keyword("/unwrap_request_pending_outpoint/v1/"),
             UNWRAP_TOTAL_LATEST: root.keyword("/unwrap_total_latest/v1"),
             UNWRAP_TOTAL_BY_HEIGHT: root.keyword("/unwrap_total_by_height/v1/"),
             UNWRAP_TOTAL_LATEST_SUCCESS: root.keyword("/unwrap_total_latest_success/v1"),
@@ -57,6 +63,20 @@ impl<'a> SubfrostTable<'a> {
         let mut k = self.UNWRAP_EVENTS_BY_ADDRESS.key().to_vec();
         push_spk(&mut k, spk);
         k.push(b'/');
+        k
+    }
+
+    pub fn unwrap_requests_by_address_prefix(&self, spk: &[u8]) -> Vec<u8> {
+        let mut k = self.UNWRAP_REQUESTS_BY_ADDRESS.key().to_vec();
+        push_spk(&mut k, spk);
+        k.push(b'/');
+        k
+    }
+
+    pub fn unwrap_request_pending_outpoint_key(&self, txid: &[u8; 32], vout: u32) -> Vec<u8> {
+        let mut k = self.UNWRAP_REQUEST_PENDING_OUTPOINT.key().to_vec();
+        k.extend_from_slice(txid);
+        k.extend_from_slice(&vout.to_be_bytes());
         k
     }
 
@@ -116,6 +136,28 @@ fn decode_wrap_event(bytes: &[u8]) -> Result<SchemaWrapEventV1> {
 
 fn encode_wrap_event(event: &SchemaWrapEventV1) -> Result<Vec<u8>> {
     Ok(borsh::to_vec(event)?)
+}
+
+fn decode_unwrap_request(bytes: &[u8]) -> Result<SchemaUnwrapRequestV1> {
+    Ok(SchemaUnwrapRequestV1::try_from_slice(bytes)?)
+}
+
+fn encode_unwrap_request(request: &SchemaUnwrapRequestV1) -> Result<Vec<u8>> {
+    Ok(borsh::to_vec(request)?)
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+struct UnwrapRequestListRefV1 {
+    all_index: u64,
+    address_spk: Vec<u8>,
+    address_index: u64,
+}
+
+fn decode_unwrap_request_refs(bytes: &[u8]) -> Result<Vec<UnwrapRequestListRefV1>> {
+    if let Ok(refs) = Vec::<UnwrapRequestListRefV1>::try_from_slice(bytes) {
+        return Ok(refs);
+    }
+    Ok(vec![UnwrapRequestListRefV1::try_from_slice(bytes)?])
 }
 
 #[derive(Clone, Copy, Debug, BorshSerialize, BorshDeserialize)]
@@ -272,6 +314,31 @@ impl SubfrostProvider {
         Ok(out)
     }
 
+    fn read_unwrap_request_list_all(
+        &self,
+        list_prefix: &[u8],
+    ) -> Result<Vec<SchemaUnwrapRequestV1>> {
+        let table = self.table();
+        let len_key = table.list_length_key(list_prefix);
+        let len = self.read_u64_len(&len_key)? as usize;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut keys = Vec::with_capacity(len);
+        for idx in 0..len {
+            keys.push(table.list_item_key(list_prefix, idx as u64));
+        }
+
+        let values = self.raw_multi_get(&keys)?;
+        let mut out = Vec::with_capacity(len);
+        for raw in values {
+            let Some(raw) = raw else { continue };
+            out.push(decode_unwrap_request(&raw)?);
+        }
+        Ok(out)
+    }
+
     fn read_unwrap_total_points_all(&self, successful: bool) -> Result<Vec<UnwrapTotalPoint>> {
         let table = self.table();
         let list_prefix = table.unwrap_total_points_prefix(successful);
@@ -336,6 +403,115 @@ impl SubfrostProvider {
         }
         puts.push((len_key, encode_u64_le(len).to_vec()));
         Ok(puts)
+    }
+
+    pub fn build_unwrap_request_appends(
+        &self,
+        params: BuildUnwrapRequestAppendsParams,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if params.requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table = self.table();
+        let all_prefix = table.UNWRAP_REQUESTS_ALL.key().to_vec();
+        let all_len_key = table.list_length_key(&all_prefix);
+        let mut all_len = self.read_u64_len(&all_len_key)?;
+        let mut address_lens: HashMap<Vec<u8>, (Vec<u8>, u64)> = HashMap::new();
+        let mut pending_refs_by_key: HashMap<Vec<u8>, Vec<UnwrapRequestListRefV1>> = HashMap::new();
+        let mut puts = Vec::with_capacity(params.requests.len().saturating_mul(4) + 1);
+
+        for request in params.requests {
+            let encoded = encode_unwrap_request(&request)?;
+            let all_index = all_len;
+            puts.push((table.list_item_key(&all_prefix, all_index), encoded.clone()));
+            all_len = all_len.saturating_add(1);
+
+            let address_spk = request.address_spk.clone();
+            if !address_lens.contains_key(&address_spk) {
+                let prefix = table.unwrap_requests_by_address_prefix(&address_spk);
+                let len = self.read_u64_len(&table.list_length_key(&prefix))?;
+                address_lens.insert(address_spk.clone(), (prefix, len));
+            }
+            let (address_prefix, address_len) =
+                address_lens.get_mut(&address_spk).expect("address length inserted");
+            let address_index = *address_len;
+            puts.push((table.list_item_key(address_prefix, address_index), encoded));
+            *address_len = address_len.saturating_add(1);
+
+            if request.fulfillment_tx.is_none() {
+                let pending_key =
+                    table.unwrap_request_pending_outpoint_key(&request.txid, request.vout);
+                if !pending_refs_by_key.contains_key(&pending_key) {
+                    let existing = self
+                        .raw_get(&pending_key)?
+                        .map(|raw| decode_unwrap_request_refs(&raw))
+                        .transpose()?
+                        .unwrap_or_default();
+                    pending_refs_by_key.insert(pending_key.clone(), existing);
+                }
+                pending_refs_by_key
+                    .get_mut(&pending_key)
+                    .expect("pending refs inserted")
+                    .push(UnwrapRequestListRefV1 { all_index, address_spk, address_index });
+            }
+        }
+
+        puts.push((all_len_key, encode_u64_le(all_len).to_vec()));
+        for (_, (address_prefix, address_len)) in address_lens {
+            puts.push((
+                table.list_length_key(&address_prefix),
+                encode_u64_le(address_len).to_vec(),
+            ));
+        }
+        for (pending_key, refs) in pending_refs_by_key {
+            puts.push((pending_key, borsh::to_vec(&refs)?));
+        }
+        Ok(puts)
+    }
+
+    pub fn build_unwrap_request_fulfillment_updates(
+        &self,
+        params: BuildUnwrapRequestFulfillmentUpdatesParams,
+    ) -> Result<BuildUnwrapRequestFulfillmentUpdatesResult> {
+        if params.spends.is_empty() {
+            return Ok(BuildUnwrapRequestFulfillmentUpdatesResult::default());
+        }
+
+        let table = self.table();
+        let all_prefix = table.UNWRAP_REQUESTS_ALL.key().to_vec();
+        let mut puts = Vec::new();
+        let mut deletes = Vec::new();
+        let mut fulfilled = 0usize;
+
+        for spend in params.spends {
+            let pending_key =
+                table.unwrap_request_pending_outpoint_key(&spend.request_txid, spend.request_vout);
+            let Some(raw_refs) = self.raw_get(&pending_key)? else { continue };
+            let refs = decode_unwrap_request_refs(&raw_refs)?;
+
+            for request_ref in refs {
+                let all_key = table.list_item_key(&all_prefix, request_ref.all_index);
+                let Some(raw_request) = self.raw_get(&all_key)? else { continue };
+                let mut request = decode_unwrap_request(&raw_request)?;
+                if request.fulfillment_tx.is_some() {
+                    continue;
+                }
+                request.fulfillment_tx = Some(spend.fulfillment_tx);
+                let encoded = encode_unwrap_request(&request)?;
+                puts.push((all_key, encoded.clone()));
+
+                let address_prefix =
+                    table.unwrap_requests_by_address_prefix(&request_ref.address_spk);
+                let address_key = table.list_item_key(&address_prefix, request_ref.address_index);
+                puts.push((address_key, encoded));
+                fulfilled = fulfilled.saturating_add(1);
+            }
+
+            deletes.push(pending_key);
+        }
+
+        Ok(BuildUnwrapRequestFulfillmentUpdatesResult { puts, deletes, fulfilled })
     }
 
     pub fn build_unwrap_total_point_appends(
@@ -441,6 +617,46 @@ impl SubfrostProvider {
         read_events_from_list(&view, &prefix, params.offset, params.limit, params.successful)
     }
 
+    pub fn get_unwrap_requests_by_address(
+        &self,
+        params: GetUnwrapRequestsByAddressParams,
+    ) -> Result<GetUnwrapRequestsResult> {
+        crate::debug_timer_log!("get_unwrap_requests_by_address");
+        let view = match params.blockhash {
+            StateAt::Block(blockhash) => self.with_view_blockhash(Some(blockhash)),
+            StateAt::Latest => self.with_height(params.height, params.height_present)?,
+        };
+        let table = view.table();
+        let prefix = table.unwrap_requests_by_address_prefix(&params.address_spk);
+        read_unwrap_requests_from_list(
+            &view,
+            &prefix,
+            params.offset,
+            params.limit,
+            params.fulfilled,
+        )
+    }
+
+    pub fn get_unwrap_requests_all(
+        &self,
+        params: GetUnwrapRequestsAllParams,
+    ) -> Result<GetUnwrapRequestsResult> {
+        crate::debug_timer_log!("get_unwrap_requests_all");
+        let view = match params.blockhash {
+            StateAt::Block(blockhash) => self.with_view_blockhash(Some(blockhash)),
+            StateAt::Latest => self.with_height(params.height, params.height_present)?,
+        };
+        let table = view.table();
+        let prefix = table.UNWRAP_REQUESTS_ALL.key().to_vec();
+        read_unwrap_requests_from_list(
+            &view,
+            &prefix,
+            params.offset,
+            params.limit,
+            params.fulfilled,
+        )
+    }
+
     pub fn get_unwrap_total_latest(
         &self,
         params: GetUnwrapTotalLatestParams,
@@ -520,6 +736,41 @@ fn read_events_from_list(
     Ok(GetWrapEventsResult { entries: out, total })
 }
 
+fn read_unwrap_requests_from_list(
+    provider: &SubfrostProvider,
+    list_prefix: &[u8],
+    offset: usize,
+    limit: usize,
+    fulfilled: Option<bool>,
+) -> Result<GetUnwrapRequestsResult> {
+    let all = provider.read_unwrap_request_list_all(list_prefix)?;
+    if all.is_empty() {
+        return Ok(GetUnwrapRequestsResult { entries: Vec::new(), total: 0 });
+    }
+
+    let mut total = 0usize;
+    let mut out = Vec::new();
+    let mut seen = 0usize;
+
+    for entry in all.into_iter().rev() {
+        if let Some(want) = fulfilled {
+            if entry.fulfilled() != want {
+                continue;
+            }
+        }
+        total = total.saturating_add(1);
+        if seen < offset {
+            seen = seen.saturating_add(1);
+            continue;
+        }
+        if out.len() < limit {
+            out.push(entry);
+        }
+    }
+
+    Ok(GetUnwrapRequestsResult { entries: out, total })
+}
+
 pub struct GetRawValueParams {
     pub blockhash: StateAt,
 
@@ -540,6 +791,28 @@ pub struct SetBatchParams {
 pub struct BuildEventListAppendsParams {
     pub list_prefix: Vec<u8>,
     pub events: Vec<SchemaWrapEventV1>,
+}
+
+pub struct BuildUnwrapRequestAppendsParams {
+    pub requests: Vec<SchemaUnwrapRequestV1>,
+}
+
+pub struct BuildUnwrapRequestFulfillmentUpdatesParams {
+    pub spends: Vec<UnwrapRequestSpend>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UnwrapRequestSpend {
+    pub request_txid: [u8; 32],
+    pub request_vout: u32,
+    pub fulfillment_tx: [u8; 32],
+}
+
+#[derive(Default)]
+pub struct BuildUnwrapRequestFulfillmentUpdatesResult {
+    pub puts: Vec<(Vec<u8>, Vec<u8>)>,
+    pub deletes: Vec<Vec<u8>>,
+    pub fulfilled: usize,
 }
 
 pub struct BuildUnwrapTotalPointAppendsParams {
@@ -603,6 +876,27 @@ pub struct GetUnwrapEventsAllParams {
     pub height_present: bool,
 }
 
+pub struct GetUnwrapRequestsByAddressParams {
+    pub blockhash: StateAt,
+
+    pub address_spk: Vec<u8>,
+    pub offset: usize,
+    pub limit: usize,
+    pub fulfilled: Option<bool>,
+    pub height: Option<u64>,
+    pub height_present: bool,
+}
+
+pub struct GetUnwrapRequestsAllParams {
+    pub blockhash: StateAt,
+
+    pub offset: usize,
+    pub limit: usize,
+    pub fulfilled: Option<bool>,
+    pub height: Option<u64>,
+    pub height_present: bool,
+}
+
 pub struct GetUnwrapTotalLatestParams {
     pub blockhash: StateAt,
 
@@ -631,6 +925,11 @@ pub struct GetWrapEventsResult {
     pub total: usize,
 }
 
+pub struct GetUnwrapRequestsResult {
+    pub entries: Vec<SchemaUnwrapRequestV1>,
+    pub total: usize,
+}
+
 #[allow(dead_code)]
 pub fn encode_wrap_event_value(event: &SchemaWrapEventV1) -> Result<Vec<u8>> {
     encode_wrap_event(event)
@@ -639,4 +938,200 @@ pub fn encode_wrap_event_value(event: &SchemaWrapEventV1) -> Result<Vec<u8>> {
 #[allow(dead_code)]
 pub fn decode_wrap_event_value(bytes: &[u8]) -> Result<SchemaWrapEventV1> {
     decode_wrap_event(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_provider() -> (TempDir, SubfrostProvider) {
+        let dir = TempDir::new().expect("temp dir");
+        let mdb = Arc::new(Mdb::open(dir.path(), b"subfrost:").expect("open mdb"));
+        (dir, SubfrostProvider::new(mdb))
+    }
+
+    fn request(
+        txid_byte: u8,
+        timestamp: u64,
+        address_spk: Vec<u8>,
+        fulfillment_tx: Option<[u8; 32]>,
+    ) -> SchemaUnwrapRequestV1 {
+        SchemaUnwrapRequestV1 {
+            timestamp,
+            txid: [txid_byte; 32],
+            vout: 2,
+            amount: 100,
+            address_spk,
+            fulfillment_tx,
+        }
+    }
+
+    #[test]
+    fn unwrap_requests_filter_and_fulfill_global_and_address_lists() {
+        let (_dir, provider) = test_provider();
+        let addr_a = vec![0x51];
+        let addr_b = vec![0x52];
+
+        let puts = provider
+            .build_unwrap_request_appends(BuildUnwrapRequestAppendsParams {
+                requests: vec![
+                    request(1, 10, addr_a.clone(), None),
+                    request(2, 20, addr_b.clone(), Some([9; 32])),
+                ],
+            })
+            .expect("build appends");
+        provider
+            .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+            .expect("write appends");
+
+        let all = provider
+            .get_unwrap_requests_all(GetUnwrapRequestsAllParams {
+                blockhash: StateAt::Latest,
+                offset: 0,
+                limit: 10,
+                fulfilled: None,
+                height: None,
+                height_present: false,
+            })
+            .expect("read all");
+        assert_eq!(all.total, 2);
+        assert_eq!(all.entries[0].txid, [2; 32]);
+        assert_eq!(all.entries[1].txid, [1; 32]);
+
+        let pending = provider
+            .get_unwrap_requests_all(GetUnwrapRequestsAllParams {
+                blockhash: StateAt::Latest,
+                offset: 0,
+                limit: 10,
+                fulfilled: Some(false),
+                height: None,
+                height_present: false,
+            })
+            .expect("read pending");
+        assert_eq!(pending.total, 1);
+        assert_eq!(pending.entries[0].txid, [1; 32]);
+
+        let fulfilled = provider
+            .get_unwrap_requests_all(GetUnwrapRequestsAllParams {
+                blockhash: StateAt::Latest,
+                offset: 0,
+                limit: 10,
+                fulfilled: Some(true),
+                height: None,
+                height_present: false,
+            })
+            .expect("read fulfilled");
+        assert_eq!(fulfilled.total, 1);
+        assert_eq!(fulfilled.entries[0].txid, [2; 32]);
+
+        let updates = provider
+            .build_unwrap_request_fulfillment_updates(BuildUnwrapRequestFulfillmentUpdatesParams {
+                spends: vec![UnwrapRequestSpend {
+                    request_txid: [1; 32],
+                    request_vout: 2,
+                    fulfillment_tx: [7; 32],
+                }],
+            })
+            .expect("build fulfillment updates");
+        assert_eq!(updates.fulfilled, 1);
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: updates.puts,
+                deletes: updates.deletes,
+            })
+            .expect("write fulfillment updates");
+
+        let pending = provider
+            .get_unwrap_requests_all(GetUnwrapRequestsAllParams {
+                blockhash: StateAt::Latest,
+                offset: 0,
+                limit: 10,
+                fulfilled: Some(false),
+                height: None,
+                height_present: false,
+            })
+            .expect("read pending after fulfillment");
+        assert_eq!(pending.total, 0);
+
+        let by_addr = provider
+            .get_unwrap_requests_by_address(GetUnwrapRequestsByAddressParams {
+                blockhash: StateAt::Latest,
+                address_spk: addr_a,
+                offset: 0,
+                limit: 10,
+                fulfilled: Some(true),
+                height: None,
+                height_present: false,
+            })
+            .expect("read fulfilled by address");
+        assert_eq!(by_addr.total, 1);
+        assert_eq!(by_addr.entries[0].txid, [1; 32]);
+        assert_eq!(by_addr.entries[0].fulfillment_tx, Some([7; 32]));
+    }
+
+    #[test]
+    fn unwrap_request_fulfillment_updates_all_refs_for_same_outpoint() {
+        let (_dir, provider) = test_provider();
+        let addr_a = vec![0x51];
+        let addr_b = vec![0x52];
+
+        let puts = provider
+            .build_unwrap_request_appends(BuildUnwrapRequestAppendsParams {
+                requests: vec![
+                    request(3, 10, addr_a.clone(), None),
+                    request(3, 10, addr_b.clone(), None),
+                ],
+            })
+            .expect("build appends");
+        provider
+            .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+            .expect("write appends");
+
+        let updates = provider
+            .build_unwrap_request_fulfillment_updates(BuildUnwrapRequestFulfillmentUpdatesParams {
+                spends: vec![UnwrapRequestSpend {
+                    request_txid: [3; 32],
+                    request_vout: 2,
+                    fulfillment_tx: [8; 32],
+                }],
+            })
+            .expect("build fulfillment updates");
+        assert_eq!(updates.fulfilled, 2);
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: updates.puts,
+                deletes: updates.deletes,
+            })
+            .expect("write fulfillment updates");
+
+        let fulfilled = provider
+            .get_unwrap_requests_all(GetUnwrapRequestsAllParams {
+                blockhash: StateAt::Latest,
+                offset: 0,
+                limit: 10,
+                fulfilled: Some(true),
+                height: None,
+                height_present: false,
+            })
+            .expect("read fulfilled");
+        assert_eq!(fulfilled.total, 2);
+        assert!(fulfilled.entries.iter().all(|entry| entry.fulfillment_tx == Some([8; 32])));
+
+        let by_addr = provider
+            .get_unwrap_requests_by_address(GetUnwrapRequestsByAddressParams {
+                blockhash: StateAt::Latest,
+                address_spk: addr_b,
+                offset: 0,
+                limit: 10,
+                fulfilled: Some(true),
+                height: None,
+                height_present: false,
+            })
+            .expect("read address row");
+        assert_eq!(by_addr.total, 1);
+        assert_eq!(by_addr.entries[0].fulfillment_tx, Some([8; 32]));
+    }
 }

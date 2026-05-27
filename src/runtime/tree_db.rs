@@ -267,9 +267,23 @@ impl VersionedTreeDb {
         height: u32,
         block_hash: &BlockHash,
         parent_hash: &BlockHash,
-    ) -> Result<(), RocksError> {
+    ) -> anyhow::Result<()> {
         let parent_arr = parent_hash.to_byte_array();
-        let base_root = self.root_for_blockhash_bytes(&parent_arr)?.unwrap_or_else(empty_root_id);
+        let base_root = match self.root_for_blockhash_bytes(&parent_arr)? {
+            Some(root) => root,
+            None => {
+                let st = self.state.read().expect("tree state poisoned");
+                if st.active_block.is_none()
+                    && (st.active_root == empty_root_id() || !self.has_committed_blocks()?)
+                {
+                    empty_root_id()
+                } else {
+                    anyhow::bail!(
+                        "missing parent root for block {height}: parent_hash={parent_hash}"
+                    );
+                }
+            }
+        };
 
         let mut st = self.state.write().expect("tree state poisoned");
         st.current_block = Some(BlockContext {
@@ -279,6 +293,20 @@ impl VersionedTreeDb {
             working_root: base_root,
         });
         Ok(())
+    }
+
+    fn has_committed_blocks(&self) -> Result<bool, RocksError> {
+        let iter = self.db.iterator(IteratorMode::From(HEIGHT_BLOCK_PREFIX, Direction::Forward));
+        for item in iter {
+            let (key, _) = item?;
+            return Ok(key.as_ref().starts_with(HEIGHT_BLOCK_PREFIX));
+        }
+        Ok(false)
+    }
+
+    pub fn abort_block(&self) {
+        let mut st = self.state.write().expect("tree state poisoned");
+        st.current_block = None;
     }
 
     pub fn finish_block(&self) -> Result<(), RocksError> {
@@ -318,6 +346,68 @@ impl VersionedTreeDb {
         }
 
         self.db.write(wb)
+    }
+
+    pub fn rewind_to_height(&self, target_height: Option<u32>) -> anyhow::Result<()> {
+        let (active_root, active_block) = match target_height {
+            Some(height) => {
+                let Some(block_hash) = self.blockhash_for_height(height)? else {
+                    anyhow::bail!("cannot rewind tree: missing block hash at height {height}");
+                };
+                let Some(root) = self.root_for_blockhash(&block_hash)? else {
+                    anyhow::bail!(
+                        "cannot rewind tree: missing root for height {height} ({block_hash})"
+                    );
+                };
+                (root, Some(block_hash.to_byte_array()))
+            }
+            None => (empty_root_id(), None),
+        };
+
+        let mut stale_height_keys: Vec<Vec<u8>> = Vec::new();
+        let mut stale_block_height_keys: Vec<Vec<u8>> = Vec::new();
+        for res in self.db.iterator(IteratorMode::From(HEIGHT_BLOCK_PREFIX, Direction::Forward)) {
+            let (key, value) = res?;
+            let key_ref = key.as_ref();
+            if !key_ref.starts_with(HEIGHT_BLOCK_PREFIX) {
+                break;
+            }
+            let Some(height) = decode_height_block_key(key_ref) else {
+                continue;
+            };
+            if target_height.map(|target| height > target).unwrap_or(true) {
+                stale_height_keys.push(key.to_vec());
+                if value.len() == 32 {
+                    let mut block_hash = [0u8; 32];
+                    block_hash.copy_from_slice(&value);
+                    stale_block_height_keys.push(block_height_key(&block_hash));
+                }
+            }
+        }
+
+        let mut st = self.state.write().expect("tree state poisoned");
+        st.current_block = None;
+        st.active_root = active_root;
+        st.active_block = active_block;
+        st.pinned_root = None;
+        st.pin_until_height = None;
+
+        let mut wb = WriteBatch::default();
+        wb.put(META_ACTIVE_ROOT, active_root);
+        match active_block {
+            Some(block_hash) => wb.put(META_ACTIVE_BLOCK, block_hash),
+            None => wb.delete(META_ACTIVE_BLOCK),
+        }
+        wb.delete(META_PINNED_ROOT);
+        wb.delete(META_PIN_UNTIL_HEIGHT);
+        for key in stale_height_keys {
+            wb.delete(key);
+        }
+        for key in stale_block_height_keys {
+            wb.delete(key);
+        }
+        self.db.write(wb)?;
+        Ok(())
     }
 
     pub fn pin_active_root_until_height(&self, until_height: u32) -> Result<(), RocksError> {
@@ -503,9 +593,75 @@ impl VersionedTreeDb {
         }
     }
 
+    fn multi_get_node(
+        &self,
+        node_id: [u8; 32],
+        keys: &[Vec<u8>],
+        sorted_indices: &[usize],
+        out: &mut [Option<Vec<u8>>],
+    ) -> Result<(), RocksError> {
+        if sorted_indices.is_empty() {
+            return Ok(());
+        }
+
+        match self.load_node(&node_id)? {
+            BptreeNode::Leaf(leaf) => {
+                for &idx in sorted_indices {
+                    if let Ok(entry_idx) =
+                        leaf.entries.binary_search_by(|entry| entry.key.as_slice().cmp(&keys[idx]))
+                    {
+                        out[idx] = leaf.entries[entry_idx].value.clone();
+                    }
+                }
+            }
+            BptreeNode::Internal(internal) => {
+                if internal.children.is_empty() {
+                    return Ok(());
+                }
+
+                let mut start = 0usize;
+                while start < sorted_indices.len() {
+                    let child_idx =
+                        child_index_for_key(&internal.keys, &keys[sorted_indices[start]]);
+                    let mut end = start + 1;
+                    while end < sorted_indices.len()
+                        && child_index_for_key(&internal.keys, &keys[sorted_indices[end]])
+                            == child_idx
+                    {
+                        end += 1;
+                    }
+
+                    if let Some(child_id) = internal.children.get(child_idx).copied() {
+                        self.multi_get_node(child_id, keys, &sorted_indices[start..end], out)?;
+                    }
+                    start = end;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn multi_get_at_root(
+        &self,
+        root: [u8; 32],
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, RocksError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sorted_indices: Vec<usize> = (0..keys.len()).collect();
+        sorted_indices.sort_by(|a, b| keys[*a].cmp(&keys[*b]));
+
+        let mut out = vec![None; keys.len()];
+        self.multi_get_node(root, keys, &sorted_indices, &mut out)?;
+        Ok(out)
+    }
+
     pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, RocksError> {
         let root = self.active_root();
-        keys.iter().map(|k| self.get_at_root(root, k)).collect()
+        self.multi_get_at_root(root, keys)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), RocksError> {
@@ -1398,5 +1554,86 @@ mod tests {
         assert_eq!(tree.get_at_root(in_progress_root, key).expect("get in-progress"), Some(value),);
 
         tree.finish_block().expect("finish block");
+    }
+
+    #[test]
+    fn begin_block_rejects_missing_parent_after_initial_root() {
+        let (_dir, tree) = new_tree();
+        let genesis = BlockHash::from_byte_array([0u8; 32]);
+        let h1 = BlockHash::from_byte_array([1u8; 32]);
+        let missing_parent = BlockHash::from_byte_array([2u8; 32]);
+        let h2 = BlockHash::from_byte_array([3u8; 32]);
+
+        tree.begin_block(1, &h1, &genesis).expect("initial block may start empty");
+        tree.finish_block().expect("finish initial");
+
+        assert!(tree.begin_block(2, &h2, &missing_parent).is_err());
+    }
+
+    #[test]
+    fn begin_block_allows_missing_parent_when_no_blocks_committed() {
+        let (_dir, tree) = new_tree();
+        let parent_before_genesis = BlockHash::from_byte_array([9u8; 32]);
+        let h840000 = BlockHash::from_byte_array([8u8; 32]);
+        let key = b"essentials:/genesis-start";
+
+        {
+            let mut state = tree.state.write().expect("tree state");
+            state.active_root = [7u8; 32];
+        }
+
+        tree.begin_block(840_000, &h840000, &parent_before_genesis)
+            .expect("first committed tree block may start empty");
+        tree.apply_batch(&[(key.to_vec(), Some(vec![1]))]).expect("apply first block");
+        tree.finish_block().expect("finish first block");
+
+        assert_eq!(tree.blockhash_for_height(840_000).expect("height hash"), Some(h840000));
+        assert_eq!(tree.get(key).expect("first block value"), Some(vec![1]));
+    }
+
+    #[test]
+    fn rewind_to_height_restores_active_root() {
+        let (_dir, tree) = new_tree();
+        let key = b"essentials:/rewind";
+
+        let genesis = BlockHash::from_byte_array([0u8; 32]);
+        let h1 = BlockHash::from_byte_array([1u8; 32]);
+        let h2 = BlockHash::from_byte_array([2u8; 32]);
+
+        tree.begin_block(1, &h1, &genesis).expect("begin block 1");
+        tree.apply_batch(&[(key.to_vec(), Some(vec![1]))]).expect("apply block 1");
+        tree.finish_block().expect("finish block 1");
+
+        tree.begin_block(2, &h2, &h1).expect("begin block 2");
+        tree.apply_batch(&[(key.to_vec(), Some(vec![2]))]).expect("apply block 2");
+        tree.finish_block().expect("finish block 2");
+        assert_eq!(tree.get(key).expect("get h2"), Some(vec![2]));
+
+        tree.rewind_to_height(Some(1)).expect("rewind to h1");
+        assert_eq!(tree.get(key).expect("get h1 after rewind"), Some(vec![1]));
+        assert_eq!(tree.active_blockhash(), Some(h1));
+    }
+
+    #[test]
+    fn rewind_to_height_prunes_orphaned_height_mappings() {
+        let (_dir, tree) = new_tree();
+
+        let genesis = BlockHash::from_byte_array([0u8; 32]);
+        let h1 = BlockHash::from_byte_array([1u8; 32]);
+        let h2 = BlockHash::from_byte_array([2u8; 32]);
+
+        tree.begin_block(1, &h1, &genesis).expect("begin block 1");
+        tree.finish_block().expect("finish block 1");
+        tree.begin_block(2, &h2, &h1).expect("begin block 2");
+        tree.finish_block().expect("finish block 2");
+
+        assert_eq!(tree.indexed_height_bounds().expect("bounds before rewind"), Some((1, 2)));
+
+        tree.rewind_to_height(Some(1)).expect("rewind to h1");
+
+        assert_eq!(tree.blockhash_for_height(1).expect("height 1 hash"), Some(h1));
+        assert_eq!(tree.blockhash_for_height(2).expect("height 2 hash"), None);
+        assert_eq!(tree.height_for_blockhash(&h2).expect("h2 height"), None);
+        assert_eq!(tree.indexed_height_bounds().expect("bounds after rewind"), Some((1, 1)));
     }
 }

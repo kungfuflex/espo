@@ -1,5 +1,7 @@
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit};
-use crate::modules::ammdata::schemas::{SchemaPoolMetricsV1, SchemaPoolMetricsV2, Timeframe};
+use crate::modules::ammdata::schemas::{
+    SchemaMarketDefs, SchemaPoolMetricsV1, SchemaPoolMetricsV2, Timeframe,
+};
 use crate::modules::ammdata::storage::{
     AmmDataProvider, GetListEntriesDescParams, GetPoolCreationInfoParams, GetPoolMetricsV2Params,
     GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, PoolMetricsIndexField,
@@ -15,6 +17,47 @@ use anyhow::Result;
 use bitcoin::Network;
 use serde_json::json;
 use std::collections::HashMap;
+
+#[derive(Clone, Copy)]
+enum PoolVolumeSide {
+    Base,
+    Quote,
+}
+
+fn pool_volume_side(
+    defs: &SchemaMarketDefs,
+    canonical_quote_units: &HashMap<SchemaAlkaneId, CanonicalQuoteUnit>,
+) -> PoolVolumeSide {
+    if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
+        PoolVolumeSide::Quote
+    } else {
+        PoolVolumeSide::Base
+    }
+}
+
+fn amount_value(
+    amount: u128,
+    token: SchemaAlkaneId,
+    price_usd: u128,
+    price_sats: u128,
+    canonical_quote_units: &HashMap<SchemaAlkaneId, CanonicalQuoteUnit>,
+    btc_usd_price: Option<u128>,
+) -> (u128, u128) {
+    if let Some(unit) = canonical_quote_units.get(&token).copied() {
+        let usd =
+            crate::modules::ammdata::canonical_quote_amount_tvl_usd(amount, unit, btc_usd_price)
+                .unwrap_or(0);
+        let sats =
+            crate::modules::ammdata::canonical_quote_amount_tvl_sats(amount, unit, btc_usd_price)
+                .unwrap_or(0);
+        return (usd, sats);
+    }
+
+    (
+        amount.saturating_mul(price_usd).saturating_div(AMOUNT_SCALE),
+        amount.saturating_mul(price_sats).saturating_div(AMOUNT_SCALE),
+    )
+}
 
 pub fn derive_pool_metrics(
     blockhash: StateAt,
@@ -254,69 +297,41 @@ pub fn derive_pool_metrics(
         let token1_volume_7d = trade_windows.token1_7d;
         let token0_volume_30d = trade_windows.token0_30d;
         let token1_volume_30d = trade_windows.token1_30d;
+        let volume_side = pool_volume_side(defs, canonical_quote_units);
+        let btc_usd_price = state.btc_usd_price;
+        let selected_volume_value = |base_amount: u128, quote_amount: u128| -> (u128, u128) {
+            match volume_side {
+                PoolVolumeSide::Base => amount_value(
+                    base_amount,
+                    defs.base_alkane_id,
+                    token0_price_usd,
+                    token0_price_sats,
+                    canonical_quote_units,
+                    btc_usd_price,
+                ),
+                PoolVolumeSide::Quote => amount_value(
+                    quote_amount,
+                    defs.quote_alkane_id,
+                    token1_price_usd,
+                    token1_price_sats,
+                    canonical_quote_units,
+                    btc_usd_price,
+                ),
+            }
+        };
 
-        let pool_volume_1d_usd = token0_volume_1d
-            .saturating_mul(token0_price_usd)
-            .saturating_div(AMOUNT_SCALE)
-            .saturating_add(
-                token1_volume_1d.saturating_mul(token1_price_usd).saturating_div(AMOUNT_SCALE),
-            );
-        let pool_volume_30d_usd = token0_volume_30d
-            .saturating_mul(token0_price_usd)
-            .saturating_div(AMOUNT_SCALE)
-            .saturating_add(
-                token1_volume_30d.saturating_mul(token1_price_usd).saturating_div(AMOUNT_SCALE),
-            );
-        let pool_volume_1d_sats = token0_volume_1d
-            .saturating_mul(token0_price_sats)
-            .saturating_div(AMOUNT_SCALE)
-            .saturating_add(
-                token1_volume_1d.saturating_mul(token1_price_sats).saturating_div(AMOUNT_SCALE),
-            );
-        let pool_volume_30d_sats = token0_volume_30d
-            .saturating_mul(token0_price_sats)
-            .saturating_div(AMOUNT_SCALE)
-            .saturating_add(
-                token1_volume_30d.saturating_mul(token1_price_sats).saturating_div(AMOUNT_SCALE),
-            );
-        let pool_volume_7d_usd = token0_volume_7d
-            .saturating_mul(token0_price_usd)
-            .saturating_div(AMOUNT_SCALE)
-            .saturating_add(
-                token1_volume_7d.saturating_mul(token1_price_usd).saturating_div(AMOUNT_SCALE),
-            );
-        let pool_volume_7d_sats = token0_volume_7d
-            .saturating_mul(token0_price_sats)
-            .saturating_div(AMOUNT_SCALE)
-            .saturating_add(
-                token1_volume_7d.saturating_mul(token1_price_sats).saturating_div(AMOUNT_SCALE),
-            );
+        let (pool_volume_1d_usd, pool_volume_1d_sats) =
+            selected_volume_value(token0_volume_1d, token1_volume_1d);
+        let (pool_volume_7d_usd, pool_volume_7d_sats) =
+            selected_volume_value(token0_volume_7d, token1_volume_7d);
+        let (pool_volume_30d_usd, pool_volume_30d_sats) =
+            selected_volume_value(token0_volume_30d, token1_volume_30d);
         let (block_base, block_quote) =
             state.in_block_trade_volumes.get(pool).copied().unwrap_or((0, 0));
-        let block_volume_usd = block_base
-            .saturating_mul(token0_price_usd)
-            .saturating_div(AMOUNT_SCALE)
-            .saturating_add(
-                block_quote.saturating_mul(token1_price_usd).saturating_div(AMOUNT_SCALE),
-            );
-        let block_volume_sats = block_base
-            .saturating_mul(token0_price_sats)
-            .saturating_div(AMOUNT_SCALE)
-            .saturating_add(
-                block_quote.saturating_mul(token1_price_sats).saturating_div(AMOUNT_SCALE),
-            );
+        let (block_volume_usd, block_volume_sats) = selected_volume_value(block_base, block_quote);
 
         let pool_volume_all_time_usd = if trade_windows.has_all_time {
-            trade_windows
-                .token0_all
-                .saturating_mul(token0_price_usd)
-                .saturating_div(AMOUNT_SCALE)
-                .saturating_add(
-                    trade_windows
-                        .token1_all
-                        .saturating_mul(token1_price_usd)
-                        .saturating_div(AMOUNT_SCALE),
-                )
+            selected_volume_value(trade_windows.token0_all, trade_windows.token1_all).0
         } else {
             prev_pool_metrics
                 .as_ref()
@@ -325,16 +340,7 @@ pub fn derive_pool_metrics(
                 .saturating_add(block_volume_usd)
         };
         let pool_volume_all_time_sats = if trade_windows.has_all_time {
-            trade_windows
-                .token0_all
-                .saturating_mul(token0_price_sats)
-                .saturating_div(AMOUNT_SCALE)
-                .saturating_add(
-                    trade_windows
-                        .token1_all
-                        .saturating_mul(token1_price_sats)
-                        .saturating_div(AMOUNT_SCALE),
-                )
+            selected_volume_value(trade_windows.token0_all, trade_windows.token1_all).1
         } else {
             prev_pool_metrics
                 .as_ref()

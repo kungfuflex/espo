@@ -199,6 +199,7 @@ pub fn layout_with_meta(
                                 @if runes_enabled {
                                     a class="navlink" href=(explorer_path("/runes")) { "Runes" }
                                 }
+                                a class="navlink" href=(explorer_path("/docs")) { "Docs" }
                             }
                             div class="nav-actions" {
                                 button class="nav-icon-btn nav-search-toggle" type="button" aria-label="Search" data-search-toggle="" {
@@ -214,6 +215,7 @@ pub fn layout_with_meta(
                                 @if runes_enabled {
                                     a class="nav-menu-link" href=(explorer_path("/runes")) { "Runes" }
                                 }
+                                a class="nav-menu-link" href=(explorer_path("/docs")) { "Docs" }
                             }
                         }
                     }

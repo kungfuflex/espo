@@ -145,6 +145,10 @@ impl BtcUsdPriceCache {
         *self.inner.write().map_err(|_| anyhow!("btc/usd price cache lock poisoned"))? = entry;
         Ok(())
     }
+
+    pub fn clear(&self) -> Result<()> {
+        self.set(None)
+    }
 }
 
 pub fn refresh_btc_usd_price_cache(
@@ -3230,8 +3234,14 @@ fn btc_price_usd_cached(blockhash: StateAt, state: &OylApiState) -> Result<u128>
     // Read-paths must never call external price feeds. For latest reads, serve the cached
     // tip-nearest BTC/USD point and lazily initialize it on first use.
     if blockhash == StateAt::Latest {
+        let tip_height = state
+            .ammdata
+            .get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })?
+            .height;
         if let Some(entry) = state.btc_usd_price_cache.get()? {
-            return Ok(entry.price);
+            if Some(entry.tip_height) == tip_height {
+                return Ok(entry.price);
+            }
         }
         return refresh_btc_usd_price_cache(
             state.ammdata.as_ref(),
@@ -4944,18 +4954,17 @@ fn build_pool_details(
         if let Ok((token0_volume_7d, token1_volume_7d, token0_volume_all, token1_volume_all)) =
             pool_candle_volume_sums(blockhash.clone(), state, &pool, now_ts)
         {
-            let fallback_7d = token0_volume_7d
-                .saturating_mul(token0_price_usd)
-                .saturating_div(PRICE_SCALE)
-                .saturating_add(
-                    token1_volume_7d.saturating_mul(token1_price_usd).saturating_div(PRICE_SCALE),
-                );
-            let fallback_all = token0_volume_all
-                .saturating_mul(token0_price_usd)
-                .saturating_div(PRICE_SCALE)
-                .saturating_add(
-                    token1_volume_all.saturating_mul(token1_price_usd).saturating_div(PRICE_SCALE),
-                );
+            let use_quote_volume = canonical_units.contains_key(&token1);
+            let fallback_7d = if use_quote_volume {
+                token1_volume_7d.saturating_mul(token1_price_usd).saturating_div(PRICE_SCALE)
+            } else {
+                token0_volume_7d.saturating_mul(token0_price_usd).saturating_div(PRICE_SCALE)
+            };
+            let fallback_all = if use_quote_volume {
+                token1_volume_all.saturating_mul(token1_price_usd).saturating_div(PRICE_SCALE)
+            } else {
+                token0_volume_all.saturating_mul(token0_price_usd).saturating_div(PRICE_SCALE)
+            };
             if pool_volume_7d_usd == 0 {
                 pool_volume_7d_usd = fallback_7d;
             }
@@ -5149,5 +5158,75 @@ fn trade_from_activity(
             Some((sold, bought, abs_i128(entry.quote_delta), abs_i128(entry.base_delta)))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::ammdata::storage::{
+        SetBatchParams as AmmDataSetBatchParams,
+        SetIndexHeightParams as AmmDataSetIndexHeightParams, encode_u128_value,
+    };
+    use crate::runtime::mdb::Mdb;
+    use tempfile::TempDir;
+
+    fn new_state_with_tempdb() -> OylApiState {
+        let dir = TempDir::new().expect("tempdir");
+        let root = Mdb::open(dir.path(), b"").expect("open mdb");
+        let essentials = Arc::new(EssentialsProvider::new(Arc::new(
+            root.clone_with_prefix(b"essentials_test:"),
+        )));
+        let ammdata = Arc::new(AmmDataProvider::new(
+            Arc::new(root.clone_with_prefix(b"ammdata_test:")),
+            essentials.clone(),
+        ));
+        let subfrost =
+            Arc::new(SubfrostProvider::new(Arc::new(root.clone_with_prefix(b"subfrost_test:"))));
+        std::mem::forget(dir);
+        OylApiState {
+            config: OylApiConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                alkane_icon_cdn: "https://example.com".to_string(),
+                ord_endpoint: None,
+            },
+            essentials,
+            ammdata,
+            subfrost,
+            http_client: Client::new(),
+            btc_usd_price_cache: Arc::new(BtcUsdPriceCache::new()),
+        }
+    }
+
+    #[test]
+    fn latest_btc_price_cache_rejects_stale_tip_height() {
+        let state = new_state_with_tempdb();
+        state
+            .ammdata
+            .set_index_height(AmmDataSetIndexHeightParams { blockhash: StateAt::Latest, height: 9 })
+            .expect("set index height");
+        state
+            .ammdata
+            .set_batch(AmmDataSetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![(
+                    state.ammdata.table().btc_usd_price_key(9),
+                    encode_u128_value(123).expect("encode price"),
+                )],
+                deletes: Vec::new(),
+            })
+            .expect("write price");
+        state
+            .btc_usd_price_cache
+            .set(Some(BtcUsdPriceCacheEntry { tip_height: 10, price_height: 10, price: 999 }))
+            .expect("seed stale cache");
+
+        let price = btc_price_usd_cached(StateAt::Latest, &state).expect("price");
+        assert_eq!(price, 123);
+        assert_eq!(
+            state.btc_usd_price_cache.get().expect("cache").map(|entry| entry.tip_height),
+            Some(9)
+        );
     }
 }

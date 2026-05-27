@@ -136,6 +136,12 @@ impl EspoModule for OylApi {
         })
     }
 
+    fn handle_reorg(&self, next_height: u32) -> Result<()> {
+        self.btc_usd_price_cache.clear()?;
+        eprintln!("[OYLAPI] cleared BTC/USD cache after reorg; next_height={next_height}");
+        Ok(())
+    }
+
     fn register_rpc(&self, _reg: &RpcNsRegistrar) {
         let Some(cfg) = self.config.clone() else {
             return;

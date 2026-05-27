@@ -133,3 +133,47 @@ where
         BTreeMap::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{Amount, ScriptBuf, TxOut, locktime::absolute, opcodes, transaction};
+
+    fn tx_with_middle_op_return() -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::builder()
+                        .push_opcode(opcodes::all::OP_RETURN)
+                        .into_script(),
+                },
+                TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() },
+            ],
+        }
+    }
+
+    fn output_amount(outputs: &OutputRuneSheets<u32>, vout: u32, id: u32) -> u128 {
+        outputs.get(&vout).and_then(|sheet| sheet.get(&id)).copied().unwrap_or(0)
+    }
+
+    #[test]
+    fn multicast_edict_uses_post_fix_non_op_return_destinations() {
+        let tx = tx_with_middle_op_return();
+        let rules = TransferRules::default();
+        let mut unallocated = RuneSheet::new();
+        let mut outputs = OutputRuneSheets::new();
+        unallocated.insert(1, 500);
+
+        rules.apply_edict(&tx, &mut unallocated, &mut outputs, 1, 300, tx.output.len() as u32);
+
+        assert_eq!(output_amount(&outputs, 0, 1), 300);
+        assert_eq!(output_amount(&outputs, 1, 1), 0);
+        assert_eq!(output_amount(&outputs, 2, 1), 200);
+        assert_eq!(unallocated.get(&1).copied().unwrap_or(0), 0);
+    }
+}

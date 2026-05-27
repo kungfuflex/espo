@@ -452,7 +452,7 @@ a:hover {
   max-width: 100%;
   margin: 0;
 }
-@media (max-width: 720px) {
+@media (max-width: 870px) {
   .navlinks-container {
     display: none;
   }
@@ -3930,4 +3930,259 @@ a.alkane-method-btn:hover {
 .footer-icon:hover {
   background: var(--panel2);
   color: var(--text);
+}
+
+.docs-hero {
+  margin-top: 50px;
+  margin-bottom: 50px;
+}
+
+.docs-example-head,
+.docs-module-head,
+.docs-method-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.docs-module h2 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.docs-module p,
+.docs-description p {
+  margin: 4px 0 0;
+}
+
+.docs-method-meta {
+  flex: 0 0 auto;
+  border-radius: 6px;
+  background: var(--panel3);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  padding: 6px 8px;
+}
+
+.docs-json-block {
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--panel3);
+  color: var(--text);
+  padding: 14px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.docs-json-block .json-viewer,
+.docs-json-block .json-raw,
+.docs-endpoint-line {
+  font-family: var(--mono);
+}
+
+.docs-json-block .json-raw {
+  overflow: visible;
+}
+
+.docs-endpoint-line {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+
+.docs-endpoint-only {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.docs-shell {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.docs-nav {
+  position: sticky;
+  top: 82px;
+  max-height: calc(100vh - 96px);
+  overflow: auto;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--panel);
+  scrollbar-color: var(--muted2) var(--panel3);
+  scrollbar-width: thin;
+}
+
+.docs-nav::-webkit-scrollbar {
+  width: 6px;
+}
+
+.docs-nav::-webkit-scrollbar-track {
+  background: var(--panel3);
+  border-radius: 8px;
+}
+
+.docs-nav::-webkit-scrollbar-thumb {
+  background: var(--muted2);
+  border-radius: 8px;
+}
+
+.docs-nav::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+.docs-nav p {
+  margin: 14px 8px 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.docs-nav a {
+  display: block;
+  padding: 7px 8px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.docs-nav a:hover {
+  background: var(--panel2);
+  color: var(--text);
+}
+
+.docs-content {
+  min-width: 0;
+}
+
+.docs-module {
+  margin-bottom: 34px;
+}
+
+.docs-module-head {
+  align-items: flex-end;
+  border-bottom: 1px solid var(--panel2);
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+}
+
+.docs-method {
+  scroll-margin-top: 86px;
+  margin-bottom: 14px;
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.docs-method-title {
+  color: var(--link);
+  padding: 14px 16px;
+  background: var(--panel2);
+  font-size: 18px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.docs-method-title span:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.docs-method-title:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+.docs-method-body {
+  box-sizing: border-box;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.docs-subtitle {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.docs-description {
+  color: var(--muted);
+}
+
+.docs-know-title {
+  margin-top: 12px;
+}
+
+.docs-know-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.docs-know-list li {
+  margin: 6px 0;
+}
+
+@media (max-width: 992px) {
+  .docs-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .docs-nav {
+    display: none;
+  }
+
+  .docs-module {
+    margin-bottom: 26px;
+  }
+
+  .docs-module-head {
+    align-items: flex-start;
+    flex-direction: column;
+    margin-bottom: 10px;
+  }
+
+  .docs-method {
+    position: relative;
+    overflow: hidden;
+    height: auto;
+    transition: 0.5s height ease;
+  }
+
+  .docs-method-title {
+    margin: 0;
+    font-size: 18px;
+    z-index: 1;
+  }
+
+  .docs-method-title .docs-method-meta {
+    display: none;
+  }
+
+  .docs-method-body {
+    width: 100%;
+    position: absolute;
+    top: -10000px;
+    opacity: 0;
+    transition: 0.5s opacity ease;
+  }
+
+  .docs-json-block,
+  .docs-json-block .json-raw {
+    font-size: 12px;
+  }
 }

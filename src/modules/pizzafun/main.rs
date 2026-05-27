@@ -289,6 +289,16 @@ impl EspoModule for Pizzafun {
         *self.index_height.read().unwrap()
     }
 
+    fn handle_reorg(&self, next_height: u32) -> Result<()> {
+        let height = self.load_index_height();
+        *self.index_height.write().unwrap() = height;
+        eprintln!(
+            "[pizzafun] reorg rollback complete; next_height={}, index height: {:?}",
+            next_height, height
+        );
+        Ok(())
+    }
+
     fn register_rpc(&self, reg: &RpcNsRegistrar) {
         let provider = self.provider.as_ref().expect("ModuleRegistry must call set_mdb()");
         rpc::register_rpc(reg.clone(), Arc::clone(provider));

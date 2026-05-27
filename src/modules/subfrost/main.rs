@@ -1,9 +1,11 @@
-use super::consts::get_frbtc_alkane;
+use super::consts::{get_frbtc_alkane, get_subfrost_wrap_address};
 use super::rpc::register_rpc;
-use super::schemas::SchemaWrapEventV1;
+use super::schemas::{SchemaUnwrapRequestV1, SchemaWrapEventV1};
 use super::storage::{
-    BuildEventListAppendsParams, BuildUnwrapTotalPointAppendsParams, GetIndexHeightParams,
-    SetBatchParams, SetIndexHeightParams, SubfrostProvider, UnwrapTotalPoint,
+    BuildEventListAppendsParams, BuildUnwrapRequestAppendsParams,
+    BuildUnwrapRequestFulfillmentUpdatesParams, BuildUnwrapTotalPointAppendsParams,
+    GetIndexHeightParams, SetBatchParams, SetIndexHeightParams, SubfrostProvider,
+    UnwrapRequestSpend, UnwrapTotalPoint,
 };
 use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceInvokeData,
@@ -19,10 +21,11 @@ use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash as _;
-use bitcoin::{Network, Transaction, Txid};
+use bitcoin::{Address, Network, ScriptBuf, Transaction, Txid};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub struct Subfrost {
@@ -108,13 +111,20 @@ impl EspoModule for Subfrost {
 
         let timer = debug::start_if(debug);
         let block_ts = block.block_header.time as u64;
-        let frbtc = get_frbtc_alkane(get_network());
+        let network = get_network();
+        let frbtc = get_frbtc_alkane(network);
+        let subfrost_wrap_script = subfrost_wrap_script(network);
 
         let mut block_tx_map: HashMap<Txid, &Transaction> = HashMap::new();
         for atx in &block.transactions {
             block_tx_map.insert(atx.transaction.compute_txid(), &atx.transaction);
         }
         let mut prev_tx_cache: HashMap<Txid, Transaction> = HashMap::new();
+        let unwrap_request_spends = collect_unwrap_request_spends(&block.transactions);
+        let fulfillment_by_outpoint: HashMap<([u8; 32], u32), [u8; 32]> = unwrap_request_spends
+            .iter()
+            .map(|spend| ((spend.request_txid, spend.request_vout), spend.fulfillment_tx))
+            .collect();
 
         let mut wrap_count: usize = 0;
         let mut unwrap_count: usize = 0;
@@ -122,6 +132,7 @@ impl EspoModule for Subfrost {
         let mut unwrap_delta_success: u128 = 0;
         let mut wrap_events_all: Vec<SchemaWrapEventV1> = Vec::new();
         let mut unwrap_events_all: Vec<SchemaWrapEventV1> = Vec::new();
+        let mut unwrap_requests_all: Vec<SchemaUnwrapRequestV1> = Vec::new();
         let mut wrap_events_by_address: HashMap<Vec<u8>, Vec<SchemaWrapEventV1>> = HashMap::new();
         let mut unwrap_events_by_address: HashMap<Vec<u8>, Vec<SchemaWrapEventV1>> = HashMap::new();
         debug::log_elapsed(module, "init_context", timer);
@@ -170,11 +181,12 @@ impl EspoModule for Subfrost {
                                 WrapKind::Unwrap => pending.amount,
                             };
                             let Some(amount) = amount else { continue };
+                            let address_spk = pending.address_spk;
                             let event = SchemaWrapEventV1 {
                                 timestamp: block_ts,
                                 txid: txid.to_byte_array(),
                                 amount,
-                                address_spk: pending.address_spk,
+                                address_spk: address_spk.clone(),
                                 success,
                             };
                             if matches!(pending.kind, WrapKind::Unwrap) {
@@ -182,6 +194,24 @@ impl EspoModule for Subfrost {
                                 if success {
                                     unwrap_delta_success =
                                         unwrap_delta_success.saturating_add(amount);
+                                }
+                                if success {
+                                    if let Some(vout) = subfrost_wrap_vout(
+                                        &tx.transaction,
+                                        subfrost_wrap_script.as_ref(),
+                                    ) {
+                                        let txid_bytes = txid.to_byte_array();
+                                        unwrap_requests_all.push(SchemaUnwrapRequestV1 {
+                                            timestamp: block_ts,
+                                            txid: txid_bytes,
+                                            vout,
+                                            amount,
+                                            address_spk: address_spk.clone(),
+                                            fulfillment_tx: fulfillment_by_outpoint
+                                                .get(&(txid_bytes, vout))
+                                                .copied(),
+                                        });
+                                    }
                                 }
                             }
                             match pending.kind {
@@ -211,6 +241,7 @@ impl EspoModule for Subfrost {
         debug::log_elapsed(module, "process_traces", timer);
 
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut deletes: Vec<Vec<u8>> = Vec::new();
         if !wrap_events_all.is_empty() {
             puts.extend(provider.build_event_list_appends(BuildEventListAppendsParams {
                 list_prefix: table.WRAP_EVENTS_ALL.key().to_vec(),
@@ -235,8 +266,24 @@ impl EspoModule for Subfrost {
                 events,
             })?);
         }
+        if !unwrap_request_spends.is_empty() {
+            let updates = provider.build_unwrap_request_fulfillment_updates(
+                BuildUnwrapRequestFulfillmentUpdatesParams { spends: unwrap_request_spends },
+            )?;
+            puts.extend(updates.puts);
+            deletes.extend(updates.deletes);
+        }
+        if !unwrap_requests_all.is_empty() {
+            puts.extend(provider.build_unwrap_request_appends(
+                BuildUnwrapRequestAppendsParams { requests: unwrap_requests_all },
+            )?);
+        }
 
-        if !puts.is_empty() || unwrap_delta_all > 0 || unwrap_delta_success > 0 {
+        if !puts.is_empty()
+            || !deletes.is_empty()
+            || unwrap_delta_all > 0
+            || unwrap_delta_success > 0
+        {
             let timer = debug::start_if(debug);
             if unwrap_delta_all > 0 || unwrap_delta_success > 0 {
                 let prev_all = provider
@@ -288,7 +335,7 @@ impl EspoModule for Subfrost {
             debug::log_elapsed(module, "update_totals", timer);
             let timer = debug::start_if(debug);
             provider
-                .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+                .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes })
                 .map_err(|e| anyhow!("[SUBFROST] set_batch failed at height {}: {e}", height))?;
             debug::log_elapsed(module, "write_batch", timer);
         }
@@ -313,6 +360,16 @@ impl EspoModule for Subfrost {
         *self.index_height.read().unwrap()
     }
 
+    fn handle_reorg(&self, next_height: u32) -> Result<()> {
+        let height = self.load_index_height()?;
+        *self.index_height.write().unwrap() = height;
+        eprintln!(
+            "[SUBFROST] reorg rollback complete; next_height={}, index height: {:?}",
+            next_height, height
+        );
+        Ok(())
+    }
+
     fn register_rpc(&self, reg: &RpcNsRegistrar) {
         if let Some(provider) = self.provider.as_ref() {
             register_rpc(reg, provider.clone());
@@ -324,7 +381,7 @@ impl EspoModule for Subfrost {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum WrapKind {
     Wrap,
     Unwrap,
@@ -473,6 +530,47 @@ fn spk_from_protostone(tx: &Transaction) -> Option<bitcoin::ScriptBuf> {
         }
     }
     None
+}
+
+fn subfrost_wrap_script(network: Network) -> Option<ScriptBuf> {
+    let address = get_subfrost_wrap_address(network);
+    if address.is_empty() {
+        return None;
+    }
+    Address::from_str(address)
+        .ok()
+        .and_then(|a| a.require_network(network).ok())
+        .map(|a| a.script_pubkey())
+}
+
+fn subfrost_wrap_vout(tx: &Transaction, wrap_script: Option<&ScriptBuf>) -> Option<u32> {
+    let wrap_script = wrap_script?;
+    tx.output
+        .iter()
+        .enumerate()
+        .filter(|(_, output)| output.script_pubkey.as_bytes() == wrap_script.as_bytes())
+        .min_by_key(|(idx, output)| (output.value.to_sat(), *idx as u64))
+        .map(|(idx, _)| idx as u32)
+}
+
+fn collect_unwrap_request_spends(
+    transactions: &[crate::alkanes::trace::EspoAlkanesTransaction],
+) -> Vec<UnwrapRequestSpend> {
+    let mut spends = Vec::new();
+    for tx in transactions {
+        let fulfillment_tx = tx.transaction.compute_txid().to_byte_array();
+        for input in &tx.transaction.input {
+            if input.previous_output.is_null() {
+                continue;
+            }
+            spends.push(UnwrapRequestSpend {
+                request_txid: input.previous_output.txid.to_byte_array(),
+                request_vout: input.previous_output.vout,
+                fulfillment_tx,
+            });
+        }
+    }
+    spends
 }
 
 fn encode_u128_value(value: u128) -> Vec<u8> {

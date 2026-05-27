@@ -231,6 +231,16 @@ impl EspoModule for TokenData {
         *self.index_height.read().unwrap()
     }
 
+    fn handle_reorg(&self, next_height: u32) -> Result<()> {
+        let height = self.load_index_height();
+        *self.index_height.write().unwrap() = height;
+        eprintln!(
+            "[TOKENDATA] reorg rollback complete; next_height={}, index height: {:?}",
+            next_height, height
+        );
+        Ok(())
+    }
+
     fn register_rpc(&self, reg: &RpcNsRegistrar) {
         register_rpc(
             reg,

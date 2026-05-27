@@ -3,6 +3,7 @@ pub mod alkane;
 pub mod alkanes;
 pub mod block;
 pub mod common;
+pub mod docs;
 pub mod home;
 pub mod rune;
 pub mod runes;

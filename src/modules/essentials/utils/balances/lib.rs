@@ -17,15 +17,16 @@ use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
     AddressActivityEntry, AddressAmountEntry, AddressIndexListKind, AlkaneBalanceTxEntry,
-    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
+    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId, HoldersCountEntry,
     address_index_list_id_alkane_balance_txs_by_token, address_index_list_id_alkane_block_txs,
-    append_address_index_values, build_outpoint_pos_versioned_puts,
-    build_outpoint_spent_versioned_puts, build_tx_pos_versioned_puts, decode_balances_vec,
-    decode_outpoint_pointer_blob_v3, decode_pointer_idx_u64, decode_u128_value,
-    encode_outpoint_pointer_blob_v3, encode_pointer_idx_u64, encode_tx_pointer_blob_v3,
-    encode_u128_value, encode_vec, get_holders_count_encoded, mk_outpoint, resolve_outpoint_id_v2,
-    resolve_outpoint_ids_batch_v2, resolve_outpoint_spent_by_id_v2,
-    resolve_outpoint_spent_by_ids_batch_v2, resolve_tx_pointer_ids_batch_v2, spk_to_address_str,
+    append_address_index_values, build_new_outpoint_pos_versioned_puts,
+    build_new_outpoint_spent_versioned_puts, build_new_tx_pos_versioned_puts,
+    build_outpoint_spent_versioned_puts, decode_balances_vec, decode_outpoint_pointer_blob_v3,
+    decode_pointer_idx_u64, decode_u128_value, encode_outpoint_pointer_blob_v3,
+    encode_pointer_idx_u64, encode_tx_pointer_blob_v3, encode_u128_value, encode_vec,
+    get_holders_count_encoded, mk_outpoint, resolve_outpoint_id_v2, resolve_outpoint_ids_batch_v2,
+    resolve_outpoint_spent_by_id_v2, resolve_outpoint_spent_by_ids_batch_v2,
+    resolve_tx_pointer_ids_batch_v2, spk_to_address_str,
 };
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetListEntriesDescParams, GetMultiValuesParams, GetRawValueParams,
@@ -39,12 +40,14 @@ use bitcoin::block::Header;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Transaction, Txid};
+use borsh::BorshDeserialize;
 use protorune_support::protostone::{Protostone, ProtostoneEdict};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 static AMMDATA_MDB: OnceLock<Arc<Mdb>> = OnceLock::new();
+const ALKANES_V217_EDICT_FIX_HEIGHT: u64 = 943_500;
 
 fn ammdata_mdb() -> Arc<Mdb> {
     AMMDATA_MDB
@@ -614,6 +617,7 @@ fn apply_transfers_multi(
     tx: &Transaction,
     protostones: &[Protostone],
     traces_for_tx: &[EspoTrace],
+    block_height: u64,
     mut seed_unalloc: Unallocated, // VIN balances only
 ) -> Result<HashMap<u32, Vec<BalanceEntry>>> {
     let mut out_map: HashMap<u32, Vec<BalanceEntry>> = HashMap::new();
@@ -750,6 +754,7 @@ fn apply_transfers_multi(
         multicast_index: u32,
         shadow_base: u32,
         shadow_end: u32,
+        block_height: u64,
     ) -> Result<()> {
         // guard
         if ed.id.block == 0 && ed.id.tx > 0 {
@@ -791,7 +796,7 @@ fn apply_transfers_multi(
                     shadow_base,
                     shadow_end,
                 );
-            } else {
+            } else if block_height >= ALKANES_V217_EDICT_FIX_HEIGHT {
                 // amount > 0 → treat ed.amount as PER-VOUT CAP, and use ALL available
                 let mut remaining = have;
                 let mut used: u128 = 0;
@@ -810,6 +815,35 @@ fn apply_transfers_multi(
                 }
 
                 // subtract only what we actually allocated; leave any leftover on the sheet
+                *entry = entry.saturating_sub(used);
+                if *entry == 0 {
+                    sheet.remove(&rid);
+                }
+            } else {
+                // Pre-v2.1.7 canonical metashrew behavior: OP_RETURN outputs consume a
+                // multicast slot while walking transaction outputs, but receive no balance.
+                let mut remaining = have;
+                let mut used: u128 = 0;
+
+                for (vout, output) in tx.output.iter().enumerate() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let give = remaining.min(ed.amount);
+                    if give == 0 {
+                        break;
+                    }
+                    remaining = remaining.saturating_sub(give);
+                    if is_op_return(&output.script_pubkey) {
+                        continue;
+                    }
+                    out_map
+                        .entry(vout as u32)
+                        .or_default()
+                        .push(BalanceEntry { alkane: rid, amount: give });
+                    used = used.saturating_add(give);
+                }
+
                 *entry = entry.saturating_sub(used);
                 if *entry == 0 {
                     sheet.remove(&rid);
@@ -958,6 +992,7 @@ fn apply_transfers_multi(
                     multicast_index,
                     shadow_base,
                     shadow_end,
+                    block_height,
                 ) {
                     eprintln!("[ESSENTIALS::balances] WARN edict apply failed: {e:?}");
                 }
@@ -1016,7 +1051,81 @@ pub(crate) fn project_tx_output_balances_from_traces(
         }
     }
 
-    apply_transfers_multi(tx, &protostones, traces_for_tx, seed_unalloc).unwrap_or_default()
+    apply_transfers_multi(
+        tx,
+        &protostones,
+        traces_for_tx,
+        ALKANES_V217_EDICT_FIX_HEIGHT,
+        seed_unalloc,
+    )
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod edict_fork_tests {
+    use super::*;
+    use bitcoin::{Amount, TxOut, locktime::absolute, opcodes, transaction};
+    use protorune_support::balance_sheet::ProtoruneRuneId;
+
+    fn tx_with_middle_op_return() -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::builder()
+                        .push_opcode(opcodes::all::OP_RETURN)
+                        .into_script(),
+                },
+                TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() },
+            ],
+        }
+    }
+
+    fn multicast_fixture(height: u64) -> HashMap<u32, Vec<BalanceEntry>> {
+        let alkane = SchemaAlkaneId { block: 2, tx: 1 };
+        let mut seed = Unallocated::default();
+        seed.add(alkane, 500);
+        let protostone = Protostone {
+            burn: None,
+            message: vec![],
+            edicts: vec![ProtostoneEdict {
+                id: ProtoruneRuneId { block: 2, tx: 1 },
+                amount: 300,
+                output: 3,
+            }],
+            refund: None,
+            pointer: Some(0),
+            from: None,
+            protocol_tag: 1,
+        };
+
+        apply_transfers_multi(&tx_with_middle_op_return(), &[protostone], &[], height, seed)
+            .expect("apply transfers")
+    }
+
+    fn amount_at(map: &HashMap<u32, Vec<BalanceEntry>>, vout: u32) -> u128 {
+        map.get(&vout).into_iter().flatten().map(|entry| entry.amount).sum()
+    }
+
+    #[test]
+    fn multicast_edicts_match_legacy_before_v217_fix() {
+        let allocations = multicast_fixture(ALKANES_V217_EDICT_FIX_HEIGHT - 1);
+        assert_eq!(amount_at(&allocations, 0), 500);
+        assert_eq!(amount_at(&allocations, 1), 0);
+        assert_eq!(amount_at(&allocations, 2), 0);
+    }
+
+    #[test]
+    fn multicast_edicts_skip_op_return_after_v217_fix() {
+        let allocations = multicast_fixture(ALKANES_V217_EDICT_FIX_HEIGHT);
+        assert_eq!(amount_at(&allocations, 0), 300);
+        assert_eq!(amount_at(&allocations, 1), 0);
+        assert_eq!(amount_at(&allocations, 2), 200);
+    }
 }
 
 /* -------------------------- Holders helpers -------------------------- */
@@ -1279,40 +1388,18 @@ pub fn bulk_update_balances_for_block(
             })
             .collect();
 
-        let mut lookup_outpoints: Vec<(Txid, u32)> =
-            Vec::with_capacity(filtered_external_inputs.len());
-        for op in &filtered_external_inputs {
-            if op.txid.len() != 32 {
-                continue;
-            }
-            let mut txid_arr = [0u8; 32];
-            txid_arr.copy_from_slice(&op.txid);
-            lookup_outpoints.push((Txid::from_byte_array(txid_arr), op.vout));
-        }
+        let lookup_outpoints =
+            lookup_pairs_from_outpoints(filtered_external_inputs.iter().copied());
+
         let lookups =
             get_outpoint_balances_with_spent_batch(StateAt::Latest, provider, &lookup_outpoints)?;
-        for (txid, vout) in lookup_outpoints {
-            let Some(lookup) = lookups.get(&(txid, vout)) else {
-                continue;
-            };
-            if lookup.spent_by.is_some() {
-                continue;
-            }
-            let key = (txid, vout);
-            if !lookup.balances.is_empty() {
-                balances_by_outpoint.insert(key, lookup.balances.clone());
-            }
-            if let Some(addr) = lookup.address.as_ref() {
-                if !addr.is_empty() {
-                    addr_by_outpoint.insert((txid, vout), addr.clone());
-                }
-            }
-            if let Some(spk) = lookup.spk.as_ref() {
-                if !spk.is_empty() {
-                    spk_by_outpoint.insert((txid, vout), spk.clone());
-                }
-            }
-        }
+        populate_outpoint_lookup_maps(
+            lookup_outpoints,
+            lookups,
+            &mut balances_by_outpoint,
+            &mut addr_by_outpoint,
+            &mut spk_by_outpoint,
+        );
 
         if debug {
             eprintln!(
@@ -1346,6 +1433,10 @@ pub fn bulk_update_balances_for_block(
             }
             let prev_txid = input.previous_output.txid;
             if block_tx_index.contains_key(&prev_txid) {
+                continue;
+            }
+            let prev_key = (prev_txid, input.previous_output.vout);
+            if addr_by_outpoint.contains_key(&prev_key) || spk_by_outpoint.contains_key(&prev_key) {
                 continue;
             }
             if trace_prevout_set.insert(prev_txid) {
@@ -1609,9 +1700,30 @@ pub fn bulk_update_balances_for_block(
         }
 
         let allocations = if tx_has_op_return(tx) {
-            let protostones = parse_protostones(tx)?;
-            // apply transfers only when there’s a proto/runestone carrier
-            apply_transfers_multi(tx, &protostones, &traces_for_tx, seed_unalloc)?
+            let protostones = match parse_protostones(tx) {
+                Ok(protostones) => protostones,
+                Err(e) => {
+                    if debug {
+                        eprintln!(
+                            "[balances] skipping malformed protostones: height={} txid={} err={e:#}",
+                            block.height, txid
+                        );
+                    }
+                    Vec::new()
+                }
+            };
+            if protostones.is_empty() {
+                HashMap::<u32, Vec<BalanceEntry>>::new()
+            } else {
+                // apply transfers only when there’s a proto/runestone carrier
+                apply_transfers_multi(
+                    tx,
+                    &protostones,
+                    &traces_for_tx,
+                    u64::from(block.height),
+                    seed_unalloc,
+                )?
+            }
         } else {
             // No OP_RETURN → no Alkanes allocations (but we already did VIN cleanup/holders--)
             HashMap::<u32, Vec<BalanceEntry>>::new()
@@ -2131,7 +2243,8 @@ pub fn bulk_update_balances_for_block(
 
     let mut outpoint_idx_appends: HashMap<String, Vec<u64>> = HashMap::new();
     let mut outpoint_pos_updates: HashMap<([u8; 32], u32), u64> = HashMap::new();
-    let mut outpoint_spent_updates: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut new_outpoint_spent_updates: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut existing_outpoint_spent_updates: HashMap<u64, [u8; 32]> = HashMap::new();
 
     let mut external_spent_candidates: Vec<(Txid, u32)> = Vec::new();
     let mut external_spent_set: HashSet<(Txid, u32)> = HashSet::new();
@@ -2201,14 +2314,12 @@ pub fn bulk_update_balances_for_block(
 
         if let Some(ref spent_by) = row.outpoint.tx_spent {
             if spent_by.len() == 32 {
-                let outpoint_id = created_outpoint_ids
-                    .get(&key)
-                    .copied()
-                    .or_else(|| external_spent_ids.get(&key).copied());
-                if let Some(id) = outpoint_id {
-                    let mut spender_arr = [0u8; 32];
-                    spender_arr.copy_from_slice(spent_by);
-                    outpoint_spent_updates.insert(id, spender_arr);
+                let mut spender_arr = [0u8; 32];
+                spender_arr.copy_from_slice(spent_by);
+                if let Some(id) = created_outpoint_ids.get(&key).copied() {
+                    new_outpoint_spent_updates.insert(id, spender_arr);
+                } else if let Some(id) = external_spent_ids.get(&key).copied() {
+                    existing_outpoint_spent_updates.insert(id, spender_arr);
                 }
             }
         }
@@ -2795,19 +2906,25 @@ pub fn bulk_update_balances_for_block(
         blob_puts.push((table.tx_pointer_blob_key(pointer_id), row_value));
     }
 
-    blob_puts.extend(build_outpoint_pos_versioned_puts(
+    blob_puts.extend(build_new_outpoint_pos_versioned_puts(
         provider,
         block.height,
         &blockhash,
         &outpoint_pos_updates,
     )?);
+    blob_puts.extend(build_new_outpoint_spent_versioned_puts(
+        provider,
+        block.height,
+        &blockhash,
+        &new_outpoint_spent_updates,
+    )?);
     blob_puts.extend(build_outpoint_spent_versioned_puts(
         provider,
         block.height,
         &blockhash,
-        &outpoint_spent_updates,
+        &existing_outpoint_spent_updates,
     )?);
-    blob_puts.extend(build_tx_pos_versioned_puts(
+    blob_puts.extend(build_new_tx_pos_versioned_puts(
         provider,
         block.height,
         &blockhash,
@@ -2882,12 +2999,19 @@ pub fn bulk_update_balances_for_block(
     section_start_deletes = deletes.len();
 
     // E) Holders deltas
-    let mut holders_full_rebuilds = 0usize;
-    let mut holders_full_rebuild_entries = 0usize;
+    let holders_full_rebuilds = 0usize;
+    let holders_full_rebuild_entries = 0usize;
     for (alkane, per_holder) in holders_delta.iter() {
         let holders_count_key = table.holders_count_key(alkane);
-        let mut holder_amounts: BTreeMap<HolderId, u128> = BTreeMap::new();
-        let mut had_zero_in_existing_list = false;
+        let prev_count = provider
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: holders_count_key.clone(),
+            })?
+            .value
+            .and_then(|raw| HoldersCountEntry::try_from_slice(&raw).ok())
+            .map(|entry| entry.count)
+            .unwrap_or(0);
         let holder_len = provider
             .get_raw_value(GetRawValueParams {
                 blockhash: StateAt::Latest,
@@ -2904,66 +3028,43 @@ pub fn bulk_update_balances_for_block(
                 }
             })
             .unwrap_or(0);
-        if holder_len > 0 {
-            let mut idx_keys = Vec::with_capacity(holder_len as usize);
-            for idx in 0..holder_len {
-                idx_keys.push(table.holder_list_idx_key(alkane, idx));
-            }
-            let idx_vals = provider
-                .get_multi_values(GetMultiValuesParams {
-                    blockhash: StateAt::Latest,
-                    keys: idx_keys,
-                })?
-                .values;
-            let mut holders = Vec::new();
-            let mut holder_keys = Vec::new();
-            for idx_val in idx_vals {
-                let Some(raw) = idx_val else { continue };
-                let holder = if raw.is_empty() {
-                    continue;
-                } else if raw[0] == b'a' {
-                    let Ok(addr) = std::str::from_utf8(&raw[1..]).map(|s| s.to_string()) else {
-                        continue;
-                    };
-                    HolderId::Address(addr)
-                } else if raw[0] == b'k' && raw.len() == 13 {
-                    HolderId::Alkane(SchemaAlkaneId {
-                        block: u32::from_be_bytes([raw[1], raw[2], raw[3], raw[4]]),
-                        tx: u64::from_be_bytes([
-                            raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12],
-                        ]),
-                    })
-                } else {
-                    continue;
-                };
-                holder_keys.push(table.holder_key(alkane, &holder));
-                holders.push(holder);
-            }
-            let holder_vals = provider
-                .get_multi_values(GetMultiValuesParams {
-                    blockhash: StateAt::Latest,
-                    keys: holder_keys,
-                })?
-                .values;
-            for (holder, value) in holders.into_iter().zip(holder_vals.into_iter()) {
-                let Some(bytes) = value else { continue };
-                let Ok(amount) = decode_u128_value(&bytes) else {
-                    continue;
-                };
-                if amount == 0 {
-                    had_zero_in_existing_list = true;
-                }
-                holder_amounts.insert(holder, amount);
-            }
-        }
 
-        let prev_count = holder_amounts.values().filter(|amt| **amt > 0).count() as u64;
-        let mut changed_holders: Vec<(HolderId, u128)> = Vec::with_capacity(per_holder.len());
-        let mut added_holders: Vec<HolderId> = Vec::new();
+        let mut holder_keys: Vec<Vec<u8>> = Vec::with_capacity(per_holder.len());
+        let mut holders: Vec<HolderId> = Vec::with_capacity(per_holder.len());
+        for holder in per_holder.keys() {
+            holder_keys.push(table.holder_key(alkane, holder));
+            holders.push(holder.clone());
+        }
+        let current_holder_values = provider
+            .get_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: holder_keys.clone(),
+            })?
+            .values;
+
+        let supply_latest_key = table.circulating_supply_latest_key(alkane);
+        let prev_supply = provider
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: supply_latest_key.clone(),
+            })?
+            .value
+            .and_then(|v| decode_u128_value(&v).ok())
+            .unwrap_or(0);
+        let mut supply = prev_supply;
+        let mut changed_holders: Vec<(Vec<u8>, u128)> = Vec::with_capacity(per_holder.len());
+        let mut added_count: u64 = 0;
+        let mut appended_holders: Vec<HolderId> = Vec::new();
         let mut removed_holders: u32 = 0;
-        let mut membership_changed = had_zero_in_existing_list;
-        for (holder, delta) in per_holder {
-            let cur = holder_amounts.get(holder).copied().unwrap_or(0);
+        for ((holder, holder_key), current_raw) in holders
+            .into_iter()
+            .zip(holder_keys.into_iter())
+            .zip(current_holder_values.into_iter())
+        {
+            let cur = current_raw.as_ref().and_then(|raw| decode_u128_value(raw).ok()).unwrap_or(0);
+            let Some(delta) = per_holder.get(&holder) else {
+                continue;
+            };
             let (is_negative, mag) = delta.as_parts();
             let next = if is_negative {
                 if mag > cur {
@@ -2977,18 +3078,24 @@ pub fn bulk_update_balances_for_block(
                 cur.saturating_add(mag)
             };
             if (cur > 0) != (next > 0) {
-                membership_changed = true;
                 if cur == 0 && next > 0 {
-                    added_holders.push(holder.clone());
+                    added_count = added_count.saturating_add(1);
+                    if current_raw.is_none() {
+                        appended_holders.push(holder.clone());
+                    }
                 } else if cur > 0 && next == 0 {
                     removed_holders = removed_holders.saturating_add(1);
                 }
             }
-            holder_amounts.insert(holder.clone(), next);
-            changed_holders.push((holder.clone(), next));
+            if next >= cur {
+                supply = supply.saturating_add(next - cur);
+            } else {
+                supply = supply.saturating_sub(cur - next);
+            }
+            changed_holders.push((holder_key, next));
         }
-        holder_amounts.retain(|_, amount| *amount > 0);
-        let new_count = holder_amounts.len() as u64;
+        let new_count =
+            prev_count.saturating_add(added_count).saturating_sub(removed_holders as u64);
         if search_index_enabled {
             let rec = provider
                 .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
@@ -3036,96 +3143,45 @@ pub fn bulk_update_balances_for_block(
         }
         puts.push((new_index_key, Vec::new()));
 
-        let supply: u128 = holder_amounts.values().copied().sum();
-        let supply_latest_key = table.circulating_supply_latest_key(alkane);
-        let prev_supply = provider
-            .get_raw_value(GetRawValueParams {
-                blockhash: StateAt::Latest,
-                key: supply_latest_key.clone(),
-            })?
-            .value
-            .and_then(|v| decode_u128_value(&v).ok())
-            .unwrap_or(0);
         if supply != prev_supply {
             let encoded = encode_u128_value(supply)?;
             puts.push((table.circulating_supply_key(alkane, block.height), encoded.clone()));
             puts.push((supply_latest_key, encoded));
         }
 
-        for (holder, amount) in changed_holders {
-            let holder_key = table.holder_key(alkane, &holder);
-            if amount == 0 {
-                deletes.push(holder_key);
-            } else {
-                puts.push((holder_key, encode_u128_value(amount)?));
-            }
+        for (holder_key, amount) in changed_holders {
+            puts.push((holder_key, encode_u128_value(amount)?));
         }
 
-        if membership_changed {
-            if !had_zero_in_existing_list && removed_holders == 0 {
-                let added_count = added_holders.len() as u32;
-                let mut added_holder_keys: Vec<Vec<u8>> = added_holders
-                    .into_iter()
-                    .map(|holder| match holder {
-                        HolderId::Address(addr) => {
-                            let mut out = Vec::with_capacity(1 + addr.len());
-                            out.push(b'a');
-                            out.extend_from_slice(addr.as_bytes());
-                            out
-                        }
-                        HolderId::Alkane(id) => {
-                            let mut out = Vec::with_capacity(13);
-                            out.push(b'k');
-                            out.extend_from_slice(&id.block.to_be_bytes());
-                            out.extend_from_slice(&id.tx.to_be_bytes());
-                            out
-                        }
-                    })
-                    .collect();
-                added_holder_keys.sort();
-                let base = holder_len;
-                for (offset, holder_key_bytes) in added_holder_keys.into_iter().enumerate() {
-                    puts.push((
-                        table.holder_list_idx_key(alkane, base.saturating_add(offset as u32)),
-                        holder_key_bytes,
-                    ));
+        let mut added_holder_keys: Vec<Vec<u8>> = appended_holders
+            .into_iter()
+            .map(|holder| match holder {
+                HolderId::Address(addr) => {
+                    let mut out = Vec::with_capacity(1 + addr.len());
+                    out.push(b'a');
+                    out.extend_from_slice(addr.as_bytes());
+                    out
                 }
-                let new_len = holder_len.saturating_add(added_count);
-                puts.push((table.holder_list_len_key(alkane), new_len.to_le_bytes().to_vec()));
-            } else {
-                let mut holder_keys_for_idx: Vec<Vec<u8>> = holder_amounts
-                    .keys()
-                    .map(|holder| match holder {
-                        HolderId::Address(addr) => {
-                            let mut out = Vec::with_capacity(1 + addr.len());
-                            out.push(b'a');
-                            out.extend_from_slice(addr.as_bytes());
-                            out
-                        }
-                        HolderId::Alkane(id) => {
-                            let mut out = Vec::with_capacity(13);
-                            out.push(b'k');
-                            out.extend_from_slice(&id.block.to_be_bytes());
-                            out.extend_from_slice(&id.tx.to_be_bytes());
-                            out
-                        }
-                    })
-                    .collect();
-                holder_keys_for_idx.sort();
-                let new_len = holder_keys_for_idx.len() as u32;
-                holders_full_rebuilds = holders_full_rebuilds.saturating_add(1);
-                holders_full_rebuild_entries =
-                    holders_full_rebuild_entries.saturating_add(new_len as usize);
-                puts.push((table.holder_list_len_key(alkane), new_len.to_le_bytes().to_vec()));
-                for (idx, holder_key_bytes) in holder_keys_for_idx.into_iter().enumerate() {
-                    puts.push((table.holder_list_idx_key(alkane, idx as u32), holder_key_bytes));
+                HolderId::Alkane(id) => {
+                    let mut out = Vec::with_capacity(13);
+                    out.push(b'k');
+                    out.extend_from_slice(&id.block.to_be_bytes());
+                    out.extend_from_slice(&id.tx.to_be_bytes());
+                    out
                 }
-                if holder_len > new_len {
-                    for idx in new_len..holder_len {
-                        deletes.push(table.holder_list_idx_key(alkane, idx));
-                    }
-                }
+            })
+            .collect();
+        added_holder_keys.sort();
+        if !added_holder_keys.is_empty() {
+            let base = holder_len;
+            for (offset, holder_key_bytes) in added_holder_keys.iter().enumerate() {
+                puts.push((
+                    table.holder_list_idx_key(alkane, base.saturating_add(offset as u32)),
+                    holder_key_bytes.clone(),
+                ));
             }
+            let new_len = holder_len.saturating_add(added_holder_keys.len() as u32);
+            puts.push((table.holder_list_len_key(alkane), new_len.to_le_bytes().to_vec()));
         }
 
         puts.push((holders_count_key, get_holders_count_encoded(new_count)?));
@@ -4333,6 +4389,63 @@ pub struct OutpointLookup {
     pub spent_by: Option<Txid>,
     pub address: Option<String>,
     pub spk: Option<ScriptBuf>,
+}
+
+fn lookup_pairs_from_outpoints<'a, I>(outpoints: I) -> Vec<(Txid, u32)>
+where
+    I: IntoIterator<Item = &'a EspoOutpoint>,
+{
+    let mut lookup_outpoints = Vec::new();
+    for op in outpoints {
+        if op.txid.len() != 32 {
+            continue;
+        }
+        let mut txid_arr = [0u8; 32];
+        txid_arr.copy_from_slice(&op.txid);
+        lookup_outpoints.push((Txid::from_byte_array(txid_arr), op.vout));
+    }
+    lookup_outpoints
+}
+
+fn populate_outpoint_lookup_maps(
+    lookup_outpoints: Vec<(Txid, u32)>,
+    mut lookups: HashMap<(Txid, u32), OutpointLookup>,
+    balances_by_outpoint: &mut HashMap<(Txid, u32), Vec<BalanceEntry>>,
+    addr_by_outpoint: &mut HashMap<(Txid, u32), String>,
+    spk_by_outpoint: &mut HashMap<(Txid, u32), ScriptBuf>,
+) -> usize {
+    let mut hits = 0usize;
+    for (txid, vout) in lookup_outpoints {
+        let key = (txid, vout);
+        let Some(lookup) = lookups.remove(&key) else {
+            continue;
+        };
+        if lookup.spent_by.is_some() {
+            continue;
+        }
+
+        let mut inserted = false;
+        if !lookup.balances.is_empty() {
+            balances_by_outpoint.insert(key, lookup.balances);
+            inserted = true;
+        }
+        if let Some(addr) = lookup.address {
+            if !addr.is_empty() {
+                addr_by_outpoint.insert(key, addr);
+                inserted = true;
+            }
+        }
+        if let Some(spk) = lookup.spk {
+            if !spk.is_empty() {
+                spk_by_outpoint.insert(key, spk);
+                inserted = true;
+            }
+        }
+        if inserted {
+            hits = hits.saturating_add(1);
+        }
+    }
+    hits
 }
 
 fn resolve_outpoint_spent_by_v2(

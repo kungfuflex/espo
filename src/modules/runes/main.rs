@@ -222,10 +222,18 @@ impl EspoModule for Runes {
         *self.index_height.read().unwrap()
     }
 
+    fn preflight_reorg(&self, next_height: u32) -> Result<()> {
+        if !self.config.enable {
+            return Ok(());
+        }
+        self.provider().preflight_rollback_before_height(next_height)
+    }
+
     fn handle_reorg(&self, next_height: u32) -> Result<()> {
         if !self.config.enable {
             return Ok(());
         }
+        self.provider().preflight_rollback_before_height(next_height)?;
         self.provider().rollback_before_height(next_height)?;
         let height = self.provider().get_index_height()?;
         self.reload_live_outpoints(height)?;
@@ -283,6 +291,7 @@ struct BlockRunesIndexer<'a> {
     uncommon_goods_amount_sum: U256,
     puts: Vec<(Vec<u8>, Vec<u8>)>,
     deletes: HashSet<Vec<u8>>,
+    preimage_values: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -333,6 +342,7 @@ impl<'a> BlockRunesIndexer<'a> {
             uncommon_goods_amount_sum: U256::ZERO,
             puts: Vec::new(),
             deletes: HashSet::new(),
+            preimage_values: BTreeMap::new(),
         }
     }
 
@@ -412,6 +422,7 @@ impl<'a> BlockRunesIndexer<'a> {
         }
         let flush_elapsed = t_flush.elapsed();
         let delete_set = std::mem::take(&mut self.deletes);
+        let preimage_values = std::mem::take(&mut self.preimage_values);
         let mut puts = std::mem::take(&mut self.puts);
         if !delete_set.is_empty() {
             puts.retain(|(key, _)| !delete_set.contains(key));
@@ -421,7 +432,8 @@ impl<'a> BlockRunesIndexer<'a> {
         let delete_count = deletes.len();
         let block_hash = block.block_header.block_hash();
         let t_write = Instant::now();
-        self.provider.set_block_batch(puts, deletes, self.height, &block_hash)?;
+        self.provider
+            .set_block_batch(puts, deletes, preimage_values, self.height, &block_hash)?;
         if debug_enabled() {
             eprintln!(
                 "[RUNES][block] height={} txs={} scan={:?} flush_tx_indexes={:?} write_batch={:?} puts={} deletes={}",
@@ -703,25 +715,38 @@ impl<'a> BlockRunesIndexer<'a> {
         for (input_idx, input) in tx.input.iter().enumerate() {
             let prev = input.previous_output;
             let outpoint = (prev.txid, prev.vout);
-            let row = if let Some(row) = self.ephem.remove(&outpoint) {
-                Some(row)
+            let (row, previous_outpoint) = if let Some(row) = self.ephem.remove(&outpoint) {
+                (Some(row), None)
             } else if self.live_outpoints.is_some() {
                 if !self.live_outpoints_contains(&outpoint) {
-                    None
+                    (None, None)
                 } else {
-                    self.provider.get_outpoint_balances(&prev.txid, prev.vout)?
+                    let row = self.provider.get_outpoint_balances(&prev.txid, prev.vout)?;
+                    let previous = row.as_ref().map(encode).transpose()?;
+                    (row, previous)
                 }
             } else {
-                self.take_point_lookup_outpoint(outpoint)?
+                let row = self.take_point_lookup_outpoint(outpoint)?;
+                let previous = row.as_ref().map(encode).transpose()?;
+                (row, previous)
             };
             let Some(row) = row else {
                 continue;
             };
             self.remove_live_outpoint(outpoint);
-            self.queue_delete(outpoint_key(&prev.txid, prev.vout));
+            let outpoint_key = outpoint_key(&prev.txid, prev.vout);
+            let previous_from_db = previous_outpoint.is_some();
+            self.preimage_values.entry(outpoint_key.clone()).or_insert(previous_outpoint);
+            self.queue_delete(outpoint_key);
             io.inputs.insert(input_idx as u32, row.balances.clone());
             if let Some(address) = row.address.as_ref() {
-                self.queue_delete(address_outpoint_key(address, &prev.txid, prev.vout));
+                let address_outpoint_key = address_outpoint_key(address, &prev.txid, prev.vout);
+                let previous_address_outpoint =
+                    if previous_from_db { Some(Vec::new()) } else { None };
+                self.preimage_values
+                    .entry(address_outpoint_key.clone())
+                    .or_insert(previous_address_outpoint);
+                self.queue_delete(address_outpoint_key);
                 touched_addresses.insert(address.clone());
                 for balance in &row.balances {
                     transfer_participants.entry(balance.id).or_default().insert(address.clone());
@@ -829,12 +854,10 @@ impl<'a> BlockRunesIndexer<'a> {
         let id = match self.next_tx_pointer {
             Some(id) => id,
             None => {
-                let id = self
-                    .provider
-                    .mdb()
-                    .get(&rune_tx_pointer_count_key())?
-                    .and_then(|bytes| super::storage::decode_u64(&bytes))
-                    .unwrap_or(0);
+                let key = rune_tx_pointer_count_key();
+                let raw = self.provider.mdb().get(&key)?;
+                let id = raw.as_deref().and_then(super::storage::decode_u64).unwrap_or(0);
+                self.preimage_values.entry(key).or_insert(raw);
                 self.next_tx_pointer = Some(id);
                 id
             }
@@ -848,12 +871,10 @@ impl<'a> BlockRunesIndexer<'a> {
         let id = match self.next_action_pointer {
             Some(id) => id,
             None => {
-                let id = self
-                    .provider
-                    .mdb()
-                    .get(&action_tx_pointer_count_key())?
-                    .and_then(|bytes| super::storage::decode_u64(&bytes))
-                    .unwrap_or(0);
+                let key = action_tx_pointer_count_key();
+                let raw = self.provider.mdb().get(&key)?;
+                let id = raw.as_deref().and_then(super::storage::decode_u64).unwrap_or(0);
+                self.preimage_values.entry(key).or_insert(raw);
                 self.next_action_pointer = Some(id);
                 id
             }
@@ -872,12 +893,10 @@ impl<'a> BlockRunesIndexer<'a> {
             RuneTxIndexKind::ActionAddress => &mut self.next_action_address_chunk_id,
         };
         if slot.is_none() {
-            let id = self
-                .provider
-                .mdb()
-                .get(&rune_tx_chunk_counter_key(kind))?
-                .and_then(|bytes| super::storage::decode_u64(&bytes))
-                .unwrap_or(0);
+            let key = rune_tx_chunk_counter_key(kind);
+            let raw = self.provider.mdb().get(&key)?;
+            let id = raw.as_deref().and_then(super::storage::decode_u64).unwrap_or(0);
+            self.preimage_values.entry(key).or_insert(raw);
             *slot = Some(id);
         }
         Ok(slot.as_mut().expect("chunk id initialized"))
@@ -986,6 +1005,7 @@ impl<'a> BlockRunesIndexer<'a> {
                 action_tx_block_list_key(self.height as u64),
                 &values,
                 &mut next_chunk_id,
+                &mut self.preimage_values,
                 &mut self.puts,
             )?;
             self.next_action_block_chunk_id = Some(next_chunk_id);
@@ -995,16 +1015,19 @@ impl<'a> BlockRunesIndexer<'a> {
             ));
         }
 
-        let address_tx_pointer_ids = std::mem::take(&mut self.action_address_pointer_ids);
-        if !address_tx_pointer_ids.is_empty() {
+        let mut action_address_pointer_ids: Vec<_> =
+            std::mem::take(&mut self.action_address_pointer_ids).into_iter().collect();
+        action_address_pointer_ids.sort_by(|a, b| a.0.cmp(&b.0));
+        if !action_address_pointer_ids.is_empty() {
             let mut next_chunk_id = *self.next_chunk_id(RuneTxIndexKind::ActionAddress)?;
-            for (address, values) in address_tx_pointer_ids {
+            for (address, values) in action_address_pointer_ids {
                 append_rune_tx_index_values(
                     self.provider,
                     RuneTxIndexKind::ActionAddress,
                     action_tx_address_list_key(&address),
                     &values,
                     &mut next_chunk_id,
+                    &mut self.preimage_values,
                     &mut self.puts,
                 )?;
             }
@@ -1027,6 +1050,7 @@ impl<'a> BlockRunesIndexer<'a> {
                 rune_tx_block_list_key(self.height as u64),
                 &values,
                 &mut next_chunk_id,
+                &mut self.preimage_values,
                 &mut self.puts,
             )?;
             self.next_block_chunk_id = Some(next_chunk_id);
@@ -1036,7 +1060,9 @@ impl<'a> BlockRunesIndexer<'a> {
             ));
         }
 
-        let address_tx_pointer_ids = std::mem::take(&mut self.address_tx_pointer_ids);
+        let mut address_tx_pointer_ids: Vec<_> =
+            std::mem::take(&mut self.address_tx_pointer_ids).into_iter().collect();
+        address_tx_pointer_ids.sort_by(|a, b| a.0.cmp(&b.0));
         if !address_tx_pointer_ids.is_empty() {
             let mut next_chunk_id = *self.next_chunk_id(RuneTxIndexKind::Address)?;
             for (address, values) in address_tx_pointer_ids {
@@ -1046,6 +1072,7 @@ impl<'a> BlockRunesIndexer<'a> {
                     rune_tx_address_list_key(&address),
                     &values,
                     &mut next_chunk_id,
+                    &mut self.preimage_values,
                     &mut self.puts,
                 )?;
             }
@@ -1198,12 +1225,10 @@ impl<'a> BlockRunesIndexer<'a> {
         let seq = match self.next_seq {
             Some(seq) => seq,
             None => {
-                let seq = self
-                    .provider
-                    .mdb()
-                    .get(&seq_count_key())?
-                    .and_then(|bytes| super::storage::decode_u64(&bytes))
-                    .unwrap_or(0);
+                let key = seq_count_key();
+                let raw = self.provider.mdb().get(&key)?;
+                let seq = raw.as_deref().and_then(super::storage::decode_u64).unwrap_or(0);
+                self.preimage_values.entry(key).or_insert(raw);
                 self.next_seq = Some(seq);
                 seq
             }
@@ -1306,16 +1331,15 @@ impl<'a> BlockRunesIndexer<'a> {
 
     fn apply_address_delta(&mut self, address: &str, id: SchemaRuneId, delta: i128) -> Result<()> {
         let address_cache_key = (address.to_string(), id);
+        let holder_cache_key = (id, address.to_string());
+        let hkey = holder_key(id, address);
         let key = address_balance_key(address, id);
         let prev = match self.address_balance_cache.get(&address_cache_key).copied() {
             Some(value) => value,
             None => {
-                let value = self
-                    .provider
-                    .mdb()
-                    .get(&key)?
-                    .and_then(|bytes| super::storage::decode_u128(&bytes))
-                    .unwrap_or(0);
+                let raw = self.provider.mdb().get(&key)?;
+                let value = raw.as_deref().and_then(super::storage::decode_u128).unwrap_or(0);
+                self.preimage_values.entry(key.clone()).or_insert(raw.clone());
                 self.address_balance_cache.insert(address_cache_key.clone(), value);
                 value
             }
@@ -1333,17 +1357,12 @@ impl<'a> BlockRunesIndexer<'a> {
             self.queue_put(key, encode_u128(next));
         }
 
-        let holder_cache_key = (id, address.to_string());
-        let hkey = holder_key(id, address);
         let hprev = match self.holder_balance_cache.get(&holder_cache_key).copied() {
             Some(value) => value,
             None => {
-                let value = self
-                    .provider
-                    .mdb()
-                    .get(&hkey)?
-                    .and_then(|bytes| super::storage::decode_u128(&bytes))
-                    .unwrap_or(0);
+                let raw = self.provider.mdb().get(&hkey)?;
+                let value = raw.as_deref().and_then(super::storage::decode_u128).unwrap_or(0);
+                self.preimage_values.entry(hkey.clone()).or_insert(raw);
                 self.holder_balance_cache.insert(holder_cache_key.clone(), value);
                 value
             }
@@ -1364,12 +1383,9 @@ impl<'a> BlockRunesIndexer<'a> {
         let count = match self.holder_count_cache.get(&id).copied() {
             Some(value) => value,
             None => {
-                let value = self
-                    .provider
-                    .mdb()
-                    .get(&count_key)?
-                    .and_then(|bytes| super::storage::decode_u64(&bytes))
-                    .unwrap_or(0);
+                let raw = self.provider.mdb().get(&count_key)?;
+                let value = raw.as_deref().and_then(super::storage::decode_u64).unwrap_or(0);
+                self.preimage_values.entry(count_key.clone()).or_insert(raw);
                 self.holder_count_cache.insert(id, value);
                 value
             }
@@ -1389,6 +1405,8 @@ impl<'a> BlockRunesIndexer<'a> {
     fn flush_address_balance_history(&mut self) -> Result<()> {
         let touched: Vec<(String, SchemaRuneId)> =
             self.address_balance_history_touched.drain().collect();
+        let mut touched = touched;
+        touched.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         for (address, id) in touched {
             let amount =
                 self.address_balance_cache.get(&(address.clone(), id)).copied().unwrap_or(0);
@@ -1397,12 +1415,9 @@ impl<'a> BlockRunesIndexer<'a> {
                 encode_u128(amount),
             );
             let len_key = address_balance_history_list_len_key(&address, id);
-            let len = self
-                .provider
-                .mdb()
-                .get(&len_key)?
-                .and_then(|bytes| super::storage::decode_u32(&bytes))
-                .unwrap_or(0);
+            let raw = self.provider.mdb().get(&len_key)?;
+            let len = raw.as_deref().and_then(super::storage::decode_u32).unwrap_or(0);
+            self.preimage_values.entry(len_key.clone()).or_insert(raw);
             self.queue_put(
                 address_balance_history_list_idx_key(&address, id, len),
                 self.height.to_be_bytes().to_vec(),
@@ -1429,7 +1444,8 @@ impl<'a> BlockRunesIndexer<'a> {
             None => {
                 let raw = self.provider.mdb().get(&key)?;
                 let had_row = raw.is_some();
-                let value = raw.and_then(|bytes| super::storage::decode_u128(&bytes)).unwrap_or(0);
+                let value = raw.as_deref().and_then(super::storage::decode_u128).unwrap_or(0);
+                self.preimage_values.entry(key.clone()).or_insert(raw);
                 (value, had_row)
             }
         };
@@ -1446,12 +1462,9 @@ impl<'a> BlockRunesIndexer<'a> {
         let len = match self.volume_len_cache.get(&len_cache_key).copied() {
             Some(value) => value,
             None => {
-                let value = self
-                    .provider
-                    .mdb()
-                    .get(&len_key)?
-                    .and_then(|bytes| super::storage::decode_u32(&bytes))
-                    .unwrap_or(0);
+                let raw = self.provider.mdb().get(&len_key)?;
+                let value = raw.as_deref().and_then(super::storage::decode_u32).unwrap_or(0);
+                self.preimage_values.entry(len_key.clone()).or_insert(raw);
                 self.volume_len_cache.insert(len_cache_key, value);
                 value
             }

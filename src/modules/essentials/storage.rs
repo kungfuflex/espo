@@ -27,6 +27,7 @@ use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
+use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
@@ -60,6 +61,179 @@ const ADDRESS_INDEX_V2_PREFIX: &[u8] = b"/address_index/v2/";
 const ADDRESS_INDEX_INLINE_CAP: usize = 8;
 const BALANCE_CHANGES_V2_PREFIX: &[u8] = b"/balance_changes/v2/";
 const ALKANE_LATEST_TRACES_V2_PREFIX: &[u8] = b"/alkane_latest_traces/v2/";
+const TX_POINTER_FILTER_WORDS: usize = 1 << 23;
+const TX_POINTER_FILTER_BITS: u64 = (TX_POINTER_FILTER_WORDS as u64) * 64;
+const TX_POINTER_FILTER_MASK: u64 = TX_POINTER_FILTER_BITS - 1;
+const TX_POINTER_FILTER_HASHES: u64 = 4;
+
+struct TxPointerFilter {
+    bits: Vec<u64>,
+    entries: usize,
+}
+
+struct TxPointerFilterState {
+    filter: Option<TxPointerFilter>,
+    build_started: bool,
+    pending: Vec<[u8; 32]>,
+}
+
+impl TxPointerFilterState {
+    fn new() -> Self {
+        Self { filter: None, build_started: false, pending: Vec::new() }
+    }
+}
+
+static TX_POINTER_FILTER: OnceLock<RwLock<TxPointerFilterState>> = OnceLock::new();
+
+fn tx_pointer_filter_lock() -> &'static RwLock<TxPointerFilterState> {
+    TX_POINTER_FILTER.get_or_init(|| RwLock::new(TxPointerFilterState::new()))
+}
+
+fn tx_pointer_filter_hash(txid: &[u8; 32], seed: u64) -> u64 {
+    let mut h = seed;
+    for byte in txid {
+        h ^= u64::from(*byte);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h ^ (h >> 32)
+}
+
+impl TxPointerFilter {
+    fn new() -> Self {
+        Self { bits: vec![0; TX_POINTER_FILTER_WORDS], entries: 0 }
+    }
+
+    fn insert(&mut self, txid: &[u8; 32]) {
+        let h1 = tx_pointer_filter_hash(txid, 0xcbf29ce484222325);
+        let h2 = tx_pointer_filter_hash(txid, 0x9e3779b185ebca87) | 1;
+        for i in 0..TX_POINTER_FILTER_HASHES {
+            let bit = h1.wrapping_add(i.wrapping_mul(h2)) & TX_POINTER_FILTER_MASK;
+            self.bits[(bit >> 6) as usize] |= 1u64 << (bit & 63);
+        }
+        self.entries = self.entries.saturating_add(1);
+    }
+
+    fn might_contain(&self, txid: &[u8; 32]) -> bool {
+        let h1 = tx_pointer_filter_hash(txid, 0xcbf29ce484222325);
+        let h2 = tx_pointer_filter_hash(txid, 0x9e3779b185ebca87) | 1;
+        for i in 0..TX_POINTER_FILTER_HASHES {
+            let bit = h1.wrapping_add(i.wrapping_mul(h2)) & TX_POINTER_FILTER_MASK;
+            if (self.bits[(bit >> 6) as usize] & (1u64 << (bit & 63))) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn build_tx_pointer_filter(provider: &EssentialsProvider) -> Result<TxPointerFilter> {
+    let started = Instant::now();
+    let table = provider.table();
+    let family_prefix = table.tx_packed_outflow_pos_point_family_prefix();
+    let namespaced_prefix = provider.blob_mdb().prefixed(&family_prefix);
+    let mut readopts = ReadOptions::default();
+    readopts.fill_cache(false);
+
+    let mut filter = TxPointerFilter::new();
+    for res in provider
+        .blob_mdb()
+        .inner_db()
+        .iterator_opt(IteratorMode::From(&namespaced_prefix, Direction::Forward), readopts)
+    {
+        let (key, _) = res.map_err(|e| anyhow!("tx pointer filter scan failed: {e}"))?;
+        let key_ref = key.as_ref();
+        if !key_ref.starts_with(&namespaced_prefix) {
+            break;
+        }
+        let relative = &key_ref[provider.blob_mdb().prefix().len()..];
+        if relative.len() != family_prefix.len() + 32 {
+            continue;
+        }
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&relative[family_prefix.len()..]);
+        filter.insert(&txid);
+    }
+
+    let elapsed_ms = started.elapsed().as_millis();
+    eprintln!(
+        "[balances] tx pointer filter scanned entries={} bytes={} elapsed_ms={}",
+        filter.entries,
+        filter.bits.len().saturating_mul(std::mem::size_of::<u64>()),
+        elapsed_ms
+    );
+    Ok(filter)
+}
+
+fn ensure_tx_pointer_filter(provider: &EssentialsProvider) -> Result<bool> {
+    if std::env::var_os("ESPO_DISABLE_TX_POINTER_FILTER").is_some() {
+        return Ok(false);
+    }
+
+    {
+        let guard = tx_pointer_filter_lock()
+            .read()
+            .map_err(|_| anyhow!("tx pointer filter lock poisoned"))?;
+        if guard.filter.is_some() {
+            return Ok(true);
+        }
+    }
+
+    let mut guard = tx_pointer_filter_lock()
+        .write()
+        .map_err(|_| anyhow!("tx pointer filter lock poisoned"))?;
+    if guard.filter.is_some() {
+        return Ok(true);
+    }
+    if guard.build_started {
+        return Ok(false);
+    }
+    guard.build_started = true;
+    let provider = provider.clone();
+    std::thread::spawn(move || match build_tx_pointer_filter(&provider) {
+        Ok(mut filter) => {
+            let lock = tx_pointer_filter_lock();
+            let Ok(mut guard) = lock.write() else {
+                eprintln!("[balances] tx pointer filter build finished but lock was poisoned");
+                return;
+            };
+            let pending_count = guard.pending.len();
+            for txid in guard.pending.drain(..) {
+                filter.insert(&txid);
+            }
+            eprintln!(
+                "[balances] tx pointer filter ready entries={} pending_applied={}",
+                filter.entries, pending_count
+            );
+            guard.filter = Some(filter);
+        }
+        Err(e) => {
+            eprintln!("[balances] tx pointer filter build failed: {e:?}");
+            if let Ok(mut guard) = tx_pointer_filter_lock().write() {
+                guard.build_started = false;
+            }
+        }
+    });
+    Ok(false)
+}
+
+pub(crate) fn note_tx_pointer_filter_updates<I>(txids: I)
+where
+    I: IntoIterator<Item = [u8; 32]>,
+{
+    let Some(lock) = TX_POINTER_FILTER.get() else {
+        return;
+    };
+    let Ok(mut guard) = lock.write() else {
+        return;
+    };
+    if let Some(filter) = guard.filter.as_mut() {
+        for txid in txids {
+            filter.insert(&txid);
+        }
+    } else if guard.build_started {
+        guard.pending.extend(txids);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AddressIndexListKind {
@@ -2540,6 +2714,57 @@ impl EssentialsProvider {
             return Ok(Vec::new());
         }
         let table = self.table();
+
+        if let Some(tree) = get_global_tree_db() {
+            let mut out: Vec<Option<BlockSummary>> = vec![None; heights.len()];
+            let mut canonical_hashes: Vec<Option<BlockHash>> = Vec::with_capacity(heights.len());
+            let mut summary_keys: Vec<Vec<u8>> = Vec::new();
+            let mut summary_key_positions: Vec<usize> = Vec::new();
+            for (idx, height) in heights.iter().copied().enumerate() {
+                let canonical_hash = tree
+                    .blockhash_for_height(height)
+                    .map_err(|e| anyhow!("tree.blockhash_for_height failed: {e}"))?;
+                if let Some(blockhash) = canonical_hash {
+                    summary_keys.push(table.block_summary_by_hash_key(&blockhash));
+                    summary_key_positions.push(idx);
+                }
+                canonical_hashes.push(canonical_hash);
+            }
+
+            if !summary_keys.is_empty() {
+                let summary_values = self.raw_blob_multi_get(&summary_keys)?;
+                for (raw, idx) in summary_values.iter().zip(summary_key_positions.iter().copied()) {
+                    let Some(summary) = raw.as_ref().and_then(|bytes| BlockSummary::decode(bytes))
+                    else {
+                        continue;
+                    };
+                    if summary.block_hash() == canonical_hashes[idx] {
+                        out[idx] = Some(summary);
+                    }
+                }
+            }
+
+            if out.iter().any(|summary| summary.is_none()) {
+                let legacy = self.get_legacy_block_summaries_by_heights(heights)?;
+                for (idx, legacy_summary) in legacy.into_iter().enumerate() {
+                    if out[idx].is_some() {
+                        continue;
+                    }
+                    let Some(canonical_hash) = canonical_hashes[idx] else {
+                        continue;
+                    };
+                    let Some(summary) = legacy_summary else {
+                        continue;
+                    };
+                    let summary_hash = summary.block_hash();
+                    if summary_hash.is_none() || summary_hash == Some(canonical_hash) {
+                        out[idx] = Some(summary);
+                    }
+                }
+            }
+
+            return Ok(out);
+        }
 
         let length_keys: Vec<Vec<u8>> =
             heights.iter().map(|height| table.height_to_hash_length_key(*height)).collect();
@@ -5701,7 +5926,14 @@ pub fn cache_block_summary(height: u32, summary: BlockSummary) {
 
 pub fn get_cached_block_summary(height: u32) -> Option<BlockSummary> {
     crate::debug_timer_log!("get_cached_block_summary");
-    block_summary_cache().read().ok().and_then(|cache| cache.get(height))
+    let summary = block_summary_cache().read().ok().and_then(|cache| cache.get(height))?;
+    if let Some(tree) = get_global_tree_db() {
+        let canonical_hash = tree.blockhash_for_height(height).ok().flatten()?;
+        if summary.block_hash() != Some(canonical_hash) {
+            return None;
+        }
+    }
+    Some(summary)
 }
 
 pub fn preload_block_summary_cache(mdb: &Mdb) -> usize {
@@ -5854,6 +6086,7 @@ fn encode_versioned_bytes32_list(entries: Vec<VersionedBytes32EntryV1>) -> Resul
         .map_err(|e| anyhow!("encode versioned_bytes32 list failed: {e}"))
 }
 
+#[allow(dead_code)]
 fn sort_versioned_u64_entries_desc(entries: &mut [VersionedU64EntryV1]) {
     entries.sort_by(|a, b| {
         b.height
@@ -5956,6 +6189,7 @@ fn resolve_visible_bytes32_entry(
     None
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_outpoint_pos_versioned_puts(
     provider: &EssentialsProvider,
     height: u32,
@@ -5996,6 +6230,33 @@ pub(crate) fn build_outpoint_pos_versioned_puts(
         }
         sort_versioned_u64_entries_desc(&mut entries);
         out.push((key, encode_versioned_u64_list(entries)?));
+    }
+    Ok(out)
+}
+
+pub(crate) fn build_new_outpoint_pos_versioned_puts(
+    provider: &EssentialsProvider,
+    height: u32,
+    blockhash: &[u8; 32],
+    updates: &HashMap<([u8; 32], u32), u64>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = provider.table();
+    let mut pairs: Vec<(([u8; 32], u32), u64)> = updates.iter().map(|(k, v)| (*k, *v)).collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::with_capacity(pairs.len());
+    for ((txid, vout), value) in pairs {
+        let key = table.outpoint_pos_point_key_from_parts(&txid, vout)?;
+        out.push((
+            key,
+            encode_versioned_u64_list(vec![VersionedU64EntryV1 {
+                height,
+                blockhash: *blockhash,
+                value,
+            }])?,
+        ));
     }
     Ok(out)
 }
@@ -6042,6 +6303,33 @@ pub(crate) fn build_outpoint_spent_versioned_puts(
     Ok(out)
 }
 
+pub(crate) fn build_new_outpoint_spent_versioned_puts(
+    provider: &EssentialsProvider,
+    height: u32,
+    blockhash: &[u8; 32],
+    updates: &HashMap<u64, [u8; 32]>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = provider.table();
+    let mut pairs: Vec<(u64, [u8; 32])> = updates.iter().map(|(k, v)| (*k, *v)).collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::with_capacity(pairs.len());
+    for (id, value) in pairs {
+        out.push((
+            table.outpoint_spent_by_id_point_key(id),
+            encode_versioned_bytes32_list(vec![VersionedBytes32EntryV1 {
+                height,
+                blockhash: *blockhash,
+                value,
+            }])?,
+        ));
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
 pub(crate) fn build_tx_pos_versioned_puts(
     provider: &EssentialsProvider,
     height: u32,
@@ -6054,6 +6342,7 @@ pub(crate) fn build_tx_pos_versioned_puts(
     let table = provider.table();
     let mut pairs: Vec<([u8; 32], u64)> = updates.iter().map(|(k, v)| (*k, *v)).collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    note_tx_pointer_filter_updates(pairs.iter().map(|(txid, _)| *txid));
     let keys: Vec<Vec<u8>> = pairs
         .iter()
         .map(|(txid, _)| table.tx_packed_outflow_pos_point_key(txid))
@@ -6080,6 +6369,33 @@ pub(crate) fn build_tx_pos_versioned_puts(
         }
         sort_versioned_u64_entries_desc(&mut entries);
         out.push((key, encode_versioned_u64_list(entries)?));
+    }
+    Ok(out)
+}
+
+pub(crate) fn build_new_tx_pos_versioned_puts(
+    provider: &EssentialsProvider,
+    height: u32,
+    blockhash: &[u8; 32],
+    updates: &HashMap<[u8; 32], u64>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = provider.table();
+    let mut pairs: Vec<([u8; 32], u64)> = updates.iter().map(|(k, v)| (*k, *v)).collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    note_tx_pointer_filter_updates(pairs.iter().map(|(txid, _)| *txid));
+    let mut out = Vec::with_capacity(pairs.len());
+    for (txid, value) in pairs {
+        out.push((
+            table.tx_packed_outflow_pos_point_key(&txid),
+            encode_versioned_u64_list(vec![VersionedU64EntryV1 {
+                height,
+                blockhash: *blockhash,
+                value,
+            }])?,
+        ));
     }
     Ok(out)
 }
@@ -6145,8 +6461,29 @@ pub(crate) fn resolve_tx_pointer_ids_batch_v2(
         return Ok(Vec::new());
     }
     let table = provider.table();
-    let keys: Vec<Vec<u8>> =
-        txids.iter().map(|txid| table.tx_packed_outflow_pos_point_key(txid)).collect();
+    let filter_enabled = ensure_tx_pointer_filter(provider)?;
+    let mut lookup_indices: Vec<usize> = Vec::new();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    if filter_enabled {
+        let guard = tx_pointer_filter_lock()
+            .read()
+            .map_err(|_| anyhow!("tx pointer filter lock poisoned"))?;
+        if let Some(filter) = guard.filter.as_ref() {
+            for (idx, txid) in txids.iter().enumerate() {
+                if filter.might_contain(txid) {
+                    lookup_indices.push(idx);
+                    keys.push(table.tx_packed_outflow_pos_point_key(txid));
+                }
+            }
+        }
+    } else {
+        lookup_indices = (0..txids.len()).collect();
+        keys = txids.iter().map(|txid| table.tx_packed_outflow_pos_point_key(txid)).collect();
+    }
+    let mut out = vec![None; txids.len()];
+    if keys.is_empty() {
+        return Ok(out);
+    }
     let raws = provider
         .get_blob_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
         .values;
@@ -6156,10 +6493,8 @@ pub(crate) fn resolve_tx_pointer_ids_batch_v2(
         .filter(|_| provider.view_blockhash().is_none());
     let fast_active = matches!(target, Some(t) if Some(t) == active_tip);
     let mut active_blockhash_by_height: HashMap<u32, Option<BlockHash>> = HashMap::new();
-    let mut out = Vec::with_capacity(txids.len());
-    for raw in raws {
+    for (out_idx, raw) in lookup_indices.into_iter().zip(raws.into_iter()) {
         let Some(raw) = raw else {
-            out.push(None);
             continue;
         };
         let entries = decode_versioned_u64_list(&raw);
@@ -6179,9 +6514,9 @@ pub(crate) fn resolve_tx_pointer_ids_batch_v2(
                     break;
                 }
             }
-            out.push(chosen);
+            out[out_idx] = chosen;
         } else {
-            out.push(resolve_visible_u64_entry(provider, &entries, target));
+            out[out_idx] = resolve_visible_u64_entry(provider, &entries, target);
         }
     }
     Ok(out)
@@ -6491,8 +6826,16 @@ pub fn append_address_index_values(
                         .value
                         .map(|raw| decode_u64_chunk(&raw))
                         .unwrap_or_default();
-                    if last_items.len() > chunk_size_usize {
-                        last_items.truncate(chunk_size_usize);
+                    if last_items.len() > rem {
+                        last_items.truncate(rem);
+                    }
+                    if last_items.len() < rem {
+                        return Err(anyhow!(
+                            "address index chunk {} for {:?} is shorter than canonical length {}",
+                            last_chunk_id,
+                            kind,
+                            rem
+                        ));
                     }
                     if last_items.len() < chunk_size_usize {
                         let free = chunk_size_usize.saturating_sub(last_items.len());
@@ -7235,6 +7578,21 @@ mod tests {
         }
     }
 
+    fn make_block_summary(height: u32, blockhash: BlockHash, tx_count: u32) -> BlockSummary {
+        BlockSummary {
+            height,
+            blockhash: blockhash.to_byte_array(),
+            trace_count: 0,
+            interaction_count: 0,
+            tx_count,
+            header: Vec::new(),
+            fee_avg: 0.0,
+            fee_median: 0.0,
+            fee_range: Vec::new(),
+            pool: None,
+        }
+    }
+
     fn write_creation_rows(
         provider: &EssentialsProvider,
         rows: &[(u64, AlkaneCreationRecord)],
@@ -7260,10 +7618,63 @@ mod tests {
 
     fn new_provider_with_tempdb() -> EssentialsProvider {
         let dir = TempDir::new().expect("tempdir");
-        let mdb = Arc::new(Mdb::open(dir.path(), b"essentials:").expect("open mdb"));
+        let mdb = Arc::new(Mdb::open(dir.path(), b"essentials_test:").expect("open mdb"));
         // Keep tempdir alive for process lifetime in tests.
         std::mem::forget(dir);
         EssentialsProvider::new(mdb)
+    }
+
+    #[test]
+    fn address_index_append_truncates_stale_tail_from_blob_chunk() {
+        let provider = new_provider_with_tempdb();
+        let kind = AddressIndexListKind::AlkaneTxs;
+        let address = "addr1";
+        let table = provider.table();
+        let meta_key = table.address_index_meta_key(address, kind);
+        let chunk_id = 7u64;
+        let chunk_key = table.address_index_chunk_blob_key(kind, chunk_id);
+
+        provider
+            .blob_mdb()
+            .put(&chunk_key, &encode_u64_chunk(vec![1, 2, 99, 100]).expect("encode chunk"))
+            .expect("write stale chunk");
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![(
+                    meta_key,
+                    encode_address_index_state(&InlineOrExternalU64V1::External {
+                        chunk_ids: vec![chunk_id],
+                        len: 2,
+                        chunk_size: 4,
+                    })
+                    .expect("encode state"),
+                )],
+                deletes: Vec::new(),
+            })
+            .expect("write meta");
+
+        let mut next_chunk_id = 8u64;
+        let mut puts = Vec::new();
+        let mut blob_puts = Vec::new();
+        let new_len = append_address_index_values(
+            &provider,
+            kind,
+            address,
+            &[3, 4],
+            &mut next_chunk_id,
+            &mut puts,
+            &mut blob_puts,
+        )
+        .expect("append");
+
+        assert_eq!(new_len, 4);
+        assert_eq!(next_chunk_id, 8);
+        let (_, rewritten_chunk) = blob_puts
+            .iter()
+            .find(|(key, _)| key == &chunk_key)
+            .expect("rewritten last chunk");
+        assert_eq!(decode_u64_chunk(rewritten_chunk), vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -7436,5 +7847,30 @@ mod tests {
             })
             .expect("h2 page");
         assert_eq!(h2_latest.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(), vec![1, 0]);
+
+        let orphan = BlockHash::from_byte_array([9u8; 32]);
+        let canonical_summary = make_block_summary(2, h2, 22);
+        let orphan_summary = make_block_summary(2, orphan, 99);
+        provider
+            .put_block_summary_indexes(&canonical_summary)
+            .expect("write canonical summary");
+        provider
+            .put_block_summary_indexes(&orphan_summary)
+            .expect("write orphan summary after canonical");
+
+        let summary = provider
+            .get_block_summaries_by_heights(&[2])
+            .expect("summaries")
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("summary");
+        assert_eq!(summary.block_hash(), Some(h2));
+        assert_eq!(summary.tx_count, 22);
+
+        cache_block_summary(2, orphan_summary);
+        assert!(get_cached_block_summary(2).is_none());
+        cache_block_summary(2, canonical_summary);
+        assert_eq!(get_cached_block_summary(2).and_then(|summary| summary.block_hash()), Some(h2));
     }
 }
