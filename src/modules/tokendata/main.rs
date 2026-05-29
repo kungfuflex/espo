@@ -1,8 +1,8 @@
 use super::rpc::register_rpc;
 use super::schemas::{SchemaTokenActivityV1, TokenActivityKind, TokenActivitySource};
 use super::storage::{
-    GetIndexHeightParams, SetBatchParams, SetBlobBatchParams, SetIndexHeightParams,
-    TokenDataProvider, encode_u64_value, scopes_for_source,
+    GetIndexHeightParams, SetBatchParams, SetBlobBatchParams, TokenDataProvider, encode_u64_value,
+    scopes_for_source,
 };
 use crate::alkanes::trace::EspoBlock;
 use crate::config::{debug_enabled, get_electrum_like, get_espo_db, get_network};
@@ -10,9 +10,11 @@ use crate::debug;
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, PRICE_SCALE, SATS_PER_BTC};
 use crate::modules::ammdata::main::pool_creator_spk_from_protostone;
-use crate::modules::ammdata::schemas::{ActivityKind, SchemaActivityV1, Timeframe};
+use crate::modules::ammdata::schemas::{
+    ActivityKind, SchemaActivityV1, SchemaMarketDefs, Timeframe,
+};
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetActivityEntryParams, GetCanonicalPoolPricesParams,
+    ActivityEntryLookup, AmmDataProvider, GetActivityEntriesParams, GetCanonicalPoolPricesParams,
     GetLatestTokenUsdCloseParams, GetListEntriesDescParams, GetPoolDefsParams,
 };
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
@@ -22,7 +24,7 @@ use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use alloy_primitives::U256;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Network, Transaction, Txid};
@@ -65,13 +67,7 @@ impl TokenData {
             .and_then(|resp| resp.height)
     }
 
-    fn persist_index_height(&self, height: u32, blockhash: StateAt) -> Result<()> {
-        self.provider()
-            .set_index_height(SetIndexHeightParams { blockhash, height })
-            .map_err(|e| anyhow!("[TOKENDATA] rocksdb put(/index_height) failed: {e}"))
-    }
-
-    fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
+    fn note_index_height_committed(&self, new_height: u32) {
         if let Some(prev) = *self.index_height.read().unwrap() {
             if new_height < prev {
                 eprintln!(
@@ -80,9 +76,7 @@ impl TokenData {
                 );
             }
         }
-        self.persist_index_height(new_height, blockhash)?;
         *self.index_height.write().unwrap() = Some(new_height);
-        Ok(())
     }
 }
 
@@ -184,40 +178,47 @@ impl EspoModule for TokenData {
         )?;
         debug::log_elapsed(module, "index_mints", timer);
 
+        let commit_timer = debug::start_if(debug);
         let timer = debug::start_if(debug);
         if !timestamp_index_appends.is_empty() {
             let mut keys = timestamp_index_appends.keys().cloned().collect::<Vec<_>>();
             keys.sort();
-            for key in keys {
-                let Some(values) = timestamp_index_appends.get(&key) else {
-                    continue;
-                };
-                provider.append_activity_index_values(
-                    key,
-                    values,
-                    &mut next_activity_index_chunk_id,
-                    &mut puts,
-                    &mut blob_puts,
-                )?;
-            }
+            let index_appends = keys
+                .into_iter()
+                .filter_map(|key| {
+                    timestamp_index_appends.get(&key).map(|values| (key, values.clone()))
+                })
+                .collect::<Vec<_>>();
+            provider.append_activity_index_values_batch(
+                index_appends,
+                &mut next_activity_index_chunk_id,
+                &mut puts,
+                &mut blob_puts,
+            )?;
             blob_puts.push((
                 table.activity_index_chunk_counter_key(),
                 encode_u64_value(next_activity_index_chunk_id),
             ));
         }
+        debug::log_elapsed(module, "commit_append_indexes", timer);
+
+        let timer = debug::start_if(debug);
         blob_puts.push((table.activity_row_counter_key(), encode_u64_value(next_activity_row_id)));
         if !blob_puts.is_empty() {
             provider.set_blob_batch(SetBlobBatchParams { puts: blob_puts })?;
         }
-        if !puts.is_empty() {
-            provider.set_batch(SetBatchParams {
-                blockhash: StateAt::Latest,
-                puts,
-                deletes: Vec::new(),
-            })?;
-        }
-        self.set_index_height(height, StateAt::Latest)?;
-        debug::log_elapsed(module, "commit", timer);
+        debug::log_elapsed(module, "commit_blob_batch", timer);
+
+        let timer = debug::start_if(debug);
+        puts.push((table.index_height_key(), height.to_le_bytes().to_vec()));
+        provider.set_batch(SetBatchParams {
+            blockhash: StateAt::Latest,
+            puts,
+            deletes: Vec::new(),
+        })?;
+        self.note_index_height_committed(height);
+        debug::log_elapsed(module, "commit_set_batch", timer);
+        debug::log_elapsed(module, "commit", commit_timer);
 
         eprintln!(
             "[TOKENDATA] indexed block #{height}: market_rows={market_rows}, mint_rows={mint_rows}, elapsed={:?}",
@@ -309,6 +310,7 @@ fn index_market_activity(
         .unwrap_or_default();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
+    let mut activity_lookups = Vec::new();
     for (key, _value) in entries {
         if !key.starts_with(&prefix) {
             continue;
@@ -323,26 +325,43 @@ fn index_market_activity(
         let Some(pool) = decode_alkane_id_be(&rest[5..17]) else {
             continue;
         };
-        let Some(activity) = amm_provider
-            .get_activity_entry(GetActivityEntryParams {
-                blockhash: StateAt::Block(blockhash),
-                pool,
-                ts: block_ts,
-                seq,
-            })
-            .ok()
-            .and_then(|resp| resp.entry)
-        else {
+        activity_lookups.push((pool, seq));
+    }
+
+    if activity_lookups.is_empty() {
+        return Ok(());
+    }
+
+    let activities = amm_provider
+        .get_activity_entries(GetActivityEntriesParams {
+            blockhash: StateAt::Block(blockhash),
+            entries: activity_lookups
+                .iter()
+                .map(|(pool, seq)| ActivityEntryLookup { pool: *pool, ts: block_ts, seq: *seq })
+                .collect(),
+        })
+        .map(|resp| resp.entries)
+        .unwrap_or_else(|_| vec![None; activity_lookups.len()]);
+
+    let mut defs_cache: HashMap<SchemaAlkaneId, Option<SchemaMarketDefs>> = HashMap::new();
+    for ((pool, _seq), activity) in activity_lookups.into_iter().zip(activities.into_iter()) {
+        let Some(activity) = activity else {
             continue;
         };
         let Some(row_txid) = normalize_activity_txid_for_block(activity.txid, &block_txids) else {
             continue;
         };
-        let Some(defs) = amm_provider
-            .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Block(blockhash), pool })
-            .ok()
-            .and_then(|resp| resp.defs)
-        else {
+        let defs = if let Some(defs) = defs_cache.get(&pool) {
+            defs.clone()
+        } else {
+            let defs = amm_provider
+                .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Block(blockhash), pool })
+                .ok()
+                .and_then(|resp| resp.defs);
+            defs_cache.insert(pool, defs.clone());
+            defs
+        };
+        let Some(defs) = defs else {
             continue;
         };
         let address_index_spks = unique_non_empty_spks(std::slice::from_ref(&activity.address_spk));

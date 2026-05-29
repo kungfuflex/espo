@@ -503,6 +503,81 @@ impl TokenDataProvider {
             .map_err(|e| anyhow!("blob_mdb.bulk_write failed: {e}"))
     }
 
+    pub fn append_activity_index_values_batch(
+        &self,
+        entries: Vec<(Vec<u8>, Vec<u64>)>,
+        next_chunk_id: &mut u64,
+        puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        blob_puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        let entries =
+            entries.into_iter().filter(|(_, values)| !values.is_empty()).collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let meta_keys = entries.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        let raw_states = self
+            .mdb
+            .multi_get(&meta_keys)
+            .map_err(|e| anyhow!("mdb.multi_get activity index states failed: {e}"))?;
+
+        let states = raw_states
+            .into_iter()
+            .map(|raw| {
+                raw.and_then(|bytes| decode_activity_index_state(&bytes))
+                    .unwrap_or_else(|| InlineOrExternalU64V1::Inline { items: Vec::new() })
+            })
+            .collect::<Vec<_>>();
+
+        let table = self.table();
+        let mut last_chunk_keys = Vec::new();
+        let mut last_chunk_slots = Vec::new();
+        for (idx, state) in states.iter().enumerate() {
+            let InlineOrExternalU64V1::External { chunk_ids, len, chunk_size } = state else {
+                continue;
+            };
+            if chunk_ids.is_empty() || entries[idx].1.is_empty() {
+                continue;
+            }
+            let chunk_size_usize = usize::try_from(*chunk_size).unwrap_or(0).max(1);
+            let rem = usize::try_from(len % chunk_size_usize as u64).unwrap_or(0);
+            if rem == 0 {
+                continue;
+            }
+            let last_chunk_id = *chunk_ids.last().unwrap_or(&0);
+            last_chunk_slots.push(idx);
+            last_chunk_keys.push(table.activity_index_chunk_blob_key(last_chunk_id));
+        }
+
+        let last_chunk_values = if last_chunk_keys.is_empty() {
+            Vec::new()
+        } else {
+            self.raw_blob_multi_get(&last_chunk_keys)?
+        };
+        let mut preloaded_last_chunks = vec![None; entries.len()];
+        for (slot, raw) in last_chunk_slots.into_iter().zip(last_chunk_values.into_iter()) {
+            preloaded_last_chunks[slot] = Some(raw);
+        }
+
+        for (((meta_key, values), state), preloaded_last_chunk) in entries
+            .into_iter()
+            .zip(states.into_iter())
+            .zip(preloaded_last_chunks.into_iter())
+        {
+            self.append_activity_index_values_with_state(
+                meta_key,
+                &values,
+                state,
+                preloaded_last_chunk,
+                next_chunk_id,
+                puts,
+                blob_puts,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn reset_all_data(&self) -> Result<()> {
         const DELETE_CHUNK_SIZE: usize = 10_000;
 
@@ -568,6 +643,27 @@ impl TokenDataProvider {
             .and_then(|raw| decode_activity_index_state(&raw))
             .unwrap_or_else(|| InlineOrExternalU64V1::Inline { items: Vec::new() });
 
+        self.append_activity_index_values_with_state(
+            meta_key,
+            values,
+            current,
+            None,
+            next_chunk_id,
+            puts,
+            blob_puts,
+        )
+    }
+
+    fn append_activity_index_values_with_state(
+        &self,
+        meta_key: Vec<u8>,
+        values: &[u64],
+        current: InlineOrExternalU64V1,
+        preloaded_last_chunk: Option<Option<Vec<u8>>>,
+        next_chunk_id: &mut u64,
+        puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        blob_puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<u64> {
         if values.is_empty() {
             return Ok(activity_index_total(&current));
         }
@@ -611,10 +707,12 @@ impl TokenDataProvider {
                     if rem > 0 {
                         let last_chunk_id = *chunk_ids.last().unwrap_or(&0);
                         let last_key = table.activity_index_chunk_blob_key(last_chunk_id);
-                        let mut last_items = self
-                            .raw_blob_get(&last_key)?
-                            .map(|raw| decode_u64_chunk(&raw))
-                            .unwrap_or_default();
+                        let last_raw = match preloaded_last_chunk {
+                            Some(raw) => raw,
+                            None => self.raw_blob_get(&last_key)?,
+                        };
+                        let mut last_items =
+                            last_raw.map(|raw| decode_u64_chunk(&raw)).unwrap_or_default();
                         if last_items.len() > rem {
                             last_items.truncate(rem);
                         }
