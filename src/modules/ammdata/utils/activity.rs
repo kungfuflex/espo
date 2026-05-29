@@ -1,7 +1,7 @@
 use crate::modules::ammdata::consts::AMOUNT_SCALE;
 use crate::modules::ammdata::schemas::{ActivityDirection, ActivityKind, SchemaActivityV1};
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetListEntriesDescParams, GetRawValueParams,
+    AmmDataProvider, GetListEntriesDescParams, GetMultiValuesParams, GetRawValueParams,
 };
 use crate::modules::ammdata::utils::candles::PriceSide;
 use crate::runtime::state_at::StateAt;
@@ -718,19 +718,24 @@ pub fn read_activity_for_pool_sorted(
     // use the requested (possibly side-aware) index
     let pairs = read_pairs_from_prefix(&iprefix)?;
 
-    // materialize primaries → ActivityRow
-    let mut rows = Vec::with_capacity(pairs.len());
-    for (ts, seq) in pairs {
+    // materialize primaries -> ActivityRow
+    let primary_keys: Vec<Vec<u8>> = pairs
+        .iter()
+        .map(|(ts, seq)| {
+            let mut pk = activity_ns_prefix(&pool);
+            pk.extend_from_slice(ts.to_string().as_bytes());
+            pk.push(b':');
+            pk.extend_from_slice(seq.to_string().as_bytes());
+            pk
+        })
+        .collect();
+    let values = provider
+        .get_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys: primary_keys })?
+        .values;
+    let mut rows = Vec::with_capacity(values.len());
+    for value in values {
         // RELATIVE primary key: "activity:v1:<pool>:<ts>:<seq>"
-        let mut pk = activity_ns_prefix(&pool);
-        pk.extend_from_slice(ts.to_string().as_bytes());
-        pk.push(b':');
-        pk.extend_from_slice(seq.to_string().as_bytes());
-
-        if let Some(v) = provider
-            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: pk })?
-            .value
-        {
+        if let Some(v) = value {
             let a = decode_activity_v1(&v)?;
             if let Some(g) = group {
                 if group_for_kind(a.kind) != g {

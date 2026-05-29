@@ -920,35 +920,35 @@ pub fn derive_token_data(
                     }
                 }
                 let cache_key = (*token, tf, target);
-                let db_best =
-                    if let Some(cached) = latest_token_usd_candle_db_cache.get(&cache_key).copied()
+                let db_best = if let Some(cached) =
+                    latest_token_usd_candle_db_cache.get(&cache_key).copied()
+                {
+                    cached
+                } else {
+                    let mut found: Option<(u64, SchemaCandleV1)> = None;
+                    let prefix = table.token_usd_candle_ns_prefix(token, tf);
+                    if let Ok(resp) =
+                        provider.get_list_entries_desc_range(GetListEntriesDescRangeParams {
+                            blockhash: StateAt::Latest,
+                            start_inclusive: prefix.clone(),
+                            end_exclusive: candle_range_end_for_target(&prefix, target),
+                            limit: 32,
+                        })
                     {
-                        cached
-                    } else {
-                        let mut found: Option<(u64, SchemaCandleV1)> = None;
-                        let prefix = table.token_usd_candle_ns_prefix(token, tf);
-                        if let Ok(resp) =
-                            provider.get_list_entries_desc_range(GetListEntriesDescRangeParams {
-                                blockhash: StateAt::Latest,
-                                start_inclusive: prefix.clone(),
-                                end_exclusive: candle_range_end_for_target(&prefix, target),
-                                limit: 32,
-                            })
-                        {
-                            for (k, v) in resp.entries {
-                                let Some(ts) = parse_ts(&k) else { continue };
-                                if ts > target {
-                                    continue;
-                                }
-                                if let Ok(c) = decode_candle_v1(&v) {
-                                    found = Some((ts, c));
-                                }
-                                break;
+                        for (k, v) in resp.entries {
+                            let Some(ts) = parse_ts(&k) else { continue };
+                            if ts > target {
+                                continue;
                             }
+                            if let Ok(c) = decode_candle_v1(&v) {
+                                found = Some((ts, c));
+                            }
+                            break;
                         }
-                        latest_token_usd_candle_db_cache.insert(cache_key, found);
-                        found
-                    };
+                    }
+                    latest_token_usd_candle_db_cache.insert(cache_key, found);
+                    found
+                };
                 if let Some((ts, c)) = db_best {
                     match best {
                         Some((best_ts, _)) if best_ts >= ts => {}
@@ -962,10 +962,10 @@ pub fn derive_token_data(
                 (SchemaAlkaneId, SchemaAlkaneId, Timeframe),
                 BTreeMap<u64, SchemaCandleV1>,
             >,
-                                         token: &SchemaAlkaneId,
-                                         quote: &SchemaAlkaneId,
-                                         tf: Timeframe,
-                                         target: u64|
+                                             token: &SchemaAlkaneId,
+                                             quote: &SchemaAlkaneId,
+                                             tf: Timeframe,
+                                             target: u64|
              -> Option<(u64, SchemaCandleV1)> {
                 let mut best: Option<(u64, SchemaCandleV1)> = None;
                 if let Some(bucket_map) = map.get(&(*token, *quote, tf)) {
@@ -1437,8 +1437,9 @@ pub fn derive_token_data(
             }
         }
         for token in tokens_with_usd_m10 {
-            let current_m10 =
-                token_usd_candle_overrides.get(&(token, Timeframe::M10, now_m10_bucket)).copied();
+            let current_m10 = token_usd_candle_overrides
+                .get(&(token, Timeframe::M10, now_m10_bucket))
+                .copied();
             let previous_m10 = provider
                 .get_raw_value(GetRawValueParams {
                     blockhash: StateAt::Latest,
@@ -1497,8 +1498,9 @@ pub fn derive_token_data(
             }
         }
         for token in tokens_with_mcusd_m10 {
-            let current_m10 =
-                token_mcusd_candle_overrides.get(&(token, Timeframe::M10, now_m10_bucket)).copied();
+            let current_m10 = token_mcusd_candle_overrides
+                .get(&(token, Timeframe::M10, now_m10_bucket))
+                .copied();
             let previous_m10 = provider
                 .get_raw_value(GetRawValueParams {
                     blockhash: StateAt::Latest,
@@ -1564,7 +1566,8 @@ pub fn derive_token_data(
                     if let Some(agg) =
                         token_usd_candle_overrides.get(&(token, tf, bucket_ts)).copied()
                     {
-                        token_derived_usd_candle_overrides.insert((token, quote, tf, bucket_ts), agg);
+                        token_derived_usd_candle_overrides
+                            .insert((token, quote, tf, bucket_ts), agg);
                     }
                 }
                 continue;
@@ -1594,9 +1597,8 @@ pub fn derive_token_data(
                         provider
                             .get_raw_value(GetRawValueParams {
                                 blockhash: StateAt::Latest,
-                                key: table.token_derived_usd_candle_key(
-                                    &token, &quote, tf, bucket_ts,
-                                ),
+                                key: table
+                                    .token_derived_usd_candle_key(&token, &quote, tf, bucket_ts),
                             })
                             .ok()
                             .and_then(|resp| resp.value)
@@ -1681,9 +1683,8 @@ pub fn derive_token_data(
                         provider
                             .get_raw_value(GetRawValueParams {
                                 blockhash: StateAt::Latest,
-                                key: table.token_derived_mcusd_candle_key(
-                                    &token, &quote, tf, bucket_ts,
-                                ),
+                                key: table
+                                    .token_derived_mcusd_candle_key(&token, &quote, tf, bucket_ts),
                             })
                             .ok()
                             .and_then(|resp| resp.value)
@@ -1889,8 +1890,7 @@ pub fn derive_token_data(
                 ),
             };
             let chart_name = format!("{}:{}-usd", token.block, token.tx);
-            let mut timeframe_changes: BTreeMap<String, SchemaChartChangeValueV1> =
-                BTreeMap::new();
+            let mut timeframe_changes: BTreeMap<String, SchemaChartChangeValueV1> = BTreeMap::new();
             for tf in active_timeframes() {
                 let secs = tf.duration_secs();
                 let target = now_bucket.saturating_sub(secs);
@@ -1919,8 +1919,7 @@ pub fn derive_token_data(
                             latest_close,
                         ),
                         mcusd_bp: crate::modules::ammdata::main::percent_change_basis_points(
-                            prev_mcusd,
-                            now_mcusd,
+                            prev_mcusd, now_mcusd,
                         ),
                     },
                 );
@@ -2337,8 +2336,7 @@ pub fn derive_token_data(
             };
             let chart_name =
                 format!("{}:{}-derived_{}:{}-usd", token.block, token.tx, quote.block, quote.tx);
-            let mut timeframe_changes: BTreeMap<String, SchemaChartChangeValueV1> =
-                BTreeMap::new();
+            let mut timeframe_changes: BTreeMap<String, SchemaChartChangeValueV1> = BTreeMap::new();
             for tf in active_timeframes() {
                 let secs = tf.duration_secs();
                 let target = now_bucket.saturating_sub(secs);
@@ -2367,8 +2365,7 @@ pub fn derive_token_data(
                             latest_close,
                         ),
                         mcusd_bp: crate::modules::ammdata::main::percent_change_basis_points(
-                            prev_mcusd,
-                            now_mcusd,
+                            prev_mcusd, now_mcusd,
                         ),
                     },
                 );

@@ -2345,16 +2345,17 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_latest_token_usd_close");
         let table = self.table();
         let prefix = table.token_usd_candle_ns_prefix(&params.token, params.timeframe);
-        let entries = self
-            .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })
+        let end_exclusive = prefix_end_exclusive(&prefix);
+        let entry = self
+            .get_list_entries_desc_range(GetListEntriesDescRangeParams {
+                blockhash: StateAt::Latest,
+                start_inclusive: prefix,
+                end_exclusive,
+                limit: 1,
+            })
             .ok()
-            .map(|resp| resp.entries)
-            .unwrap_or_default();
-        let close = entries
-            .into_iter()
-            .next()
-            .and_then(|(_k, v)| decode_candle_v1(&v).ok())
-            .map(|c| c.close);
+            .and_then(|resp| resp.entries.into_iter().next());
+        let close = entry.and_then(|(_k, v)| decode_candle_v1(&v).ok()).map(|c| c.close);
         Ok(GetLatestTokenUsdCloseResult { close })
     }
 
@@ -2946,6 +2947,29 @@ impl AmmDataProvider {
         Ok(GetActivityEntryResult { entry })
     }
 
+    pub fn get_activity_entries(
+        &self,
+        params: GetActivityEntriesParams,
+    ) -> Result<GetActivityEntriesResult> {
+        crate::debug_timer_log!("get_activity_entries");
+        let table = self.table();
+        let keys: Vec<Vec<u8>> = params
+            .entries
+            .iter()
+            .map(|entry| table.activity_key(&entry.pool, entry.ts, entry.seq))
+            .collect();
+        let mut values = Vec::with_capacity(keys.len());
+        let at_blockhash = params.blockhash.resolve(self.view_blockhash);
+        for chunk in keys.chunks(512) {
+            values.extend(self.raw_multi_get_at(chunk, at_blockhash)?);
+        }
+        let entries = values
+            .into_iter()
+            .map(|raw| raw.and_then(|v| decode_activity_v1(&v).ok()))
+            .collect();
+        Ok(GetActivityEntriesResult { entries })
+    }
+
     pub fn get_token_activity_page(
         &self,
         params: GetTokenActivityPageParams,
@@ -3238,6 +3262,7 @@ impl AmmDataProvider {
         params: GetCanonicalPoolPricesParams,
     ) -> Result<GetCanonicalPoolPricesResult> {
         crate::debug_timer_log!("get_canonical_pool_prices");
+        let table = self.table();
         let mut frbtc_price = 0u128;
         let mut busd_price = 0u128;
         let canonical_height = params
@@ -3282,11 +3307,22 @@ impl AmmDataProvider {
             } else {
                 continue;
             };
-            let res =
-                read_candles_v1(self, entry.pool_id, Timeframe::M10, 1, params.now_ts, side).ok();
-            let close = res
-                .and_then(|slice| slice.candles_newest_first.first().copied())
-                .map(|c| c.close)
+            let candle_prefix = table.candle_ns_prefix(&entry.pool_id, Timeframe::M10);
+            let end_exclusive = prefix_end_exclusive(&candle_prefix);
+            let close = self
+                .get_list_entries_desc_range(GetListEntriesDescRangeParams {
+                    blockhash: StateAt::Latest,
+                    start_inclusive: candle_prefix,
+                    end_exclusive,
+                    limit: 1,
+                })
+                .ok()
+                .and_then(|resp| resp.entries.into_iter().next())
+                .and_then(|(_k, v)| decode_full_candle_v1(&v).ok())
+                .map(|c| match side {
+                    PriceSide::Base => c.base_candle.close,
+                    PriceSide::Quote => c.quote_candle.close,
+                })
                 .unwrap_or(0);
             match unit {
                 CanonicalQuoteUnit::Btc => frbtc_price = close,
@@ -3895,15 +3931,18 @@ impl AmmDataProvider {
             dir,
         })?;
 
+        let lookups: Vec<ActivityEntryLookup> = page_result
+            .entries
+            .iter()
+            .map(|entry| ActivityEntryLookup { pool: entry.pool, ts: entry.ts, seq: entry.seq })
+            .collect();
+        let stored_entries = self.get_activity_entries(GetActivityEntriesParams {
+            blockhash: StateAt::Latest,
+            entries: lookups,
+        })?;
         let mut activity = Vec::with_capacity(page_result.entries.len());
-        for entry in page_result.entries.iter() {
-            let stored = self.get_activity_entry(GetActivityEntryParams {
-                blockhash: StateAt::Latest,
-                pool: entry.pool,
-                ts: entry.ts,
-                seq: entry.seq,
-            })?;
-            let Some(stored) = stored.entry else { continue };
+        for (entry, stored) in page_result.entries.iter().zip(stored_entries.entries.into_iter()) {
+            let Some(stored) = stored else { continue };
             let defs = self
                 .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool: entry.pool })
                 .ok()
@@ -4964,6 +5003,23 @@ pub struct GetActivityEntryParams {
 
 pub struct GetActivityEntryResult {
     pub entry: Option<SchemaActivityV1>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ActivityEntryLookup {
+    pub pool: SchemaAlkaneId,
+    pub ts: u64,
+    pub seq: u32,
+}
+
+pub struct GetActivityEntriesParams {
+    pub blockhash: StateAt,
+
+    pub entries: Vec<ActivityEntryLookup>,
+}
+
+pub struct GetActivityEntriesResult {
+    pub entries: Vec<Option<SchemaActivityV1>>,
 }
 
 #[derive(Clone, Debug)]
