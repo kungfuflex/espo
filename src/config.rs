@@ -371,6 +371,8 @@ pub struct ConfigFile {
     #[serde(default = "default_trace_read_workers")]
     pub trace_read_workers: u16,
     #[serde(default)]
+    pub recover_missing_traces_by_txid: bool,
+    #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
     #[serde(default)]
     pub google_analytics_tag: Option<String>,
@@ -413,6 +415,7 @@ pub struct AppConfig {
     pub compact_tx_trace_rows: bool,
     pub address_index_chunk_size: u32,
     pub trace_read_workers: u16,
+    pub recover_missing_traces_by_txid: bool,
     pub explorer_networks: Option<ExplorerNetworks>,
     pub google_analytics_tag: Option<String>,
     pub misc: MiscConfig,
@@ -483,6 +486,7 @@ impl AppConfig {
             compact_tx_trace_rows: file.compact_tx_trace_rows,
             address_index_chunk_size: file.address_index_chunk_size,
             trace_read_workers: file.trace_read_workers,
+            recover_missing_traces_by_txid: file.recover_missing_traces_by_txid,
             explorer_networks,
             google_analytics_tag,
             misc: file.misc,
@@ -753,6 +757,10 @@ pub fn get_trace_read_workers() -> usize {
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|workers| *workers > 0)
         .unwrap_or_else(|| get_config().trace_read_workers.max(1) as usize)
+}
+
+pub fn recover_missing_traces_by_txid() -> bool {
+    get_config().recover_missing_traces_by_txid
 }
 
 pub fn is_strict_mode() -> bool {

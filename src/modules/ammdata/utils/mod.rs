@@ -13,3 +13,4 @@ pub mod live_reserves;
 pub mod pathfinder;
 pub mod reserves;
 pub mod search;
+pub mod token_volume;

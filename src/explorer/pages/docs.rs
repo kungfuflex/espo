@@ -752,6 +752,25 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     json!({ "ok": true, "candles": [{ "ts": 1710000000, "open": "1", "high": "2", "low": "1", "close": "2", "volume": "100" }] }),
                 ),
                 rpc_doc(
+                    "ammdata.get_token_volume",
+                    "Returns raw token-side AMM volume buckets for a token. A swap contributes the amount of that token traded whether the token is the pool base asset or the quote asset.",
+                    json!({ "token": "2:0", "timeframe": "1h", "limit": 10, "page": 1 }),
+                    json!({
+                        "ok": true,
+                        "token": "2:0",
+                        "timeframe": "1h",
+                        "page": 1,
+                        "limit": 10,
+                        "total": 128,
+                        "has_more": true,
+                        "newest_ts": 1779886800,
+                        "points": [
+                            { "ts": 1779886800, "volume": "11486258" },
+                            { "ts": 1779883200, "volume": "875000000" }
+                        ]
+                    }),
+                ),
+                rpc_doc(
                     "ammdata.get_chart_change_block",
                     "Returns one chart change point for a named chart at a height.",
                     json!({ "chart": "btc_usd", "height": 946000 }),
@@ -898,6 +917,24 @@ fn docs_modules() -> Vec<ModuleDoc> {
                         "scale": "10000000000000000",
                         "latest": { "height": 951279, "value": "64040138676553303341511" },
                         "points": [{ "height": 951000, "value": "64024572352483080490211" }]
+                    }),
+                ),
+                rpc_doc(
+                    "ammdata.get_token_total_volume",
+                    "Returns the cumulative raw AMM amount traded for one token, keyed by block height. The latest value is the all-time token-side AMM volume recorded by the index.",
+                    json!({ "token": "2:0", "from_height": 951000, "to_height": 951279, "page": 1, "limit": 10 }),
+                    json!({
+                        "ok": true,
+                        "token": "2:0",
+                        "page": 1,
+                        "limit": 10,
+                        "range_min": 951000,
+                        "range_max": 951279,
+                        "latest": { "height": 951279, "value": "2381492765411" },
+                        "points": [
+                            { "height": 951000, "value": "2367000000000" },
+                            { "height": 951001, "value": "2368123456789" }
+                        ]
                     }),
                 ),
                 rpc_doc(

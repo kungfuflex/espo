@@ -21,6 +21,7 @@ use crate::modules::ammdata::utils::pathfinder::{
     plan_implicit_default_fee, plan_swap_exact_tokens_for_tokens,
     plan_swap_exact_tokens_for_tokens_implicit, plan_swap_tokens_for_exact_tokens,
 };
+use crate::modules::ammdata::utils::token_volume::read_token_volume_v1;
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListPointer};
@@ -80,6 +81,8 @@ pub struct AmmDataTable<'a> {
     pub BTC_USD_PRICE: KvPointer<'a>,
     pub BTC_USD_LINE: ListPointer<'a>,
     pub TOTAL_VOLUME_AMM: KvPointer<'a>,
+    pub TOKEN_VOLUME_CANDLES: ListPointer<'a>,
+    pub TOKEN_VOLUME_TOTAL: KvPointer<'a>,
     pub TOKEN_DERIVED_MCAP_USD_CANDLES: ListPointer<'a>,
     pub CHART_CHANGE_EVENTS: KvPointer<'a>,
     pub CHART_CHANGE_LATEST: KvPointer<'a>,
@@ -140,6 +143,8 @@ impl<'a> AmmDataTable<'a> {
             BTC_USD_PRICE: root.keyword("/btc_usd_price/v1/"),
             BTC_USD_LINE: root.list_keyword("btu1:"),
             TOTAL_VOLUME_AMM: root.keyword("/total_volume_amm/v1/"),
+            TOKEN_VOLUME_CANDLES: root.list_keyword("tv1:"),
+            TOKEN_VOLUME_TOTAL: root.keyword("/token_volume_total/v1/"),
             TOKEN_DERIVED_MCAP_USD_CANDLES: root.list_keyword("tdmc1:"),
             CHART_CHANGE_EVENTS: root.keyword("/chart_change_events/v1/"),
             CHART_CHANGE_LATEST: root.keyword("/chart_change_latest/v1/"),
@@ -581,6 +586,64 @@ impl<'a> AmmDataTable<'a> {
 
     pub fn parse_total_volume_amm_key(&self, unit: TotalVolumeAmmUnit, key: &[u8]) -> Option<u64> {
         let prefix = self.total_volume_amm_prefix(unit);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 8 {
+            return None;
+        }
+        let mut height = [0u8; 8];
+        height.copy_from_slice(rest);
+        Some(u64::from_be_bytes(height))
+    }
+
+    pub fn token_volume_ns_prefix(&self, token: &SchemaAlkaneId, tf: Timeframe) -> Vec<u8> {
+        let blk_hex = format!("{:x}", token.block);
+        let tx_hex = format!("{:x}", token.tx);
+        let suffix = format!("{}:{}:{}:", blk_hex, tx_hex, tf.code());
+        self.TOKEN_VOLUME_CANDLES.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn token_volume_key(
+        &self,
+        token: &SchemaAlkaneId,
+        tf: Timeframe,
+        bucket_ts: u64,
+    ) -> Vec<u8> {
+        let mut k = self.token_volume_ns_prefix(token, tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
+    pub fn parse_token_volume_key(
+        &self,
+        token: &SchemaAlkaneId,
+        tf: Timeframe,
+        key: &[u8],
+    ) -> Option<u64> {
+        let prefix = self.token_volume_ns_prefix(token, tf);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        std::str::from_utf8(&key[prefix.len()..]).ok()?.parse::<u64>().ok()
+    }
+
+    pub fn token_total_volume_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {
+        let blk_hex = format!("{:x}", token.block);
+        let tx_hex = format!("{:x}", token.tx);
+        let suffix = format!("{}:{}/", blk_hex, tx_hex);
+        self.TOKEN_VOLUME_TOTAL.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn token_total_volume_key(&self, token: &SchemaAlkaneId, height: u64) -> Vec<u8> {
+        let mut k = self.token_total_volume_prefix(token);
+        k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    pub fn parse_token_total_volume_key(&self, token: &SchemaAlkaneId, key: &[u8]) -> Option<u64> {
+        let prefix = self.token_total_volume_prefix(token);
         if !key.starts_with(&prefix) {
             return None;
         }
@@ -1869,6 +1932,60 @@ impl AmmDataProvider {
         )?;
         for (k, v) in entries {
             let Some(point_height) = table.parse_total_volume_amm_key(unit, &k) else {
+                continue;
+            };
+            if let Ok(value) = decode_u128_value(&v) {
+                return Ok(Some((point_height, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn get_token_total_volume_at_or_before_height(
+        &self,
+        token: &SchemaAlkaneId,
+        height: u32,
+    ) -> Result<Option<(u64, u128)>> {
+        let table = self.table();
+        let rel_prefix = table.token_total_volume_prefix(token);
+        let end_exclusive =
+            table.token_total_volume_key(token, u64::from(height).saturating_add(1));
+        let entries = self.raw_scan_range_entries_page_at(
+            &rel_prefix,
+            Some(&end_exclusive),
+            self.view_blockhash,
+            0,
+            16,
+            true,
+        )?;
+        for (k, v) in entries {
+            let Some(point_height) = table.parse_token_total_volume_key(token, &k) else {
+                continue;
+            };
+            if let Ok(value) = decode_u128_value(&v) {
+                return Ok(Some((point_height, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn get_latest_token_total_volume(
+        &self,
+        token: &SchemaAlkaneId,
+    ) -> Result<Option<(u64, u128)>> {
+        let table = self.table();
+        let rel_prefix = table.token_total_volume_prefix(token);
+        let end_exclusive = prefix_end_exclusive(&rel_prefix);
+        let entries = self.raw_scan_range_entries_page_at(
+            &rel_prefix,
+            end_exclusive.as_deref(),
+            self.view_blockhash,
+            0,
+            16,
+            true,
+        )?;
+        for (k, v) in entries {
+            let Some(point_height) = table.parse_token_total_volume_key(token, &k) else {
                 continue;
             };
             if let Ok(value) = decode_u128_value(&v) {
@@ -4324,6 +4441,155 @@ impl AmmDataProvider {
             }),
         })
     }
+
+    pub fn rpc_get_token_volume(
+        &self,
+        params: RpcGetTokenVolumeParams,
+    ) -> Result<RpcGetTokenVolumeResult> {
+        let Some(token_raw) = params.token.as_deref() else {
+            return Ok(RpcGetTokenVolumeResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_token",
+                    "hint": "token should be an Alkane id like \"2:0\""
+                }),
+            });
+        };
+        let Some(token) = parse_id_from_str(token_raw) else {
+            return Ok(RpcGetTokenVolumeResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_token",
+                    "hint": "token should be an Alkane id like \"2:0\""
+                }),
+            });
+        };
+
+        let tf = params.timeframe.as_deref().and_then(parse_timeframe).unwrap_or(Timeframe::H1);
+        let legacy_size = params.size.map(|n| n as usize);
+        let limit = params.limit.map(|n| n as usize).or(legacy_size).unwrap_or(120);
+        let page = params.page.map(|n| n as usize).unwrap_or(1);
+        let now = params.now.unwrap_or_else(now_ts);
+
+        match read_token_volume_v1(self, token, tf, now) {
+            Ok(slice) => {
+                let total = slice.points_newest_first.len();
+                let offset = limit.saturating_mul(page.saturating_sub(1));
+                let end = (offset + limit).min(total);
+                let page_slice =
+                    if offset >= total { &[][..] } else { &slice.points_newest_first[offset..end] };
+                let points: Vec<Value> = page_slice
+                    .iter()
+                    .map(|(ts, amount)| {
+                        json!({
+                            "ts": ts,
+                            "volume": amount.to_string()
+                        })
+                    })
+                    .collect();
+
+                Ok(RpcGetTokenVolumeResult {
+                    value: json!({
+                        "ok": true,
+                        "token": id_str(&token),
+                        "timeframe": tf.code(),
+                        "page": page,
+                        "limit": limit,
+                        "total": total,
+                        "has_more": end < total,
+                        "newest_ts": slice.newest_ts,
+                        "points": points
+                    }),
+                })
+            }
+            Err(e) => Ok(RpcGetTokenVolumeResult {
+                value: json!({ "ok": false, "error": format!("read_failed: {e}") }),
+            }),
+        }
+    }
+
+    pub fn rpc_get_token_total_volume(
+        &self,
+        params: RpcGetTokenTotalVolumeParams,
+    ) -> Result<RpcGetTokenTotalVolumeResult> {
+        let Some(token_raw) = params.token.as_deref() else {
+            return Ok(RpcGetTokenTotalVolumeResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_token",
+                    "hint": "token should be an Alkane id like \"2:0\""
+                }),
+            });
+        };
+        let Some(token) = parse_id_from_str(token_raw) else {
+            return Ok(RpcGetTokenTotalVolumeResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_token",
+                    "hint": "token should be an Alkane id like \"2:0\""
+                }),
+            });
+        };
+
+        let table = self.table();
+        let start_height =
+            params.range_min.or(params.from_height).or(params.start_height).unwrap_or(0);
+        let max_height = params.range_max.or(params.to_height).or(params.end_height);
+        let limit = params.limit.unwrap_or(1000).clamp(1, 10_000) as usize;
+        let page = params.page.unwrap_or(1).max(1);
+        let offset = page.saturating_sub(1).saturating_mul(limit as u64) as usize;
+
+        let start_key = table.token_total_volume_key(&token, start_height);
+        let end_key = max_height
+            .and_then(|h| h.checked_add(1).map(|end| table.token_total_volume_key(&token, end)));
+        let prefix_end = if end_key.is_none() {
+            let prefix = table.token_total_volume_prefix(&token);
+            prefix_end_exclusive(&prefix)
+        } else {
+            None
+        };
+        let end_exclusive = end_key.as_deref().or(prefix_end.as_deref());
+        let entries = self.raw_scan_range_entries_page_at(
+            &start_key,
+            end_exclusive,
+            self.view_blockhash,
+            offset,
+            limit,
+            false,
+        )?;
+
+        let mut points = Vec::new();
+        for (key, value) in entries {
+            let Some(height) = table.parse_token_total_volume_key(&token, &key) else {
+                continue;
+            };
+            let Ok(total) = decode_u128_value(&value) else { continue };
+            points.push(json!({
+                "height": height,
+                "value": total.to_string()
+            }));
+        }
+
+        let latest = self.get_latest_token_total_volume(&token)?.map(|(height, value)| {
+            json!({
+                "height": height,
+                "value": value.to_string()
+            })
+        });
+
+        Ok(RpcGetTokenTotalVolumeResult {
+            value: json!({
+                "ok": true,
+                "token": id_str(&token),
+                "page": page,
+                "limit": limit,
+                "range_min": start_height,
+                "range_max": max_height,
+                "latest": latest,
+                "points": points
+            }),
+        })
+    }
 }
 
 pub struct GetRawValueParams {
@@ -4931,6 +5197,19 @@ pub struct RpcGetCandlesResult {
     pub value: Value,
 }
 
+pub struct RpcGetTokenVolumeParams {
+    pub token: Option<String>,
+    pub timeframe: Option<String>,
+    pub limit: Option<u64>,
+    pub size: Option<u64>,
+    pub page: Option<u64>,
+    pub now: Option<u64>,
+}
+
+pub struct RpcGetTokenVolumeResult {
+    pub value: Value,
+}
+
 pub struct RpcGetChartChangeBlockParams {
     pub chart: Option<String>,
     pub height: Option<u64>,
@@ -5044,6 +5323,22 @@ pub struct RpcGetTotalVolumeAmmParams {
 }
 
 pub struct RpcGetTotalVolumeAmmResult {
+    pub value: Value,
+}
+
+pub struct RpcGetTokenTotalVolumeParams {
+    pub token: Option<String>,
+    pub range_min: Option<u64>,
+    pub range_max: Option<u64>,
+    pub from_height: Option<u64>,
+    pub to_height: Option<u64>,
+    pub start_height: Option<u64>,
+    pub end_height: Option<u64>,
+    pub limit: Option<u64>,
+    pub page: Option<u64>,
+}
+
+pub struct RpcGetTokenTotalVolumeResult {
     pub value: Value,
 }
 

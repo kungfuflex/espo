@@ -4,6 +4,7 @@ use crate::modules::ammdata::schemas::{
 };
 use crate::modules::ammdata::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
 use crate::modules::ammdata::utils::candles::CandleCache;
+use crate::modules::ammdata::utils::token_volume::TokenVolumeCache;
 use crate::schemas::SchemaAlkaneId;
 use std::collections::{HashMap, HashSet};
 
@@ -70,6 +71,9 @@ pub struct IndexState {
     pub btc_usd_price_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub btc_usd_line_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub total_volume_amm_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub token_volume_cache: TokenVolumeCache,
+    pub token_volume_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub token_volume_total_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub canonical_pool_writes: Vec<(Vec<u8>, Vec<u8>)>,
 
     pub candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
@@ -141,6 +145,9 @@ impl IndexState {
             btc_usd_price_writes: Vec::new(),
             btc_usd_line_writes: Vec::new(),
             total_volume_amm_writes: Vec::new(),
+            token_volume_cache: TokenVolumeCache::new(),
+            token_volume_candle_writes: Vec::new(),
+            token_volume_total_writes: Vec::new(),
             canonical_pool_writes: Vec::new(),
             candle_writes: Vec::new(),
             pool_candle_overrides: HashMap::new(),

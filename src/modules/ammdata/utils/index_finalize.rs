@@ -23,6 +23,8 @@ pub struct FinalizeStats {
     pub btc_usd_price: usize,
     pub btc_usd_line: usize,
     pub total_volume_amm: usize,
+    pub token_volume_candles: usize,
+    pub token_volume_total: usize,
     pub canonical_pools: usize,
     pub pool_name_index: usize,
     pub amm_factories: usize,
@@ -199,6 +201,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     let btc_cnt = state.btc_usd_price_writes.len();
     let btcl_cnt = state.btc_usd_line_writes.len();
     let tva_cnt = state.total_volume_amm_writes.len();
+    let tvc_cnt = state.token_volume_candle_writes.len();
+    let tvt_cnt = state.token_volume_total_writes.len();
     let cp_cnt = state.canonical_pool_writes.len();
     let pn_cnt = state.pool_name_index_writes.len();
     let af_cnt = state.amm_factory_writes.len();
@@ -247,6 +251,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         || !state.btc_usd_price_writes.is_empty()
         || !state.btc_usd_line_writes.is_empty()
         || !state.total_volume_amm_writes.is_empty()
+        || !state.token_volume_candle_writes.is_empty()
+        || !state.token_volume_total_writes.is_empty()
         || !state.canonical_pool_writes.is_empty()
         || !state.pool_name_index_writes.is_empty()
         || !state.amm_factory_writes.is_empty()
@@ -290,6 +296,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     puts.extend(std::mem::take(&mut state.btc_usd_price_writes));
     puts.extend(std::mem::take(&mut state.btc_usd_line_writes));
     puts.extend(std::mem::take(&mut state.total_volume_amm_writes));
+    puts.extend(std::mem::take(&mut state.token_volume_candle_writes));
+    puts.extend(std::mem::take(&mut state.token_volume_total_writes));
     puts.extend(std::mem::take(&mut state.canonical_pool_writes));
     puts.extend(std::mem::take(&mut state.pool_name_index_writes));
     puts.extend(std::mem::take(&mut state.amm_factory_writes));
@@ -345,6 +353,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         btc_usd_price: btc_cnt,
         btc_usd_line: btcl_cnt,
         total_volume_amm: tva_cnt,
+        token_volume_candles: tvc_cnt,
+        token_volume_total: tvt_cnt,
         canonical_pools: cp_cnt,
         pool_name_index: pn_cnt,
         amm_factories: af_cnt,

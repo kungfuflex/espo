@@ -21,7 +21,7 @@ use protorune::message::MessageContext;
 use protorune_support::balance_sheet::BalanceSheet;
 use protorune_support::balance_sheet::ProtoruneRuneId;
 use protorune_support::utils::consensus_encode;
-use rocksdb::{Direction, IteratorMode};
+use rocksdb::{Direction, IteratorMode, ReadOptions};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -372,6 +372,17 @@ fn trace_read_worker_count(item_count: usize) -> usize {
         .max(1)
 }
 
+fn prefix_end_exclusive(mut p: Vec<u8>) -> Option<Vec<u8>> {
+    for i in (0..p.len()).rev() {
+        if p[i] != 0xff {
+            p[i] += 1;
+            p.truncate(i + 1);
+            return Some(p);
+        }
+    }
+    None
+}
+
 pub struct MetashrewAdapter {
     root: SdbPointer<'static>,
 }
@@ -704,9 +715,7 @@ impl MetashrewAdapter {
 
         let mut out: Vec<PartialEspoTrace> = Vec::new();
         for (outpoint, fallback) in traces_by_outpoint {
-            let trace_bytes = traces.TRACES_NATIVE.select(&outpoint).get();
-            let trace =
-                if !trace_bytes.is_empty() { decode_trace_blob(&trace_bytes) } else { fallback };
+            let trace = self.trace_for_outpoint(db, &traces, &outpoint).or(fallback);
             if let Some(trace) = trace {
                 out.push(PartialEspoTrace { protobuf_trace: trace, outpoint });
             }
@@ -920,7 +929,11 @@ impl MetashrewAdapter {
     ) -> Result<Vec<PartialEspoTrace>> {
         let root = self.root_ptr(db);
         let traces = TraceTablesNative::new(&root);
-        let outpoints = traces.TRACES_BY_HEIGHT_NATIVE.select_value(block).get_list();
+        let by_height = traces.TRACES_BY_HEIGHT_NATIVE.select_value(block);
+        let mut outpoints = by_height.get_list();
+        if outpoints.is_empty() {
+            outpoints = self.scan_lengthless_trace_height_index(db, &by_height, allow_txids)?;
+        }
         let list_len = outpoints.len();
 
         let mut missing_trace_blobs = 0usize;
@@ -960,9 +973,7 @@ impl MetashrewAdapter {
             unique_outpoints
                 .into_iter()
                 .map(|outpoint| {
-                    let trace_bytes = traces.TRACES_NATIVE.select(&outpoint).get();
-                    let trace =
-                        if trace_bytes.is_empty() { None } else { decode_trace_blob(&trace_bytes) };
+                    let trace = self.trace_for_outpoint(db, &traces, &outpoint);
                     (outpoint, trace)
                 })
                 .collect()
@@ -977,12 +988,7 @@ impl MetashrewAdapter {
                         let mut out = Vec::with_capacity(chunk.len());
                         for outpoint in chunk {
                             let outpoint = outpoint.clone();
-                            let trace_bytes = traces.TRACES_NATIVE.select(&outpoint).get();
-                            let trace = if trace_bytes.is_empty() {
-                                None
-                            } else {
-                                decode_trace_blob(&trace_bytes)
-                            };
+                            let trace = self.trace_for_outpoint(db, &traces, &outpoint);
                             out.push((outpoint, trace));
                         }
                         out
@@ -1028,6 +1034,120 @@ impl MetashrewAdapter {
         }
 
         Ok(final_traces)
+    }
+
+    fn trace_for_outpoint(
+        &self,
+        db: &SDB,
+        traces: &TraceTablesNative<'_>,
+        outpoint: &Vec<u8>,
+    ) -> Option<AlkanesTrace> {
+        let parent = traces.TRACES_NATIVE.select(outpoint);
+        let trace_bytes = parent.get();
+        if !trace_bytes.is_empty() {
+            if let Some(trace) = decode_trace_blob(&trace_bytes) {
+                return Some(trace);
+            }
+        }
+
+        self.scan_lengthless_trace_blob(db, &parent)
+    }
+
+    fn scan_lengthless_trace_blob(
+        &self,
+        db: &SDB,
+        parent: &SdbPointer<'_>,
+    ) -> Option<AlkanesTrace> {
+        let mut prefix = parent.key_with_label();
+        prefix.push(b'/');
+
+        let mut readopts = ReadOptions::default();
+        if let Some(upper) = prefix_end_exclusive(prefix.clone()) {
+            readopts.set_iterate_upper_bound(upper);
+        }
+        readopts.set_total_order_seek(true);
+
+        let mut best: Option<(u64, AlkanesTrace)> = None;
+        let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), readopts);
+        while let Some(Ok((key, value))) = it.next() {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+
+            let suffix = &key[prefix.len()..];
+            if suffix.is_empty() || suffix == b"length" || suffix.contains(&b'/') {
+                continue;
+            }
+
+            let Ok(suffix_str) = std::str::from_utf8(suffix) else {
+                continue;
+            };
+            let Ok(index) = suffix_str.parse::<u64>() else {
+                continue;
+            };
+            let Some(trace) = decode_trace_blob(&value) else {
+                continue;
+            };
+
+            if best.as_ref().map_or(true, |(best_index, _)| index > *best_index) {
+                best = Some((index, trace));
+            }
+        }
+
+        best.map(|(_, trace)| trace)
+    }
+
+    fn scan_lengthless_trace_height_index(
+        &self,
+        db: &SDB,
+        by_height: &SdbPointer<'_>,
+        allow_txids: Option<&HashSet<[u8; 32]>>,
+    ) -> Result<Vec<Arc<Vec<u8>>>> {
+        let mut prefix = by_height.key_with_label();
+        prefix.push(b'/');
+
+        let mut readopts = ReadOptions::default();
+        if let Some(upper) = prefix_end_exclusive(prefix.clone()) {
+            readopts.set_iterate_upper_bound(upper);
+        }
+        readopts.set_total_order_seek(true);
+
+        let mut out = Vec::new();
+        let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), readopts);
+        while let Some(Ok((key, value))) = it.next() {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+
+            let suffix = &key[prefix.len()..];
+            if suffix.is_empty() || suffix == b"length" || suffix.contains(&b'/') {
+                continue;
+            }
+
+            let Some(decoded) = decode_height_prefixed(&value)
+                .or_else(|| if value.len() >= 36 { Some(value[..36].to_vec()) } else { None })
+            else {
+                continue;
+            };
+            if decoded.len() < 36 {
+                continue;
+            }
+
+            let outpoint = decoded[..36].to_vec();
+            if let Some(allow_txids) = allow_txids {
+                let mut txid_key = [0u8; 32];
+                txid_key.copy_from_slice(&outpoint[..32]);
+                let mut reversed = txid_key;
+                reversed.reverse();
+                if !allow_txids.contains(&txid_key) && !allow_txids.contains(&reversed) {
+                    continue;
+                }
+            }
+
+            out.push(Arc::new(outpoint));
+        }
+
+        Ok(out)
     }
 
     pub(crate) fn traces_for_block_as_prost_with_db_uncaught(

@@ -796,7 +796,61 @@ fn apply_transfers_multi(
                     shadow_base,
                     shadow_end,
                 );
-            } else if block_height >= ALKANES_V217_EDICT_FIX_HEIGHT {
+            } else if block_height < ALKANES_V217_EDICT_FIX_HEIGHT
+                && have <= (spendable_vouts.len() as u128).saturating_mul(ed.amount)
+            {
+                // Pre-v2.1.7 canonical metashrew behavior for amount-capped multicast:
+                // an OP_RETURN consumes one amount slot, but that slot is deferred and
+                // appended to the next spendable output after the regular walk stops.
+                let mut remaining = have;
+                let mut used: u128 = 0;
+                let mut deferred: Vec<u128> = Vec::new();
+                let mut last_consumed_idx: Option<usize> = None;
+
+                for (idx, output) in tx.output.iter().enumerate() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let give = remaining.min(ed.amount);
+                    if give == 0 {
+                        break;
+                    }
+                    remaining = remaining.saturating_sub(give);
+                    used = used.saturating_add(give);
+                    last_consumed_idx = Some(idx);
+
+                    if is_op_return(&output.script_pubkey) {
+                        deferred.push(give);
+                    } else {
+                        out_map
+                            .entry(idx as u32)
+                            .or_default()
+                            .push(BalanceEntry { alkane: rid, amount: give });
+                    }
+                }
+
+                let mut search_from =
+                    last_consumed_idx.map(|idx| idx.saturating_add(1)).unwrap_or(0);
+                for amount in deferred {
+                    let Some(next_idx) =
+                        tx.output.iter().enumerate().skip(search_from).find_map(|(idx, output)| {
+                            if is_op_return(&output.script_pubkey) { None } else { Some(idx) }
+                        })
+                    else {
+                        continue;
+                    };
+                    out_map
+                        .entry(next_idx as u32)
+                        .or_default()
+                        .push(BalanceEntry { alkane: rid, amount });
+                    search_from = next_idx.saturating_add(1);
+                }
+
+                *entry = entry.saturating_sub(used);
+                if *entry == 0 {
+                    sheet.remove(&rid);
+                }
+            } else {
                 // amount > 0 → treat ed.amount as PER-VOUT CAP, and use ALL available
                 let mut remaining = have;
                 let mut used: u128 = 0;
@@ -815,35 +869,6 @@ fn apply_transfers_multi(
                 }
 
                 // subtract only what we actually allocated; leave any leftover on the sheet
-                *entry = entry.saturating_sub(used);
-                if *entry == 0 {
-                    sheet.remove(&rid);
-                }
-            } else {
-                // Pre-v2.1.7 canonical metashrew behavior: OP_RETURN outputs consume a
-                // multicast slot while walking transaction outputs, but receive no balance.
-                let mut remaining = have;
-                let mut used: u128 = 0;
-
-                for (vout, output) in tx.output.iter().enumerate() {
-                    if remaining == 0 {
-                        break;
-                    }
-                    let give = remaining.min(ed.amount);
-                    if give == 0 {
-                        break;
-                    }
-                    remaining = remaining.saturating_sub(give);
-                    if is_op_return(&output.script_pubkey) {
-                        continue;
-                    }
-                    out_map
-                        .entry(vout as u32)
-                        .or_default()
-                        .push(BalanceEntry { alkane: rid, amount: give });
-                    used = used.saturating_add(give);
-                }
-
                 *entry = entry.saturating_sub(used);
                 if *entry == 0 {
                     sheet.remove(&rid);
@@ -1085,6 +1110,24 @@ mod edict_fork_tests {
         }
     }
 
+    fn tx_with_leading_op_return(output_count: usize) -> Transaction {
+        let mut outputs = Vec::with_capacity(output_count);
+        outputs.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::builder().push_opcode(opcodes::all::OP_RETURN).into_script(),
+        });
+        for _ in 1..output_count {
+            outputs.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() });
+        }
+
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: outputs,
+        }
+    }
+
     fn multicast_fixture(height: u64) -> HashMap<u32, Vec<BalanceEntry>> {
         let alkane = SchemaAlkaneId { block: 2, tx: 1 };
         let mut seed = Unallocated::default();
@@ -1114,9 +1157,9 @@ mod edict_fork_tests {
     #[test]
     fn multicast_edicts_match_legacy_before_v217_fix() {
         let allocations = multicast_fixture(ALKANES_V217_EDICT_FIX_HEIGHT - 1);
-        assert_eq!(amount_at(&allocations, 0), 500);
+        assert_eq!(amount_at(&allocations, 0), 300);
         assert_eq!(amount_at(&allocations, 1), 0);
-        assert_eq!(amount_at(&allocations, 2), 0);
+        assert_eq!(amount_at(&allocations, 2), 200);
     }
 
     #[test]
@@ -1125,6 +1168,102 @@ mod edict_fork_tests {
         assert_eq!(amount_at(&allocations, 0), 300);
         assert_eq!(amount_at(&allocations, 1), 0);
         assert_eq!(amount_at(&allocations, 2), 200);
+    }
+
+    #[test]
+    fn pre_v217_multicast_skips_op_return_before_consuming_amount() {
+        let alkane = SchemaAlkaneId { block: 2, tx: 0 };
+        let mut seed = Unallocated::default();
+        seed.add(alkane, 312_500_000);
+        let protostone = Protostone {
+            burn: None,
+            message: vec![],
+            edicts: vec![ProtostoneEdict {
+                id: ProtoruneRuneId { block: 2, tx: 0 },
+                amount: 312_500_000,
+                output: 34,
+            }],
+            refund: None,
+            pointer: Some(31),
+            from: None,
+            protocol_tag: 1,
+        };
+
+        let allocations = apply_transfers_multi(
+            &tx_with_leading_op_return(34),
+            &[protostone],
+            &[],
+            ALKANES_V217_EDICT_FIX_HEIGHT - 1,
+            seed,
+        )
+        .expect("apply transfers");
+
+        assert_eq!(amount_at(&allocations, 1), 312_500_000);
+        assert_eq!(amount_at(&allocations, 31), 0);
+    }
+
+    #[test]
+    fn pre_v217_multicast_leftover_pointer_matches_metashrew_skip_behavior() {
+        let alkane = SchemaAlkaneId { block: 2, tx: 16 };
+        let mut seed = Unallocated::default();
+        seed.add(alkane, 299_500_000_000);
+        let protostone = Protostone {
+            burn: None,
+            message: vec![],
+            edicts: vec![ProtostoneEdict {
+                id: ProtoruneRuneId { block: 2, tx: 16 },
+                amount: 8_000_000_000,
+                output: 34,
+            }],
+            refund: None,
+            pointer: Some(31),
+            from: None,
+            protocol_tag: 1,
+        };
+
+        let allocations = apply_transfers_multi(
+            &tx_with_leading_op_return(34),
+            &[protostone],
+            &[],
+            ALKANES_V217_EDICT_FIX_HEIGHT - 1,
+            seed,
+        )
+        .expect("apply transfers");
+
+        assert_eq!(amount_at(&allocations, 31), 43_500_000_000);
+    }
+
+    #[test]
+    fn pre_v217_multicast_defers_leading_op_return_slot_before_partial_output() {
+        let alkane = SchemaAlkaneId { block: 2, tx: 25_720 };
+        let mut seed = Unallocated::default();
+        seed.add(alkane, 835_695_545_699);
+        let protostone = Protostone {
+            burn: None,
+            message: vec![],
+            edicts: vec![ProtostoneEdict {
+                id: ProtoruneRuneId { block: 2, tx: 25_720 },
+                amount: 50_000_000_000,
+                output: 93,
+            }],
+            refund: None,
+            pointer: Some(90),
+            from: None,
+            protocol_tag: 1,
+        };
+
+        let allocations = apply_transfers_multi(
+            &tx_with_leading_op_return(93),
+            &[protostone],
+            &[],
+            ALKANES_V217_EDICT_FIX_HEIGHT - 1,
+            seed,
+        )
+        .expect("apply transfers");
+
+        assert_eq!(amount_at(&allocations, 15), 50_000_000_000);
+        assert_eq!(amount_at(&allocations, 16), 35_695_545_699);
+        assert_eq!(amount_at(&allocations, 17), 50_000_000_000);
     }
 }
 

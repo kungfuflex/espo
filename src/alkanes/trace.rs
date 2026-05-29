@@ -3,6 +3,7 @@ use crate::config::{
     get_metashrew,
     get_metashrew_sdb,
     get_network,
+    recover_missing_traces_by_txid,
 };
 use crate::consts::alkanes_genesis_block;
 use crate::core::blockfetcher::BlockSource;
@@ -349,6 +350,19 @@ fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
     format!("{}:{}", hex::encode(txid_be), vout)
 }
 
+fn alkane_cellpack_from_protostone(protostone: &Protostone) -> Option<Cellpack> {
+    if protostone.protocol_tag != 1 || protostone.message.is_empty() {
+        return None;
+    }
+
+    let calldata: Vec<u8> = protostone.message.iter().flat_map(|v| v.to_be_bytes()).collect();
+    let Ok(varint_list) = decode_varint_list(&mut Cursor::new(calldata)) else {
+        return None;
+    };
+
+    TryInto::<Cellpack>::try_into(varint_list).ok()
+}
+
 #[cfg(test)]
 fn tx_has_alkanes_protocol(tx: &Transaction) -> bool {
     let Some(Artifact::Runestone(ref runestone)) = Runestone::decipher(tx) else {
@@ -359,7 +373,7 @@ fn tx_has_alkanes_protocol(tx: &Transaction) -> bool {
     };
     protostones
         .iter()
-        .any(|protostone| protostone.protocol_tag == 1 && !protostone.message.is_empty())
+        .any(|protostone| alkane_cellpack_from_protostone(protostone).is_some())
 }
 
 // parse possibly-tailed trace (strip trailing u32 if needed)
@@ -499,7 +513,6 @@ fn select_canonical_traces(
     let mut traces_by_txid: HashMap<Txid, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
     let mut recovered_txids: Vec<String> = Vec::new();
     let mut missing_candidate_txids: Vec<String> = Vec::new();
-    let txid_fallback_enabled = std::env::var_os("ESPO_ENABLE_TXID_TRACE_FALLBACK").is_some();
     let selected_txids: HashSet<Txid> = selected.iter().map(|(txid, _)| *txid).collect();
 
     let mut height_index = partial_traces_indexed(height_partials, Some(&selected_txids))?;
@@ -513,30 +526,23 @@ fn select_canonical_traces(
         if !alkane_protocol_txids.contains(txid) {
             continue;
         }
+        if !recover_missing_traces_by_txid() {
+            missing_candidate_txids.push(txid.to_string());
+            continue;
+        }
 
-        if txid_fallback_enabled {
-            let fallback_partials = metashrew
-                .traces_for_tx_with_db_uncaught(metashrew_sdb.as_ref(), txid)
-                .with_context(|| format!("failed traces_for_tx_with_db_uncaught({txid})"))?;
-            let allow = HashSet::from([*txid]);
-            let mut fallback_index = partial_traces_indexed(fallback_partials, Some(&allow))?;
-            if let Some(vouts_partials) = fallback_index.remove(txid) {
-                traces_by_txid.insert(*txid, vouts_partials);
-                recovered_txids.push(txid.to_string());
-                continue;
-            }
+        let fallback_partials = metashrew
+            .traces_for_tx_with_db_uncaught(metashrew_sdb.as_ref(), txid)
+            .with_context(|| format!("failed traces_for_tx_with_db_uncaught({txid})"))?;
+        let allow = HashSet::from([*txid]);
+        let mut fallback_index = partial_traces_indexed(fallback_partials, Some(&allow))?;
+        if let Some(vouts_partials) = fallback_index.remove(txid) {
+            traces_by_txid.insert(*txid, vouts_partials);
+            recovered_txids.push(txid.to_string());
+            continue;
         }
 
         missing_candidate_txids.push(txid.to_string());
-    }
-
-    if !missing_candidate_txids.is_empty() {
-        let listed = missing_candidate_txids.join(", ");
-        anyhow::bail!(
-            "canonical trace set incomplete at block {}: missing traces for canonical txids [{}]",
-            block,
-            listed
-        );
     }
 
     let unexpected_height_trace_txids: Vec<String> = height_index
@@ -626,38 +632,17 @@ pub fn get_espo_block_with_opts(
                 };
                 let mut has_alkane_protocol = false;
                 for protostone in protostones {
-                    if protostone.protocol_tag != 1 {
+                    let Some(cellpack) = alkane_cellpack_from_protostone(&protostone) else {
                         continue;
-                    }
-                    if protostone.message.is_empty() {
-                        continue;
-                    }
-                    has_alkane_protocol = true;
-                    let calldata: Vec<u8> =
-                        protostone.message.iter().flat_map(|v| v.to_be_bytes()).collect();
-                    let varint_list = match decode_varint_list(&mut Cursor::new(calldata)) {
-                        Ok(list) => list,
-                        Err(err) => {
-                            if std::env::var_os("ESPO_LOG_DIESEL_MINTS").is_some() {
-                                eprintln!(
-                                    "[TRACE::get_espo_block] diesel mint decode failed: txid={} err={err:#}",
-                                    tx.compute_txid()
-                                );
-                            }
-                            continue;
-                        }
                     };
-                    if varint_list.len() < 2 {
-                        continue;
-                    }
-                    if let Ok(cellpack) = TryInto::<Cellpack>::try_into(varint_list) {
-                        if cellpack.target == AlkaneId::new(2, 0)
-                            && !cellpack.inputs.is_empty()
-                            && cellpack.inputs[0] == 77
-                        {
-                            diesel_mints = diesel_mints.saturating_add(1);
-                            break;
-                        }
+
+                    has_alkane_protocol = true;
+                    if cellpack.target == AlkaneId::new(2, 0)
+                        && !cellpack.inputs.is_empty()
+                        && cellpack.inputs[0] == 77
+                    {
+                        diesel_mints = diesel_mints.saturating_add(1);
+                        break;
                     }
                 }
                 if has_alkane_protocol {
@@ -809,5 +794,27 @@ mod tests {
     fn tx_has_alkanes_protocol_returns_false_for_plain_tx() {
         let tx = sample_tx(2);
         assert!(!tx_has_alkanes_protocol(&tx));
+    }
+
+    #[test]
+    fn tx_has_alkanes_protocol_detects_cellpack_without_canonical_trace() {
+        let raw = hex::decode(concat!(
+            "0200000000010173490f9241ff4f2b11e59555233b2c1aae44c58b5553ad9023e39fc9ea67a33b",
+            "0200000000ffffffff0322020000000000002251200a3571c7d2419230a38031eb2fe9a6f9a61a",
+            "048475b20b3381e05a87ffcd94e00000000000000000296a5d26ff7f8190ec82d08bc0a886",
+            "ad82c48892a0f4c601ff7f86d1aee5ce95edc0ea958688d5b9b10b241f030000000000160014",
+            "96b87abec6cea3a5a15d7dc7ba748a9bbeef884602473044022004a05eaae7a4af1ca384cd8ff0",
+            "b46af478ff22d14d50638b76e70434e319db91022061a667262a1dcf405c2937e21aa2c0f7bd508",
+            "3298e9513aff5f69b5f39f7cfb801210374e106c95d47879e75196e5e82d0d38fa5a4441d7e8e",
+            "106ab618bf673b20058000000000"
+        ))
+        .expect("valid hex");
+        let tx: Transaction = bitcoin::consensus::deserialize(&raw).expect("valid tx");
+
+        assert_eq!(
+            tx.compute_txid().to_string(),
+            "fc40bc89baf56dfcccf53bfaafac930518c658caac70929808a2a21c1e4a8aa0"
+        );
+        assert!(tx_has_alkanes_protocol(&tx));
     }
 }

@@ -18,6 +18,7 @@ pub fn process_balance_deltas(
     essentials: &EssentialsProvider,
     canonical_quote_units: &HashMap<SchemaAlkaneId, CanonicalQuoteUnit>,
     frames: &[Timeframe],
+    token_volume_frames: &[Timeframe],
     tx_meta: &HashMap<Txid, (Vec<u8>, bool)>,
     state: &mut IndexState,
 ) {
@@ -207,6 +208,20 @@ pub fn process_balance_deltas(
                     base_volume,
                     quote_volume,
                 );
+                state.token_volume_cache.apply_trade_for_frames(
+                    block_ts,
+                    defs.base_alkane_id,
+                    token_volume_frames,
+                    base_volume,
+                );
+                if defs.quote_alkane_id != defs.base_alkane_id {
+                    state.token_volume_cache.apply_trade_for_frames(
+                        block_ts,
+                        defs.quote_alkane_id,
+                        token_volume_frames,
+                        quote_volume,
+                    );
+                }
 
                 if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
                     let entry =

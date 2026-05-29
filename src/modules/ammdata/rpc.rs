@@ -2,7 +2,8 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
     RpcGetBestMevSwapParams, RpcGetBtcUsdPriceParams, RpcGetCandlesParams,
     RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams, RpcGetPoolsParams,
-    RpcGetTokenActivityParams, RpcGetTotalVolumeAmmParams, RpcPingParams,
+    RpcGetTokenActivityParams, RpcGetTokenTotalVolumeParams, RpcGetTokenVolumeParams,
+    RpcGetTotalVolumeAmmParams, RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -48,6 +49,49 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         }
                     };
                     view.rpc_get_candles(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_token_volume = reg.clone();
+    let mdb_token_volume: Arc<AmmDataProvider> = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_token_volume
+            .register("get_token_volume", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_token_volume);
+                async move {
+                    let params = RpcGetTokenVolumeParams {
+                        token: payload
+                            .get("token")
+                            .or_else(|| payload.get("alkane"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        timeframe: payload
+                            .get("timeframe")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        size: payload.get("size").and_then(|v| v.as_u64()),
+                        page: payload.get("page").and_then(|v| v.as_u64()),
+                        now: payload.get("now").and_then(|v| v.as_u64()),
+                    };
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_token_volume(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -422,6 +466,49 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         }
                     };
                     view.rpc_get_total_volume_amm(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_token_total_volume = reg.clone();
+    let mdb_token_total_volume = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_token_total_volume
+            .register("get_token_total_volume", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_token_total_volume);
+                async move {
+                    let params = RpcGetTokenTotalVolumeParams {
+                        token: payload
+                            .get("token")
+                            .or_else(|| payload.get("alkane"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        range_min: payload.get("range_min").and_then(|v| v.as_u64()),
+                        range_max: payload.get("range_max").and_then(|v| v.as_u64()),
+                        from_height: payload.get("from_height").and_then(|v| v.as_u64()),
+                        to_height: payload.get("to_height").and_then(|v| v.as_u64()),
+                        start_height: payload.get("start_height").and_then(|v| v.as_u64()),
+                        end_height: payload.get("end_height").and_then(|v| v.as_u64()),
+                        limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        page: payload.get("page").and_then(|v| v.as_u64()),
+                    };
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_token_total_volume(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
