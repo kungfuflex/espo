@@ -19,6 +19,7 @@
   --chart-red: rgba(255, 85, 85, 0.85);
   --bg-success: #335c45;
   --warning: #fda948;
+  --banner-color: #2b4c8a;
   --radius: 8px;
   --mono:
     ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
@@ -144,7 +145,7 @@ a:hover {
   padding: 10px 24px;
   position: relative;
   z-index: 9;
-  background: var(--panel2);
+  background: var(--banner-color);
   color: var(--text);
   display: flex;
   align-items: center;
