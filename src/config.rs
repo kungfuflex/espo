@@ -173,6 +173,10 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
+fn default_sync_banner_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExplorerNetworks {
     #[serde(default)]
@@ -225,6 +229,44 @@ pub struct StrictModeConfig {
 pub struct MiscConfig {
     #[serde(default)]
     pub show_terminal_ad: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncBannerConfig {
+    #[serde(default = "default_sync_banner_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub message_zh: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub link_text: Option<String>,
+    #[serde(default)]
+    pub link_text_zh: Option<String>,
+}
+
+impl SyncBannerConfig {
+    fn normalized(self) -> Option<Self> {
+        if !self.enabled {
+            return None;
+        }
+
+        let message = self.message.trim().to_string();
+        if message.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            enabled: self.enabled,
+            message,
+            message_zh: normalize_optional_string(self.message_zh),
+            url: normalize_optional_string(self.url),
+            link_text: normalize_optional_string(self.link_text),
+            link_text_zh: normalize_optional_string(self.link_text_zh),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -348,6 +390,8 @@ pub struct ConfigFile {
     pub explorer_pizza_tv_endpoint: String,
     #[serde(default = "default_explorer_amm_prefix")]
     pub explorer_amm_prefix: String,
+    #[serde(default)]
+    pub sync_banner: Option<SyncBannerConfig>,
     #[serde(default = "default_network")]
     pub network: String,
     #[serde(default)]
@@ -404,6 +448,7 @@ pub struct AppConfig {
     pub explorer_base_path: String,
     pub explorer_pizza_tv_endpoint: String,
     pub explorer_amm_prefix: String,
+    pub sync_banner: Option<SyncBannerConfig>,
     pub network: Network,
     pub metashrew_db_label: Option<String>,
     pub strict_mode: Option<StrictModeConfig>,
@@ -454,6 +499,7 @@ impl AppConfig {
             .unwrap_or_else(default_explorer_amm_prefix);
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
         let google_analytics_tag = normalize_optional_string(file.google_analytics_tag);
+        let sync_banner = file.sync_banner.and_then(|b| b.normalized());
         let debug_backup = file.debug_backup;
 
         Ok(Self {
@@ -475,6 +521,7 @@ impl AppConfig {
             explorer_base_path,
             explorer_pizza_tv_endpoint,
             explorer_amm_prefix,
+            sync_banner,
             network,
             metashrew_db_label: normalize_optional_string(file.metashrew_db_label),
             strict_mode: file.strict_mode,
@@ -819,6 +866,10 @@ pub fn get_explorer_pizza_tv_endpoint() -> &'static str {
 
 pub fn get_explorer_amm_prefix() -> &'static str {
     &get_config().explorer_amm_prefix
+}
+
+pub fn get_sync_banner() -> Option<&'static SyncBannerConfig> {
+    get_config().sync_banner.as_ref()
 }
 
 pub fn get_explorer_networks() -> Option<&'static ExplorerNetworks> {

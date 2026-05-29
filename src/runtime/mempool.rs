@@ -17,6 +17,7 @@ use crate::modules::runes::transfer::{
     OutputRuneSheets, RuneSheet, RunestoneTransfer, TransferRules,
 };
 use crate::runtime::mdb::Mdb;
+use crate::runtime::shutdown::is_shutdown_requested;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result};
@@ -1494,6 +1495,25 @@ fn decode_trace_hex(
     Ok(Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }))
 }
 
+fn compact_view_error(error: &Value) -> String {
+    let code = error.get("code").and_then(|v| v.as_i64());
+    let message = error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| error.as_str().unwrap_or("unknown metashrew_view error"))
+        .lines()
+        .next()
+        .unwrap_or("unknown metashrew_view error");
+    let mut summary: String = message.chars().take(300).collect();
+    if message.chars().count() > 300 {
+        summary.push_str("...");
+    }
+    match code {
+        Some(code) => format!("code {code}: {summary}"),
+        None => summary,
+    }
+}
+
 async fn view_traces_for_tx(
     http: &Client,
     view_url: &str,
@@ -1501,6 +1521,9 @@ async fn view_traces_for_tx(
     tx: &Transaction,
     protostone_count: usize,
 ) -> Option<Vec<EspoTrace>> {
+    if is_shutdown_requested() {
+        return None;
+    }
     if protostone_count == 0 {
         return None;
     }
@@ -1515,6 +1538,9 @@ async fn view_traces_for_tx(
     let mut traces: Vec<EspoTrace> = Vec::new();
     let mut had_error = false;
     for batch in jobs.chunks(MEMPOOL_VIEW_BATCH_SIZE) {
+        if is_shutdown_requested() {
+            return None;
+        }
         let owned_batch: Vec<(u32, String)> = batch.to_vec();
         let futs = stream::iter(owned_batch.into_iter().map(|(vout, input_hex)| {
             let body = json!({
@@ -1531,50 +1557,73 @@ async fn view_traces_for_tx(
             let view_url = view_url.to_string();
             let txid = *txid;
             async move {
+                if is_shutdown_requested() {
+                    return Err(());
+                }
                 let resp_json: Value = match http.post(&view_url).json(&body).send().await {
                     Ok(r) => match r.error_for_status() {
                         Ok(ok) => match ok.json().await {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!(
-                                    "[mempool] view response decode failed for {}@{}: {:?}",
-                                    txid, vout, e
-                                );
+                                if !is_shutdown_requested() {
+                                    eprintln!(
+                                        "[mempool] view response decode failed for {}@{}: {:?}",
+                                        txid, vout, e
+                                    );
+                                }
                                 return Err(());
                             }
                         },
                         Err(e) => {
-                            eprintln!("[mempool] view HTTP error for {}@{}: {:?}", txid, vout, e);
+                            if !is_shutdown_requested() {
+                                eprintln!(
+                                    "[mempool] view HTTP error for {}@{}: {:?}",
+                                    txid, vout, e
+                                );
+                            }
                             return Err(());
                         }
                     },
                     Err(e) => {
-                        eprintln!("[mempool] view POST failed for {}@{}: {:?}", txid, vout, e);
+                        if !is_shutdown_requested() {
+                            eprintln!("[mempool] view POST failed for {}@{}: {:?}", txid, vout, e);
+                        }
                         return Err(());
                     }
                 };
 
                 if let Some(error) = resp_json.get("error") {
-                    eprintln!(
-                        "[mempool] metashrew_view trace error for {}@{}: {}",
-                        txid, vout, error
-                    );
+                    if !is_shutdown_requested() {
+                        eprintln!(
+                            "[mempool] metashrew_view trace failed for {}@{}: {}",
+                            txid,
+                            vout,
+                            compact_view_error(error)
+                        );
+                    }
                     return Err(());
                 }
                 let result_hex = resp_json.get("result").and_then(|v| v.as_str()).or_else(|| {
                     resp_json.get("result").and_then(|v| v.get("trace")).and_then(|v| v.as_str())
                 });
                 let Some(result_hex) = result_hex else {
-                    eprintln!(
-                        "[mempool] metashrew_view trace missing result for {}@{}",
-                        txid, vout
-                    );
+                    if !is_shutdown_requested() {
+                        eprintln!(
+                            "[mempool] metashrew_view trace missing result for {}@{}",
+                            txid, vout
+                        );
+                    }
                     return Err(());
                 };
                 match decode_trace_hex(result_hex, &txid, tx, vout) {
                     Ok(trace) => Ok(trace),
                     Err(e) => {
-                        eprintln!("[mempool] decode view trace {}@{} failed: {:?}", txid, vout, e);
+                        if !is_shutdown_requested() {
+                            eprintln!(
+                                "[mempool] decode view trace {}@{} failed: {:?}",
+                                txid, vout, e
+                            );
+                        }
                         Err(())
                     }
                 }
@@ -2763,6 +2812,9 @@ fn start_mempool_hydration(network: Network) {
 
 async fn trace_worker(http: Client, view_url: String) {
     loop {
+        if is_shutdown_requested() {
+            break;
+        }
         let next = trace_queue().lock().ok().and_then(|mut queue| queue.pop_front());
         let Some(txid) = next else {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2778,6 +2830,9 @@ async fn trace_worker(http: Client, view_url: String) {
         };
         if entry.fixed_trace.is_some() {
             continue;
+        }
+        if is_shutdown_requested() {
+            break;
         }
         let traces =
             view_traces_for_tx(&http, &view_url, &txid, transaction, entry.protostones.len()).await;
@@ -2951,6 +3006,9 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     let mut last_raw_refresh = SystemTime::now();
 
     loop {
+        if is_shutdown_requested() {
+            return Ok(());
+        }
         let should_refresh = last_raw_refresh.elapsed().unwrap_or_default() >= raw_poll;
         if should_refresh {
             eprintln!("[mempool] canonical getrawmempool refresh");

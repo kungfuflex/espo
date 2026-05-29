@@ -138,6 +138,28 @@ a:hover {
   padding: 10px;
   margin: 0 auto;
 }
+.syncing-banner {
+  width: 100%;
+  margin: 0;
+  padding: 10px 24px;
+  position: relative;
+  z-index: 9;
+  background: var(--panel2);
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 14px;
+  line-height: 1.45;
+  font-weight: 500;
+}
+.syncing-banner-link {
+  color: var(--link);
+  font-weight: 700;
+  white-space: nowrap;
+}
 .topbar {
   position: sticky;
   top: 0;

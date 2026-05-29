@@ -98,6 +98,8 @@ mod tests {
             explorer_host: None,
             explorer_base_path: String::from("/"),
             explorer_pizza_tv_endpoint: String::from("https://tv.pizza.fun"),
+            explorer_amm_prefix: String::from("https://www.oyl.io/swap"),
+            sync_banner: None,
             network: bitcoin::Network::Regtest,
             metashrew_db_label: None,
             strict_mode: None,

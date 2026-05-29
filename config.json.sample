@@ -15,6 +15,7 @@
   "explorer_host": "127.0.0.1:8081",
   "explorer_base_path": "/",
   "google_analytics_tag": null,
+  "sync_banner": null,
   "mempool": {
     "enabled": true,
     "raw_poll_secs": 60,

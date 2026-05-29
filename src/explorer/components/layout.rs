@@ -3,7 +3,9 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
-use crate::config::{get_explorer_networks, get_google_analytics_tag, get_network};
+use crate::config::{
+    get_explorer_networks, get_google_analytics_tag, get_network, get_sync_banner,
+};
 use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
 use crate::explorer::components::footer::footer;
 use crate::explorer::components::svg_assets::{
@@ -120,6 +122,20 @@ pub fn layout_with_meta(
     let root_base_path_js = format!("{:?}", explorer_base_path());
     let network_dropdown = network_dropdown();
     let runes_enabled = runes_enabled_from_global_config();
+    let sync_banner = get_sync_banner().map(|banner| {
+        let message = if language.is_chinese() {
+            banner.message_zh.as_deref().unwrap_or(&banner.message)
+        } else {
+            &banner.message
+        };
+        let link_text = if language.is_chinese() {
+            banner.link_text_zh.as_deref().or(banner.link_text.as_deref())
+        } else {
+            banner.link_text.as_deref()
+        }
+        .or(banner.url.as_deref());
+        (message, banner.url.as_deref(), link_text)
+    });
     let google_analytics = google_analytics_scripts();
     let lang_toggle_label =
         if language.is_chinese() { "Switch to English" } else { "切换到中文" };
@@ -232,6 +248,16 @@ pub fn layout_with_meta(
                                 div class="search-results" data-search-results="" aria-hidden="true" {
                                     div class="search-results-body" data-search-results-body="" {}
                                 }
+                            }
+                        }
+                    }
+                }
+                @if let Some((message, url, link_text)) = sync_banner {
+                    div class="syncing-banner" role="status" {
+                        span { (message) }
+                        @if let (Some(url), Some(link_text)) = (url, link_text) {
+                            a class="syncing-banner-link" href=(url) target="_blank" rel="noopener noreferrer" {
+                                (link_text)
                             }
                         }
                     }
