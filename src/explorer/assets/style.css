@@ -306,6 +306,22 @@ a:hover {
   width: 20px;
   height: 20px;
 }
+.dropdown-token-icon-wrap {
+  position: relative;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 20px;
+  overflow: hidden;
+  border-radius: 50%;
+  background: var(--panel3);
+}
+.dropdown-token-icon-wrap .alk-icon-letter {
+  font-size: 10px;
+  line-height: 1;
+}
 .dropdown-caret svg {
   width: 16px;
   height: 16px;

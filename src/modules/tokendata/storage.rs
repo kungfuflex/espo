@@ -1042,6 +1042,7 @@ impl TokenDataProvider {
             params.limit,
             params.start_time,
             params.end_time,
+            params.quote_amount_filter,
         )
     }
 
@@ -1082,6 +1083,7 @@ impl TokenDataProvider {
             params.limit,
             params.start_time,
             params.end_time,
+            None,
         )
     }
 
@@ -1098,8 +1100,26 @@ impl TokenDataProvider {
         limit: usize,
         start_time: Option<u64>,
         end_time: Option<u64>,
+        quote_amount_filter: Option<TokenActivityQuoteAmountFilter>,
     ) -> Result<GetTokenActivityPageResult> {
         let blockhash = blockhash.resolve(self.view_blockhash);
+        if quote_amount_filter.is_some()
+            && kind.is_none()
+            && start_time.is_none()
+            && end_time.is_none()
+            && source_sort == requested_sort
+        {
+            return self.get_filtered_activity_page_from_prefix(
+                prefix,
+                timestamp_prefix,
+                blockhash,
+                source_sort,
+                dir,
+                offset,
+                limit,
+                quote_amount_filter,
+            );
+        }
         if matches!(source_sort, TokenActivitySortField::Timestamp)
             && matches!(requested_sort, TokenActivitySortField::Timestamp)
             && kind.is_none()
@@ -1247,6 +1267,7 @@ impl TokenDataProvider {
             .filter(|(entry, _)| {
                 timeframe_applied || end_time.map(|e| entry.timestamp <= e).unwrap_or(true)
             })
+            .filter(|(entry, _)| row_matches_quote_amount_filter(entry, quote_amount_filter))
             .collect();
 
         match requested_sort {
@@ -1267,6 +1288,106 @@ impl TokenDataProvider {
         };
         let page = entries.into_iter().skip(offset).take(limit).map(|(entry, _)| entry).collect();
         Ok(GetTokenActivityPageResult { entries: page, total })
+    }
+
+    fn get_filtered_activity_page_from_prefix(
+        &self,
+        prefix: Vec<u8>,
+        timestamp_prefix: Vec<u8>,
+        blockhash: Option<BlockHash>,
+        source_sort: TokenActivitySortField,
+        dir: SortDir,
+        offset: usize,
+        limit: usize,
+        quote_amount_filter: Option<TokenActivityQuoteAmountFilter>,
+    ) -> Result<GetTokenActivityPageResult> {
+        if limit == 0 {
+            return Ok(GetTokenActivityPageResult { entries: Vec::new(), total: 0 });
+        }
+
+        let mut seen = 0usize;
+        let mut out = Vec::with_capacity(limit.saturating_add(1));
+        let batch = limit.max(128).min(512);
+
+        match source_sort {
+            TokenActivitySortField::Timestamp => {
+                let total_unfiltered =
+                    self.get_activity_index_total(&timestamp_prefix, blockhash)?;
+                let mut scan_offset = 0usize;
+                while scan_offset < total_unfiltered && out.len() <= limit {
+                    let take = batch.min(total_unfiltered.saturating_sub(scan_offset));
+                    let (ids, _) = self.get_activity_index_row_ids_page(
+                        &prefix,
+                        blockhash,
+                        scan_offset,
+                        take,
+                        dir,
+                    )?;
+                    if ids.is_empty() {
+                        break;
+                    }
+                    scan_offset = scan_offset.saturating_add(ids.len());
+                    for row in self.get_activity_rows_by_ids(&ids)? {
+                        if !row_matches_quote_amount_filter(&row, quote_amount_filter) {
+                            continue;
+                        }
+                        if seen < offset {
+                            seen = seen.saturating_add(1);
+                            continue;
+                        }
+                        out.push(row);
+                        if out.len() > limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            TokenActivitySortField::Amount => {
+                let end_exclusive = prefix_end_exclusive(&prefix);
+                let mut scan_offset = 0usize;
+                loop {
+                    let page = self.raw_scan_range_entries_page(
+                        &prefix,
+                        end_exclusive.as_deref(),
+                        blockhash,
+                        scan_offset,
+                        batch,
+                        matches!(dir, SortDir::Desc),
+                    )?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    scan_offset = scan_offset.saturating_add(page.len());
+                    let ids = page
+                        .into_iter()
+                        .filter_map(|(_, value)| decode_u64_value(&value).ok())
+                        .collect::<Vec<_>>();
+                    for row in self.get_activity_rows_by_ids(&ids)? {
+                        if !row_matches_quote_amount_filter(&row, quote_amount_filter) {
+                            continue;
+                        }
+                        if seen < offset {
+                            seen = seen.saturating_add(1);
+                            continue;
+                        }
+                        out.push(row);
+                        if out.len() > limit {
+                            break;
+                        }
+                    }
+                    if out.len() > limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let has_more = out.len() > limit;
+        if has_more {
+            out.truncate(limit);
+        }
+        let total = offset.saturating_add(out.len()).saturating_add(if has_more { 1 } else { 0 });
+        Ok(GetTokenActivityPageResult { entries: out, total })
     }
 }
 
@@ -1304,6 +1425,13 @@ pub struct GetTokenActivityPageParams {
     pub dir: SortDir,
     pub start_time: Option<u64>,
     pub end_time: Option<u64>,
+    pub quote_amount_filter: Option<TokenActivityQuoteAmountFilter>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenActivityQuoteAmountFilter {
+    pub quote: SchemaAlkaneId,
+    pub min_amount: u128,
 }
 
 fn decode_height_tail(bytes: &[u8]) -> Option<u32> {
@@ -1395,6 +1523,18 @@ fn timestamp_sort_tuple(row: &SchemaTokenActivityV1) -> (u64, u32, [u8; 32]) {
 
 fn amount_sort_tuple(row: &SchemaTokenActivityV1) -> (u128, u64, u32, [u8; 32]) {
     (amount_from_row(row), row.timestamp, 0, row.txid)
+}
+
+fn row_matches_quote_amount_filter(
+    row: &SchemaTokenActivityV1,
+    filter: Option<TokenActivityQuoteAmountFilter>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    row.source == TokenActivitySource::Market
+        && row.counter_token == Some(filter.quote)
+        && row.counter_delta.unsigned_abs() >= filter.min_amount
 }
 
 pub fn scopes_for_source(source: TokenActivitySource) -> [TokenActivityScope; 2] {
