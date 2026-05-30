@@ -421,6 +421,12 @@ fn method_notes(method: &MethodDoc) -> Vec<String> {
             "Sort fields are route-specific. Unsupported values fall back to the handler default or return a validation error, depending on the route.",
         );
     }
+    if contains_any(&combined, &["canonical_quote", "min_quote_amount", "min_amount"]) {
+        push_note(
+            &mut notes,
+            "`canonical_quote`/`quote` filters token activity to rows whose counter token is that Alkane id. `min_quote_amount`/`min_amount` is a raw 1e8-scaled token amount, such as `100000` for 0.001 frBTC.",
+        );
+    }
     if combined.contains("include_outpoints") {
         push_note(
             &mut notes,
@@ -1191,19 +1197,34 @@ fn docs_modules() -> Vec<ModuleDoc> {
             methods: vec![
                 rpc_doc(
                     "tokendata.get_token_activity",
-                    "Returns token activity for one Alkane across market and mint sources.",
-                    json!({ "token": "2:0", "page": 1, "limit": 10, "from": 1700000000, "to": 1800000000, "scope": "all" }),
+                    "Returns token activity for one Alkane across market and mint sources. Market reads can be filtered to a canonical quote pool with a minimum quote-side amount.",
+                    json!({
+                        "token": "2:68479",
+                        "page": 1,
+                        "limit": 10,
+                        "from": 1700000000,
+                        "to": 1800000000,
+                        "filter": "market",
+                        "sort_by": "timestamp",
+                        "dir": "desc",
+                        "canonical_quote": "32:0",
+                        "min_quote_amount": "100000"
+                    }),
                     json!({
                         "ok": true,
-                        "total": 3824968,
+                        "total": 11,
                         "entries": [{
-                            "kind": "mint",
+                            "kind": "buy",
+                            "source": "market",
                             "height": 951279,
                             "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90",
-                            "token": "2:0",
-                            "amount": "1000000",
-                            "mint_price_paid_sats": 1540,
-                            "chain_txids": ["f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90"]
+                            "token": "2:68479",
+                            "pool": "2:90001",
+                            "counter_token": "32:0",
+                            "token_delta": "250000000000",
+                            "counter_delta": "-100000",
+                            "chain_txids": ["f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90"],
+                            "success": true
                         }]
                     }),
                 ),
