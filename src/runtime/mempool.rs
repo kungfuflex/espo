@@ -1,6 +1,7 @@
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
-    protobuf_trace_events,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceInvokeContext,
+    EspoSandshrewLikeTraceInvokeData, EspoSandshrewLikeTraceShortId, EspoTrace,
+    extract_alkane_storage, protobuf_trace_events,
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use crate::config::{
@@ -907,6 +908,64 @@ fn diesel_trace_for_tx(
     let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::default();
     let storage_changes = extract_alkane_storage(&protobuf_trace, tx).unwrap_or_default();
     Some(vec![EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }])
+}
+
+fn trace_short_id_from_schema(id: &SchemaAlkaneId) -> EspoSandshrewLikeTraceShortId {
+    EspoSandshrewLikeTraceShortId { block: hex_u128(id.block as u128), tx: hex_u128(id.tx as u128) }
+}
+
+fn fast_trace_for_protostone(
+    txid: &Txid,
+    tx: &Transaction,
+    vout: u32,
+    protostone: &Protostone,
+) -> Option<EspoTrace> {
+    let cellpack = cellpack_from_protostone(protostone)?;
+    let contract_id = SchemaAlkaneId {
+        block: cellpack.target.block.try_into().ok()?,
+        tx: cellpack.target.tx.try_into().ok()?,
+    };
+    let invoke = EspoSandshrewLikeTraceEvent::Invoke(EspoSandshrewLikeTraceInvokeData {
+        typ: "call".to_string(),
+        context: EspoSandshrewLikeTraceInvokeContext {
+            myself: trace_short_id_from_schema(&contract_id),
+            caller: EspoSandshrewLikeTraceShortId {
+                block: "0x0".to_string(),
+                tx: "0x0".to_string(),
+            },
+            inputs: cellpack.inputs.iter().map(|value| hex_u128(*value)).collect(),
+            incoming_alkanes: Vec::new(),
+            vout,
+        },
+        fuel: 0,
+    });
+    let sandshrew_trace =
+        EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events: vec![invoke] };
+    let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::default();
+    let storage_changes = extract_alkane_storage(&protobuf_trace, tx).unwrap_or_default();
+    let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
+
+    Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })
+}
+
+fn fast_traces_for_tx(
+    txid: &Txid,
+    tx: &Transaction,
+    protostones: &[Protostone],
+) -> Option<Vec<EspoTrace>> {
+    if protostones.is_empty() {
+        return None;
+    }
+
+    let base = shadow_base(tx);
+    let traces = protostones
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, protostone)| {
+            fast_trace_for_protostone(txid, tx, base + idx as u32, protostone)
+        })
+        .collect();
+    Some(traces)
 }
 
 fn combined_traces(entry: &MempoolTransactionStruct) -> Option<Vec<EspoTrace>> {
@@ -2810,7 +2869,7 @@ fn start_mempool_hydration(network: Network) {
     });
 }
 
-async fn trace_worker(http: Client, view_url: String) {
+async fn trace_worker(http: Client, view_url: String, populate_with_views: bool) {
     loop {
         if is_shutdown_requested() {
             break;
@@ -2834,8 +2893,11 @@ async fn trace_worker(http: Client, view_url: String) {
         if is_shutdown_requested() {
             break;
         }
-        let traces =
-            view_traces_for_tx(&http, &view_url, &txid, transaction, entry.protostones.len()).await;
+        let traces = if populate_with_views {
+            view_traces_for_tx(&http, &view_url, &txid, transaction, entry.protostones.len()).await
+        } else {
+            fast_traces_for_tx(&txid, transaction, &entry.protostones)
+        };
         if let Some(traces) = traces {
             let mut event_entry = None;
             if let Ok(mut state) = mempool_state().write() {
@@ -2981,8 +3043,8 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     }
 
     eprintln!(
-        "[mempool] service starting (raw_poll={}s, template_poll={}s, view_url={})",
-        cfg.raw_poll_secs, cfg.template_poll_secs, view_url
+        "[mempool] service starting (raw_poll={}s, template_poll={}s, populate_with_views={}, view_url={})",
+        cfg.raw_poll_secs, cfg.template_poll_secs, cfg.populate_with_views, view_url
     );
 
     eprintln!("[mempool] startup getrawmempool refresh");
@@ -2998,7 +3060,7 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     }
 
     for _ in 0..cfg.trace_workers.max(1) {
-        tokio::spawn(trace_worker(http.clone(), view_url.clone()));
+        tokio::spawn(trace_worker(http.clone(), view_url.clone(), cfg.populate_with_views));
     }
 
     let template_poll = Duration::from_secs(cfg.template_poll_secs.max(1));
@@ -3143,4 +3205,87 @@ pub fn purge_confirmed_from_chain() -> Result<usize> {
         eprintln!("[mempool] purged {} confirmed txs from store", removed);
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alkanes_support::cellpack::Cellpack;
+    use alkanes_support::id::AlkaneId;
+    use bitcoin::{
+        Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime, transaction::Version,
+    };
+
+    fn sample_tx() -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() }],
+        }
+    }
+
+    fn cellpack_protostone(target: AlkaneId, inputs: Vec<u128>) -> Protostone {
+        let cellpack = Cellpack { target, inputs };
+        Protostone {
+            burn: None,
+            message: cellpack.encipher(),
+            edicts: Vec::new(),
+            refund: None,
+            pointer: None,
+            from: None,
+            protocol_tag: 1,
+        }
+    }
+
+    #[test]
+    fn fast_traces_for_tx_builds_summary_from_protostone_cellpack() {
+        let tx = sample_tx();
+        let txid = tx.compute_txid();
+        let protostone = cellpack_protostone(AlkaneId { block: 4, tx: 797 }, vec![42, 99, 1000]);
+
+        let traces = fast_traces_for_tx(&txid, &tx, &[protostone]).expect("fast traces");
+
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].sandshrew_trace.outpoint, format!("{}:2", txid));
+        assert!(traces[0].protobuf_trace.events.is_empty());
+        assert_eq!(traces[0].outpoint.vout, 2);
+        assert_eq!(traces[0].outpoint.txid, txid.to_byte_array().to_vec());
+
+        let EspoSandshrewLikeTraceEvent::Invoke(invoke) = &traces[0].sandshrew_trace.events[0]
+        else {
+            panic!("expected invoke event");
+        };
+        assert_eq!(invoke.typ, "call");
+        assert_eq!(invoke.context.myself.block, "0x4");
+        assert_eq!(invoke.context.myself.tx, "0x31d");
+        assert_eq!(invoke.context.caller.block, "0x0");
+        assert_eq!(invoke.context.caller.tx, "0x0");
+        assert_eq!(invoke.context.inputs, vec!["0x2a", "0x63", "0x3e8"]);
+        assert_eq!(invoke.context.vout, 2);
+    }
+
+    #[test]
+    fn fast_traces_for_tx_marks_non_cellpack_protostones_processed() {
+        let tx = sample_tx();
+        let txid = tx.compute_txid();
+        let protostone = Protostone {
+            burn: None,
+            message: Vec::new(),
+            edicts: Vec::new(),
+            refund: None,
+            pointer: None,
+            from: None,
+            protocol_tag: 1,
+        };
+
+        let traces = fast_traces_for_tx(&txid, &tx, &[protostone]).expect("fast traces");
+
+        assert!(traces.is_empty());
+    }
 }

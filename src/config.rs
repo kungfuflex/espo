@@ -273,6 +273,8 @@ impl SyncBannerConfig {
 pub struct MempoolConfig {
     #[serde(default = "default_mempool_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub populate_with_views: bool,
     #[serde(default = "default_mempool_raw_poll_secs")]
     pub raw_poll_secs: u64,
     #[serde(default = "default_mempool_template_poll_secs")]
@@ -303,6 +305,7 @@ impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
             enabled: default_mempool_enabled(),
+            populate_with_views: false,
             raw_poll_secs: default_mempool_raw_poll_secs(),
             template_poll_secs: default_mempool_template_poll_secs(),
             trace_workers: default_mempool_trace_workers(),

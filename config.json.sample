@@ -18,6 +18,7 @@
   "sync_banner": null,
   "mempool": {
     "enabled": true,
+    "populate_with_views": false,
     "raw_poll_secs": 60,
     "template_poll_secs": 10,
     "trace_workers": 1,

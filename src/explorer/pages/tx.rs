@@ -698,8 +698,7 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
         html! {
             div class="block-hero full-bleed" {
                 @if let Some(index) = selected_mempool_index {
-                    @let _ = index;
-                    (block_carousel_with_mempool(None, espo_tip))
+                    (block_carousel_with_mempool(Some(index), espo_tip))
                 } @else {
                     (block_carousel(tx_height, espo_tip))
                 }
