@@ -1349,27 +1349,6 @@ pub fn get_mempool_block_detail(
             MempoolTxFilter::Rune => entry_has_rune_action(entry),
         }
     });
-    ordered.sort_by(|a, b| {
-        let aa = state.txs.get(a);
-        let bb = state.txs.get(b);
-        let a_rate = package_rates
-            .get(a)
-            .copied()
-            .or_else(|| aa.map(|tx| tx.fee_rate))
-            .unwrap_or_default();
-        let b_rate = package_rates
-            .get(b)
-            .copied()
-            .or_else(|| bb.map(|tx| tx.fee_rate))
-            .unwrap_or_default();
-        let a_fee = aa.map(|tx| tx.fee_sat).unwrap_or_default();
-        let b_fee = bb.map(|tx| tx.fee_sat).unwrap_or_default();
-        b_rate
-            .partial_cmp(&a_rate)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b_fee.cmp(&a_fee))
-            .then_with(|| a.cmp(b))
-    });
     let tx_total = ordered.len();
     let off = limit.saturating_mul(page.saturating_sub(1));
     let end = off.saturating_add(limit).min(tx_total);

@@ -43,7 +43,8 @@ use crate::modules::essentials::storage::{
     load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
-    OutpointLookup, get_outpoint_balances_with_spent_batch, project_tx_output_balances_from_traces,
+    OutpointLookup, get_outpoint_balances_with_spent_batch,
+    project_tx_output_balances_from_traces_with_projector,
 };
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RunesProvider, SchemaRuneId};
@@ -52,6 +53,7 @@ use crate::runtime::mempool::{
     MempoolBlockTx, MempoolTxFilter, get_mempool_block_detail, get_mempool_block_spenders,
     get_mempool_block_transactions_for_targets, get_mempool_transactions,
 };
+use crate::runtime::mempool_projection::MempoolProjectionRegistry;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
 
@@ -293,6 +295,7 @@ pub(crate) fn mempool_block_projected_balances(
 ) -> HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> {
     let mut projected_by_outpoint: HashMap<(Txid, u32), Vec<BalanceEntry>> = HashMap::new();
     let mut projected_by_tx: HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> = HashMap::new();
+    let mut contract_projector = MempoolProjectionRegistry::from_latest_indices();
 
     for item in ordered_txs {
         let mut input_totals: BTreeMap<crate::schemas::SchemaAlkaneId, u128> = BTreeMap::new();
@@ -313,7 +316,12 @@ pub(crate) fn mempool_block_projected_balances(
             .map(|(alkane, amount)| BalanceEntry { alkane, amount })
             .collect();
         let traces = item.traces.as_deref().unwrap_or(&[]);
-        let projected = project_tx_output_balances_from_traces(&item.tx, traces, input_balances);
+        let projected = project_tx_output_balances_from_traces_with_projector(
+            &item.tx,
+            traces,
+            input_balances,
+            Some(&mut contract_projector),
+        );
         if projected.is_empty() {
             continue;
         }
@@ -1176,8 +1184,21 @@ pub async fn mempool_block_page(
     .unwrap_or_default();
     let projected_balances_by_tx =
         mempool_block_projected_balances(&projection_txs_for_balances, &outpoint_map);
+    let projected_balances_by_outpoint: HashMap<(Txid, u32), Vec<BalanceEntry>> =
+        projected_balances_by_tx
+            .iter()
+            .flat_map(|(txid, outputs)| {
+                outputs.iter().map(|(vout, balances)| ((*txid, *vout), balances.clone()))
+            })
+            .collect();
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
-        outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
+        let mut lookup = outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default();
+        if lookup.balances.is_empty() {
+            if let Some(projected) = projected_balances_by_outpoint.get(&(*txid, vout)) {
+                lookup.balances = projected.clone();
+            }
+        }
+        lookup
     };
     let outspends_map: std::collections::HashMap<Txid, Vec<Option<Txid>>> = {
         let mempool_spenders = get_mempool_block_spenders(template_index).unwrap_or_default();

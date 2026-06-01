@@ -49,6 +49,25 @@ use std::time::Instant;
 static AMMDATA_MDB: OnceLock<Arc<Mdb>> = OnceLock::new();
 const ALKANES_V217_EDICT_FIX_HEIGHT: u64 = 943_500;
 
+pub(crate) type ProjectionSheet = BTreeMap<SchemaAlkaneId, u128>;
+
+#[allow(dead_code)]
+pub(crate) struct ContractProjectionContext<'a> {
+    pub tx: &'a Transaction,
+    pub protostone: &'a Protostone,
+    pub protostone_index: usize,
+    pub shadow_vout: u32,
+    pub incoming: &'a ProjectionSheet,
+}
+
+pub(crate) struct ContractProjection {
+    pub output: ProjectionSheet,
+}
+
+pub(crate) trait MempoolContractProjector {
+    fn project(&mut self, ctx: ContractProjectionContext<'_>) -> Option<ContractProjection>;
+}
+
 fn ammdata_mdb() -> Arc<Mdb> {
     AMMDATA_MDB
         .get_or_init(|| Arc::new(Mdb::from_db(get_espo_db(), b"ammdata:")))
@@ -619,6 +638,7 @@ fn apply_transfers_multi(
     traces_for_tx: &[EspoTrace],
     block_height: u64,
     mut seed_unalloc: Unallocated, // VIN balances only
+    mut contract_projector: Option<&mut dyn MempoolContractProjector>,
 ) -> Result<HashMap<u32, Vec<BalanceEntry>>> {
     let mut out_map: HashMap<u32, Vec<BalanceEntry>> = HashMap::new();
 
@@ -980,6 +1000,20 @@ fn apply_transfers_multi(
             }
         }
 
+        if status == EspoTraceType::NOTRACE {
+            if let Some(projector) = contract_projector.as_deref_mut() {
+                if let Some(projection) = projector.project(ContractProjectionContext {
+                    tx,
+                    protostone: ps,
+                    protostone_index: i,
+                    shadow_vout,
+                    incoming: &sheet,
+                }) {
+                    sheet = projection.output;
+                }
+            }
+        }
+
         // If we have a status and it is Failure → refund net_in (only), skip edicts.
         if status == EspoTraceType::REVERT {
             if let Some(ref net_in_map) = net_in {
@@ -1057,6 +1091,15 @@ pub(crate) fn project_tx_output_balances_from_traces(
     traces_for_tx: &[EspoTrace],
     input_balances: Vec<BalanceEntry>,
 ) -> HashMap<u32, Vec<BalanceEntry>> {
+    project_tx_output_balances_from_traces_with_projector(tx, traces_for_tx, input_balances, None)
+}
+
+pub(crate) fn project_tx_output_balances_from_traces_with_projector(
+    tx: &Transaction,
+    traces_for_tx: &[EspoTrace],
+    input_balances: Vec<BalanceEntry>,
+    contract_projector: Option<&mut dyn MempoolContractProjector>,
+) -> HashMap<u32, Vec<BalanceEntry>> {
     if !tx_has_op_return(tx) {
         return HashMap::new();
     }
@@ -1082,6 +1125,7 @@ pub(crate) fn project_tx_output_balances_from_traces(
         traces_for_tx,
         ALKANES_V217_EDICT_FIX_HEIGHT,
         seed_unalloc,
+        contract_projector,
     )
     .unwrap_or_default()
 }
@@ -1146,7 +1190,7 @@ mod edict_fork_tests {
             protocol_tag: 1,
         };
 
-        apply_transfers_multi(&tx_with_middle_op_return(), &[protostone], &[], height, seed)
+        apply_transfers_multi(&tx_with_middle_op_return(), &[protostone], &[], height, seed, None)
             .expect("apply transfers")
     }
 
@@ -1195,6 +1239,7 @@ mod edict_fork_tests {
             &[],
             ALKANES_V217_EDICT_FIX_HEIGHT - 1,
             seed,
+            None,
         )
         .expect("apply transfers");
 
@@ -1227,6 +1272,7 @@ mod edict_fork_tests {
             &[],
             ALKANES_V217_EDICT_FIX_HEIGHT - 1,
             seed,
+            None,
         )
         .expect("apply transfers");
 
@@ -1258,6 +1304,7 @@ mod edict_fork_tests {
             &[],
             ALKANES_V217_EDICT_FIX_HEIGHT - 1,
             seed,
+            None,
         )
         .expect("apply transfers");
 
@@ -1861,6 +1908,7 @@ pub fn bulk_update_balances_for_block(
                     &traces_for_tx,
                     u64::from(block.height),
                     seed_unalloc,
+                    None,
                 )?
             }
         } else {
