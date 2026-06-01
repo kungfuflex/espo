@@ -22,11 +22,10 @@ use crate::runtime::shutdown::is_shutdown_requested;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result};
-use bitcoin::blockdata::script::Instruction;
 use bitcoin::consensus::Encodable;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Network, OutPoint, Transaction, Txid, opcodes};
+use bitcoin::{Address, Network, OutPoint, Transaction, Txid};
 use bitcoincore_rpc::RpcApi;
 use futures::{StreamExt, stream};
 use ordinals::{Artifact, Edict, RuneId, Runestone};
@@ -503,18 +502,7 @@ fn protostones_for_tx(tx: &Transaction) -> Vec<Protostone> {
     }
 }
 
-fn tx_has_runestone_carrier(tx: &Transaction) -> bool {
-    tx.output.iter().any(|output| {
-        let mut instructions = output.script_pubkey.instructions();
-        matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_RETURN))))
-            && matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_PUSHNUM_13))))
-    })
-}
-
 fn is_uncommon_goods_mint_tx(tx: &Transaction) -> bool {
-    if !tx_has_runestone_carrier(tx) {
-        return false;
-    }
     Runestone::decipher(tx)
         .as_ref()
         .and_then(|artifact| artifact.mint())
@@ -733,7 +721,7 @@ fn project_rune_io_for_block(
         let Some(tx) = txs.get(txid).and_then(|entry| entry.tx.as_ref()) else {
             continue;
         };
-        let artifact = tx_has_runestone_carrier(tx).then(|| Runestone::decipher(tx)).flatten();
+        let artifact = Runestone::decipher(tx);
         let mut io = TxRuneIo::default();
         let mut unallocated: RuneSheet<SchemaRuneId> = BTreeMap::new();
 

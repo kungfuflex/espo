@@ -55,7 +55,7 @@ use crate::runtime::mempool::{
 };
 use crate::runtime::mempool_projection::MempoolProjectionRegistry;
 use crate::runtime::state_at::StateAt;
-use crate::schemas::EspoOutpoint;
+use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 
 fn format_with_commas(n: u64) -> String {
     let mut s = n.to_string();
@@ -325,6 +325,7 @@ pub(crate) fn mempool_block_projected_balances(
         if projected.is_empty() {
             continue;
         }
+        let projected = sanitize_diesel_ug_projection(item, projected);
 
         for (vout, entries) in &projected {
             projected_by_outpoint.insert((item.txid, *vout), entries.clone());
@@ -333,6 +334,38 @@ pub(crate) fn mempool_block_projected_balances(
     }
 
     projected_by_tx
+}
+
+fn sanitize_diesel_ug_projection(
+    item: &MempoolBlockTx,
+    mut projected: HashMap<u32, Vec<BalanceEntry>>,
+) -> HashMap<u32, Vec<BalanceEntry>> {
+    const DIESEL_ID: SchemaAlkaneId = SchemaAlkaneId { block: 2, tx: 0 };
+    let has_ug_mint = item
+        .rune_io
+        .as_ref()
+        .map(|io| io.minted.iter().any(|minted| minted.id.block == 1 && minted.id.tx == 0))
+        .unwrap_or(false);
+    if !has_ug_mint {
+        return projected;
+    }
+
+    for entries in projected.values_mut() {
+        let diesel_rows = entries.iter().filter(|entry| entry.alkane == DIESEL_ID).count();
+        if diesel_rows <= 1 {
+            continue;
+        }
+        let mut removed_one_unit = false;
+        entries.retain(|entry| {
+            if !removed_one_unit && entry.alkane == DIESEL_ID && entry.amount == 1 {
+                removed_one_unit = true;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    projected
 }
 
 pub async fn block_page(
