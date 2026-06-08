@@ -26,6 +26,7 @@ use crate::modules::essentials::utils::balances::{
     OutpointLookup, project_tx_output_balances_from_traces,
 };
 use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
+use crate::modules::essentials::utils::names::display_alkane_name;
 use crate::modules::runes::storage::{RuneBalance, RunesProvider, TxRuneIo};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
@@ -1461,8 +1462,8 @@ pub(crate) fn alkane_meta(
     let mut symbol: Option<String> = None;
 
     if let Ok(Some(rec)) = load_creation_record(essentials_mdb, id) {
-        if let Some(n) = rec.names.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            name = Some(n.to_string());
+        if let Some(n) = display_alkane_name(&rec.names) {
+            name = Some(n);
         }
         if let Some(s) = rec.symbols.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
             symbol = Some(s.to_string());

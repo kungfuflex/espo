@@ -31,6 +31,15 @@ pub fn normalize_alkane_name(name: &str) -> Option<String> {
     Some(trimmed.to_ascii_lowercase())
 }
 
+pub fn display_alkane_name(names: &[String]) -> Option<String> {
+    names
+        .iter()
+        .rev()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 fn parse_short_id(id: &EspoSandshrewLikeTraceShortId) -> Option<SchemaAlkaneId> {
     fn parse_u32_or_hex(s: &str) -> Option<u32> {
         if let Some(hex) = s.strip_prefix("0x") {

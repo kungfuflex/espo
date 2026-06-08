@@ -12,6 +12,7 @@ use crate::modules::essentials::utils::balances::{
     get_transfer_volume_for_alkane,
 };
 use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
+use crate::modules::essentials::utils::names::display_alkane_name;
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RuneBalance, RunesProvider};
 use crate::runtime::mdb::{Mdb, MdbBatch};
@@ -3141,7 +3142,7 @@ impl EssentialsProvider {
                 .map(|hc| hc.count)
                 .unwrap_or(0);
             let inspection_json = rec.inspection.as_ref().map(inspection_to_json);
-            let name = rec.names.first().cloned();
+            let name = display_alkane_name(&rec.names);
             let symbol = rec.symbols.first().cloned();
             items.push(json!({
                 "alkane": format!("{}:{}", rec.alkane.block, rec.alkane.tx),
@@ -3226,7 +3227,7 @@ impl EssentialsProvider {
                 .unwrap_or(0)
             });
         let inspection_json = record.inspection.as_ref().map(inspection_to_json);
-        let name = record.names.first().cloned();
+        let name = display_alkane_name(&record.names);
         let symbol = record.symbols.first().cloned();
 
         Ok(RpcGetAlkaneInfoResult {
