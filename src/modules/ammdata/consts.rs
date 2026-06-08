@@ -26,6 +26,8 @@ pub const SATS_PER_BTC: u128 = AMOUNT_SCALE;
 pub const K_TOLERANCE_BPS: u128 = 10; // 0.1%
 pub const FRBTC_ALKANE_ID: SchemaAlkaneId = SchemaAlkaneId { block: 32, tx: 0 };
 pub const BUSD_ALKANE_ID: SchemaAlkaneId = SchemaAlkaneId { block: 2, tx: 56801 };
+pub const MAINNET_FIRE_ALKANE_ID: SchemaAlkaneId = SchemaAlkaneId { block: 2, tx: 77623 };
+pub const MAINNET_FIRE_USD_CHART_START_TS: u64 = 1_780_875_600;
 // BUSD stops contributing as a canonical USD quote at this height and is treated as a normal token.
 pub const BUSD_CANONICAL_QUOTE_FORK_HEIGHT: u32 = 946_500;
 

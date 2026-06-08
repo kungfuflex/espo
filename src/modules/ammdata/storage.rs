@@ -6,8 +6,8 @@ use super::schemas::{
 use crate::config::get_network;
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{
-    CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block,
-    canonical_quotes_at_height,
+    CanonicalQuoteUnit, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID, MAINNET_FIRE_USD_CHART_START_TS,
+    PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block, canonical_quotes_at_height,
 };
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
@@ -5645,6 +5645,8 @@ fn read_token_usd_candles_v1(
         }
     }
 
+    apply_token_chart_start_cutoff(token, &mut per_bucket);
+
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
     }
@@ -5743,6 +5745,8 @@ fn read_token_derived_usd_candles_v1(
             }
         }
     }
+
+    apply_token_chart_start_cutoff(token, &mut per_bucket);
 
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
@@ -5843,6 +5847,8 @@ fn read_token_derived_mcusd_candles_v1(
         }
     }
 
+    apply_token_chart_start_cutoff(token, &mut per_bucket);
+
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
     }
@@ -5941,6 +5947,8 @@ fn read_token_mcusd_candles_v1(
         }
     }
 
+    apply_token_chart_start_cutoff(token, &mut per_bucket);
+
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
     }
@@ -6007,6 +6015,15 @@ fn read_token_mcusd_candles_v1(
     let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+}
+
+fn apply_token_chart_start_cutoff(
+    token: SchemaAlkaneId,
+    per_bucket: &mut BTreeMap<u64, SchemaCandleV1>,
+) {
+    if get_network() == bitcoin::Network::Bitcoin && token == MAINNET_FIRE_ALKANE_ID {
+        per_bucket.retain(|ts, _| *ts >= MAINNET_FIRE_USD_CHART_START_TS);
+    }
 }
 
 fn read_btc_usd_line_v1(
