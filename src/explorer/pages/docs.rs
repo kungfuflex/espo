@@ -536,6 +536,12 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     json!({ "ok": true, "alkane": "2:0", "name": "DIESEL", "symbol": "diesel", "holder_count": 6409, "creation_height": 880000 }),
                 ),
                 rpc_doc(
+                    "essentials.get_factory_children",
+                    "Returns child Alkane IDs indexed for a factory Alkane. The index is populated from creation records as new blocks are indexed; historical children appear after a reindex.",
+                    json!({ "factory": "4:780993" }),
+                    json!({ "ok": true, "factory": "4:780993", "children": ["2:80663"] }),
+                ),
+                rpc_doc(
                     "essentials.get_block_summary",
                     "Returns the indexed Alkane summary for a block height.",
                     json!({ "height": 946000 }),

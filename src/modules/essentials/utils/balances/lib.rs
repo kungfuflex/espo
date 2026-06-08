@@ -303,6 +303,7 @@ pub(crate) fn mint_deltas_from_trace(
         owner: Option<SchemaAlkaneId>,
         mint_candidate: bool,
         incoming: Vec<(SchemaAlkaneId, u128)>,
+        nested_mints: BTreeMap<SchemaAlkaneId, u128>,
     }
 
     let mut stack: Vec<Frame> = Vec::new();
@@ -353,47 +354,63 @@ pub(crate) fn mint_deltas_from_trace(
                     owner: parse_short_id(&inv.context.myself),
                     mint_candidate,
                     incoming,
+                    nested_mints: BTreeMap::new(),
                 });
             }
             EspoSandshrewLikeTraceEvent::Return(ret) => {
                 let Some(frame) = stack.pop() else {
                     return None;
                 };
-                if !frame.mint_candidate {
-                    continue;
-                }
-                if ret.status != EspoSandshrewLikeTraceStatus::Success {
-                    continue;
-                }
-                let Some(owner) = frame.owner else {
-                    continue;
-                };
-                let mut returned: Vec<(SchemaAlkaneId, u128)> = ret
-                    .response
-                    .alkanes
-                    .iter()
-                    .filter_map(|t| {
-                        let id = parse_short_id(&t.id)?;
-                        let value = parse_u128_from_str(&t.value)?;
-                        if value == 0 {
-                            return None;
-                        }
-                        Some((id, value))
-                    })
-                    .collect();
-                if !frame.incoming.is_empty() && !returned.is_empty() {
-                    for (inc_id, inc_value) in &frame.incoming {
-                        if let Some(pos) = returned
+                let mut frame_mints = frame.nested_mints;
+                if frame.mint_candidate && ret.status == EspoSandshrewLikeTraceStatus::Success {
+                    if let Some(owner) = frame.owner {
+                        let mut returned: Vec<(SchemaAlkaneId, u128)> = ret
+                            .response
+                            .alkanes
                             .iter()
-                            .position(|(id, value)| id == inc_id && value == inc_value)
-                        {
-                            returned.remove(pos);
+                            .filter_map(|t| {
+                                let id = parse_short_id(&t.id)?;
+                                let value = parse_u128_from_str(&t.value)?;
+                                if value == 0 {
+                                    return None;
+                                }
+                                Some((id, value))
+                            })
+                            .collect();
+                        if !frame.incoming.is_empty() && !returned.is_empty() {
+                            for (inc_id, inc_value) in &frame.incoming {
+                                if let Some(pos) = returned
+                                    .iter()
+                                    .position(|(id, value)| id == inc_id && value == inc_value)
+                                {
+                                    returned.remove(pos);
+                                }
+                            }
+                        }
+                        if let Some((_, value)) = returned.iter().find(|(id, _)| *id == owner) {
+                            let nested = frame_mints.get(&owner).copied().unwrap_or(0);
+                            let delta = value.saturating_sub(nested);
+                            if delta > 0 {
+                                *deltas.entry(owner).or_default() =
+                                    deltas.get(&owner).copied().unwrap_or(0).saturating_add(delta);
+                                *frame_mints.entry(owner).or_default() = frame_mints
+                                    .get(&owner)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    .saturating_add(delta);
+                            }
                         }
                     }
                 }
-                if let Some((_, value)) = returned.iter().find(|(id, _)| *id == owner) {
-                    *deltas.entry(owner).or_default() =
-                        deltas.get(&owner).copied().unwrap_or(0).saturating_add(*value);
+                if let Some(parent) = stack.last_mut() {
+                    for (alkane, amount) in frame_mints {
+                        *parent.nested_mints.entry(alkane).or_default() = parent
+                            .nested_mints
+                            .get(&alkane)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_add(amount);
+                    }
                 }
             }
             EspoSandshrewLikeTraceEvent::Create(_) => {}

@@ -7,9 +7,9 @@ use crate::modules::essentials::storage::{
     RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams, RpcGetAlkaneBlockTxsParams,
     RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams, RpcGetAlkaneTxSummaryParams,
     RpcGetAllAlkanesParams, RpcGetBlockSummaryParams, RpcGetBlockTracesParams,
-    RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
-    RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams,
-    RpcGetTransferVolumeParams, RpcPingParams,
+    RpcGetCirculatingSupplyParams, RpcGetFactoryChildrenParams, RpcGetHoldersCountParams,
+    RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams,
+    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcPingParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
@@ -164,6 +164,35 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.to_string()),
                         };
                         view.rpc_get_alkane_info(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_factory_children = reg.clone();
+        let mdb_factory_children = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_factory_children
+                .register("get_factory_children", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_factory_children);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetFactoryChildrenParams {
+                            factory: payload
+                                .get("factory")
+                                .or_else(|| payload.get("factory_alkane"))
+                                .or_else(|| payload.get("alkane"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        };
+                        view.rpc_get_factory_children(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }

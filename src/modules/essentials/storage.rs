@@ -469,6 +469,7 @@ pub struct EssentialsTable<'a> {
     pub ALKANE_CREATION_SEQ: KvPointer<'a>,
     pub ALKANE_CREATION_COUNT: KvPointer<'a>,
     pub ALKANE_CREATIONS_IN_BLOCK: KvPointer<'a>,
+    pub ALKANE_FACTORY_CHILDREN: ListPointer<'a>,
     pub CIRCULATING_SUPPLY: KvPointer<'a>,
     pub CIRCULATING_SUPPLY_LATEST: KvPointer<'a>,
     pub TOTAL_MINTED: KvPointer<'a>,
@@ -512,6 +513,7 @@ impl<'a> EssentialsTable<'a> {
             ALKANE_CREATION_SEQ: root.keyword("/alkanes/creation/seq/v1/"),
             ALKANE_CREATION_COUNT: root.keyword("/alkanes/creation/count"),
             ALKANE_CREATIONS_IN_BLOCK: root.keyword("/alkanes/creation/in_block/v2/"),
+            ALKANE_FACTORY_CHILDREN: root.list_keyword("/alkanes/factory_children/v1/"),
             CIRCULATING_SUPPLY: root.keyword("/circulating_supply/v1/"),
             CIRCULATING_SUPPLY_LATEST: root.keyword("/circulating_supply/latest/"),
             TOTAL_MINTED: root.keyword("/total_minted/v1/"),
@@ -1702,6 +1704,28 @@ impl<'a> EssentialsTable<'a> {
         self.ALKANE_CREATIONS_IN_BLOCK.select(&height.to_be_bytes()).key().to_vec()
     }
 
+    pub fn alkane_factory_child_key(
+        &self,
+        factory: &SchemaAlkaneId,
+        child: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1 + 12);
+        suffix.extend_from_slice(&factory.block.to_be_bytes());
+        suffix.extend_from_slice(&factory.tx.to_be_bytes());
+        suffix.push(b'/');
+        suffix.extend_from_slice(&child.block.to_be_bytes());
+        suffix.extend_from_slice(&child.tx.to_be_bytes());
+        self.ALKANE_FACTORY_CHILDREN.select(&suffix).key().to_vec()
+    }
+
+    pub fn alkane_factory_children_prefix(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1);
+        suffix.extend_from_slice(&factory.block.to_be_bytes());
+        suffix.extend_from_slice(&factory.tx.to_be_bytes());
+        suffix.push(b'/');
+        self.ALKANE_FACTORY_CHILDREN.select(&suffix).key().to_vec()
+    }
+
     pub fn alkane_tx_summary_key(&self, txid: &[u8; 32]) -> Vec<u8> {
         self.tx_packed_outflow_pos_point_key(txid)
     }
@@ -2543,6 +2567,45 @@ impl EssentialsProvider {
         Ok(GetCreationIdsInBlockResult { alkanes })
     }
 
+    pub fn get_factory_children(
+        &self,
+        params: GetFactoryChildrenParams,
+    ) -> Result<GetFactoryChildrenResult> {
+        crate::debug_timer_log!("get_factory_children");
+        let table = self.table();
+        let prefix = table.alkane_factory_children_prefix(&params.factory);
+        let children = self.read_factory_children_from_index(&prefix, params.blockhash)?;
+
+        Ok(GetFactoryChildrenResult { children })
+    }
+
+    fn read_factory_children_from_index(
+        &self,
+        prefix: &[u8],
+        blockhash: StateAt,
+    ) -> Result<Vec<SchemaAlkaneId>> {
+        let keys = self
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+                blockhash,
+                prefix: prefix.to_vec(),
+            })
+            .map(|res| res.keys)
+            .unwrap_or_default();
+        let mut children = Vec::new();
+        for key in keys {
+            if key.len() < prefix.len() + 12 {
+                continue;
+            }
+            let Some(child) = decode_alkane_id_be(&key[prefix.len()..]) else {
+                continue;
+            };
+            children.push(child);
+        }
+        children.sort_by(|a, b| a.block.cmp(&b.block).then_with(|| a.tx.cmp(&b.tx)));
+        children.dedup();
+        Ok(children)
+    }
+
     pub fn get_holders_count(
         &self,
         params: GetHoldersCountParams,
@@ -3244,6 +3307,43 @@ impl EssentialsProvider {
                 "symbols": record.symbols,
                 "holder_count": holder_count,
                 "inspection": inspection_json,
+            }),
+        })
+    }
+
+    pub fn rpc_get_factory_children(
+        &self,
+        params: RpcGetFactoryChildrenParams,
+    ) -> Result<RpcGetFactoryChildrenResult> {
+        let Some(factory_raw) = params.factory.as_deref() else {
+            return Ok(RpcGetFactoryChildrenResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_factory",
+                    "hint": "provide factory as \"<block>:<tx>\" (hex ok)"
+                }),
+            });
+        };
+        let Some(factory) = parse_alkane_from_str(factory_raw) else {
+            return Ok(RpcGetFactoryChildrenResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_factory",
+                    "hint": "provide factory as \"<block>:<tx>\" (hex ok)"
+                }),
+            });
+        };
+        let children = self
+            .get_factory_children(GetFactoryChildrenParams { blockhash: StateAt::Latest, factory })?
+            .children;
+        Ok(RpcGetFactoryChildrenResult {
+            value: json!({
+                "ok": true,
+                "factory": format!("{}:{}", factory.block, factory.tx),
+                "children": children
+                    .iter()
+                    .map(|child| format!("{}:{}", child.block, child.tx))
+                    .collect::<Vec<_>>(),
             }),
         })
     }
@@ -5298,6 +5398,16 @@ pub struct GetCreationIdsInBlockResult {
     pub alkanes: Vec<SchemaAlkaneId>,
 }
 
+pub struct GetFactoryChildrenParams {
+    pub blockhash: StateAt,
+
+    pub factory: SchemaAlkaneId,
+}
+
+pub struct GetFactoryChildrenResult {
+    pub children: Vec<SchemaAlkaneId>,
+}
+
 pub struct GetHoldersCountParams {
     pub blockhash: StateAt,
 
@@ -5450,6 +5560,14 @@ pub struct RpcGetAlkaneInfoParams {
 }
 
 pub struct RpcGetAlkaneInfoResult {
+    pub value: Value,
+}
+
+pub struct RpcGetFactoryChildrenParams {
+    pub factory: Option<String>,
+}
+
+pub struct RpcGetFactoryChildrenResult {
     pub value: Value,
 }
 
@@ -7623,6 +7741,37 @@ mod tests {
         // Keep tempdir alive for process lifetime in tests.
         std::mem::forget(dir);
         EssentialsProvider::new(mdb)
+    }
+
+    #[test]
+    fn factory_children_reads_indexed_children_only() {
+        let provider = new_provider_with_tempdb();
+        let table = provider.table();
+        let factory = SchemaAlkaneId { block: 4, tx: 780_993 };
+        let child_a = SchemaAlkaneId { block: 2, tx: 80_663 };
+        let child_b = SchemaAlkaneId { block: 2, tx: 80_664 };
+        let other = SchemaAlkaneId { block: 2, tx: 80_665 };
+
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (table.alkane_factory_child_key(&factory, &child_b), Vec::new()),
+                    (table.alkane_factory_child_key(&factory, &child_a), Vec::new()),
+                    (
+                        table.alkane_factory_child_key(&SchemaAlkaneId { block: 4, tx: 1 }, &other),
+                        Vec::new(),
+                    ),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write factory children");
+
+        let result = provider
+            .get_factory_children(GetFactoryChildrenParams { blockhash: StateAt::Latest, factory })
+            .expect("factory children");
+
+        assert_eq!(result.children, vec![child_a, child_b]);
     }
 
     #[test]

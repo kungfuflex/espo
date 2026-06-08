@@ -1,5 +1,5 @@
 use super::defs::SignedU128;
-use super::lib::accumulate_alkane_balance_deltas;
+use super::lib::{accumulate_alkane_balance_deltas, mint_deltas_from_trace};
 use crate::alkanes::trace::{EspoHostFunctionValues, EspoSandshrewLikeTrace, get_espo_block};
 use crate::config::{AppConfig, MempoolConfig, MiscConfig, init_config_from};
 use crate::core::blockfetcher::BlockFetchMode;
@@ -76,6 +76,77 @@ fn host_function_values_decode_block_909402() {
     assert!(!coinbase.is_empty());
     assert_eq!(diesel.len(), 16);
     assert_eq!(fee.len(), 16);
+}
+
+#[test]
+fn mint_deltas_count_proxy_delegate_mint_once() {
+    let host_values = test_host_function_values();
+    let trace_json = r#"
+{
+  "outpoint": "8cdfdca62e8691bb71ed0aa295a2711d74da03c21cd8966f520b24b570359226:6",
+  "events": [
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x2", "tx": "0x12f37"},
+          "caller": {"block": "0x2", "tx": "0x12f3f"},
+          "inputs": ["0x4d", "0x9ff9abefb"],
+          "incomingAlkanes": [],
+          "vout": 6
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "invoke",
+      "data": {
+        "type": "delegatecall",
+        "context": {
+          "myself": {"block": "0x2", "tx": "0x12f37"},
+          "caller": {"block": "0x2", "tx": "0x12f3f"},
+          "inputs": ["0x4d", "0x9ff9abefb"],
+          "incomingAlkanes": [],
+          "vout": 6
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {
+          "alkanes": [
+            {"id": {"block": "0x2", "tx": "0x12f37"}, "value": "0x9ff9abefb"}
+          ],
+          "data": "0x",
+          "storage": []
+        }
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {
+          "alkanes": [
+            {"id": {"block": "0x2", "tx": "0x12f37"}, "value": "0x9ff9abefb"}
+          ],
+          "data": "0x",
+          "storage": []
+        }
+      }
+    }
+  ]
+}
+"#;
+    let trace: EspoSandshrewLikeTrace = serde_json::from_str(trace_json).expect("parse trace");
+    let token = SchemaAlkaneId { block: 2, tx: 77623 };
+    let deltas = mint_deltas_from_trace(&trace, &host_values).expect("mint deltas");
+
+    assert_eq!(deltas.get(&token).copied(), Some(42_943_037_179));
 }
 
 #[test]

@@ -205,6 +205,7 @@ impl EspoModule for Essentials {
         let mut creation_rows_by_id: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut creation_rows_seq: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut holders_index_rows: HashSet<Vec<u8>> = HashSet::new();
+        let mut factory_child_rows: HashSet<Vec<u8>> = HashSet::new();
         // in-block name/symbol updates detected from storage writes
         let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> = HashMap::new();
         let mut cap_updates: HashMap<SchemaAlkaneId, u128> = HashMap::new();
@@ -665,6 +666,12 @@ impl EspoModule for Essentials {
                         }
                     }
                     if dirty {
+                        if let Some(factory) =
+                            updated.inspection.as_ref().and_then(|i| i.factory_alkane)
+                        {
+                            factory_child_rows
+                                .insert(table.alkane_factory_child_key(&factory, &updated.alkane));
+                        }
                         let encoded_updated = match encode_creation_record(&updated) {
                             Ok(v) => v,
                             Err(e) => {
@@ -689,6 +696,10 @@ impl EspoModule for Essentials {
                     .insert(table.alkane_creation_seq_key(next_creation_seq), alkane_id_bytes);
                 next_creation_seq = next_creation_seq.saturating_add(1);
                 holders_index_rows.insert(table.alkane_holders_ordered_key(0, &rec.alkane));
+                if let Some(factory) = rec.inspection.as_ref().and_then(|i| i.factory_alkane) {
+                    factory_child_rows
+                        .insert(table.alkane_factory_child_key(&factory, &rec.alkane));
+                }
             }
         }
 
@@ -772,6 +783,8 @@ impl EspoModule for Essentials {
         orbital_collection_name_keys.sort_unstable();
         let mut holders_index_keys: Vec<Vec<u8>> = holders_index_rows.into_iter().collect();
         holders_index_keys.sort_unstable();
+        let mut factory_child_keys: Vec<Vec<u8>> = factory_child_rows.into_iter().collect();
+        factory_child_keys.sort_unstable();
         let mut creation_count_row: Option<[u8; 8]> = None;
         if new_creations_added > 0 {
             creation_count_row = Some(next_creation_seq.to_le_bytes());
@@ -812,6 +825,9 @@ impl EspoModule for Essentials {
             }
         }
         for k in &holders_index_keys {
+            puts.push((k.clone(), Vec::new()));
+        }
+        for k in &factory_child_keys {
             puts.push((k.clone(), Vec::new()));
         }
         if let Some(count_bytes) = creation_count_row {
