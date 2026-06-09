@@ -765,6 +765,11 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             only_alkane_txs: payload
                                 .get("only_alkane_txs")
                                 .and_then(|v| v.as_bool()),
+                            filter: payload
+                                .get("filter")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty()),
                         };
                         view.rpc_get_address_transactions(params)
                             .map(|resp| resp.value)

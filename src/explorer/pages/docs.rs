@@ -427,6 +427,28 @@ fn method_notes(method: &MethodDoc) -> Vec<String> {
             "`canonical_quote`/`quote` filters token activity to rows whose counter token is that Alkane id. `min_quote_amount`/`min_amount` is a raw 1e8-scaled token amount, such as `100000` for 0.001 frBTC.",
         );
     }
+    if method.title == "essentials.get_address_transactions" {
+        push_note(
+            &mut notes,
+            "`only_alkane_txs` defaults to true. Set it to false only when you want the full Bitcoin address history instead of the Alkane transaction index.",
+        );
+        push_note(
+            &mut notes,
+            "`filter` accepts an Alkane id such as `2:0` and is valid only when `only_alkane_txs` is true or omitted.",
+        );
+        push_note(
+            &mut notes,
+            "Filtered results match Alkane transactions whose first trace event is an `invoke` where `context.myself` equals the requested Alkane id.",
+        );
+        push_note(
+            &mut notes,
+            "The filter is applied at request time by scanning the existing address Alkane transaction list until the requested page is filled. It does not require a new index.",
+        );
+        push_note(
+            &mut notes,
+            "When `filter` is provided, `total` is `null` because the filtered total is not known without scanning the complete address history. Use `has_more` for pagination.",
+        );
+    }
     if combined.contains("include_outpoints") {
         push_note(
             &mut notes,
@@ -702,9 +724,9 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_address_transactions",
-                    "Returns Bitcoin transactions for an address and can be narrowed to Alkane transactions.",
-                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "only_alkane_txs": true }),
-                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "total": 19, "transactions": [{ "txid": "e212e704173d61d19a280de3af2f6a5166ecf95e9a2a98f74ceeeb3de323ea1c", "blockHeight": 939827, "confirmed": true }] }),
+                    "Returns Bitcoin transactions for an address and can be narrowed to Alkane transactions. When `filter` is provided with `only_alkane_txs`, it scans Alkane transactions until the requested page is filled and returns `total: null`.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "only_alkane_txs": true, "filter": "2:0" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "total": null, "transactions": [{ "txid": "e212e704173d61d19a280de3af2f6a5166ecf95e9a2a98f74ceeeb3de323ea1c", "blockHeight": 939827, "confirmed": true }] }),
                 ),
                 rpc_doc(
                     "essentials.get_alkane_latest_traces",

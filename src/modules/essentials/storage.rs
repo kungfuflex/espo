@@ -4910,6 +4910,30 @@ impl EssentialsProvider {
             .max(1)
             .min(MAX_PAGE_LIMIT as u64) as usize;
         let only_alkane_txs = params.only_alkane_txs.unwrap_or(true);
+        let alkane_filter = if let Some(raw_filter) =
+            params.filter.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            if !only_alkane_txs {
+                return Ok(RpcGetAddressTransactionsResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "filter_requires_only_alkane_txs",
+                    }),
+                });
+            }
+            let Some(alkane) = parse_alkane_from_str(raw_filter) else {
+                return Ok(RpcGetAddressTransactionsResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "invalid_filter",
+                        "detail": "filter must be an alkane id like \"2:0\"",
+                    }),
+                });
+            };
+            Some(alkane)
+        } else {
+            None
+        };
         let network = get_network();
         let page_offset = page.saturating_sub(1).try_into().unwrap_or(usize::MAX);
         let off = limit.saturating_mul(page_offset);
@@ -4932,11 +4956,19 @@ impl EssentialsProvider {
             .filter(|entry| {
                 !only_alkane_txs || entry.traces.as_ref().map_or(false, |t| !t.is_empty())
             })
+            .filter(|entry| {
+                alkane_filter.as_ref().map_or(true, |filter| {
+                    entry.traces.as_ref().map_or(false, |traces| {
+                        espo_traces_first_invoke_matches_filter(traces, filter)
+                    })
+                })
+            })
             .collect();
         let pending_total = pending_filtered.len();
         let pending_slice_start = off.min(pending_total);
         let pending_slice_end = (off + limit).min(pending_total);
         let pending_set: HashSet<Txid> = pending_filtered.iter().map(|entry| entry.txid).collect();
+        let mut filtered_has_more = alkane_filter.is_some() && pending_slice_end < pending_total;
 
         let mut tx_renders: Vec<AddressTxRender> = Vec::new();
         for entry in pending_filtered
@@ -4959,7 +4991,7 @@ impl EssentialsProvider {
             .get_blockchain_info()
             .ok()
             .map(|info| info.blocks as u64);
-        let mut confirmed_total = if only_alkane_txs {
+        let confirmed_index_total = if only_alkane_txs {
             get_address_index_list_len(
                 self,
                 StateAt::Latest,
@@ -4970,10 +5002,101 @@ impl EssentialsProvider {
         } else {
             0
         };
+        let mut confirmed_total = if alkane_filter.is_some() { 0 } else { confirmed_index_total };
 
         if only_alkane_txs {
             let confirmed_offset = off.saturating_sub(pending_total);
-            if remaining_slots > 0 {
+            if let Some(filter) = alkane_filter.as_ref() {
+                let target_matches =
+                    confirmed_offset.saturating_add(remaining_slots).saturating_add(1);
+                if target_matches > 0 && !filtered_has_more {
+                    let scan_chunk = get_address_index_chunk_size().max(256) as u64;
+                    let mut range_end = confirmed_index_total as u64;
+                    let mut matches: Vec<(Txid, AlkaneTxSummary)> = Vec::new();
+
+                    while range_end > 0 && matches.len() < target_matches {
+                        let range_start = range_end.saturating_sub(scan_chunk);
+                        let ids = get_address_index_list_range(
+                            self,
+                            StateAt::Latest,
+                            AddressIndexListKind::AlkaneTxs,
+                            &address,
+                            range_start,
+                            range_end,
+                        )
+                        .unwrap_or_default();
+
+                        for id in ids.into_iter().rev() {
+                            let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
+                                continue;
+                            };
+                            if !sandshrew_traces_first_invoke_matches_filter(&blob.traces, filter) {
+                                continue;
+                            }
+                            let txid = Txid::from_byte_array(blob.txid);
+                            let summary = tx_summary_from_pointer_blob(blob);
+                            matches.push((txid, summary));
+                            if matches.len() >= target_matches {
+                                break;
+                            }
+                        }
+
+                        range_end = range_start;
+                    }
+
+                    let page_match_end = confirmed_offset.saturating_add(remaining_slots);
+                    filtered_has_more = matches.len() > page_match_end;
+                    if remaining_slots > 0 {
+                        let page_matches = matches
+                            .into_iter()
+                            .skip(confirmed_offset)
+                            .take(remaining_slots)
+                            .collect::<Vec<_>>();
+                        let txids: Vec<Txid> =
+                            page_matches.iter().map(|(txid, _summary)| *txid).collect();
+                        if !txids.is_empty() {
+                            let raw_txs =
+                                electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+
+                            for (idx, (txid, summary)) in page_matches.into_iter().enumerate() {
+                                let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                                if raw.is_empty() {
+                                    continue;
+                                }
+                                let tx: Transaction = match deserialize(&raw) {
+                                    Ok(value) => value,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[rpc_get_address_transactions] failed to decode tx {}: {e}",
+                                            txid
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let confirmations = {
+                                    let h = summary.height as u64;
+                                    if h == 0 {
+                                        None
+                                    } else {
+                                        chain_tip.and_then(|tip| {
+                                            if tip >= h { Some(tip - h + 1) } else { None }
+                                        })
+                                    }
+                                };
+                                let traces = traces_from_summary(&txid, &summary);
+                                tx_renders.push(AddressTxRender {
+                                    txid,
+                                    tx,
+                                    traces: (!traces.is_empty()).then_some(traces),
+                                    confirmations,
+                                    is_mempool: false,
+                                    summary: Some(summary),
+                                });
+                            }
+                        }
+                    }
+                }
+            } else if remaining_slots > 0 {
                 let confirmed_slice_start = confirmed_offset.min(confirmed_total);
                 let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
 
@@ -5149,8 +5272,12 @@ impl EssentialsProvider {
                 "address": address,
                 "page": page,
                 "limit": limit,
-                "total": tx_total,
-                "has_more": (off + tx_renders.len()) < tx_total,
+                "total": if alkane_filter.is_some() { Value::Null } else { json!(tx_total) },
+                "has_more": if alkane_filter.is_some() {
+                    filtered_has_more
+                } else {
+                    (off + tx_renders.len()) < tx_total
+                },
                 "transactions": transactions,
             }),
         })
@@ -5754,6 +5881,7 @@ pub struct RpcGetAddressTransactionsParams {
     pub page: Option<u64>,
     pub limit: Option<u64>,
     pub only_alkane_txs: Option<bool>,
+    pub filter: Option<String>,
 }
 
 pub struct RpcGetAddressTransactionsResult {
@@ -7296,15 +7424,24 @@ pub(crate) fn load_tx_summary_v2(
     let mut txid_arr = [0u8; 32];
     txid_arr.copy_from_slice(txid.as_byte_array());
     let packed = load_tx_packed_outflow_v2(provider, txid)?;
-    let mut outflows = Vec::with_capacity(packed.outflows.len());
-    for (_owner, outflow_map) in packed.outflows {
-        outflows.push(AlkaneBalanceTxEntry {
-            txid: txid_arr,
-            height: packed.height,
-            outflow: outflow_map,
-        });
+    Some(tx_summary_from_parts(txid_arr, packed.height, packed.traces, packed.outflows))
+}
+
+fn tx_summary_from_pointer_blob(blob: TxPointerBlobV3) -> AlkaneTxSummary {
+    tx_summary_from_parts(blob.txid, blob.height, blob.traces, blob.outflows)
+}
+
+fn tx_summary_from_parts(
+    txid: [u8; 32],
+    height: u32,
+    traces: Vec<EspoSandshrewLikeTrace>,
+    outflows_by_owner: BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+) -> AlkaneTxSummary {
+    let mut outflows = Vec::with_capacity(outflows_by_owner.len());
+    for (_owner, outflow_map) in outflows_by_owner {
+        outflows.push(AlkaneBalanceTxEntry { txid, height, outflow: outflow_map });
     }
-    Some(AlkaneTxSummary { txid: txid_arr, traces: packed.traces, outflows, height: packed.height })
+    AlkaneTxSummary { txid, traces, outflows, height }
 }
 
 fn mem_entry_to_json(entry: &MempoolEntry) -> Value {
@@ -7545,6 +7682,51 @@ fn traces_from_summary(txid: &Txid, summary: &AlkaneTxSummary) -> Vec<EspoTrace>
         .iter()
         .filter_map(|trace| sandshrew_to_espo_trace(txid, trace))
         .collect()
+}
+
+fn sandshrew_traces_first_invoke_matches_filter(
+    traces: &[EspoSandshrewLikeTrace],
+    filter: &SchemaAlkaneId,
+) -> bool {
+    let Some(trace) = traces.first() else {
+        return false;
+    };
+    trace_first_invoke_matches_filter(&trace.events, filter)
+}
+
+fn espo_traces_first_invoke_matches_filter(traces: &[EspoTrace], filter: &SchemaAlkaneId) -> bool {
+    let Some(trace) = traces.first() else {
+        return false;
+    };
+    trace_first_invoke_matches_filter(&trace.sandshrew_trace.events, filter)
+}
+
+fn trace_first_invoke_matches_filter(
+    events: &[EspoSandshrewLikeTraceEvent],
+    filter: &SchemaAlkaneId,
+) -> bool {
+    let Some(EspoSandshrewLikeTraceEvent::Invoke(invoke)) = events.first() else {
+        return false;
+    };
+    parse_trace_id_u32(&invoke.context.myself.block) == Some(filter.block)
+        && parse_trace_id_u64(&invoke.context.myself.tx) == Some(filter.tx)
+}
+
+fn parse_trace_id_u32(s: &str) -> Option<u32> {
+    parse_trace_id_u128(s)?.try_into().ok()
+}
+
+fn parse_trace_id_u64(s: &str) -> Option<u64> {
+    parse_trace_id_u128(s)?.try_into().ok()
+}
+
+fn parse_trace_id_u128(s: &str) -> Option<u128> {
+    let s = s.trim();
+    if let Some(x) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u128::from_str_radix(x, 16).ok()
+    } else {
+        s.parse::<u128>().ok()
+    }
 }
 
 fn sandshrew_to_espo_trace(txid: &Txid, trace: &EspoSandshrewLikeTrace) -> Option<EspoTrace> {
