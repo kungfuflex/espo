@@ -1,6 +1,6 @@
 use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
-    EspoSandshrewLikeTraceStatus,
+    EspoSandshrewLikeTraceStatus, EspoTrace,
 };
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::runtime::state_at::StateAt;
@@ -179,6 +179,22 @@ pub struct AlkaneCreationRecord {
     pub mint_amount: u128,
 }
 
+pub fn trace_succeeded(trace: &EspoTrace) -> bool {
+    trace
+        .sandshrew_trace
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            if let EspoSandshrewLikeTraceEvent::Return(data) = event {
+                Some(!matches!(data.status, EspoSandshrewLikeTraceStatus::Failure))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(true)
+}
+
 pub fn created_alkane_records_from_block(block: &EspoBlock) -> Vec<AlkaneCreationRecord> {
     let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
     let mut out: Vec<AlkaneCreationRecord> = Vec::new();
@@ -188,12 +204,7 @@ pub fn created_alkane_records_from_block(block: &EspoBlock) -> Vec<AlkaneCreatio
         let mut txid = tx.transaction.compute_txid().to_byte_array();
         txid.reverse(); // store txid in standard BE display order
         for trace in traces {
-            let reverted = trace
-                .sandshrew_trace
-                .events
-                .iter()
-                .any(|ev| matches!(ev, EspoSandshrewLikeTraceEvent::Return(r) if matches!(r.status, EspoSandshrewLikeTraceStatus::Failure)));
-            if reverted {
+            if !trace_succeeded(trace) {
                 continue;
             }
             for ev in trace.sandshrew_trace.events.iter() {
@@ -261,6 +272,72 @@ pub fn inspection_to_json(record: &StoredInspectionResult) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alkanes::trace::{
+        EspoAlkanesTransaction, EspoBlock, EspoSandshrewLikeTrace,
+        EspoSandshrewLikeTraceReturnData, EspoSandshrewLikeTraceReturnResponse,
+        EspoSandshrewLikeTraceStatus, EspoTrace,
+    };
+    use crate::schemas::EspoOutpoint;
+    use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+    use bitcoin::block::Header;
+    use bitcoin::blockdata::constants::genesis_block;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{
+        Amount, Network, ScriptBuf, Transaction, TxOut, locktime::absolute, transaction,
+    };
+    use std::collections::HashMap;
+
+    fn test_tx(value: u64) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut { value: Amount::from_sat(value), script_pubkey: ScriptBuf::new() }],
+        }
+    }
+
+    fn short_id(block: &str, tx: &str) -> EspoSandshrewLikeTraceShortId {
+        EspoSandshrewLikeTraceShortId { block: block.to_string(), tx: tx.to_string() }
+    }
+
+    fn return_event(status: EspoSandshrewLikeTraceStatus) -> EspoSandshrewLikeTraceEvent {
+        EspoSandshrewLikeTraceEvent::Return(EspoSandshrewLikeTraceReturnData {
+            status,
+            response: EspoSandshrewLikeTraceReturnResponse {
+                alkanes: vec![],
+                data: "0x".to_string(),
+                storage: vec![],
+            },
+        })
+    }
+
+    fn create_trace(outpoint: String, status: EspoSandshrewLikeTraceStatus) -> EspoTrace {
+        EspoTrace {
+            sandshrew_trace: EspoSandshrewLikeTrace {
+                outpoint,
+                events: vec![
+                    EspoSandshrewLikeTraceEvent::Create(short_id("0x2", "0x13e67")),
+                    return_event(status),
+                ],
+            },
+            protobuf_trace: AlkanesTrace::default(),
+            storage_changes: HashMap::new(),
+            outpoint: EspoOutpoint::default(),
+        }
+    }
+
+    fn test_block(transactions: Vec<EspoAlkanesTransaction>) -> EspoBlock {
+        let header: Header = genesis_block(Network::Bitcoin).header;
+        EspoBlock {
+            is_latest: true,
+            height: 953133,
+            block_header: header,
+            host_function_values: (vec![], vec![], vec![], vec![]),
+            fee_summary: None,
+            tx_count: transactions.len(),
+            transactions,
+        }
+    }
 
     #[test]
     fn inspection_round_trip() {
@@ -294,5 +371,36 @@ mod tests {
         let parsed = parse_short_id(&short).expect("parsed");
         assert_eq!(parsed.block, 2);
         assert_eq!(parsed.tx, 16);
+    }
+
+    #[test]
+    fn duplicate_create_skips_failed_trace_and_keeps_successful_later_create() {
+        let tx1 = test_tx(1);
+        let tx2 = test_tx(2);
+        let mut txid2 = tx2.compute_txid().to_byte_array();
+        txid2.reverse();
+        let block = test_block(vec![
+            EspoAlkanesTransaction {
+                traces: Some(vec![create_trace(
+                    "first:0".to_string(),
+                    EspoSandshrewLikeTraceStatus::Failure,
+                )]),
+                transaction: tx1,
+            },
+            EspoAlkanesTransaction {
+                traces: Some(vec![create_trace(
+                    "second:0".to_string(),
+                    EspoSandshrewLikeTraceStatus::Success,
+                )]),
+                transaction: tx2,
+            },
+        ]);
+
+        let records = created_alkane_records_from_block(&block);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].alkane, SchemaAlkaneId { block: 2, tx: 81511 });
+        assert_eq!(records[0].txid, txid2);
+        assert_eq!(records[0].tx_index_in_block, 1);
     }
 }

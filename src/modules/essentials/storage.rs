@@ -32,7 +32,8 @@ use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
+    MempoolBlockTx, MempoolEntry, get_mempool_index_transactions_ordered_by_block_and_fee,
+    get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
 };
 use crate::utils::electrum_like::{AddressHistoryEntry, AddressUtxo, ElectrumLikeBackend};
 pub use crate::utils::fee_rates::{BlockFeeRateSummary, compute_block_fee_rate_summary};
@@ -2982,60 +2983,30 @@ impl EssentialsProvider {
         let page = params.page.unwrap_or(1).max(1) as usize;
         let limit = params.limit.unwrap_or(100).max(1) as usize;
         let address = params.address.as_deref().and_then(normalize_address);
+        let min_fee_paid = params.fee_paid.filter(|value| value.is_finite() && *value >= 0.0);
 
-        let mut items: Vec<Value> = Vec::new();
-        let mut total_traces: usize = 0;
-
-        let has_more = if let Some(addr) = address {
-            let pending = self
-                .get_mempool_pending_for_address(GetMempoolPendingForAddressParams {
-                    blockhash: StateAt::Latest,
-                    address: addr.clone(),
-                })
-                .map(|resp| resp.entries)
-                .unwrap_or_default();
-            let pending_len = pending.len();
-            let offset = limit.saturating_mul(page.saturating_sub(1));
-            for (idx, entry) in pending.into_iter().enumerate() {
-                if idx < offset {
-                    continue;
-                }
-                if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
-                    continue;
-                }
-                if items.len() >= limit {
-                    break;
-                }
-                if let Some(t) = entry.traces.as_ref() {
-                    total_traces += t.len();
-                }
-                items.push(mem_entry_to_json(&entry));
-            }
-            pending_len > offset + items.len()
-        } else {
-            let seen_page = self
-                .get_mempool_seen_page(GetMempoolSeenPageParams {
-                    blockhash: StateAt::Latest,
-                    page,
-                    limit,
-                })
-                .unwrap_or(GetMempoolSeenPageResult { txids: Vec::new(), has_more: false });
-            for txid in seen_page.txids {
-                let entry = self
-                    .get_mempool_entry(GetMempoolEntryParams { blockhash: StateAt::Latest, txid })
-                    .ok()
-                    .and_then(|resp| resp.entry);
-                let Some(entry) = entry else { continue };
-                if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
-                    continue;
-                }
-                if let Some(t) = entry.traces.as_ref() {
-                    total_traces += t.len();
-                }
-                items.push(mem_entry_to_json(&entry));
-            }
-            seen_page.has_more
-        };
+        let filtered = get_mempool_index_transactions_ordered_by_block_and_fee()
+            .into_iter()
+            .filter(|entry| entry.traces.as_ref().is_some_and(|traces| !traces.is_empty()))
+            .filter(|entry| {
+                address
+                    .as_ref()
+                    .map_or(true, |addr| entry.addresses.iter().any(|candidate| candidate == addr))
+            })
+            .filter(|entry| min_fee_paid.map_or(true, |fee_paid| entry.fee_rate >= fee_paid))
+            .collect::<Vec<_>>();
+        let total_traces = filtered
+            .iter()
+            .map(|entry| entry.traces.as_ref().map_or(0, Vec::len))
+            .sum::<usize>();
+        let offset = limit.saturating_mul(page.saturating_sub(1));
+        let items = filtered
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(mem_block_tx_to_json)
+            .collect::<Vec<_>>();
+        let has_more = offset.saturating_add(items.len()) < filtered.len();
 
         Ok(RpcGetMempoolTracesResult {
             value: json!({
@@ -3044,6 +3015,7 @@ impl EssentialsProvider {
                 "limit": limit,
                 "has_more": has_more,
                 "total": total_traces,
+                "tx_total": filtered.len(),
                 "items": items,
             }),
         })
@@ -5655,6 +5627,7 @@ pub struct RpcGetMempoolTracesParams {
     pub page: Option<u64>,
     pub limit: Option<u64>,
     pub address: Option<String>,
+    pub fee_paid: Option<f64>,
 }
 
 pub struct RpcGetMempoolTracesResult {
@@ -7444,25 +7417,48 @@ fn tx_summary_from_parts(
     AlkaneTxSummary { txid, traces, outflows, height }
 }
 
-fn mem_entry_to_json(entry: &MempoolEntry) -> Value {
-    let mut traces_json: Vec<Value> = Vec::new();
-    if let Some(traces) = entry.traces.as_ref() {
-        for t in traces {
-            let events_val = prettyify_protobuf_trace_json(&t.protobuf_trace)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .unwrap_or(Value::Null);
-            traces_json.push(json!({
-                "outpoint": format!("{}:{}", entry.txid, t.outpoint.vout),
-                "events": events_val,
-            }));
-        }
-    }
+fn mem_block_tx_to_json(entry: &MempoolBlockTx) -> Value {
+    let traces_json = entry
+        .traces
+        .as_ref()
+        .map(|traces| {
+            traces
+                .iter()
+                .map(|trace| mempool_trace_to_json(&entry.txid, trace))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let protostones = entry.protostones.iter().map(protostone_to_value).collect::<Vec<_>>();
+    let mempool_block = entry.position.as_ref().map(|position| position.block);
+    let mempool_position_vsize = entry.position.as_ref().map(|position| position.vsize);
 
     json!({
         "txid": entry.txid.to_string(),
         "first_seen": entry.first_seen,
+        "mempool_block": mempool_block,
+        "mempool_position_vsize": mempool_position_vsize,
+        "fee_sat": entry.fee_sat,
+        "vsize": entry.vsize,
+        "fee_paid": entry.fee_rate,
+        "fee_rate": entry.fee_rate,
+        "readiness": &entry.readiness,
+        "defer_alkane_trace_status": entry.defer_alkane_trace_status,
+        "has_protostones": !protostones.is_empty(),
+        "hasProtostones": !protostones.is_empty(),
+        "protostone": Value::Array(protostones.clone()),
+        "protostones": Value::Array(protostones),
         "traces": traces_json,
+    })
+}
+
+fn mempool_trace_to_json(txid: &Txid, trace: &EspoTrace) -> Value {
+    let events_val = prettyify_protobuf_trace_json(&trace.protobuf_trace)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(Value::Null);
+    json!({
+        "outpoint": format!("{}:{}", txid, trace.outpoint.vout),
+        "events": events_val,
     })
 }
 

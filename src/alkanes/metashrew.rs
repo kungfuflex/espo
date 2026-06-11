@@ -454,6 +454,7 @@ impl MetashrewAdapter {
         id: SupportAlkaneId,
         seen: &mut HashSet<(u128, u128)>,
         hops: usize,
+        prefer_first_version: bool,
     ) -> Result<Option<(Vec<u8>, SupportAlkaneId)>> {
         const MAX_HOPS: usize = 64;
         if hops > MAX_HOPS {
@@ -464,7 +465,13 @@ impl MetashrewAdapter {
         }
 
         let id_bytes: Vec<u8> = (&id).into();
-        let payload = ptr.select(&id_bytes).get();
+        let id_ptr = ptr.select(&id_bytes);
+        let payload = if prefer_first_version {
+            let len = id_ptr.length();
+            if len > 0 { id_ptr.select_index(0).get() } else { id_ptr.get() }
+        } else {
+            id_ptr.get()
+        };
         if payload.is_empty() {
             return Ok(None);
         }
@@ -472,7 +479,7 @@ impl MetashrewAdapter {
         if payload.len() == 32 {
             let alias = SupportAlkaneId::try_from(payload.as_ref().clone())
                 .map_err(|e| anyhow!("decode alkane alias for ({}, {}): {e}", id.block, id.tx))?;
-            return self.load_wasm_inner(ptr, alias, seen, hops + 1);
+            return self.load_wasm_inner(ptr, alias, seen, hops + 1, prefer_first_version);
         }
 
         let bytes = gz::decompress(payload.as_ref().clone())
@@ -485,11 +492,28 @@ impl MetashrewAdapter {
         db: &SDB,
         alkane: &SchemaAlkaneId,
     ) -> Result<Option<(Vec<u8>, SchemaAlkaneId)>> {
+        self.get_alkane_wasm_bytes_with_db_version(db, alkane, false)
+    }
+
+    pub fn get_alkane_wasm_bytes_with_db_prefer_first_version(
+        &self,
+        db: &SDB,
+        alkane: &SchemaAlkaneId,
+    ) -> Result<Option<(Vec<u8>, SchemaAlkaneId)>> {
+        self.get_alkane_wasm_bytes_with_db_version(db, alkane, true)
+    }
+
+    fn get_alkane_wasm_bytes_with_db_version(
+        &self,
+        db: &SDB,
+        alkane: &SchemaAlkaneId,
+        prefer_first_version: bool,
+    ) -> Result<Option<(Vec<u8>, SchemaAlkaneId)>> {
         let mut seen = HashSet::new();
         let root = self.root_ptr(db);
         let base = root.keyword("/alkanes/");
         let alkane_id = SupportAlkaneId { block: alkane.block as u128, tx: alkane.tx as u128 };
-        let res = self.load_wasm_inner(&base, alkane_id, &mut seen, 0)?;
+        let res = self.load_wasm_inner(&base, alkane_id, &mut seen, 0, prefer_first_version)?;
         if let Some((bytes, sid)) = res {
             let block: u32 = sid
                 .block
@@ -512,6 +536,15 @@ impl MetashrewAdapter {
         let db = get_metashrew_sdb();
         db.catch_up_now().context("metashrew catch_up before wasm fetch")?;
         self.get_alkane_wasm_bytes_with_db(db.as_ref(), alkane)
+    }
+
+    pub fn get_alkane_wasm_bytes_prefer_first_version(
+        &self,
+        alkane: &SchemaAlkaneId,
+    ) -> Result<Option<(Vec<u8>, SchemaAlkaneId)>> {
+        let db = get_metashrew_sdb();
+        db.catch_up_now().context("metashrew catch_up before wasm fetch")?;
+        self.get_alkane_wasm_bytes_with_db_prefer_first_version(db.as_ref(), alkane)
     }
 
     fn get_alkanes_tip_height_with_db(&self, db: &SDB) -> Result<u32> {

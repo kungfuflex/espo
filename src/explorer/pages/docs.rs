@@ -514,18 +514,31 @@ fn docs_modules() -> Vec<ModuleDoc> {
             methods: vec![
                 rpc_doc(
                     "essentials.get_mempool_traces",
-                    "Returns paged Alkane traces currently observed in the mempool, optionally filtered by address.",
-                    json!({ "page": 1, "limit": 10, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    "Returns paged Alkane traces from the in-memory projected mempool index, optionally filtered by address and minimum sats/vbyte paid via fee_paid. Results are ordered by projected mempool block with the next block first, then by fee paid within that block.",
+                    json!({ "page": 1, "limit": 10, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "fee_paid": 2.16 }),
                     json!({
                         "ok": true,
                         "page": 1,
                         "limit": 10,
                         "has_more": false,
                         "total": 1,
+                        "tx_total": 1,
                         "items": [{
                             "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90",
-                            "fee": 1540,
+                            "mempool_block": 0,
+                            "fee_sat": 1540,
+                            "fee_paid": 10.0,
+                            "fee_rate": 10.0,
                             "vsize": 154,
+                            "protostone": [{
+                                "protocol_tag": 1,
+                                "message": "02000000000000000000000000000000",
+                                "edicts": [],
+                                "pointer": null,
+                                "refund": null,
+                                "from": null,
+                                "burn": null
+                            }],
                             "traces": [{
                                 "outpoint": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90:0",
                                 "events": [{ "event": "invoke", "data": { "context": { "myself": { "block": "0x2", "tx": "0x0" } } } }]

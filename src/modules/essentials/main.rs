@@ -14,7 +14,7 @@ use crate::modules::essentials::storage::{
 use crate::modules::essentials::utils::creation_meta::{get_cap, get_value_per_mint};
 use crate::modules::essentials::utils::inspections::{
     AlkaneCreationRecord, StoredInspectionResult, created_alkane_records_from_block,
-    inspect_wasm_metadata,
+    inspect_wasm_metadata, trace_succeeded,
 };
 use crate::modules::essentials::utils::names::{
     get_name as get_alkane_name, normalize_alkane_name,
@@ -65,6 +65,15 @@ fn decode_u128_le_bytes(bytes: &[u8]) -> Option<u128> {
         buf[..bytes.len()].copy_from_slice(bytes);
     }
     Some(u128::from_le_bytes(buf))
+}
+
+fn decode_alkane_id_le_pair(bytes: &[u8]) -> Option<SchemaAlkaneId> {
+    if bytes.len() < 32 {
+        return None;
+    }
+    let block = decode_u128_le_bytes(&bytes[..16])?;
+    let tx = decode_u128_le_bytes(&bytes[16..32])?;
+    Some(SchemaAlkaneId { block: block.try_into().ok()?, tx: tx.try_into().ok()? })
 }
 
 fn is_orbital_instance(inspection: &StoredInspectionResult) -> bool {
@@ -210,6 +219,7 @@ impl EspoModule for Essentials {
         let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> = HashMap::new();
         let mut cap_updates: HashMap<SchemaAlkaneId, u128> = HashMap::new();
         let mut mint_updates: HashMap<SchemaAlkaneId, u128> = HashMap::new();
+        let mut factory_hint_updates: HashMap<SchemaAlkaneId, SchemaAlkaneId> = HashMap::new();
         let mut orbital_index_updates: HashMap<SchemaAlkaneId, u128> = HashMap::new();
         let mut orbital_collection_name_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut orbital_collection_name_cache: HashMap<SchemaAlkaneId, Option<String>> =
@@ -273,20 +283,36 @@ impl EspoModule for Essentials {
         };
 
         let mut total_pairs_dedup = 0usize;
+        let mut seen_created_storage_alkanes: HashSet<SchemaAlkaneId> = HashSet::new();
 
         for tx in block.transactions.iter() {
             let Some(traces) = tx.traces.as_ref() else { continue };
             for trace in traces.iter() {
-                let mut created_in_trace: HashSet<SchemaAlkaneId> = HashSet::new();
+                if !trace_succeeded(trace) {
+                    continue;
+                }
+                let mut first_creations_in_trace: HashSet<SchemaAlkaneId> = HashSet::new();
+                let mut duplicate_creations_in_trace: HashSet<SchemaAlkaneId> = HashSet::new();
                 for ev in trace.sandshrew_trace.events.iter() {
                     if let EspoSandshrewLikeTraceEvent::Create(create) = ev {
                         if let Some(id) = parse_short_id(create) {
-                            created_in_trace.insert(id);
+                            if seen_created_storage_alkanes.insert(id) {
+                                first_creations_in_trace.insert(id);
+                            } else {
+                                duplicate_creations_in_trace.insert(id);
+                            }
                         }
                     }
                 }
 
                 for (alk, kvs) in trace.storage_changes.iter() {
+                    if duplicate_creations_in_trace.contains(alk)
+                        && !first_creations_in_trace.contains(alk)
+                    {
+                        continue;
+                    }
+                    let first_created_in_trace = first_creations_in_trace.contains(alk);
+                    let duplicate_created_in_trace = duplicate_creations_in_trace.contains(alk);
                     for (skey, (txid, value)) in kvs.iter() {
                         // Key for value row
                         let k_v = table.kv_row_key(alk, skey);
@@ -323,13 +349,17 @@ impl EspoModule for Essentials {
                             };
                         if skey.as_slice() == b"/name" {
                             if let Ok(name) = String::from_utf8(value.clone()) {
-                                push_if_new(&mut meta_updates, *alk, Some(name), None);
+                                if !duplicate_created_in_trace {
+                                    push_if_new(&mut meta_updates, *alk, Some(name), None);
+                                }
                             }
                         } else if skey.as_slice() == b"/symbol" {
                             if let Ok(symbol) = String::from_utf8(value.clone()) {
-                                push_if_new(&mut meta_updates, *alk, None, Some(symbol));
+                                if !duplicate_created_in_trace {
+                                    push_if_new(&mut meta_updates, *alk, None, Some(symbol));
+                                }
                             }
-                        } else if created_in_trace.contains(alk) {
+                        } else if first_created_in_trace {
                             if skey.as_slice() == b"/cap" {
                                 if let Some(cap) = decode_u128_le_bytes(value) {
                                     cap_updates.insert(*alk, cap);
@@ -343,6 +373,10 @@ impl EspoModule for Essentials {
                             } else if skey.as_slice() == b"/index" {
                                 if let Some(idx) = decode_u128_le_bytes(value) {
                                     orbital_index_updates.insert(*alk, idx);
+                                }
+                            } else if skey.as_slice() == b"/factory_id" {
+                                if let Some(factory_id) = decode_alkane_id_le_pair(value) {
+                                    factory_hint_updates.insert(*alk, factory_id);
                                 }
                             }
                         }
@@ -427,7 +461,16 @@ impl EspoModule for Essentials {
         let inspect_timer = debug::start_if(debug);
         let metashrew = get_metashrew();
         for rec in created_records.iter_mut() {
-            match metashrew.get_alkane_wasm_bytes(&rec.alkane) {
+            let wasm_result = if let Some(factory_hint) = factory_hint_updates.get(&rec.alkane) {
+                match metashrew.get_alkane_wasm_bytes_prefer_first_version(factory_hint) {
+                    Ok(Some(value)) => Ok(Some(value)),
+                    Ok(None) => metashrew.get_alkane_wasm_bytes_prefer_first_version(&rec.alkane),
+                    Err(_) => metashrew.get_alkane_wasm_bytes_prefer_first_version(&rec.alkane),
+                }
+            } else {
+                metashrew.get_alkane_wasm_bytes_prefer_first_version(&rec.alkane)
+            };
+            match wasm_result {
                 Ok(Some((wasm_bytes, factory_id))) => {
                     let cached = {
                         let cache = self.inspection_cache.read().unwrap();

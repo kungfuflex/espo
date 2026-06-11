@@ -2,7 +2,7 @@ use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
 };
 use crate::config::get_metashrew_rpc_url;
-use crate::modules::essentials::utils::inspections::StoredInspectionResult;
+use crate::modules::essentials::utils::inspections::{StoredInspectionResult, trace_succeeded};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
@@ -78,6 +78,9 @@ fn name_from_creation_trace(block: &EspoBlock, alkane: &SchemaAlkaneId) -> Optio
     for tx in block.transactions.iter() {
         let Some(traces) = tx.traces.as_ref() else { continue };
         for trace in traces.iter() {
+            if !trace_succeeded(trace) {
+                continue;
+            }
             let created = trace.sandshrew_trace.events.iter().any(|ev| {
                 matches!(ev, EspoSandshrewLikeTraceEvent::Create(create) if parse_short_id(create).as_ref() == Some(alkane))
             });
@@ -235,5 +238,98 @@ where
             let rt = Runtime::new().context("failed to build ad-hoc Tokio runtime")?;
             rt.block_on(fut)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alkanes::trace::{
+        AlkaneStorageChanges, EspoAlkanesTransaction, EspoSandshrewLikeTrace,
+        EspoSandshrewLikeTraceReturnData, EspoSandshrewLikeTraceReturnResponse,
+        EspoSandshrewLikeTraceStatus, EspoTrace,
+    };
+    use crate::schemas::EspoOutpoint;
+    use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+    use bitcoin::block::Header;
+    use bitcoin::blockdata::constants::genesis_block;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{Network, Transaction, Txid, transaction};
+    use std::collections::HashMap;
+
+    fn short_id(block: &str, tx: &str) -> EspoSandshrewLikeTraceShortId {
+        EspoSandshrewLikeTraceShortId { block: block.to_string(), tx: tx.to_string() }
+    }
+
+    fn return_event(status: EspoSandshrewLikeTraceStatus) -> EspoSandshrewLikeTraceEvent {
+        EspoSandshrewLikeTraceEvent::Return(EspoSandshrewLikeTraceReturnData {
+            status,
+            response: EspoSandshrewLikeTraceReturnResponse {
+                alkanes: vec![],
+                data: "0x".to_string(),
+                storage: vec![],
+            },
+        })
+    }
+
+    fn creation_trace(
+        alkane: SchemaAlkaneId,
+        status: EspoSandshrewLikeTraceStatus,
+        name: &str,
+    ) -> EspoTrace {
+        let mut kvs = HashMap::new();
+        kvs.insert(b"/name".to_vec(), (Txid::all_zeros(), name.as_bytes().to_vec()));
+        let mut storage_changes = AlkaneStorageChanges::new();
+        storage_changes.insert(alkane, kvs);
+        EspoTrace {
+            sandshrew_trace: EspoSandshrewLikeTrace {
+                outpoint: "test:0".to_string(),
+                events: vec![
+                    EspoSandshrewLikeTraceEvent::Create(short_id(
+                        &format!("0x{:x}", alkane.block),
+                        &format!("0x{:x}", alkane.tx),
+                    )),
+                    return_event(status),
+                ],
+            },
+            protobuf_trace: AlkanesTrace::default(),
+            storage_changes,
+            outpoint: EspoOutpoint::default(),
+        }
+    }
+
+    fn test_block(traces: Vec<EspoTrace>) -> EspoBlock {
+        let header: Header = genesis_block(Network::Bitcoin).header;
+        EspoBlock {
+            is_latest: true,
+            height: 952646,
+            block_header: header,
+            host_function_values: (vec![], vec![], vec![], vec![]),
+            fee_summary: None,
+            tx_count: traces.len(),
+            transactions: traces
+                .into_iter()
+                .map(|trace| EspoAlkanesTransaction {
+                    traces: Some(vec![trace]),
+                    transaction: Transaction {
+                        version: transaction::Version::TWO,
+                        lock_time: LockTime::ZERO,
+                        input: vec![],
+                        output: vec![],
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn name_from_creation_trace_skips_failed_create_trace() {
+        let alkane = SchemaAlkaneId { block: 2, tx: 80663 };
+        let block = test_block(vec![
+            creation_trace(alkane, EspoSandshrewLikeTraceStatus::Failure, "FIRE Bond #1559"),
+            creation_trace(alkane, EspoSandshrewLikeTraceStatus::Success, "FIRE / frBTC LP"),
+        ]);
+
+        assert_eq!(name_from_creation_trace(&block, &alkane).as_deref(), Some("FIRE / frBTC LP"));
     }
 }

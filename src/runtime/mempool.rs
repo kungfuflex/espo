@@ -144,8 +144,11 @@ pub struct MempoolBlockDelta {
 pub struct MempoolBlockTx {
     pub txid: Txid,
     pub tx: Transaction,
+    pub protostones: Vec<Protostone>,
     pub traces: Option<Vec<EspoTrace>>,
     pub rune_io: Option<TxRuneIo>,
+    pub addresses: Vec<String>,
+    pub first_seen: u64,
     pub fee_sat: u64,
     pub vsize: u64,
     pub fee_rate: f64,
@@ -1349,8 +1352,11 @@ pub fn get_mempool_block_detail(
                 Some(MempoolBlockTx {
                     txid: *txid,
                     tx,
+                    protostones: entry.protostones.clone(),
                     traces: combined_traces(entry),
                     rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
@@ -1386,8 +1392,11 @@ pub fn get_mempool_block_ordered_transactions(index: usize) -> Option<Vec<Mempoo
                 Some(MempoolBlockTx {
                     txid: *txid,
                     tx,
+                    protostones: entry.protostones.clone(),
                     traces: combined_traces(entry),
                     rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
@@ -1398,6 +1407,55 @@ pub fn get_mempool_block_ordered_transactions(index: usize) -> Option<Vec<Mempoo
             })
             .collect(),
     )
+}
+
+pub fn get_mempool_index_transactions_ordered_by_block_and_fee() -> Vec<MempoolBlockTx> {
+    let Ok(state) = mempool_state().read() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for template in &state.templates {
+        let ordered: Vec<Txid> = template
+            .transaction_ids
+            .iter()
+            .filter_map(|txid_str| Txid::from_str(txid_str).ok())
+            .collect();
+        let package_rates =
+            package_effective_rates_for_block(&ordered, &state.txs, &HashMap::new());
+        let mut block_txs = ordered
+            .iter()
+            .filter_map(|txid| {
+                let entry = state.txs.get(txid)?;
+                let tx = entry.tx.clone()?;
+                Some(MempoolBlockTx {
+                    txid: *txid,
+                    tx,
+                    protostones: entry.protostones.clone(),
+                    traces: combined_traces(entry),
+                    rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
+                    fee_sat: entry.fee_sat,
+                    vsize: entry.vsize,
+                    fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
+                    position: entry.position.clone(),
+                    readiness: derive_readiness(entry),
+                    defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
+                })
+            })
+            .collect::<Vec<_>>();
+        block_txs.sort_by(|left, right| {
+            right
+                .fee_sat
+                .cmp(&left.fee_sat)
+                .then_with(|| {
+                    right.fee_rate.partial_cmp(&left.fee_rate).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.txid.cmp(&right.txid))
+        });
+        out.extend(block_txs);
+    }
+    out
 }
 
 pub fn get_mempool_block_transactions_for_targets(
@@ -1444,8 +1502,11 @@ pub fn get_mempool_block_transactions_for_targets(
                 Some(MempoolBlockTx {
                     txid: *txid,
                     tx,
+                    protostones: entry.protostones.clone(),
                     traces: combined_traces(entry),
                     rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: entry.fee_rate,
