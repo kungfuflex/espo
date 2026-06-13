@@ -1504,7 +1504,7 @@ pub async fn alkane_page(
                     div class="alkane-hero-text" {
                         div class="alkane-hero-tags" {
                             span class="alkane-tag" { "ALKANE" }
-                            @if phishing_warning.is_some() {
+                            @if phishing_warning.map(|warning| warning.is_scam()).unwrap_or(false) {
                                 span class="alkane-tag scam-tag" { "SCAM" }
                             }
                         }
@@ -1514,28 +1514,43 @@ pub async fn alkane_page(
                 }
 
                 @if let Some(warning) = phishing_warning {
-                    div class="alkane-phishing-warning" role="alert" {
-                        div class="alkane-phishing-warning-head" {
-                            @if is_chinese_page {
-                                span { "钓鱼风险警告" }
-                            } @else {
-                                span { "PHISHING WARNING" }
-                            }
-                        }
-                        @if is_chinese_page {
-                            p lang="zh-Hans" { "该 Alkane 已被标记为钓鱼或诈骗活动。除非你完全理解风险，否则请勿交易、转账或与其交互。" }
-                            @if !warning.note_zh.trim().is_empty() {
-                                p lang="zh-Hans" {
-                                    span class="alkane-phishing-warning-label" { "危险: " }
-                                    (linked_note_text(warning.note_zh))
+                    @let note = if is_chinese_page { warning.note_zh } else { warning.note_en };
+                    @if warning.is_scam() {
+                        div class="alkane-phishing-warning" role="alert" {
+                            div class="alkane-phishing-warning-head" {
+                                @if is_chinese_page {
+                                    span { "钓鱼风险警告" }
+                                } @else {
+                                    span { "PHISHING WARNING" }
                                 }
                             }
-                        } @else {
-                            p { "This alkane has been flagged as phishing or scam activity. Do not trade, transfer, or interact with it unless you fully understand the risk." }
-                            @if !warning.note_en.trim().is_empty() {
+                            @if is_chinese_page {
+                                p lang="zh-Hans" { "该 Alkane 已被标记为钓鱼或诈骗活动。除非你完全理解风险，否则请勿交易、转账或与其交互。" }
+                                @if !note.trim().is_empty() {
+                                    p lang="zh-Hans" {
+                                        span class="alkane-phishing-warning-label" { "危险: " }
+                                        (linked_note_text(note))
+                                    }
+                                }
+                            } @else {
+                                p { "This alkane has been flagged as phishing or scam activity. Do not trade, transfer, or interact with it unless you fully understand the risk." }
+                                @if !note.trim().is_empty() {
+                                    p {
+                                        span class="alkane-phishing-warning-label" { "DANGER: " }
+                                        (linked_note_text(note))
+                                    }
+                                }
+                            }
+                        }
+                    } @else if !note.trim().is_empty() {
+                        div class="alkane-phishing-warning reduced" role="note" {
+                            @if is_chinese_page {
+                                p lang="zh-Hans" {
+                                    (linked_note_text(note))
+                                }
+                            } @else {
                                 p {
-                                    span class="alkane-phishing-warning-label" { "DANGER: " }
-                                    (linked_note_text(warning.note_en))
+                                    (linked_note_text(note))
                                 }
                             }
                         }

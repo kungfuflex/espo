@@ -2472,6 +2472,8 @@ a:hover {
     var(--panel);
   color: #fff;
   box-shadow: none;
+  min-width: 0;
+  overflow: hidden;
 }
 .alkane-phishing-warning-head {
   display: flex;
@@ -2500,10 +2502,21 @@ a:hover {
   color: #ffe3e3;
   font-size: 15px;
   line-height: 1.5;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .alkane-phishing-warning-label {
   color: #fff;
   font-weight: 800;
+}
+.alkane-phishing-warning.reduced {
+  background:
+    linear-gradient(90deg, rgba(255, 193, 7, 0.2), rgba(255, 193, 7, 0.08)),
+    var(--panel);
+}
+.alkane-phishing-warning.reduced p {
+  color: #fff0bd;
 }
 .alkane-hero-title {
   margin: 0;
