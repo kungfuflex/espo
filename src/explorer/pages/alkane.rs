@@ -1516,7 +1516,6 @@ pub async fn alkane_page(
                 @if let Some(warning) = phishing_warning {
                     div class="alkane-phishing-warning" role="alert" {
                         div class="alkane-phishing-warning-head" {
-                            span class="alkane-phishing-warning-badge" { "SCAM" }
                             @if is_chinese_page {
                                 span { "钓鱼风险警告" }
                             } @else {
