@@ -24,6 +24,7 @@ use crate::explorer::components::tx_view::{
 use crate::explorer::pages::common::{fmt_alkane_amount, format_integer};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{current_language, explorer_path};
+use crate::explorer::phishing::{is_phishing_alkane, phishing_warning_for};
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, FRBTC_ALKANE_ID, PRICE_SCALE, SATS_PER_BTC};
 use crate::modules::ammdata::schemas::{SchemaTokenMetricsV1, Timeframe};
@@ -720,7 +721,8 @@ pub async fn alkane_page(
     let activity_order = ActivityOrder::from_query(q.order.as_deref());
     let activity_dir = ActivityDir::from_query(q.dir.as_deref());
     let activity_filter = ActivityFilter::from_query(q.filter.as_deref());
-    let all_range_label = if current_language().is_chinese() { "全部" } else { "All" };
+    let is_chinese_page = current_language().is_chinese();
+    let all_range_label = if is_chinese_page { "全部" } else { "All" };
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let alk_str = format!("{}:{}", alk.block, alk.tx);
@@ -936,6 +938,7 @@ pub async fn alkane_page(
     let chart_hidden = if tv_iframe_src.is_some() { "0" } else { "1" };
     let market_has_summary = if market_summary.is_some() { "1" } else { "0" };
     let buy_url = alkane_buy_url(&alk_str);
+    let phishing_warning = phishing_warning_for(&alk);
 
     let inspection = creation_record.as_ref().and_then(|r| r.inspection.as_ref());
     let mut inspect_source = inspection.cloned();
@@ -1004,6 +1007,7 @@ pub async fn alkane_page(
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(h.amount)) }
                         a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk_str}"))) { (coin_label.clone()) }
+                        (scam_tag_for(&alk))
                     }
                 },
                 html! {
@@ -1108,6 +1112,7 @@ pub async fn alkane_page(
                         }
                         span class="alk-amt mono" { (fmt_activity_amount(entry.amount)) }
                         a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk_str}"))) { (coin_label.clone()) }
+                        (scam_tag_for(&alk))
                     }
                 },
             ]
@@ -1353,6 +1358,7 @@ pub async fn alkane_page(
                 html! {
                     div class="alkane-token-activity-pool" {
                         a class="link" href=(explorer_path(&format!("/alkane/{pool_id}"))) { (pool_label) }
+                        (scam_tag_for(&pool))
                     }
                 }
             } else {
@@ -1428,10 +1434,12 @@ pub async fn alkane_page(
                             }
                             span class="alk-amt mono" { (fmt_signed_alkane_amount(entry.token_delta)) }
                             a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk_str}"))) { (coin_label.clone()) }
+                            (scam_tag_for(&alk))
                         }
                         @if let Some(price_paid_usd) = entry.mint_price_paid_usd.as_ref() {
                             div class="alkane-token-activity-flow-line neutral" {
                                 span class="alkane-token-activity-price-paid" { "Price paid: $" (price_paid_usd) " / " (coin_label.clone()) }
+                                (scam_tag_for(&alk))
                             }
                         }
                         @if let Some((counter_token, counter_delta)) = entry.counter {
@@ -1457,6 +1465,7 @@ pub async fn alkane_page(
                                 }
                                 span class="alk-amt mono" { (fmt_signed_alkane_amount(counter_delta)) }
                                 a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{counter_id}"))) { (counter_label) }
+                                (scam_tag_for(&counter_token))
                             }
                         }
                     }
@@ -1493,9 +1502,44 @@ pub async fn alkane_page(
                         span class="alk-icon-letter" { (fallback_letter) }
                     }
                     div class="alkane-hero-text" {
-                        span class="alkane-tag" { "ALKANE" }
+                        div class="alkane-hero-tags" {
+                            span class="alkane-tag" { "ALKANE" }
+                            @if phishing_warning.is_some() {
+                                span class="alkane-tag scam-tag" { "SCAM" }
+                            }
+                        }
                         h1 class="alkane-hero-title" { (display_name.clone()) }
                         span class="alkane-hero-id mono" { (alk_str.clone()) }
+                    }
+                }
+
+                @if let Some(warning) = phishing_warning {
+                    div class="alkane-phishing-warning" role="alert" {
+                        div class="alkane-phishing-warning-head" {
+                            span class="alkane-phishing-warning-badge" { "SCAM" }
+                            @if is_chinese_page {
+                                span { "钓鱼风险警告" }
+                            } @else {
+                                span { "PHISHING WARNING" }
+                            }
+                        }
+                        @if is_chinese_page {
+                            p lang="zh-Hans" { "该 Alkane 已被标记为钓鱼或诈骗活动。除非你完全理解风险，否则请勿交易、转账或与其交互。" }
+                            @if !warning.note_zh.trim().is_empty() {
+                                p lang="zh-Hans" {
+                                    span class="alkane-phishing-warning-label" { "危险: " }
+                                    (linked_note_text(warning.note_zh))
+                                }
+                            }
+                        } @else {
+                            p { "This alkane has been flagged as phishing or scam activity. Do not trade, transfer, or interact with it unless you fully understand the risk." }
+                            @if !warning.note_en.trim().is_empty() {
+                                p {
+                                    span class="alkane-phishing-warning-label" { "DANGER: " }
+                                    (linked_note_text(warning.note_en))
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1533,6 +1577,7 @@ pub async fn alkane_page(
                                     span class="alkane-stat-label" { "Symbol" }
                                     div class="alkane-stat-line" {
                                         span class="alkane-stat-value" { (meta.symbol.clone()) }
+                                        (scam_tag_for(&alk))
                                     }
                                 }
                                 div class="alkane-stat" {
@@ -2011,6 +2056,72 @@ fn addr_prefix_suffix(addr: &str) -> (String, String) {
     let prefix = addr[..split_at].to_string();
     let suffix = addr[split_at..].to_string();
     (prefix, suffix)
+}
+
+fn scam_tag_for(alk: &SchemaAlkaneId) -> Markup {
+    if is_phishing_alkane(alk) {
+        html! { span class="tag scam-tag" { "SCAM" } }
+    } else {
+        html! {}
+    }
+}
+
+fn next_url_start(text: &str) -> Option<usize> {
+    match (text.find("https://"), text.find("http://")) {
+        (Some(https), Some(http)) => Some(https.min(http)),
+        (Some(https), None) => Some(https),
+        (None, Some(http)) => Some(http),
+        (None, None) => None,
+    }
+}
+
+fn url_token_end(text: &str, start: usize) -> usize {
+    text[start..]
+        .char_indices()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(start + idx))
+        .unwrap_or(text.len())
+}
+
+fn linked_note_text(note: &str) -> Markup {
+    let mut parts: Vec<Markup> = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(start_rel) = next_url_start(&note[cursor..]) {
+        let start = cursor + start_rel;
+        if cursor < start {
+            parts.push(html! { (&note[cursor..start]) });
+        }
+
+        let token_end = url_token_end(note, start);
+        let token = &note[start..token_end];
+        let url = token.trim_end_matches(|c| {
+            matches!(c, '.' | ',' | ';' | '!' | ')' | ']' | '。' | '，' | '）' | '】')
+        });
+        let trailing = &note[start + url.len()..token_end];
+
+        if url != "https://" && url != "http://" {
+            parts.push(html! {
+                a class="link" href=(url) target="_blank" rel="noopener noreferrer" { (url) }
+            });
+            if !trailing.is_empty() {
+                parts.push(html! { (trailing) });
+            }
+        } else {
+            parts.push(html! { (token) });
+        }
+
+        cursor = token_end;
+    }
+
+    if cursor < note.len() {
+        parts.push(html! { (&note[cursor..]) });
+    }
+
+    html! {
+        @for part in parts {
+            (part)
+        }
+    }
 }
 
 fn url_escape_component(raw: &str) -> String {

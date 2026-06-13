@@ -1822,16 +1822,22 @@ a:hover {
   align-items: center;
   gap: 6px;
   justify-content: flex-end;
+  border: none;
+  box-shadow: none;
+  font-weight: 700;
 }
 .alkane-token-activity-flow-line.neutral {
   color: var(--muted);
 }
 .alkane-token-activity-flow-line.neutral .alkane-token-activity-price-paid {
   color: var(--muted3);
-  font-weight: 600;
+  font-weight: 700;
 }
 .alkane-token-activity-card td:nth-child(4) .alk-line {
   justify-content: flex-end;
+  border: none;
+  box-shadow: none;
+  font-weight: 700;
 }
 
 .io-amount {
@@ -2416,6 +2422,12 @@ a:hover {
   min-width: 0;
   max-width: 100%;
 }
+.alkane-hero-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
 .alkane-tag {
   display: inline-flex;
   align-items: center;
@@ -2429,6 +2441,69 @@ a:hover {
   font-size: 13px;
   text-transform: uppercase;
   width: fit-content;
+}
+.alkane-tag.scam-tag,
+.tag.scam-tag {
+  background: rgba(255, 65, 65, 0.18);
+  color: #ff6b6b;
+  border: none;
+  box-shadow: none;
+}
+.tag.scam-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  line-height: 1;
+}
+.alkane-phishing-warning {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+  border-radius: 8px;
+  border: none;
+  background:
+    linear-gradient(90deg, rgba(255, 65, 65, 0.22), rgba(255, 65, 65, 0.08)),
+    var(--panel);
+  color: #fff;
+  box-shadow: none;
+}
+.alkane-phishing-warning-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: #ff7a7a;
+  font-size: 20px;
+  font-weight: 900;
+  letter-spacing: 0.4px;
+}
+.alkane-phishing-warning-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 0.6px;
+}
+.alkane-phishing-warning p {
+  margin: 0;
+  color: #ffe3e3;
+  font-size: 15px;
+  line-height: 1.5;
+}
+.alkane-phishing-warning-label {
+  color: #fff;
+  font-weight: 800;
 }
 .alkane-hero-title {
   margin: 0;
@@ -3195,6 +3270,9 @@ a.alkane-method-btn:hover {
   padding: 2px 0;
   min-width: 0;
   width: 100%;
+  border: none;
+  box-shadow: none;
+  font-weight: 700;
 }
 .alk-arrow .icon {
   width: 16px;
@@ -3209,7 +3287,7 @@ a.alkane-method-btn:hover {
 }
 .alk-amt {
   color: #fff;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 0.1px;
   flex: 0 0 auto;
 }
@@ -3221,7 +3299,7 @@ a.alkane-method-btn:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--muted3);
-  font-weight: 600;
+  font-weight: 700;
   text-transform: uppercase;
 }
 .alk-holding-pct {

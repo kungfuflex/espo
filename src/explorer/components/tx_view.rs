@@ -21,6 +21,7 @@ use crate::explorer::pages::common::{
     fmt_alkane_amount, fmt_amount, fmt_scaled_amount, format_fee_rate,
 };
 use crate::explorer::paths::explorer_path;
+use crate::explorer::phishing::is_phishing_alkane;
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider, load_creation_record};
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, project_tx_output_balances_from_traces,
@@ -1391,6 +1392,9 @@ fn balances_list(
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(be.amount)) }
                         a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk}"))) { (meta.name.value.clone()) }
+                        @if is_phishing_alkane(&be.alkane) {
+                            span class="tag scam-tag" { "SCAM" }
+                        }
                     }
                 };
                 (inner)
