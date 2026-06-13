@@ -31,8 +31,8 @@ impl PhishingAlkaneWarning {
 pub const PHISHING_ALKANE_WARNINGS: &[PhishingAlkaneWarning] = &[PhishingAlkaneWarning {
     id: SchemaAlkaneId { block: 4, tx: 31425 },
     kind: AlkaneWarningKind::Notice,
-    note_en: "This Alkane should not be confused with pizza.fun's unreleased token and is in no way related to pizza.fun. Please see the official stance on this here: https://x.com/mork1e/status/2065242600521519246?s=20",
-    note_zh: "请勿将该 Alkane 与 pizza.fun 尚未发布的代币混淆；它与 pizza.fun 没有任何关系。请在此查看官方立场：https://x.com/mork1e/status/2065242600521519246?s=20",
+    note_en: "This alkane should not be confused with pizza.fun's unreleased token and is in no way related to pizza.fun. Please see the official stance on this here: https://x.com/mork1e/status/2065242600521519246?s=20",
+    note_zh: "请勿将该 alkane 与 pizza.fun 尚未发布的代币混淆；它与 pizza.fun 没有任何关系。请在此查看官方立场：https://x.com/mork1e/status/2065242600521519246?s=20",
 }];
 
 pub fn phishing_warning_for(id: &SchemaAlkaneId) -> Option<&'static PhishingAlkaneWarning> {
