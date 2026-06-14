@@ -589,6 +589,12 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     json!({ "ok": true, "alkane": "2:0", "page": 1, "limit": 1, "total": 6409, "items": [{ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "amount": "30950001348973" }] }),
                 ),
                 rpc_doc(
+                    "essentials.get_orbital_holders",
+                    "Returns holders for an orbital factory, counting each child Alkane held as one unit.",
+                    json!({ "factory": "4:780993", "page": 1, "limit": 1 }),
+                    json!({ "ok": true, "factory": "4:780993", "page": 1, "limit": 1, "total": 249, "items": [{ "type": "address", "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "amount": "3" }] }),
+                ),
+                rpc_doc(
                     "essentials.get_transfer_volume",
                     "Ranks addresses by cumulative transfer volume for an Alkane.",
                     json!({ "alkane": "2:0", "page": 1, "limit": 1 }),
@@ -611,6 +617,42 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     "Returns Alkane activity detected for a Bitcoin address.",
                     json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
                     json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "total_received": { "2:0": "357260014838703" }, "transfer_volume": { "2:0": "357810014838703" } }),
+                ),
+                rpc_doc(
+                    "essentials.address_cumulative_send_alkanes",
+                    "Returns cumulative address sends attributed to source Alkanes and tokens.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "kind": "send", "items": [{ "source_alkane": "2:0", "alkane": "2:0", "amount": "715000000" }] }),
+                ),
+                rpc_doc(
+                    "essentials.address_cumulative_receive_alkanes",
+                    "Returns cumulative address receives attributed to source Alkanes and tokens.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "kind": "receive", "items": [{ "source_alkane": "2:0", "alkane": "2:0", "amount": "312500000" }] }),
+                ),
+                rpc_doc(
+                    "essentials.address_cumulative_send_orbitals",
+                    "Returns cumulative address sends attributed to factory orbitals and tokens.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "kind": "send", "items": [{ "orbital": "2:0", "alkane": "4:3", "amount": "1" }] }),
+                ),
+                rpc_doc(
+                    "essentials.address_cumulative_receive_orbitals",
+                    "Returns cumulative address receives attributed to factory orbitals and tokens.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "kind": "receive", "items": [{ "orbital": "2:0", "alkane": "4:3", "amount": "1" }] }),
+                ),
+                rpc_doc(
+                    "essentials.get_orbital_send_volumes",
+                    "Ranks addresses by cumulative send volume attributed to an orbital.",
+                    json!({ "factory": "4:780993", "page": 1, "limit": 1 }),
+                    json!({ "ok": true, "factory": "4:780993", "kind": "send", "page": 1, "limit": 1, "total": 249, "items": [{ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "amount": "12" }] }),
+                ),
+                rpc_doc(
+                    "essentials.get_orbital_receive_volumes",
+                    "Ranks addresses by cumulative receive volume attributed to an orbital.",
+                    json!({ "factory": "4:780993", "page": 1, "limit": 1 }),
+                    json!({ "ok": true, "factory": "4:780993", "kind": "receive", "page": 1, "limit": 1, "total": 249, "items": [{ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "amount": "12" }] }),
                 ),
                 rpc_doc(
                     "essentials.get_address_balances",

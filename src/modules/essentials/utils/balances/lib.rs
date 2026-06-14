@@ -16,21 +16,22 @@ use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
-    AddressActivityEntry, AddressAmountEntry, AddressIndexListKind, AlkaneBalanceTxEntry,
-    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId, HoldersCountEntry,
+    AddressActivityEntry, AddressAmountEntry, AddressContractAmountEntry, AddressIndexListKind,
+    AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId, HoldersCountEntry,
     address_index_list_id_alkane_balance_txs_by_token, address_index_list_id_alkane_block_txs,
     append_address_index_values, build_new_outpoint_pos_versioned_puts,
     build_new_outpoint_spent_versioned_puts, build_new_tx_pos_versioned_puts,
-    build_outpoint_spent_versioned_puts, decode_balances_vec, decode_outpoint_pointer_blob_v3,
-    decode_pointer_idx_u64, decode_u128_value, encode_outpoint_pointer_blob_v3,
+    build_outpoint_spent_versioned_puts, decode_address_contract_amount_entries,
+    decode_balances_vec, decode_outpoint_pointer_blob_v3, decode_pointer_idx_u64,
+    decode_u128_value, encode_address_contract_amount_entries, encode_outpoint_pointer_blob_v3,
     encode_pointer_idx_u64, encode_tx_pointer_blob_v3, encode_u128_value, encode_vec,
     get_holders_count_encoded, mk_outpoint, resolve_outpoint_id_v2, resolve_outpoint_ids_batch_v2,
     resolve_outpoint_spent_by_id_v2, resolve_outpoint_spent_by_ids_batch_v2,
     resolve_tx_pointer_ids_batch_v2, spk_to_address_str,
 };
 use crate::modules::essentials::storage::{
-    EssentialsProvider, GetListEntriesDescParams, GetMultiValuesParams, GetRawValueParams,
-    SetBatchParams,
+    EssentialsProvider, EssentialsTable, GetCreationRecordParams, GetListEntriesDescParams,
+    GetMultiValuesParams, GetRawValueParams, SetBatchParams,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::state_at::StateAt;
@@ -42,7 +43,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Transaction, Txid};
 use borsh::BorshDeserialize;
 use protorune_support::protostone::{Protostone, ProtostoneEdict};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -66,6 +67,30 @@ pub(crate) struct ContractProjection {
 
 pub(crate) trait MempoolContractProjector {
     fn project(&mut self, ctx: ContractProjectionContext<'_>) -> Option<ContractProjection>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum AttributionSource {
+    Address(String),
+    Contract(SchemaAlkaneId),
+}
+
+type SourceAmounts = VecDeque<(AttributionSource, u128)>;
+type SourcedSheet = BTreeMap<SchemaAlkaneId, SourceAmounts>;
+type ContractTokenAmounts = BTreeMap<(SchemaAlkaneId, SchemaAlkaneId), u128>;
+type AddressContractAmounts = HashMap<String, ContractTokenAmounts>;
+
+#[derive(Default)]
+struct TransferApplication {
+    allocations: HashMap<u32, Vec<BalanceEntry>>,
+    send_contracts: AddressContractAmounts,
+    receive_contracts_by_vout: HashMap<u32, ContractTokenAmounts>,
+}
+
+#[derive(Default)]
+struct TraceSourceFlow {
+    returned: SourcedSheet,
+    send_contracts: AddressContractAmounts,
 }
 
 fn ammdata_mdb() -> Arc<Mdb> {
@@ -641,6 +666,293 @@ pub(crate) fn accumulate_alkane_balance_deltas(
     (true, outflows)
 }
 
+fn source_amounts_total(sources: &SourceAmounts) -> u128 {
+    sources.iter().map(|(_, amount)| *amount).fold(0u128, u128::saturating_add)
+}
+
+fn add_source_amount(sources: &mut SourceAmounts, source: AttributionSource, amount: u128) {
+    if amount == 0 {
+        return;
+    }
+    if let Some((last_source, last_amount)) = sources.back_mut() {
+        if *last_source == source {
+            *last_amount = last_amount.saturating_add(amount);
+            return;
+        }
+    }
+    sources.push_back((source, amount));
+}
+
+fn source_amount(source: AttributionSource, amount: u128) -> SourceAmounts {
+    let mut sources = SourceAmounts::new();
+    add_source_amount(&mut sources, source, amount);
+    sources
+}
+
+fn add_sources_to_sheet(sheet: &mut SourcedSheet, token: SchemaAlkaneId, sources: SourceAmounts) {
+    if sources.is_empty() {
+        return;
+    }
+    let entry = sheet.entry(token).or_default();
+    for (source, amount) in sources {
+        add_source_amount(entry, source, amount);
+    }
+    if entry.is_empty() {
+        sheet.remove(&token);
+    }
+}
+
+fn merge_sourced_sheet(target: &mut SourcedSheet, source: SourcedSheet) {
+    for (token, sources) in source {
+        add_sources_to_sheet(target, token, sources);
+    }
+}
+
+fn add_contract_token_amount(
+    map: &mut ContractTokenAmounts,
+    contract: SchemaAlkaneId,
+    token: SchemaAlkaneId,
+    amount: u128,
+) {
+    if amount == 0 {
+        return;
+    }
+    let key = (contract, token);
+    let entry = map.entry(key).or_default();
+    *entry = entry.saturating_add(amount);
+}
+
+fn add_address_contract_amount(
+    map: &mut AddressContractAmounts,
+    address: String,
+    contract: SchemaAlkaneId,
+    token: SchemaAlkaneId,
+    amount: u128,
+) {
+    if amount == 0 {
+        return;
+    }
+    add_contract_token_amount(map.entry(address).or_default(), contract, token, amount);
+}
+
+fn merge_address_contract_amounts(
+    target: &mut AddressContractAmounts,
+    source: AddressContractAmounts,
+) {
+    for (address, entries) in source {
+        let target_entries = target.entry(address).or_default();
+        for ((contract, token), amount) in entries {
+            add_contract_token_amount(target_entries, contract, token, amount);
+        }
+    }
+}
+
+fn add_contract_receives_from_sources(
+    receives: &mut ContractTokenAmounts,
+    token: SchemaAlkaneId,
+    sources: &SourceAmounts,
+) {
+    for (source, amount) in sources.iter() {
+        if let AttributionSource::Contract(contract) = source {
+            add_contract_token_amount(receives, *contract, token, *amount);
+        }
+    }
+}
+
+fn take_sources_from_amounts(sources: &mut SourceAmounts, amount: u128) -> SourceAmounts {
+    let mut remaining = amount;
+    let mut taken = SourceAmounts::new();
+    while remaining > 0 {
+        let remove_front = {
+            let Some((source, available)) = sources.front_mut() else {
+                break;
+            };
+            let take = (*available).min(remaining);
+            add_source_amount(&mut taken, source.clone(), take);
+            *available = available.saturating_sub(take);
+            remaining = remaining.saturating_sub(take);
+            *available == 0
+        };
+        if remove_front {
+            sources.pop_front();
+        }
+    }
+    taken
+}
+
+fn take_sources_from_sheet(
+    sheet: &mut SourcedSheet,
+    token: &SchemaAlkaneId,
+    amount: u128,
+) -> SourceAmounts {
+    if amount == 0 {
+        return SourceAmounts::new();
+    }
+    let Some(sources) = sheet.get_mut(token) else {
+        return SourceAmounts::new();
+    };
+    let taken = take_sources_from_amounts(sources, amount);
+    if sources.is_empty() {
+        sheet.remove(token);
+    }
+    taken
+}
+
+fn take_sources_for_delta(
+    source_sheet: &mut SourcedSheet,
+    delta: &BTreeMap<SchemaAlkaneId, u128>,
+) -> SourcedSheet {
+    let mut out = SourcedSheet::new();
+    for (token, amount) in delta {
+        let sources = take_sources_from_sheet(source_sheet, token, *amount);
+        add_sources_to_sheet(&mut out, *token, sources);
+    }
+    out
+}
+
+fn trace_source_flow(
+    trace: &EspoSandshrewLikeTrace,
+    incoming_sources: SourcedSheet,
+    host_function_values: &EspoHostFunctionValues,
+) -> Option<TraceSourceFlow> {
+    let trace = clean_espo_sandshrew_like_trace(trace, host_function_values)?;
+
+    #[derive(Copy, Clone, Eq, PartialEq)]
+    enum FrameKind {
+        Normal,
+        Delegate,
+        Static,
+    }
+
+    #[derive(Clone)]
+    struct Frame {
+        kind: FrameKind,
+        owner: SchemaAlkaneId,
+        parent_normal_index: Option<usize>,
+        incoming: SourcedSheet,
+        held: SourcedSheet,
+    }
+
+    fn nearest_normal_index(stack: &[Frame]) -> Option<usize> {
+        stack.iter().rposition(|frame| matches!(frame.kind, FrameKind::Normal))
+    }
+
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut top_sources = incoming_sources;
+    let mut out = TraceSourceFlow::default();
+
+    for ev in &trace.events {
+        match ev {
+            EspoSandshrewLikeTraceEvent::Invoke(inv) => {
+                let Some(owner) = parse_short_id(&inv.context.myself) else {
+                    return None;
+                };
+                let in_static_subtree =
+                    stack.iter().any(|frame| matches!(frame.kind, FrameKind::Static));
+                let kind = if in_static_subtree {
+                    FrameKind::Static
+                } else {
+                    match inv.typ.to_ascii_lowercase().as_str() {
+                        "delegatecall" => FrameKind::Delegate,
+                        "staticcall" => FrameKind::Static,
+                        _ => FrameKind::Normal,
+                    }
+                };
+                let parent_normal_index = nearest_normal_index(&stack);
+                let mut incoming = SourcedSheet::new();
+
+                if !matches!(kind, FrameKind::Static) {
+                    let incoming_amounts = transfers_to_sheet(&inv.context.incoming_alkanes);
+                    for (token, amount) in incoming_amounts {
+                        let mut sources = if let Some(parent_idx) = parent_normal_index {
+                            take_sources_from_sheet(&mut stack[parent_idx].held, &token, amount)
+                        } else {
+                            take_sources_from_sheet(&mut top_sources, &token, amount)
+                        };
+                        let sourced = source_amounts_total(&sources);
+                        if sourced < amount {
+                            if let Some(parent_idx) = parent_normal_index {
+                                add_source_amount(
+                                    &mut sources,
+                                    AttributionSource::Contract(stack[parent_idx].owner),
+                                    amount - sourced,
+                                );
+                            }
+                        }
+                        add_sources_to_sheet(&mut incoming, token, sources);
+                    }
+                }
+
+                stack.push(Frame {
+                    kind,
+                    owner,
+                    parent_normal_index,
+                    held: incoming.clone(),
+                    incoming,
+                });
+            }
+            EspoSandshrewLikeTraceEvent::Return(ret) => {
+                let Some(mut frame) = stack.pop() else {
+                    return None;
+                };
+
+                if matches!(frame.kind, FrameKind::Static) {
+                    continue;
+                }
+
+                if ret.status == EspoSandshrewLikeTraceStatus::Failure {
+                    if let Some(parent_idx) = frame.parent_normal_index {
+                        merge_sourced_sheet(&mut stack[parent_idx].held, frame.incoming);
+                    }
+                    continue;
+                }
+
+                let outgoing = transfers_to_sheet(&ret.response.alkanes);
+                let mut returned = SourcedSheet::new();
+                for (token, amount) in outgoing {
+                    let mut sources = take_sources_from_sheet(&mut frame.held, &token, amount);
+                    let sourced = source_amounts_total(&sources);
+                    if sourced < amount {
+                        add_source_amount(
+                            &mut sources,
+                            AttributionSource::Contract(frame.owner),
+                            amount - sourced,
+                        );
+                    }
+                    add_sources_to_sheet(&mut returned, token, sources);
+                }
+
+                for (token, sources) in frame.held {
+                    for (source, amount) in sources {
+                        if let AttributionSource::Address(address) = source {
+                            add_address_contract_amount(
+                                &mut out.send_contracts,
+                                address,
+                                frame.owner,
+                                token,
+                                amount,
+                            );
+                        }
+                    }
+                }
+
+                if let Some(parent_idx) = frame.parent_normal_index {
+                    merge_sourced_sheet(&mut stack[parent_idx].held, returned);
+                } else {
+                    merge_sourced_sheet(&mut out.returned, returned);
+                }
+            }
+            EspoSandshrewLikeTraceEvent::Create(_) => {}
+        }
+    }
+
+    if !stack.is_empty() {
+        return None;
+    }
+
+    Some(out)
+}
+
 /* -------------------------- Edicts + routing (multi-protostone, per your rules) -------------------------- */
 
 /// Whether `vout` is a valid, spendable, non-OP_RETURN output index for this tx.
@@ -649,15 +961,19 @@ fn is_valid_spend_vout(tx: &Transaction, vout: u32) -> bool {
     i < tx.output.len() && !is_op_return(&tx.output[i].script_pubkey)
 }
 
-fn apply_transfers_multi(
+fn apply_transfers_multi_attributed(
     tx: &Transaction,
     protostones: &[Protostone],
     traces_for_tx: &[EspoTrace],
     block_height: u64,
+    host_function_values: &EspoHostFunctionValues,
     mut seed_unalloc: Unallocated, // VIN balances only
+    mut seed_sources: SourcedSheet,
     mut contract_projector: Option<&mut dyn MempoolContractProjector>,
-) -> Result<HashMap<u32, Vec<BalanceEntry>>> {
+) -> Result<TransferApplication> {
     let mut out_map: HashMap<u32, Vec<BalanceEntry>> = HashMap::new();
+    let mut receive_contracts_by_vout: HashMap<u32, ContractTokenAmounts> = HashMap::new();
+    let mut send_contracts: AddressContractAmounts = HashMap::new();
 
     let n_outputs: u32 = tx.output.len() as u32;
     let multicast_index: u32 = n_outputs; // runes multicast
@@ -695,6 +1011,8 @@ fn apply_transfers_multi(
     // Sheet incoming routed explicitly to protostone[i] (from previous pointers/edicts/refunds)
     let mut incoming_shadow: Vec<BTreeMap<SchemaAlkaneId, u128>> =
         vec![BTreeMap::new(); protostones.len()];
+    let mut incoming_shadow_sources: Vec<SourcedSheet> =
+        vec![SourcedSheet::new(); protostones.len()];
 
     // helpers
     fn push_to_vout(
@@ -713,11 +1031,28 @@ fn apply_transfers_multi(
         }
     }
 
+    fn push_sources_to_vout(
+        receive_contracts_by_vout: &mut HashMap<u32, ContractTokenAmounts>,
+        vout: u32,
+        source_delta: &SourcedSheet,
+    ) {
+        for (token, sources) in source_delta {
+            add_contract_receives_from_sources(
+                receive_contracts_by_vout.entry(vout).or_default(),
+                *token,
+                sources,
+            );
+        }
+    }
+
     fn route_delta(
         target: u32,
         delta: &BTreeMap<SchemaAlkaneId, u128>,
+        source_delta: &mut SourcedSheet,
         out_map: &mut HashMap<u32, Vec<BalanceEntry>>,
+        receive_contracts_by_vout: &mut HashMap<u32, ContractTokenAmounts>,
         incoming_shadow: &mut [BTreeMap<SchemaAlkaneId, u128>],
+        incoming_shadow_sources: &mut [SourcedSheet],
         tx: &Transaction,
         spendable_vouts: &[u32],
         n_outputs: u32,
@@ -748,10 +1083,14 @@ fn apply_transfers_multi(
                     if amt == 0 {
                         continue;
                     }
+                    let mut routed_sources = SourcedSheet::new();
+                    let sources = take_sources_from_sheet(source_delta, rid, amt);
+                    add_sources_to_sheet(&mut routed_sources, *rid, sources);
                     out_map
                         .entry(*out_i)
                         .or_default()
                         .push(BalanceEntry { alkane: *rid, amount: amt });
+                    push_sources_to_vout(receive_contracts_by_vout, *out_i, &routed_sources);
                 }
             }
             return;
@@ -762,6 +1101,7 @@ fn apply_transfers_multi(
                 return;
             }
             push_to_vout(out_map, target, delta);
+            push_sources_to_vout(receive_contracts_by_vout, target, source_delta);
             return;
         }
 
@@ -775,6 +1115,7 @@ fn apply_transfers_multi(
                 *sheet.entry(*rid).or_default() =
                     sheet.get(rid).copied().unwrap_or(0).saturating_add(amt);
             }
+            merge_sourced_sheet(&mut incoming_shadow_sources[idx], std::mem::take(source_delta));
             return;
         }
         // else burn by omission
@@ -782,9 +1123,12 @@ fn apply_transfers_multi(
 
     fn apply_single_edict(
         sheet: &mut BTreeMap<SchemaAlkaneId, u128>,
+        source_sheet: &mut SourcedSheet,
         ed: &ProtostoneEdict,
         out_map: &mut HashMap<u32, Vec<BalanceEntry>>,
+        receive_contracts_by_vout: &mut HashMap<u32, ContractTokenAmounts>,
         incoming_shadow: &mut [BTreeMap<SchemaAlkaneId, u128>],
+        incoming_shadow_sources: &mut [SourcedSheet],
         tx: &Transaction,
         spendable_vouts: &[u32],
         n_outputs: u32,
@@ -817,6 +1161,9 @@ fn apply_transfers_multi(
                 // even split of ALL available (what you already had working)
                 let mut delta = BTreeMap::new();
                 delta.insert(rid, have);
+                let mut source_delta = SourcedSheet::new();
+                let sources = take_sources_from_sheet(source_sheet, &rid, have);
+                add_sources_to_sheet(&mut source_delta, rid, sources);
                 // zero it out from the sheet before routing
                 *entry = 0;
                 sheet.remove(&rid);
@@ -824,8 +1171,11 @@ fn apply_transfers_multi(
                 route_delta(
                     out_idx,
                     &delta,
+                    &mut source_delta,
                     out_map,
+                    receive_contracts_by_vout,
                     incoming_shadow,
+                    incoming_shadow_sources,
                     tx,
                     spendable_vouts,
                     n_outputs,
@@ -841,7 +1191,7 @@ fn apply_transfers_multi(
                 // appended to the next spendable output after the regular walk stops.
                 let mut remaining = have;
                 let mut used: u128 = 0;
-                let mut deferred: Vec<u128> = Vec::new();
+                let mut deferred: Vec<(u128, SourcedSheet)> = Vec::new();
                 let mut last_consumed_idx: Option<usize> = None;
 
                 for (idx, output) in tx.output.iter().enumerate() {
@@ -852,23 +1202,31 @@ fn apply_transfers_multi(
                     if give == 0 {
                         break;
                     }
+                    let mut routed_sources = SourcedSheet::new();
+                    let sources = take_sources_from_sheet(source_sheet, &rid, give);
+                    add_sources_to_sheet(&mut routed_sources, rid, sources);
                     remaining = remaining.saturating_sub(give);
                     used = used.saturating_add(give);
                     last_consumed_idx = Some(idx);
 
                     if is_op_return(&output.script_pubkey) {
-                        deferred.push(give);
+                        deferred.push((give, routed_sources));
                     } else {
                         out_map
                             .entry(idx as u32)
                             .or_default()
                             .push(BalanceEntry { alkane: rid, amount: give });
+                        push_sources_to_vout(
+                            receive_contracts_by_vout,
+                            idx as u32,
+                            &routed_sources,
+                        );
                     }
                 }
 
                 let mut search_from =
                     last_consumed_idx.map(|idx| idx.saturating_add(1)).unwrap_or(0);
-                for amount in deferred {
+                for (amount, routed_sources) in deferred {
                     let Some(next_idx) =
                         tx.output.iter().enumerate().skip(search_from).find_map(|(idx, output)| {
                             if is_op_return(&output.script_pubkey) { None } else { Some(idx) }
@@ -880,6 +1238,11 @@ fn apply_transfers_multi(
                         .entry(next_idx as u32)
                         .or_default()
                         .push(BalanceEntry { alkane: rid, amount });
+                    push_sources_to_vout(
+                        receive_contracts_by_vout,
+                        next_idx as u32,
+                        &routed_sources,
+                    );
                     search_from = next_idx.saturating_add(1);
                 }
 
@@ -900,7 +1263,11 @@ fn apply_transfers_multi(
                     if give == 0 {
                         break;
                     }
+                    let mut routed_sources = SourcedSheet::new();
+                    let sources = take_sources_from_sheet(source_sheet, &rid, give);
+                    add_sources_to_sheet(&mut routed_sources, rid, sources);
                     out_map.entry(*v).or_default().push(BalanceEntry { alkane: rid, amount: give });
+                    push_sources_to_vout(receive_contracts_by_vout, *v, &routed_sources);
                     remaining = remaining.saturating_sub(give);
                     used = used.saturating_add(give);
                 }
@@ -925,6 +1292,9 @@ fn apply_transfers_multi(
         // take from sheet
         let entry = sheet.entry(rid).or_default();
         let take = (*entry).min(need);
+        let mut source_delta = SourcedSheet::new();
+        let sources = take_sources_from_sheet(source_sheet, &rid, take);
+        add_sources_to_sheet(&mut source_delta, rid, sources);
         *entry = entry.saturating_sub(take);
         if *entry == 0 {
             sheet.remove(&rid);
@@ -939,8 +1309,11 @@ fn apply_transfers_multi(
         route_delta(
             out_idx,
             &delta,
+            &mut source_delta,
             out_map,
+            receive_contracts_by_vout,
             incoming_shadow,
+            incoming_shadow_sources,
             tx,
             spendable_vouts,
             n_outputs,
@@ -957,6 +1330,7 @@ fn apply_transfers_multi(
 
         // sheet starts with explicitly routed incoming to this shadow.
         let mut sheet: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
+        let mut source_sheet: SourcedSheet = SourcedSheet::new();
 
         // merge routed-in firstx
         for (rid, amt) in std::mem::take(&mut incoming_shadow[i]) {
@@ -966,9 +1340,11 @@ fn apply_transfers_multi(
             *sheet.entry(rid).or_default() =
                 sheet.get(&rid).copied().unwrap_or(0).saturating_add(amt);
         }
+        merge_sourced_sheet(&mut source_sheet, std::mem::take(&mut incoming_shadow_sources[i]));
 
         // if there is a trace for this protostone, compute net_out and status
-        let (net_in, net_out, status) = match trace_by_shadow.get(&shadow_vout) {
+        let trace_for_shadow = trace_by_shadow.get(&shadow_vout).copied();
+        let (net_in, net_out, status) = match trace_for_shadow {
             Some(trace) => compute_nets(trace),
             None => (None, None, EspoTraceType::NOTRACE),
         };
@@ -980,16 +1356,29 @@ fn apply_transfers_multi(
 
         // On success, consume incoming amounts so only returned/minted balances remain.
         if status == EspoTraceType::SUCCESS {
+            if i == 0 {
+                merge_sourced_sheet(&mut source_sheet, std::mem::take(&mut seed_sources));
+            }
+            let mut trace_in_sources = SourcedSheet::new();
             if let Some(ref net_in_map) = net_in {
                 for (rid, amt) in net_in_map {
                     if *amt == 0 {
                         continue;
                     }
+                    let sources = take_sources_from_sheet(&mut source_sheet, rid, *amt);
+                    add_sources_to_sheet(&mut trace_in_sources, *rid, sources);
                     let entry = sheet.entry(*rid).or_default();
                     *entry = entry.saturating_sub(*amt);
                     if *entry == 0 {
                         sheet.remove(rid);
                     }
+                }
+            }
+            if let Some(trace) = trace_for_shadow {
+                if let Some(flow) = trace_source_flow(trace, trace_in_sources, host_function_values)
+                {
+                    merge_address_contract_amounts(&mut send_contracts, flow.send_contracts);
+                    merge_sourced_sheet(&mut source_sheet, flow.returned);
                 }
             }
         }
@@ -1015,6 +1404,7 @@ fn apply_transfers_multi(
                 *sheet.entry(rid).or_default() =
                     sheet.get(&rid).copied().unwrap_or(0).saturating_add(amt);
             }
+            merge_sourced_sheet(&mut source_sheet, std::mem::take(&mut seed_sources));
         }
 
         if status == EspoTraceType::NOTRACE {
@@ -1033,13 +1423,20 @@ fn apply_transfers_multi(
 
         // If we have a status and it is Failure → refund net_in (only), skip edicts.
         if status == EspoTraceType::REVERT {
+            if i == 0 {
+                merge_sourced_sheet(&mut source_sheet, std::mem::take(&mut seed_sources));
+            }
             if let Some(ref net_in_map) = net_in {
                 if let Some(refund_ptr) = ps.refund {
+                    let mut source_delta = take_sources_for_delta(&mut source_sheet, net_in_map);
                     route_delta(
                         refund_ptr,
                         &net_in_map,
+                        &mut source_delta,
                         &mut out_map,
+                        &mut receive_contracts_by_vout,
                         &mut incoming_shadow,
+                        &mut incoming_shadow_sources,
                         tx,
                         &spendable_vouts,
                         n_outputs,
@@ -1059,9 +1456,12 @@ fn apply_transfers_multi(
             for ed in &ps.edicts {
                 if let Err(e) = apply_single_edict(
                     &mut sheet,
+                    &mut source_sheet,
                     ed,
                     &mut out_map,
+                    &mut receive_contracts_by_vout,
                     &mut incoming_shadow,
+                    &mut incoming_shadow_sources,
                     tx,
                     &spendable_vouts,
                     n_outputs,
@@ -1078,11 +1478,15 @@ fn apply_transfers_multi(
         // leftovers after edicts:
         if !sheet.is_empty() {
             if let Some(ptr) = ps.pointer {
+                let mut source_delta = take_sources_for_delta(&mut source_sheet, &sheet);
                 route_delta(
                     ptr,
                     &sheet,
+                    &mut source_delta,
                     &mut out_map,
+                    &mut receive_contracts_by_vout,
                     &mut incoming_shadow,
+                    &mut incoming_shadow_sources,
                     tx,
                     &spendable_vouts,
                     n_outputs,
@@ -1093,14 +1497,38 @@ fn apply_transfers_multi(
             } else {
                 // per your note: do NOT auto-chain; send to first non-OP_RETURN vout
                 if let Some(v) = spendable_vouts.first().copied() {
+                    let source_delta = take_sources_for_delta(&mut source_sheet, &sheet);
                     push_to_vout(&mut out_map, v, &sheet);
+                    push_sources_to_vout(&mut receive_contracts_by_vout, v, &source_delta);
                 }
                 // else burn by omission
             }
         }
     }
 
-    Ok(out_map)
+    Ok(TransferApplication { allocations: out_map, send_contracts, receive_contracts_by_vout })
+}
+
+fn apply_transfers_multi(
+    tx: &Transaction,
+    protostones: &[Protostone],
+    traces_for_tx: &[EspoTrace],
+    block_height: u64,
+    seed_unalloc: Unallocated,
+    contract_projector: Option<&mut dyn MempoolContractProjector>,
+) -> Result<HashMap<u32, Vec<BalanceEntry>>> {
+    let host_function_values = EspoHostFunctionValues::default();
+    Ok(apply_transfers_multi_attributed(
+        tx,
+        protostones,
+        traces_for_tx,
+        block_height,
+        &host_function_values,
+        seed_unalloc,
+        SourcedSheet::new(),
+        contract_projector,
+    )?
+    .allocations)
 }
 
 pub(crate) fn project_tx_output_balances_from_traces(
@@ -1145,6 +1573,395 @@ pub(crate) fn project_tx_output_balances_from_traces_with_projector(
         contract_projector,
     )
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    fn alkane(block: u32, tx: u64) -> SchemaAlkaneId {
+        SchemaAlkaneId { block, tx }
+    }
+
+    fn address_sources(token: SchemaAlkaneId, address: &str, amount: u128) -> SourcedSheet {
+        address_source_chunks(token, &[(address, amount)])
+    }
+
+    fn address_source_chunks(token: SchemaAlkaneId, chunks: &[(&str, u128)]) -> SourcedSheet {
+        let mut sheet = SourcedSheet::new();
+        let mut sources = SourceAmounts::new();
+        for (address, amount) in chunks {
+            add_source_amount(
+                &mut sources,
+                AttributionSource::Address((*address).to_string()),
+                *amount,
+            );
+        }
+        add_sources_to_sheet(&mut sheet, token, sources);
+        sheet
+    }
+
+    fn source_total(sources: &SourceAmounts, source: AttributionSource) -> u128 {
+        sources
+            .iter()
+            .filter_map(
+                |(candidate, amount)| if candidate == &source { Some(*amount) } else { None },
+            )
+            .fold(0u128, u128::saturating_add)
+    }
+
+    #[test]
+    fn receive_contract_sources_flow_fifo_across_outputs() {
+        let token = alkane(2, 0);
+        let contract = token;
+        let trace_json = r#"
+{
+  "outpoint": "test",
+  "events": [
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x2", "tx": "0x0"},
+          "caller": {"block": "0x0", "tx": "0x0"},
+          "inputs": [],
+          "incomingAlkanes": [
+            {"id": {"block": "0x2", "tx": "0x0"}, "value": "0x1bee"}
+          ],
+          "vout": 2
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {
+          "alkanes": [
+            {"id": {"block": "0x2", "tx": "0x0"}, "value": "0x28a0"}
+          ],
+          "data": "0x",
+          "storage": []
+        }
+      }
+    }
+  ]
+}
+"#;
+        let trace: EspoSandshrewLikeTrace = serde_json::from_str(trace_json).expect("trace json");
+        let host_values = EspoHostFunctionValues::default();
+        let flow = trace_source_flow(&trace, address_sources(token, "addr_a", 7_150), &host_values)
+            .expect("source flow");
+
+        let mut returned = flow.returned;
+        let first = take_sources_from_sheet(&mut returned, &token, 10_000);
+        let second = take_sources_from_sheet(&mut returned, &token, 400);
+
+        assert_eq!(source_total(&first, AttributionSource::Address("addr_a".to_string())), 7_150);
+        assert_eq!(source_total(&first, AttributionSource::Contract(contract)), 2_850);
+        assert_eq!(source_total(&second, AttributionSource::Contract(contract)), 400);
+    }
+
+    #[test]
+    fn onchain_height_946000_trace_returns_created_chunk_after_vin_fifo() {
+        let token = alkane(2, 0);
+        let trace_json = r#"
+{
+  "outpoint": "a44d1f42e1eb15b779f75089cd496f61b73ef68d411d09701ebd9ea51ade7cf8:3",
+  "events": [
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x2", "tx": "0x0"},
+          "caller": {"block": "0x0", "tx": "0x0"},
+          "inputs": ["0x4d", "0x0", "0x0", "0x0", "0x0", "0x0", "0x0", "0x0", "0x0", "0x0", "0x0", "0x0", "0x0"],
+          "incomingAlkanes": [
+            {"id": {"block": "0x2", "tx": "0x0"}, "value": "0x2330ba25"}
+          ],
+          "vout": 3
+        },
+        "fuel": 25382538
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {"alkanes": [], "data": "0x26000000000000000000000000000000", "storage": []}
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {"alkanes": [], "data": "0x5f69d712000000000000000000000000", "storage": []}
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {
+          "alkanes": [
+            {"id": {"block": "0x2", "tx": "0x0"}, "value": "0x2330ba25"},
+            {"id": {"block": "0x2", "tx": "0x0"}, "value": "0x7c08f8"}
+          ],
+          "data": "0x",
+          "storage": []
+        }
+      }
+    }
+  ]
+}
+"#;
+        let trace: EspoSandshrewLikeTrace = serde_json::from_str(trace_json).expect("trace json");
+        let host_values = (
+            Vec::new(),
+            Vec::new(),
+            hex::decode("26000000000000000000000000000000").expect("diesel host value"),
+            hex::decode("5f69d712000000000000000000000000").expect("fee host value"),
+        );
+        let flow =
+            trace_source_flow(&trace, address_sources(token, "addr_a", 590_395_941), &host_values)
+                .expect("source flow");
+
+        let mut returned = flow.returned;
+        let vin_chunk = take_sources_from_sheet(&mut returned, &token, 590_395_941);
+        let created_chunk = take_sources_from_sheet(&mut returned, &token, 8_128_760);
+
+        assert_eq!(
+            source_total(&vin_chunk, AttributionSource::Address("addr_a".to_string())),
+            590_395_941
+        );
+        assert_eq!(source_total(&vin_chunk, AttributionSource::Contract(token)), 0);
+        assert_eq!(source_total(&created_chunk, AttributionSource::Contract(token)), 8_128_760);
+    }
+
+    #[test]
+    fn send_contract_sources_consume_vin_chunks_fifo() {
+        let token = alkane(2, 0);
+        let parent = alkane(4, 1);
+        let child = alkane(4, 2);
+        let trace_json = r#"
+{
+  "outpoint": "test",
+  "events": [
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x4", "tx": "0x1"},
+          "caller": {"block": "0x0", "tx": "0x0"},
+          "inputs": [],
+          "incomingAlkanes": [
+            {"id": {"block": "0x2", "tx": "0x0"}, "value": "0x64"}
+          ],
+          "vout": 2
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x4", "tx": "0x2"},
+          "caller": {"block": "0x4", "tx": "0x1"},
+          "inputs": [],
+          "incomingAlkanes": [
+            {"id": {"block": "0x2", "tx": "0x0"}, "value": "0x50"}
+          ],
+          "vout": 2
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {"alkanes": [], "data": "0x", "storage": []}
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {"alkanes": [], "data": "0x", "storage": []}
+      }
+    }
+  ]
+}
+"#;
+        let trace: EspoSandshrewLikeTrace = serde_json::from_str(trace_json).expect("trace json");
+        let host_values = EspoHostFunctionValues::default();
+        let flow = trace_source_flow(
+            &trace,
+            address_source_chunks(token, &[("addr_a", 60), ("addr_b", 40)]),
+            &host_values,
+        )
+        .expect("source flow");
+
+        let addr_a = flow.send_contracts.get("addr_a").expect("addr_a sends");
+        let addr_b = flow.send_contracts.get("addr_b").expect("addr_b sends");
+        assert_eq!(addr_a.get(&(child, token)).copied(), Some(60));
+        assert_eq!(addr_a.get(&(parent, token)).copied(), None);
+        assert_eq!(addr_b.get(&(child, token)).copied(), Some(20));
+        assert_eq!(addr_b.get(&(parent, token)).copied(), Some(20));
+    }
+
+    #[test]
+    fn static_subtrees_do_not_attribute_sends() {
+        let token = alkane(2, 0);
+        let trace_json = r#"
+{
+  "outpoint": "test",
+  "events": [
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x4", "tx": "0x1"},
+          "caller": {"block": "0x0", "tx": "0x0"},
+          "inputs": [],
+          "incomingAlkanes": [
+            {"id": {"block": "0x2", "tx": "0x0"}, "value": "0x64"}
+          ],
+          "vout": 2
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "invoke",
+      "data": {
+        "type": "staticcall",
+        "context": {
+          "myself": {"block": "0x4", "tx": "0x2"},
+          "caller": {"block": "0x4", "tx": "0x1"},
+          "inputs": [],
+          "incomingAlkanes": [],
+          "vout": 2
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x4", "tx": "0x3"},
+          "caller": {"block": "0x4", "tx": "0x2"},
+          "inputs": [],
+          "incomingAlkanes": [
+            {"id": {"block": "0x2", "tx": "0x0"}, "value": "0x50"}
+          ],
+          "vout": 2
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {"alkanes": [], "data": "0x", "storage": []}
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {"alkanes": [], "data": "0x", "storage": []}
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {"alkanes": [], "data": "0x", "storage": []}
+      }
+    }
+  ]
+}
+"#;
+        let trace: EspoSandshrewLikeTrace = serde_json::from_str(trace_json).expect("trace json");
+        let host_values = EspoHostFunctionValues::default();
+        let flow = trace_source_flow(&trace, address_sources(token, "addr_a", 100), &host_values)
+            .expect("source flow");
+
+        let addr = flow.send_contracts.get("addr_a").expect("parent send");
+        assert_eq!(addr.len(), 1);
+        assert_eq!(addr.get(&(alkane(4, 1), token)).copied(), Some(100));
+    }
+
+    #[test]
+    fn orbital_rollup_aggregates_child_contract_deltas_by_factory() {
+        let factory = alkane(2, 0);
+        let child_a = alkane(2, 1);
+        let child_b = alkane(2, 2);
+        let unrelated = alkane(2, 3);
+        let token = alkane(4, 3);
+
+        let mut deltas = AddressContractAmounts::new();
+        add_address_contract_amount(&mut deltas, "addr_a".to_string(), child_a, token, 1);
+        add_address_contract_amount(&mut deltas, "addr_a".to_string(), child_b, token, 2);
+        add_address_contract_amount(&mut deltas, "addr_a".to_string(), unrelated, token, 5);
+
+        let factory_by_child = HashMap::from([(child_a, factory), (child_b, factory)]);
+        let rolled = rollup_contract_amounts_to_orbitals(&deltas, &factory_by_child);
+        let addr = rolled.get("addr_a").expect("rolled address");
+
+        assert_eq!(addr.len(), 1);
+        assert_eq!(addr.get(&(factory, token)).copied(), Some(3));
+    }
+
+    #[test]
+    fn orbital_volume_deltas_sum_tokens_per_address_and_factory() {
+        let factory = alkane(2, 0);
+        let other_factory = alkane(2, 1);
+        let token_a = alkane(4, 3);
+        let token_b = alkane(4, 4);
+
+        let mut deltas = AddressContractAmounts::new();
+        add_address_contract_amount(&mut deltas, "addr_a".to_string(), factory, token_a, 7);
+        add_address_contract_amount(&mut deltas, "addr_a".to_string(), factory, token_b, 5);
+        add_address_contract_amount(&mut deltas, "addr_b".to_string(), factory, token_a, 3);
+        add_address_contract_amount(&mut deltas, "addr_a".to_string(), other_factory, token_a, 11);
+
+        let volumes = orbital_volume_deltas_from_address_amounts(&deltas);
+
+        assert_eq!(volumes.get(&factory).and_then(|m| m.get("addr_a")).copied(), Some(12));
+        assert_eq!(volumes.get(&factory).and_then(|m| m.get("addr_b")).copied(), Some(3));
+        assert_eq!(volumes.get(&other_factory).and_then(|m| m.get("addr_a")).copied(), Some(11));
+    }
+
+    #[test]
+    fn orbital_holder_delta_accumulator_nets_zero_crossings() {
+        let factory = alkane(2, 0);
+        let addr_a = HolderId::Address("addr_a".to_string());
+        let addr_b = HolderId::Address("addr_b".to_string());
+
+        let mut deltas: HashMap<SchemaAlkaneId, BTreeMap<HolderId, SignedU128>> = HashMap::new();
+        add_orbital_holder_delta(&mut deltas, factory, addr_a.clone(), SignedU128::positive(1));
+        add_orbital_holder_delta(&mut deltas, factory, addr_a.clone(), SignedU128::positive(1));
+        add_orbital_holder_delta(&mut deltas, factory, addr_a.clone(), SignedU128::negative(1));
+        add_orbital_holder_delta(&mut deltas, factory, addr_b.clone(), SignedU128::positive(1));
+        add_orbital_holder_delta(&mut deltas, factory, addr_b.clone(), SignedU128::negative(1));
+
+        let entry = deltas.get(&factory).expect("factory deltas");
+        assert_eq!(entry.len(), 1);
+        assert_eq!(entry.get(&addr_a).map(SignedU128::as_parts), Some((false, 1)));
+        assert!(!entry.contains_key(&addr_b));
+    }
 }
 
 #[cfg(test)]
@@ -1340,11 +2157,270 @@ fn holder_order_key(id: &HolderId) -> String {
     }
 }
 
+fn holder_id_index_bytes(holder: &HolderId) -> Vec<u8> {
+    match holder {
+        HolderId::Address(addr) => {
+            let mut out = Vec::with_capacity(1 + addr.len());
+            out.push(b'a');
+            out.extend_from_slice(addr.as_bytes());
+            out
+        }
+        HolderId::Alkane(id) => {
+            let mut out = Vec::with_capacity(13);
+            out.push(b'k');
+            out.extend_from_slice(&id.block.to_be_bytes());
+            out.extend_from_slice(&id.tx.to_be_bytes());
+            out
+        }
+    }
+}
+
+fn parse_holder_id_index_bytes(raw: &[u8]) -> Option<HolderId> {
+    if raw.is_empty() {
+        return None;
+    }
+    match raw[0] {
+        b'a' => std::str::from_utf8(&raw[1..])
+            .ok()
+            .map(|addr| HolderId::Address(addr.to_string())),
+        b'k' if raw.len() == 13 => Some(HolderId::Alkane(SchemaAlkaneId {
+            block: u32::from_be_bytes([raw[1], raw[2], raw[3], raw[4]]),
+            tx: u64::from_be_bytes([
+                raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12],
+            ]),
+        })),
+        _ => None,
+    }
+}
+
 fn sort_address_amount_entries(entries: &mut Vec<AddressAmountEntry>) {
     entries.sort_by(|a, b| match b.amount.cmp(&a.amount) {
         std::cmp::Ordering::Equal => a.address.cmp(&b.address),
         o => o,
     });
+}
+
+fn sort_address_contract_amount_entries(entries: &mut Vec<AddressContractAmountEntry>) {
+    entries.sort_by(|a, b| {
+        b.amount
+            .cmp(&a.amount)
+            .then_with(|| a.contract.cmp(&b.contract))
+            .then_with(|| a.alkane.cmp(&b.alkane))
+    });
+}
+
+fn apply_contract_amount_delta(
+    current: Vec<AddressContractAmountEntry>,
+    delta: &ContractTokenAmounts,
+) -> Vec<AddressContractAmountEntry> {
+    let mut amounts: BTreeMap<(SchemaAlkaneId, SchemaAlkaneId), u128> = BTreeMap::new();
+    for entry in current {
+        if entry.amount == 0 {
+            continue;
+        }
+        let key = (entry.contract, entry.alkane);
+        *amounts.entry(key).or_default() =
+            amounts.get(&key).copied().unwrap_or(0).saturating_add(entry.amount);
+    }
+    for ((contract, token), amount) in delta {
+        if *amount == 0 {
+            continue;
+        }
+        let key = (*contract, *token);
+        *amounts.entry(key).or_default() =
+            amounts.get(&key).copied().unwrap_or(0).saturating_add(*amount);
+    }
+    let mut entries: Vec<AddressContractAmountEntry> = amounts
+        .into_iter()
+        .filter_map(|((contract, alkane), amount)| {
+            if amount == 0 {
+                None
+            } else {
+                Some(AddressContractAmountEntry { contract, alkane, amount })
+            }
+        })
+        .collect();
+    sort_address_contract_amount_entries(&mut entries);
+    entries
+}
+
+fn rollup_contract_amounts_to_orbitals(
+    deltas: &AddressContractAmounts,
+    factory_by_child: &HashMap<SchemaAlkaneId, SchemaAlkaneId>,
+) -> AddressContractAmounts {
+    let mut rolled = AddressContractAmounts::new();
+    for (address, entries) in deltas {
+        for ((child, token), amount) in entries {
+            let Some(factory) = factory_by_child.get(child) else {
+                continue;
+            };
+            add_address_contract_amount(&mut rolled, address.clone(), *factory, *token, *amount);
+        }
+    }
+    rolled
+}
+
+fn orbital_volume_deltas_from_address_amounts(
+    deltas: &AddressContractAmounts,
+) -> HashMap<SchemaAlkaneId, HashMap<String, u128>> {
+    let mut out: HashMap<SchemaAlkaneId, HashMap<String, u128>> = HashMap::new();
+    for (address, entries) in deltas {
+        for ((orbital, _token), amount) in entries {
+            if *amount == 0 {
+                continue;
+            }
+            let slot = out.entry(*orbital).or_default().entry(address.clone()).or_default();
+            *slot = slot.saturating_add(*amount);
+        }
+    }
+    out
+}
+
+fn add_orbital_holder_delta(
+    deltas: &mut HashMap<SchemaAlkaneId, BTreeMap<HolderId, SignedU128>>,
+    factory: SchemaAlkaneId,
+    holder: HolderId,
+    delta: SignedU128,
+) {
+    if delta.is_zero() {
+        return;
+    }
+    let entry = deltas.entry(factory).or_default();
+    let slot = entry.entry(holder.clone()).or_insert_with(SignedU128::zero);
+    *slot += delta;
+    if slot.is_zero() {
+        entry.remove(&holder);
+    }
+    if entry.is_empty() {
+        deltas.remove(&factory);
+    }
+}
+
+fn apply_orbital_volume_deltas(
+    provider: &EssentialsProvider,
+    table: &EssentialsTable<'_>,
+    puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    deltas: &HashMap<SchemaAlkaneId, HashMap<String, u128>>,
+    receive: bool,
+) -> Result<()> {
+    for (factory, per_addr) in deltas {
+        if per_addr.is_empty() {
+            continue;
+        }
+        let len_key = if receive {
+            table.orbital_receive_volume_list_len_key(factory)
+        } else {
+            table.orbital_send_volume_list_len_key(factory)
+        };
+        let len = provider
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: len_key.clone() })?
+            .value
+            .and_then(|bytes| {
+                if bytes.len() == 4 {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&bytes);
+                    Some(u32::from_le_bytes(arr))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let mut addresses: Vec<String> = per_addr.keys().cloned().collect();
+        addresses.sort();
+        let entry_keys: Vec<Vec<u8>> = addresses
+            .iter()
+            .map(|address| {
+                if receive {
+                    table.orbital_receive_volume_entry_key(factory, address)
+                } else {
+                    table.orbital_send_volume_entry_key(factory, address)
+                }
+            })
+            .collect();
+        let current_values = provider
+            .get_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: entry_keys.clone(),
+            })?
+            .values;
+
+        let mut appended: Vec<String> = Vec::new();
+        for ((address, key), current_raw) in
+            addresses.iter().zip(entry_keys.into_iter()).zip(current_values.into_iter())
+        {
+            let delta = per_addr.get(address).copied().unwrap_or(0);
+            if delta == 0 {
+                continue;
+            }
+            let prev =
+                current_raw.as_ref().and_then(|raw| decode_u128_value(raw).ok()).unwrap_or(0);
+            let next = prev.saturating_add(delta);
+            puts.push((key, encode_u128_value(next)?));
+            if prev == 0 && next > 0 && current_raw.is_none() {
+                appended.push(address.clone());
+            }
+        }
+
+        if !appended.is_empty() {
+            let base = len;
+            for (offset, address) in appended.iter().enumerate() {
+                let idx_key = if receive {
+                    table.orbital_receive_volume_list_idx_key(
+                        factory,
+                        base.saturating_add(offset as u32),
+                    )
+                } else {
+                    table.orbital_send_volume_list_idx_key(
+                        factory,
+                        base.saturating_add(offset as u32),
+                    )
+                };
+                puts.push((idx_key, address.as_bytes().to_vec()));
+            }
+            let new_len = len.saturating_add(appended.len() as u32);
+            puts.push((len_key, new_len.to_le_bytes().to_vec()));
+        }
+    }
+    Ok(())
+}
+
+fn contracts_in_address_amounts(deltas: &AddressContractAmounts) -> HashSet<SchemaAlkaneId> {
+    let mut contracts = HashSet::new();
+    for entries in deltas.values() {
+        for ((contract, _), amount) in entries {
+            if *amount > 0 {
+                contracts.insert(*contract);
+            }
+        }
+    }
+    contracts
+}
+
+fn resolve_factory_by_child(
+    provider: &EssentialsProvider,
+    children: HashSet<SchemaAlkaneId>,
+) -> Result<HashMap<SchemaAlkaneId, SchemaAlkaneId>> {
+    let mut children: Vec<SchemaAlkaneId> = children.into_iter().collect();
+    children.sort();
+    let mut out = HashMap::new();
+    for child in children {
+        let Some(record) = provider
+            .get_creation_record(GetCreationRecordParams {
+                blockhash: StateAt::Latest,
+                alkane: child,
+            })?
+            .record
+        else {
+            continue;
+        };
+        let Some(factory) = record.inspection.and_then(|inspection| inspection.factory_alkane)
+        else {
+            continue;
+        };
+        out.insert(child, factory);
+    }
+    Ok(out)
 }
 
 fn read_address_amount_prefix_page(
@@ -1439,6 +2515,8 @@ pub fn bulk_update_balances_for_block(
         HashMap::new();
     let mut address_balance_delta: HashMap<String, HashMap<SchemaAlkaneId, SignedU128>> =
         HashMap::new();
+    let mut address_contract_send_delta: AddressContractAmounts = HashMap::new();
+    let mut address_contract_receive_delta: AddressContractAmounts = HashMap::new();
 
     let push_balance_tx_entry = |map: &mut HashMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>,
                                  alk: SchemaAlkaneId,
@@ -1713,6 +2791,7 @@ pub fn bulk_update_balances_for_block(
 
         // Seed from VIN balances only
         let mut seed_unalloc = Unallocated::default();
+        let mut seed_sources: SourcedSheet = SourcedSheet::new();
 
         // Gather ephemerals for this tx & apply; for externals, use prefetched maps
         for input in &tx.input {
@@ -1764,6 +2843,11 @@ pub fn bulk_update_balances_for_block(
                 if let Some(addr) = ephem_outpoint_addr.get(&in_str) {
                     tx_addrs.insert(addr.clone());
                     for be in bals {
+                        add_sources_to_sheet(
+                            &mut seed_sources,
+                            be.alkane,
+                            source_amount(AttributionSource::Address(addr.clone()), be.amount),
+                        );
                         add_holder_delta(
                             be.alkane,
                             HolderId::Address(addr.clone()),
@@ -1818,6 +2902,11 @@ pub fn bulk_update_balances_for_block(
                     tx_addrs.insert(addr.clone());
                     // holders-- and mark legacy addr-row delete
                     for be in &bals {
+                        add_sources_to_sheet(
+                            &mut seed_sources,
+                            be.alkane,
+                            source_amount(AttributionSource::Address(addr.clone()), be.amount),
+                        );
                         add_holder_delta(
                             be.alkane,
                             HolderId::Address(addr.clone()),
@@ -1902,7 +2991,7 @@ pub fn bulk_update_balances_for_block(
             }
         }
 
-        let allocations = if tx_has_op_return(tx) {
+        let transfer_application = if tx_has_op_return(tx) {
             let protostones = match parse_protostones(tx) {
                 Ok(protostones) => protostones,
                 Err(e) => {
@@ -1916,22 +3005,30 @@ pub fn bulk_update_balances_for_block(
                 }
             };
             if protostones.is_empty() {
-                HashMap::<u32, Vec<BalanceEntry>>::new()
+                TransferApplication::default()
             } else {
                 // apply transfers only when there’s a proto/runestone carrier
-                apply_transfers_multi(
+                apply_transfers_multi_attributed(
                     tx,
                     &protostones,
                     &traces_for_tx,
                     u64::from(block.height),
+                    &block.host_function_values,
                     seed_unalloc,
+                    seed_sources,
                     None,
                 )?
             }
         } else {
             // No OP_RETURN → no Alkanes allocations (but we already did VIN cleanup/holders--)
-            HashMap::<u32, Vec<BalanceEntry>>::new()
+            TransferApplication::default()
         };
+        merge_address_contract_amounts(
+            &mut address_contract_send_delta,
+            transfer_application.send_contracts,
+        );
+        let mut receive_contracts_by_vout = transfer_application.receive_contracts_by_vout;
+        let allocations = transfer_application.allocations;
         // record outputs ephemerally (for same-block spends)
         for (vout_idx, entries_for_vout) in allocations {
             if entries_for_vout.is_empty() || vout_idx as usize >= tx.output.len() {
@@ -1944,6 +3041,13 @@ pub fn bulk_update_balances_for_block(
 
             if let Some(address_str) = spk_to_address_str(&output.script_pubkey, network) {
                 tx_addrs.insert(address_str.clone());
+                if let Some(receives) = receive_contracts_by_vout.remove(&vout_idx) {
+                    let addr_receives =
+                        address_contract_receive_delta.entry(address_str.clone()).or_default();
+                    for ((contract, token), amount) in receives {
+                        add_contract_token_amount(addr_receives, contract, token, amount);
+                    }
+                }
                 // Combine duplicates
                 let mut amounts_by_alkane: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
                 for entry in entries_for_vout {
@@ -3205,6 +4309,10 @@ pub fn bulk_update_balances_for_block(
     // E) Holders deltas
     let holders_full_rebuilds = 0usize;
     let holders_full_rebuild_entries = 0usize;
+    let holder_child_factories =
+        resolve_factory_by_child(provider, holders_delta.keys().copied().collect())?;
+    let mut orbital_holders_delta: HashMap<SchemaAlkaneId, BTreeMap<HolderId, SignedU128>> =
+        HashMap::new();
     for (alkane, per_holder) in holders_delta.iter() {
         let holders_count_key = table.holders_count_key(alkane);
         let prev_count = provider
@@ -3287,8 +4395,24 @@ pub fn bulk_update_balances_for_block(
                     if current_raw.is_none() {
                         appended_holders.push(holder.clone());
                     }
+                    if let Some(factory) = holder_child_factories.get(alkane) {
+                        add_orbital_holder_delta(
+                            &mut orbital_holders_delta,
+                            *factory,
+                            holder.clone(),
+                            SignedU128::positive(1),
+                        );
+                    }
                 } else if cur > 0 && next == 0 {
                     removed_holders = removed_holders.saturating_add(1);
+                    if let Some(factory) = holder_child_factories.get(alkane) {
+                        add_orbital_holder_delta(
+                            &mut orbital_holders_delta,
+                            *factory,
+                            holder.clone(),
+                            SignedU128::negative(1),
+                        );
+                    }
                 }
             }
             if next >= cur {
@@ -3359,21 +4483,7 @@ pub fn bulk_update_balances_for_block(
 
         let mut added_holder_keys: Vec<Vec<u8>> = appended_holders
             .into_iter()
-            .map(|holder| match holder {
-                HolderId::Address(addr) => {
-                    let mut out = Vec::with_capacity(1 + addr.len());
-                    out.push(b'a');
-                    out.extend_from_slice(addr.as_bytes());
-                    out
-                }
-                HolderId::Alkane(id) => {
-                    let mut out = Vec::with_capacity(13);
-                    out.push(b'k');
-                    out.extend_from_slice(&id.block.to_be_bytes());
-                    out.extend_from_slice(&id.tx.to_be_bytes());
-                    out
-                }
-            })
+            .map(|holder| holder_id_index_bytes(&holder))
             .collect();
         added_holder_keys.sort();
         if !added_holder_keys.is_empty() {
@@ -3389,6 +4499,86 @@ pub fn bulk_update_balances_for_block(
         }
 
         puts.push((holders_count_key, get_holders_count_encoded(new_count)?));
+    }
+
+    for (factory, per_holder) in orbital_holders_delta.iter() {
+        let holder_len = provider
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: table.orbital_holder_list_len_key(factory),
+            })?
+            .value
+            .and_then(|bytes| {
+                if bytes.len() == 4 {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&bytes);
+                    Some(u32::from_le_bytes(arr))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let mut holder_keys: Vec<Vec<u8>> = Vec::with_capacity(per_holder.len());
+        let mut holders: Vec<HolderId> = Vec::with_capacity(per_holder.len());
+        for holder in per_holder.keys() {
+            holder_keys.push(table.orbital_holder_key(factory, holder));
+            holders.push(holder.clone());
+        }
+        let current_holder_values = provider
+            .get_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: holder_keys.clone(),
+            })?
+            .values;
+
+        let mut changed_holders: Vec<(Vec<u8>, u128)> = Vec::with_capacity(per_holder.len());
+        let mut appended_holders: Vec<HolderId> = Vec::new();
+        for ((holder, holder_key), current_raw) in holders
+            .into_iter()
+            .zip(holder_keys.into_iter())
+            .zip(current_holder_values.into_iter())
+        {
+            let cur = current_raw.as_ref().and_then(|raw| decode_u128_value(raw).ok()).unwrap_or(0);
+            let Some(delta) = per_holder.get(&holder) else {
+                continue;
+            };
+            let (is_negative, mag) = delta.as_parts();
+            let next = if is_negative {
+                // Orbital holders are a new forward index; missing historical rows should not halt indexing.
+                cur.saturating_sub(mag)
+            } else {
+                cur.saturating_add(mag)
+            };
+            if next == 0 && current_raw.is_none() {
+                continue;
+            }
+            if cur == 0 && next > 0 && current_raw.is_none() {
+                appended_holders.push(holder.clone());
+            }
+            changed_holders.push((holder_key, next));
+        }
+
+        for (holder_key, amount) in changed_holders {
+            puts.push((holder_key, encode_u128_value(amount)?));
+        }
+
+        let mut added_holder_keys: Vec<Vec<u8>> = appended_holders
+            .into_iter()
+            .map(|holder| holder_id_index_bytes(&holder))
+            .collect();
+        added_holder_keys.sort();
+        if !added_holder_keys.is_empty() {
+            let base = holder_len;
+            for (offset, holder_key_bytes) in added_holder_keys.iter().enumerate() {
+                puts.push((
+                    table.orbital_holder_list_idx_key(factory, base.saturating_add(offset as u32)),
+                    holder_key_bytes.clone(),
+                ));
+            }
+            let new_len = holder_len.saturating_add(added_holder_keys.len() as u32);
+            puts.push((table.orbital_holder_list_len_key(factory), new_len.to_le_bytes().to_vec()));
+        }
     }
     if debug {
         eprintln!(
@@ -3637,6 +4827,101 @@ pub fn bulk_update_balances_for_block(
                 new_len.to_le_bytes().to_vec(),
             ));
         }
+    }
+
+    if !address_contract_send_delta.is_empty() || !address_contract_receive_delta.is_empty() {
+        let mut child_contracts = contracts_in_address_amounts(&address_contract_send_delta);
+        child_contracts.extend(contracts_in_address_amounts(&address_contract_receive_delta));
+        let factory_by_child = resolve_factory_by_child(provider, child_contracts)?;
+        let address_orbital_send_delta =
+            rollup_contract_amounts_to_orbitals(&address_contract_send_delta, &factory_by_child);
+        let address_orbital_receive_delta =
+            rollup_contract_amounts_to_orbitals(&address_contract_receive_delta, &factory_by_child);
+        let orbital_send_volume_delta =
+            orbital_volume_deltas_from_address_amounts(&address_orbital_send_delta);
+        let orbital_receive_volume_delta =
+            orbital_volume_deltas_from_address_amounts(&address_orbital_receive_delta);
+
+        let mut addresses: HashSet<String> = HashSet::new();
+        addresses.extend(address_contract_send_delta.keys().cloned());
+        addresses.extend(address_contract_receive_delta.keys().cloned());
+        addresses.extend(address_orbital_send_delta.keys().cloned());
+        addresses.extend(address_orbital_receive_delta.keys().cloned());
+        let mut addresses: Vec<String> = addresses.into_iter().collect();
+        addresses.sort();
+
+        for addr in &addresses {
+            if let Some(delta) = address_contract_send_delta.get(addr) {
+                let key = table.address_cumulative_send_alkanes_key(addr);
+                let current = provider
+                    .get_raw_value(GetRawValueParams {
+                        blockhash: StateAt::Latest,
+                        key: key.clone(),
+                    })?
+                    .value
+                    .and_then(|bytes| decode_address_contract_amount_entries(&bytes).ok())
+                    .unwrap_or_default();
+                let entries = apply_contract_amount_delta(current, delta);
+                puts.push((key, encode_address_contract_amount_entries(&entries)?));
+            }
+
+            if let Some(delta) = address_contract_receive_delta.get(addr) {
+                let key = table.address_cumulative_receive_alkanes_key(addr);
+                let current = provider
+                    .get_raw_value(GetRawValueParams {
+                        blockhash: StateAt::Latest,
+                        key: key.clone(),
+                    })?
+                    .value
+                    .and_then(|bytes| decode_address_contract_amount_entries(&bytes).ok())
+                    .unwrap_or_default();
+                let entries = apply_contract_amount_delta(current, delta);
+                puts.push((key, encode_address_contract_amount_entries(&entries)?));
+            }
+
+            if let Some(delta) = address_orbital_send_delta.get(addr) {
+                let key = table.address_cumulative_send_orbitals_key(addr);
+                let current = provider
+                    .get_raw_value(GetRawValueParams {
+                        blockhash: StateAt::Latest,
+                        key: key.clone(),
+                    })?
+                    .value
+                    .and_then(|bytes| decode_address_contract_amount_entries(&bytes).ok())
+                    .unwrap_or_default();
+                let entries = apply_contract_amount_delta(current, delta);
+                puts.push((key, encode_address_contract_amount_entries(&entries)?));
+            }
+
+            if let Some(delta) = address_orbital_receive_delta.get(addr) {
+                let key = table.address_cumulative_receive_orbitals_key(addr);
+                let current = provider
+                    .get_raw_value(GetRawValueParams {
+                        blockhash: StateAt::Latest,
+                        key: key.clone(),
+                    })?
+                    .value
+                    .and_then(|bytes| decode_address_contract_amount_entries(&bytes).ok())
+                    .unwrap_or_default();
+                let entries = apply_contract_amount_delta(current, delta);
+                puts.push((key, encode_address_contract_amount_entries(&entries)?));
+            }
+        }
+
+        apply_orbital_volume_deltas(
+            provider,
+            &table,
+            &mut puts,
+            &orbital_send_volume_delta,
+            false,
+        )?;
+        apply_orbital_volume_deltas(
+            provider,
+            &table,
+            &mut puts,
+            &orbital_receive_volume_delta,
+            true,
+        )?;
     }
 
     for (alkane, delta) in minted_delta_by_alk.iter() {
@@ -4928,6 +6213,159 @@ pub fn get_holders_for_alkane(
     let end = (off + l).min(total);
     let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
     Ok((total, supply, slice))
+}
+
+pub fn get_orbital_holders_for_factory(
+    blockhash: StateAt,
+    provider: &EssentialsProvider,
+    factory: SchemaAlkaneId,
+    page: usize,
+    limit: usize,
+) -> Result<(usize /*total*/, u128 /*counted children*/, Vec<HolderEntry>)> {
+    let table = provider.table();
+    let len = provider
+        .get_raw_value(GetRawValueParams {
+            blockhash,
+            key: table.orbital_holder_list_len_key(&factory),
+        })?
+        .value
+        .and_then(|bytes| {
+            if bytes.len() == 4 {
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(&bytes);
+                Some(u32::from_le_bytes(arr))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    let mut all: Vec<HolderEntry> = Vec::new();
+    if len > 0 {
+        let mut idx_keys = Vec::with_capacity(len as usize);
+        for idx in 0..len {
+            idx_keys.push(table.orbital_holder_list_idx_key(&factory, idx));
+        }
+        let idx_vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
+            .values;
+        let mut holders = Vec::new();
+        let mut holder_keys = Vec::new();
+        for idx_val in idx_vals {
+            let Some(raw) = idx_val else { continue };
+            let Some(holder) = parse_holder_id_index_bytes(&raw) else { continue };
+            holder_keys.push(table.orbital_holder_key(&factory, &holder));
+            holders.push(holder);
+        }
+
+        let vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: holder_keys })?
+            .values;
+        for (holder, value) in holders.into_iter().zip(vals.into_iter()) {
+            let Some(bytes) = value else { continue };
+            let Ok(amount) = decode_u128_value(&bytes) else {
+                continue;
+            };
+            if amount == 0 {
+                continue;
+            }
+            all.push(HolderEntry { holder, amount });
+        }
+    }
+
+    all.sort_by(|a, b| match b.amount.cmp(&a.amount) {
+        std::cmp::Ordering::Equal => holder_order_key(&a.holder).cmp(&holder_order_key(&b.holder)),
+        o => o,
+    });
+    let total = all.len();
+    let supply: u128 = all.iter().map(|h| h.amount).sum();
+    let p = page.max(1);
+    let l = limit.max(1);
+    let off = l.saturating_mul(p - 1);
+    let end = (off + l).min(total);
+    let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
+    Ok((total, supply, slice))
+}
+
+pub fn get_orbital_volume_for_factory(
+    blockhash: StateAt,
+    provider: &EssentialsProvider,
+    factory: SchemaAlkaneId,
+    receive: bool,
+    page: usize,
+    limit: usize,
+) -> Result<(usize, Vec<AddressAmountEntry>)> {
+    let table = provider.table();
+    let len_key = if receive {
+        table.orbital_receive_volume_list_len_key(&factory)
+    } else {
+        table.orbital_send_volume_list_len_key(&factory)
+    };
+    let len = provider
+        .get_raw_value(GetRawValueParams { blockhash, key: len_key })?
+        .value
+        .and_then(|bytes| {
+            if bytes.len() == 4 {
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(&bytes);
+                Some(u32::from_le_bytes(arr))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    let mut all: Vec<AddressAmountEntry> = Vec::new();
+    if len > 0 {
+        let mut idx_keys = Vec::with_capacity(len as usize);
+        for idx in 0..len {
+            idx_keys.push(if receive {
+                table.orbital_receive_volume_list_idx_key(&factory, idx)
+            } else {
+                table.orbital_send_volume_list_idx_key(&factory, idx)
+            });
+        }
+        let idx_vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
+            .values;
+        let mut addresses = Vec::new();
+        let mut amount_keys = Vec::new();
+        for idx_val in idx_vals {
+            let Some(raw) = idx_val else { continue };
+            let Ok(address) = std::str::from_utf8(&raw).map(|s| s.to_string()) else {
+                continue;
+            };
+            amount_keys.push(if receive {
+                table.orbital_receive_volume_entry_key(&factory, &address)
+            } else {
+                table.orbital_send_volume_entry_key(&factory, &address)
+            });
+            addresses.push(address);
+        }
+
+        let vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: amount_keys })?
+            .values;
+        for (address, value) in addresses.into_iter().zip(vals.into_iter()) {
+            let Some(bytes) = value else { continue };
+            let Ok(amount) = decode_u128_value(&bytes) else {
+                continue;
+            };
+            if amount == 0 {
+                continue;
+            }
+            all.push(AddressAmountEntry { address, amount });
+        }
+    }
+
+    sort_address_amount_entries(&mut all);
+    let total = all.len();
+    let p = page.max(1);
+    let l = limit.max(1);
+    let off = l.saturating_mul(p - 1);
+    let end = (off + l).min(total);
+    let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
+    Ok((total, slice))
 }
 
 pub fn get_transfer_volume_for_alkane(
