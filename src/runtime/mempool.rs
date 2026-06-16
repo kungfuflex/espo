@@ -48,7 +48,7 @@ use tokio::sync::broadcast;
 pub const MEMPOOL_POLL_SECS: u64 = 5;
 pub const MEMPOOL_VIEW_BATCH_SIZE: usize = 10;
 pub const MEMPOOL_LOG_STEP: usize = 100;
-pub const MEMPOOL_MAX_TXS: usize = 50_000;
+pub const MEMPOOL_MAX_TXS: usize = 200_000;
 pub const MEMPOOL_MIN_FEE_RATE_SATS_VBYTE: f64 = 0.5;
 /// --- End tunables ---
 
