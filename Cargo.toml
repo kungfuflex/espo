@@ -17,6 +17,7 @@ required-features = ["binary"]
 [features]
 # Feature that's only available for non-WASM builds
 binary = []
+jemalloc-prof = ["binary", "dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "tikv-jemallocator/profiling"]
 test-utils = ["alkanes", "metashrew-runtime", "rockshrew-runtime", "wasmtime", "protorune/test-utils"]
 
 [dependencies]
@@ -57,6 +58,8 @@ bitcoincore-rpc = "0.19.0"
 tower-http = { version = "0.5", features = ["cors"] }
 alkanes-cli-common = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 zmq = "0.10"
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
 
 # Required dependencies for alkanes support (from alkanes-rs)
 metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // ✅ bring in balances bulk updater
-use crate::modules::essentials::utils::balances::bulk_update_balances_for_block;
+use crate::modules::essentials::utils::balances::bulk_update_balances_for_block_with_factory_hints;
 
 fn parse_short_id(
     id: &crate::alkanes::trace::EspoSandshrewLikeTraceShortId,
@@ -629,10 +629,17 @@ impl EspoModule for Essentials {
         debug::log_elapsed(module, "build_creation_indexes", timer);
         let mut creations_in_block: Vec<SchemaAlkaneId> = Vec::new();
         let mut seen_creations_in_block: HashSet<SchemaAlkaneId> = HashSet::new();
+        let mut balance_factory_hints = factory_hint_updates.clone();
         for rec in created_records.iter() {
             if seen_creations_in_block.insert(rec.alkane) {
                 creations_in_block.push(rec.alkane);
             }
+            if let Some(factory) = rec.inspection.as_ref().and_then(|i| i.factory_alkane) {
+                balance_factory_hints.insert(rec.alkane, factory);
+            }
+        }
+        for (child, factory) in balance_factory_hints.iter() {
+            factory_child_rows.insert(table.alkane_factory_child_key(factory, child));
         }
         // Dedup against existing records to avoid double-counting if re-run.
         let timer = debug::start_if(debug);
@@ -908,7 +915,11 @@ impl EspoModule for Essentials {
                 block.transactions.len()
             );
         }
-        if let Err(e) = bulk_update_balances_for_block(provider, &block) {
+        if let Err(e) = bulk_update_balances_for_block_with_factory_hints(
+            provider,
+            &block,
+            &balance_factory_hints,
+        ) {
             eprintln!(
                 "[ESSENTIALS] bulk_update_balances_for_block failed at block #{}: {e}",
                 block.height

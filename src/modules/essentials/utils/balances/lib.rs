@@ -17,21 +17,24 @@ use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
     AddressActivityEntry, AddressAmountEntry, AddressContractAmountEntry, AddressIndexListKind,
-    AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId, HoldersCountEntry,
+    AddressOrbitalBalanceEntry, AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry,
+    HolderId, HoldersCountEntry, OrbitalHolderEntry,
     address_index_list_id_alkane_balance_txs_by_token, address_index_list_id_alkane_block_txs,
     append_address_index_values, build_new_outpoint_pos_versioned_puts,
     build_new_outpoint_spent_versioned_puts, build_new_tx_pos_versioned_puts,
     build_outpoint_spent_versioned_puts, decode_address_contract_amount_entries,
-    decode_balances_vec, decode_outpoint_pointer_blob_v3, decode_pointer_idx_u64,
-    decode_u128_value, encode_address_contract_amount_entries, encode_outpoint_pointer_blob_v3,
-    encode_pointer_idx_u64, encode_tx_pointer_blob_v3, encode_u128_value, encode_vec,
-    get_holders_count_encoded, mk_outpoint, resolve_outpoint_id_v2, resolve_outpoint_ids_batch_v2,
+    decode_address_orbital_balance_entries, decode_balances_vec, decode_orbital_holder_entry,
+    decode_outpoint_pointer_blob_v3, decode_pointer_idx_u64, decode_u128_value,
+    encode_address_contract_amount_entries, encode_address_orbital_balance_entries,
+    encode_orbital_holder_entry, encode_outpoint_pointer_blob_v3, encode_pointer_idx_u64,
+    encode_tx_pointer_blob_v3, encode_u128_value, encode_vec, get_holders_count_encoded,
+    mk_outpoint, resolve_outpoint_id_v2, resolve_outpoint_ids_batch_v2,
     resolve_outpoint_spent_by_id_v2, resolve_outpoint_spent_by_ids_batch_v2,
     resolve_tx_pointer_ids_batch_v2, spk_to_address_str,
 };
 use crate::modules::essentials::storage::{
-    EssentialsProvider, EssentialsTable, GetCreationRecordParams, GetListEntriesDescParams,
-    GetMultiValuesParams, GetRawValueParams, SetBatchParams,
+    EssentialsProvider, EssentialsTable, GetCreationRecordParams, GetFactoryChildrenParams,
+    GetListEntriesDescParams, GetMultiValuesParams, GetRawValueParams, SetBatchParams,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::state_at::StateAt;
@@ -43,7 +46,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Transaction, Txid};
 use borsh::BorshDeserialize;
 use protorune_support::protostone::{Protostone, ProtostoneEdict};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -79,6 +82,9 @@ type SourceAmounts = VecDeque<(AttributionSource, u128)>;
 type SourcedSheet = BTreeMap<SchemaAlkaneId, SourceAmounts>;
 type ContractTokenAmounts = BTreeMap<(SchemaAlkaneId, SchemaAlkaneId), u128>;
 type AddressContractAmounts = HashMap<String, ContractTokenAmounts>;
+type SourceTokenAddressAmounts = HashMap<(SchemaAlkaneId, SchemaAlkaneId), HashMap<String, u128>>;
+type OrbitalChildHolderDeltas =
+    HashMap<SchemaAlkaneId, BTreeMap<HolderId, BTreeMap<SchemaAlkaneId, SignedU128>>>;
 
 #[derive(Default)]
 struct TransferApplication {
@@ -953,6 +959,45 @@ fn trace_source_flow(
     Some(out)
 }
 
+fn trace_root_owner(
+    trace: &EspoSandshrewLikeTrace,
+    host_function_values: &EspoHostFunctionValues,
+) -> Option<SchemaAlkaneId> {
+    let cleaned = clean_espo_sandshrew_like_trace(trace, host_function_values);
+    let events = cleaned.as_ref().map(|t| t.events.as_slice()).unwrap_or(&trace.events);
+    events.iter().find_map(|ev| {
+        if let EspoSandshrewLikeTraceEvent::Invoke(inv) = ev {
+            parse_short_id(&inv.context.myself)
+        } else {
+            None
+        }
+    })
+}
+
+fn final_trace_return_sources(
+    root_owner: SchemaAlkaneId,
+    mut incoming_sources: SourcedSheet,
+    net_out: &BTreeMap<SchemaAlkaneId, u128>,
+) -> SourcedSheet {
+    let mut out = SourcedSheet::new();
+    for (token, amount) in net_out {
+        if *amount == 0 {
+            continue;
+        }
+        let mut sources = take_sources_from_sheet(&mut incoming_sources, token, *amount);
+        let sourced = source_amounts_total(&sources);
+        if sourced < *amount {
+            add_source_amount(
+                &mut sources,
+                AttributionSource::Contract(root_owner),
+                amount.saturating_sub(sourced),
+            );
+        }
+        add_sources_to_sheet(&mut out, *token, sources);
+    }
+    out
+}
+
 /* -------------------------- Edicts + routing (multi-protostone, per your rules) -------------------------- */
 
 /// Whether `vout` is a valid, spendable, non-OP_RETURN output index for this tx.
@@ -1374,11 +1419,21 @@ fn apply_transfers_multi_attributed(
                     }
                 }
             }
+            let trace_in_sources_for_receive = trace_in_sources.clone();
             if let Some(trace) = trace_for_shadow {
                 if let Some(flow) = trace_source_flow(trace, trace_in_sources, host_function_values)
                 {
                     merge_address_contract_amounts(&mut send_contracts, flow.send_contracts);
-                    merge_sourced_sheet(&mut source_sheet, flow.returned);
+                }
+            }
+            if let (Some(trace), Some(ref net_out_map)) = (trace_for_shadow, net_out.as_ref()) {
+                if let Some(root_owner) = trace_root_owner(trace, host_function_values) {
+                    let final_sources = final_trace_return_sources(
+                        root_owner,
+                        trace_in_sources_for_receive,
+                        net_out_map,
+                    );
+                    merge_sourced_sheet(&mut source_sheet, final_sources);
                 }
             }
         }
@@ -1742,6 +1797,107 @@ mod attribution_tests {
     }
 
     #[test]
+    fn final_receive_sources_use_outermost_frame_not_inner_return_source() {
+        let token = alkane(2, 77_623);
+        let outer = alkane(2, 77_631);
+        let inner = token;
+        let trace_json = r#"
+{
+  "outpoint": "test",
+  "events": [
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x2", "tx": "0x12f3f"},
+          "caller": {"block": "0x0", "tx": "0x0"},
+          "inputs": [],
+          "incomingAlkanes": [],
+          "vout": 6
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x2", "tx": "0x12f37"},
+          "caller": {"block": "0x2", "tx": "0x12f3f"},
+          "inputs": [],
+          "incomingAlkanes": [],
+          "vout": 6
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {
+          "alkanes": [
+            {"id": {"block": "0x2", "tx": "0x12f37"}, "value": "0x5"}
+          ],
+          "data": "0x",
+          "storage": []
+        }
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {
+          "alkanes": [
+            {"id": {"block": "0x2", "tx": "0x12f37"}, "value": "0x5"}
+          ],
+          "data": "0x",
+          "storage": []
+        }
+      }
+    }
+  ]
+}
+"#;
+        let trace: EspoSandshrewLikeTrace = serde_json::from_str(trace_json).expect("trace json");
+        let host_values = EspoHostFunctionValues::default();
+
+        let flow =
+            trace_source_flow(&trace, SourcedSheet::new(), &host_values).expect("source flow");
+        let mut nested_return_sources = flow.returned;
+        let nested_chunk = take_sources_from_sheet(&mut nested_return_sources, &token, 5);
+        assert_eq!(source_total(&nested_chunk, AttributionSource::Contract(inner)), 5);
+
+        let root_owner = trace_root_owner(&trace, &host_values).expect("root owner");
+        assert_eq!(root_owner, outer);
+        let (_net_in, net_out, status) = compute_nets(&trace);
+        assert_eq!(status, EspoTraceType::SUCCESS);
+        let mut final_sources =
+            final_trace_return_sources(root_owner, SourcedSheet::new(), net_out.as_ref().unwrap());
+        let final_chunk = take_sources_from_sheet(&mut final_sources, &token, 5);
+
+        assert_eq!(source_total(&final_chunk, AttributionSource::Contract(outer)), 5);
+        assert_eq!(source_total(&final_chunk, AttributionSource::Contract(inner)), 0);
+    }
+
+    #[test]
+    fn final_receive_sources_keep_vin_fifo_before_outer_created_excess() {
+        let token = alkane(2, 0);
+        let outer = alkane(4, 1);
+        let net_out = BTreeMap::from([(token, 10)]);
+
+        let mut final_sources =
+            final_trace_return_sources(outer, address_sources(token, "addr_a", 7), &net_out);
+        let chunk = take_sources_from_sheet(&mut final_sources, &token, 10);
+
+        assert_eq!(source_total(&chunk, AttributionSource::Address("addr_a".to_string())), 7);
+        assert_eq!(source_total(&chunk, AttributionSource::Contract(outer)), 3);
+    }
+
+    #[test]
     fn send_contract_sources_consume_vin_chunks_fifo() {
         let token = alkane(2, 0);
         let parent = alkane(4, 1);
@@ -1925,7 +2081,7 @@ mod attribution_tests {
     }
 
     #[test]
-    fn orbital_volume_deltas_sum_tokens_per_address_and_factory() {
+    fn volume_deltas_are_scoped_by_source_and_token() {
         let factory = alkane(2, 0);
         let other_factory = alkane(2, 1);
         let token_a = alkane(4, 3);
@@ -1937,30 +2093,91 @@ mod attribution_tests {
         add_address_contract_amount(&mut deltas, "addr_b".to_string(), factory, token_a, 3);
         add_address_contract_amount(&mut deltas, "addr_a".to_string(), other_factory, token_a, 11);
 
-        let volumes = orbital_volume_deltas_from_address_amounts(&deltas);
+        let volumes = volume_deltas_from_address_amounts(&deltas);
 
-        assert_eq!(volumes.get(&factory).and_then(|m| m.get("addr_a")).copied(), Some(12));
-        assert_eq!(volumes.get(&factory).and_then(|m| m.get("addr_b")).copied(), Some(3));
-        assert_eq!(volumes.get(&other_factory).and_then(|m| m.get("addr_a")).copied(), Some(11));
+        assert_eq!(
+            volumes.get(&(factory, token_a)).and_then(|m| m.get("addr_a")).copied(),
+            Some(7)
+        );
+        assert_eq!(
+            volumes.get(&(factory, token_b)).and_then(|m| m.get("addr_a")).copied(),
+            Some(5)
+        );
+        assert_eq!(
+            volumes.get(&(factory, token_a)).and_then(|m| m.get("addr_b")).copied(),
+            Some(3)
+        );
+        assert_eq!(
+            volumes.get(&(other_factory, token_a)).and_then(|m| m.get("addr_a")).copied(),
+            Some(11)
+        );
     }
 
     #[test]
     fn orbital_holder_delta_accumulator_nets_zero_crossings() {
         let factory = alkane(2, 0);
+        let child_a = alkane(2, 1);
+        let child_b = alkane(2, 2);
         let addr_a = HolderId::Address("addr_a".to_string());
         let addr_b = HolderId::Address("addr_b".to_string());
 
-        let mut deltas: HashMap<SchemaAlkaneId, BTreeMap<HolderId, SignedU128>> = HashMap::new();
-        add_orbital_holder_delta(&mut deltas, factory, addr_a.clone(), SignedU128::positive(1));
-        add_orbital_holder_delta(&mut deltas, factory, addr_a.clone(), SignedU128::positive(1));
-        add_orbital_holder_delta(&mut deltas, factory, addr_a.clone(), SignedU128::negative(1));
-        add_orbital_holder_delta(&mut deltas, factory, addr_b.clone(), SignedU128::positive(1));
-        add_orbital_holder_delta(&mut deltas, factory, addr_b.clone(), SignedU128::negative(1));
+        let mut deltas: OrbitalChildHolderDeltas = HashMap::new();
+        add_orbital_child_holder_delta(
+            &mut deltas,
+            factory,
+            addr_a.clone(),
+            child_a,
+            SignedU128::positive(1),
+        );
+        add_orbital_child_holder_delta(
+            &mut deltas,
+            factory,
+            addr_a.clone(),
+            child_b,
+            SignedU128::positive(1),
+        );
+        add_orbital_child_holder_delta(
+            &mut deltas,
+            factory,
+            addr_a.clone(),
+            child_b,
+            SignedU128::negative(1),
+        );
+        add_orbital_child_holder_delta(
+            &mut deltas,
+            factory,
+            addr_b.clone(),
+            child_a,
+            SignedU128::positive(1),
+        );
+        add_orbital_child_holder_delta(
+            &mut deltas,
+            factory,
+            addr_b.clone(),
+            child_a,
+            SignedU128::negative(1),
+        );
 
         let entry = deltas.get(&factory).expect("factory deltas");
         assert_eq!(entry.len(), 1);
-        assert_eq!(entry.get(&addr_a).map(SignedU128::as_parts), Some((false, 1)));
+        let addr_a_children = entry.get(&addr_a).expect("addr_a child deltas");
+        assert_eq!(addr_a_children.len(), 1);
+        assert_eq!(addr_a_children.get(&child_a).map(SignedU128::as_parts), Some((false, 1)));
         assert!(!entry.contains_key(&addr_b));
+    }
+
+    #[test]
+    fn factory_hints_resolve_orbital_children_without_name_dependency() {
+        let factory = alkane(4, 520);
+        let fire_position = alkane(2, 77_635);
+        let unrelated = alkane(2, 1);
+        let children = HashSet::from([fire_position, unrelated]);
+        let hints = HashMap::from([(fire_position, factory)]);
+
+        let resolved = resolve_factory_by_child_from_hints(&children, &hints);
+
+        assert_eq!(resolved.get(&fire_position).copied(), Some(factory));
+        assert!(!resolved.contains_key(&unrelated));
     }
 }
 
@@ -2260,58 +2477,216 @@ fn rollup_contract_amounts_to_orbitals(
     rolled
 }
 
-fn orbital_volume_deltas_from_address_amounts(
+fn volume_deltas_from_address_amounts(
     deltas: &AddressContractAmounts,
-) -> HashMap<SchemaAlkaneId, HashMap<String, u128>> {
-    let mut out: HashMap<SchemaAlkaneId, HashMap<String, u128>> = HashMap::new();
+) -> SourceTokenAddressAmounts {
+    let mut out: SourceTokenAddressAmounts = HashMap::new();
     for (address, entries) in deltas {
-        for ((orbital, _token), amount) in entries {
+        for ((source, token), amount) in entries {
             if *amount == 0 {
                 continue;
             }
-            let slot = out.entry(*orbital).or_default().entry(address.clone()).or_default();
+            let slot =
+                out.entry((*source, *token)).or_default().entry(address.clone()).or_default();
             *slot = slot.saturating_add(*amount);
         }
     }
     out
 }
 
-fn add_orbital_holder_delta(
-    deltas: &mut HashMap<SchemaAlkaneId, BTreeMap<HolderId, SignedU128>>,
+fn add_orbital_child_holder_delta(
+    deltas: &mut OrbitalChildHolderDeltas,
     factory: SchemaAlkaneId,
     holder: HolderId,
+    child: SchemaAlkaneId,
     delta: SignedU128,
 ) {
     if delta.is_zero() {
         return;
     }
-    let entry = deltas.entry(factory).or_default();
-    let slot = entry.entry(holder.clone()).or_insert_with(SignedU128::zero);
-    *slot += delta;
-    if slot.is_zero() {
-        entry.remove(&holder);
-    }
-    if entry.is_empty() {
-        deltas.remove(&factory);
+    let remove_holder = {
+        let entry = deltas.entry(factory).or_default().entry(holder.clone()).or_default();
+        let slot = entry.entry(child).or_insert_with(SignedU128::zero);
+        *slot += delta;
+        if slot.is_zero() {
+            entry.remove(&child);
+        }
+        entry.is_empty()
+    };
+    if remove_holder {
+        let remove_factory = if let Some(per_holder) = deltas.get_mut(&factory) {
+            per_holder.remove(&holder);
+            per_holder.is_empty()
+        } else {
+            false
+        };
+        if remove_factory {
+            deltas.remove(&factory);
+        }
     }
 }
 
-fn apply_orbital_volume_deltas(
+fn hydrate_orbital_children_from_holder_index(
+    provider: &EssentialsProvider,
+    table: &EssentialsTable<'_>,
+    factory: &SchemaAlkaneId,
+    holder: &HolderId,
+) -> Result<BTreeSet<SchemaAlkaneId>> {
+    let children = provider
+        .get_factory_children(GetFactoryChildrenParams {
+            blockhash: StateAt::Latest,
+            factory: *factory,
+        })?
+        .children;
+    if children.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    let keys: Vec<Vec<u8>> = children.iter().map(|child| table.holder_key(child, holder)).collect();
+    let values = provider
+        .get_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
+        .values;
+
+    let mut held = BTreeSet::new();
+    for (child, value) in children.into_iter().zip(values.into_iter()) {
+        let amount = value.as_ref().and_then(|bytes| decode_u128_value(bytes).ok()).unwrap_or(0);
+        if amount > 0
+            || matches!(holder, HolderId::Alkane(id) if *id == child)
+                && lookup_self_balance(&child).unwrap_or(0) > 0
+        {
+            held.insert(child);
+        }
+    }
+    Ok(held)
+}
+
+fn add_address_orbital_balance_delta(
+    deltas: &mut HashMap<String, BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>>,
+    address: &str,
+    factory: SchemaAlkaneId,
+    child: SchemaAlkaneId,
+    delta: SignedU128,
+) {
+    if delta.is_zero() {
+        return;
+    }
+    let remove_child = {
+        let slot = deltas
+            .entry(address.to_string())
+            .or_default()
+            .entry(factory)
+            .or_default()
+            .entry(child)
+            .or_insert_with(SignedU128::zero);
+        *slot += delta;
+        slot.is_zero()
+    };
+    if remove_child {
+        let remove_address = if let Some(per_factory) = deltas.get_mut(address) {
+            if let Some(per_child) = per_factory.get_mut(&factory) {
+                per_child.remove(&child);
+                if per_child.is_empty() {
+                    per_factory.remove(&factory);
+                }
+            }
+            per_factory.is_empty()
+        } else {
+            false
+        };
+        if remove_address {
+            deltas.remove(address);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SourceVolumeIndex {
+    Alkane,
+    Orbital,
+}
+
+fn source_volume_list_len_key(
+    table: &EssentialsTable<'_>,
+    index: SourceVolumeIndex,
+    source: &SchemaAlkaneId,
+    alkane: &SchemaAlkaneId,
+    receive: bool,
+) -> Vec<u8> {
+    match (index, receive) {
+        (SourceVolumeIndex::Alkane, false) => table.alkane_send_volume_list_len_key(source, alkane),
+        (SourceVolumeIndex::Alkane, true) => {
+            table.alkane_receive_volume_list_len_key(source, alkane)
+        }
+        (SourceVolumeIndex::Orbital, false) => {
+            table.orbital_send_volume_list_len_key(source, alkane)
+        }
+        (SourceVolumeIndex::Orbital, true) => {
+            table.orbital_receive_volume_list_len_key(source, alkane)
+        }
+    }
+}
+
+fn source_volume_list_idx_key(
+    table: &EssentialsTable<'_>,
+    index: SourceVolumeIndex,
+    source: &SchemaAlkaneId,
+    alkane: &SchemaAlkaneId,
+    idx: u32,
+    receive: bool,
+) -> Vec<u8> {
+    match (index, receive) {
+        (SourceVolumeIndex::Alkane, false) => {
+            table.alkane_send_volume_list_idx_key(source, alkane, idx)
+        }
+        (SourceVolumeIndex::Alkane, true) => {
+            table.alkane_receive_volume_list_idx_key(source, alkane, idx)
+        }
+        (SourceVolumeIndex::Orbital, false) => {
+            table.orbital_send_volume_list_idx_key(source, alkane, idx)
+        }
+        (SourceVolumeIndex::Orbital, true) => {
+            table.orbital_receive_volume_list_idx_key(source, alkane, idx)
+        }
+    }
+}
+
+fn source_volume_entry_key(
+    table: &EssentialsTable<'_>,
+    index: SourceVolumeIndex,
+    source: &SchemaAlkaneId,
+    alkane: &SchemaAlkaneId,
+    address: &str,
+    receive: bool,
+) -> Vec<u8> {
+    match (index, receive) {
+        (SourceVolumeIndex::Alkane, false) => {
+            table.alkane_send_volume_entry_key(source, alkane, address)
+        }
+        (SourceVolumeIndex::Alkane, true) => {
+            table.alkane_receive_volume_entry_key(source, alkane, address)
+        }
+        (SourceVolumeIndex::Orbital, false) => {
+            table.orbital_send_volume_entry_key(source, alkane, address)
+        }
+        (SourceVolumeIndex::Orbital, true) => {
+            table.orbital_receive_volume_entry_key(source, alkane, address)
+        }
+    }
+}
+
+fn apply_source_volume_deltas(
     provider: &EssentialsProvider,
     table: &EssentialsTable<'_>,
     puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    deltas: &HashMap<SchemaAlkaneId, HashMap<String, u128>>,
+    deltas: &SourceTokenAddressAmounts,
+    index: SourceVolumeIndex,
     receive: bool,
 ) -> Result<()> {
-    for (factory, per_addr) in deltas {
+    for ((source, alkane), per_addr) in deltas {
         if per_addr.is_empty() {
             continue;
         }
-        let len_key = if receive {
-            table.orbital_receive_volume_list_len_key(factory)
-        } else {
-            table.orbital_send_volume_list_len_key(factory)
-        };
+        let len_key = source_volume_list_len_key(table, index, source, alkane, receive);
         let len = provider
             .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: len_key.clone() })?
             .value
@@ -2330,13 +2705,7 @@ fn apply_orbital_volume_deltas(
         addresses.sort();
         let entry_keys: Vec<Vec<u8>> = addresses
             .iter()
-            .map(|address| {
-                if receive {
-                    table.orbital_receive_volume_entry_key(factory, address)
-                } else {
-                    table.orbital_send_volume_entry_key(factory, address)
-                }
-            })
+            .map(|address| source_volume_entry_key(table, index, source, alkane, address, receive))
             .collect();
         let current_values = provider
             .get_multi_values(GetMultiValuesParams {
@@ -2365,17 +2734,14 @@ fn apply_orbital_volume_deltas(
         if !appended.is_empty() {
             let base = len;
             for (offset, address) in appended.iter().enumerate() {
-                let idx_key = if receive {
-                    table.orbital_receive_volume_list_idx_key(
-                        factory,
-                        base.saturating_add(offset as u32),
-                    )
-                } else {
-                    table.orbital_send_volume_list_idx_key(
-                        factory,
-                        base.saturating_add(offset as u32),
-                    )
-                };
+                let idx_key = source_volume_list_idx_key(
+                    table,
+                    index,
+                    source,
+                    alkane,
+                    base.saturating_add(offset as u32),
+                    receive,
+                );
                 puts.push((idx_key, address.as_bytes().to_vec()));
             }
             let new_len = len.saturating_add(appended.len() as u32);
@@ -2397,14 +2763,31 @@ fn contracts_in_address_amounts(deltas: &AddressContractAmounts) -> HashSet<Sche
     contracts
 }
 
+fn resolve_factory_by_child_from_hints(
+    children: &HashSet<SchemaAlkaneId>,
+    factory_hints: &HashMap<SchemaAlkaneId, SchemaAlkaneId>,
+) -> HashMap<SchemaAlkaneId, SchemaAlkaneId> {
+    let mut out = HashMap::new();
+    for child in children {
+        if let Some(factory) = factory_hints.get(child) {
+            out.insert(*child, *factory);
+        }
+    }
+    out
+}
+
 fn resolve_factory_by_child(
     provider: &EssentialsProvider,
     children: HashSet<SchemaAlkaneId>,
+    factory_hints: &HashMap<SchemaAlkaneId, SchemaAlkaneId>,
 ) -> Result<HashMap<SchemaAlkaneId, SchemaAlkaneId>> {
+    let mut out = resolve_factory_by_child_from_hints(&children, factory_hints);
     let mut children: Vec<SchemaAlkaneId> = children.into_iter().collect();
     children.sort();
-    let mut out = HashMap::new();
     for child in children {
+        if out.contains_key(&child) {
+            continue;
+        }
         let Some(record) = provider
             .get_creation_record(GetCreationRecordParams {
                 blockhash: StateAt::Latest,
@@ -2468,6 +2851,15 @@ Public API
 pub fn bulk_update_balances_for_block(
     provider: &EssentialsProvider,
     block: &EspoBlock,
+) -> Result<()> {
+    bulk_update_balances_for_block_with_factory_hints(provider, block, &HashMap::new())
+}
+
+#[allow(unused_assignments)]
+pub fn bulk_update_balances_for_block_with_factory_hints(
+    provider: &EssentialsProvider,
+    block: &EspoBlock,
+    factory_hints: &HashMap<SchemaAlkaneId, SchemaAlkaneId>,
 ) -> Result<()> {
     crate::debug_timer_log!("bulk_update_balances_for_block.total");
     let debug = debug_enabled();
@@ -4310,9 +4702,8 @@ pub fn bulk_update_balances_for_block(
     let holders_full_rebuilds = 0usize;
     let holders_full_rebuild_entries = 0usize;
     let holder_child_factories =
-        resolve_factory_by_child(provider, holders_delta.keys().copied().collect())?;
-    let mut orbital_holders_delta: HashMap<SchemaAlkaneId, BTreeMap<HolderId, SignedU128>> =
-        HashMap::new();
+        resolve_factory_by_child(provider, holders_delta.keys().copied().collect(), factory_hints)?;
+    let mut orbital_holders_delta: OrbitalChildHolderDeltas = HashMap::new();
     for (alkane, per_holder) in holders_delta.iter() {
         let holders_count_key = table.holders_count_key(alkane);
         let prev_count = provider
@@ -4396,20 +4787,22 @@ pub fn bulk_update_balances_for_block(
                         appended_holders.push(holder.clone());
                     }
                     if let Some(factory) = holder_child_factories.get(alkane) {
-                        add_orbital_holder_delta(
+                        add_orbital_child_holder_delta(
                             &mut orbital_holders_delta,
                             *factory,
                             holder.clone(),
+                            *alkane,
                             SignedU128::positive(1),
                         );
                     }
                 } else if cur > 0 && next == 0 {
                     removed_holders = removed_holders.saturating_add(1);
                     if let Some(factory) = holder_child_factories.get(alkane) {
-                        add_orbital_holder_delta(
+                        add_orbital_child_holder_delta(
                             &mut orbital_holders_delta,
                             *factory,
                             holder.clone(),
+                            *alkane,
                             SignedU128::negative(1),
                         );
                     }
@@ -4501,11 +4894,15 @@ pub fn bulk_update_balances_for_block(
         puts.push((holders_count_key, get_holders_count_encoded(new_count)?));
     }
 
+    let mut address_orbital_balance_deltas: HashMap<
+        String,
+        BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+    > = HashMap::new();
     for (factory, per_holder) in orbital_holders_delta.iter() {
         let holder_len = provider
             .get_raw_value(GetRawValueParams {
                 blockhash: StateAt::Latest,
-                key: table.orbital_holder_list_len_key(factory),
+                key: table.orbital_holder_v2_list_len_key(factory),
             })?
             .value
             .and_then(|bytes| {
@@ -4522,7 +4919,7 @@ pub fn bulk_update_balances_for_block(
         let mut holder_keys: Vec<Vec<u8>> = Vec::with_capacity(per_holder.len());
         let mut holders: Vec<HolderId> = Vec::with_capacity(per_holder.len());
         for holder in per_holder.keys() {
-            holder_keys.push(table.orbital_holder_key(factory, holder));
+            holder_keys.push(table.orbital_holder_v2_key(factory, holder));
             holders.push(holder.clone());
         }
         let current_holder_values = provider
@@ -4532,35 +4929,72 @@ pub fn bulk_update_balances_for_block(
             })?
             .values;
 
-        let mut changed_holders: Vec<(Vec<u8>, u128)> = Vec::with_capacity(per_holder.len());
+        let mut changed_holders: Vec<(Vec<u8>, OrbitalHolderEntry)> =
+            Vec::with_capacity(per_holder.len());
         let mut appended_holders: Vec<HolderId> = Vec::new();
         for ((holder, holder_key), current_raw) in holders
             .into_iter()
             .zip(holder_keys.into_iter())
             .zip(current_holder_values.into_iter())
         {
-            let cur = current_raw.as_ref().and_then(|raw| decode_u128_value(raw).ok()).unwrap_or(0);
-            let Some(delta) = per_holder.get(&holder) else {
+            let had_v2_row = current_raw.is_some();
+            let current_entry =
+                current_raw.as_ref().and_then(|raw| decode_orbital_holder_entry(raw).ok());
+            let mut children: BTreeSet<SchemaAlkaneId> = if let Some(entry) = current_entry {
+                entry.alkanes.into_iter().collect()
+            } else {
+                hydrate_orbital_children_from_holder_index(provider, &table, factory, &holder)?
+            };
+            if !had_v2_row {
+                if let HolderId::Address(address) = &holder {
+                    for child in &children {
+                        add_address_orbital_balance_delta(
+                            &mut address_orbital_balance_deltas,
+                            address,
+                            *factory,
+                            *child,
+                            SignedU128::positive(1),
+                        );
+                    }
+                }
+            }
+            let Some(child_deltas) = per_holder.get(&holder) else {
                 continue;
             };
-            let (is_negative, mag) = delta.as_parts();
-            let next = if is_negative {
-                // Orbital holders are a new forward index; missing historical rows should not halt indexing.
-                cur.saturating_sub(mag)
-            } else {
-                cur.saturating_add(mag)
-            };
-            if next == 0 && current_raw.is_none() {
+            for (child, delta) in child_deltas {
+                let (is_negative, mag) = delta.as_parts();
+                if mag == 0 {
+                    continue;
+                }
+                if is_negative {
+                    children.remove(child);
+                } else {
+                    children.insert(*child);
+                }
+                if let HolderId::Address(address) = &holder {
+                    add_address_orbital_balance_delta(
+                        &mut address_orbital_balance_deltas,
+                        address,
+                        *factory,
+                        *child,
+                        *delta,
+                    );
+                }
+            }
+            let alkanes: Vec<SchemaAlkaneId> = children.into_iter().collect();
+            let next = alkanes.len() as u128;
+            if next == 0 && !had_v2_row {
                 continue;
             }
-            if cur == 0 && next > 0 && current_raw.is_none() {
+            if next > 0 && !had_v2_row {
                 appended_holders.push(holder.clone());
             }
-            changed_holders.push((holder_key, next));
+            changed_holders
+                .push((holder_key, OrbitalHolderEntry { holder, amount: next, alkanes }));
         }
 
-        for (holder_key, amount) in changed_holders {
-            puts.push((holder_key, encode_u128_value(amount)?));
+        for (holder_key, entry) in changed_holders {
+            puts.push((holder_key, encode_orbital_holder_entry(entry)?));
         }
 
         let mut added_holder_keys: Vec<Vec<u8>> = appended_holders
@@ -4572,13 +5006,59 @@ pub fn bulk_update_balances_for_block(
             let base = holder_len;
             for (offset, holder_key_bytes) in added_holder_keys.iter().enumerate() {
                 puts.push((
-                    table.orbital_holder_list_idx_key(factory, base.saturating_add(offset as u32)),
+                    table.orbital_holder_v2_list_idx_key(
+                        factory,
+                        base.saturating_add(offset as u32),
+                    ),
                     holder_key_bytes.clone(),
                 ));
             }
             let new_len = holder_len.saturating_add(added_holder_keys.len() as u32);
-            puts.push((table.orbital_holder_list_len_key(factory), new_len.to_le_bytes().to_vec()));
+            puts.push((
+                table.orbital_holder_v2_list_len_key(factory),
+                new_len.to_le_bytes().to_vec(),
+            ));
         }
+    }
+
+    for (address, per_factory_delta) in address_orbital_balance_deltas {
+        let key = table.address_orbital_balances_v2_key(&address);
+        let current = provider
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: key.clone() })?
+            .value
+            .and_then(|raw| decode_address_orbital_balance_entries(&raw).ok())
+            .unwrap_or_default();
+        let mut by_factory: BTreeMap<SchemaAlkaneId, BTreeSet<SchemaAlkaneId>> = current
+            .into_iter()
+            .map(|entry| (entry.factory, entry.alkanes.into_iter().collect()))
+            .collect();
+
+        for (factory, per_child_delta) in per_factory_delta {
+            let children = by_factory.entry(factory).or_default();
+            for (child, delta) in per_child_delta {
+                let (is_negative, mag) = delta.as_parts();
+                if mag == 0 {
+                    continue;
+                }
+                if is_negative {
+                    children.remove(&child);
+                } else {
+                    children.insert(child);
+                }
+            }
+            if children.is_empty() {
+                by_factory.remove(&factory);
+            }
+        }
+
+        let entries: Vec<AddressOrbitalBalanceEntry> = by_factory
+            .into_iter()
+            .map(|(factory, children)| {
+                let alkanes: Vec<SchemaAlkaneId> = children.into_iter().collect();
+                AddressOrbitalBalanceEntry { factory, amount: alkanes.len() as u128, alkanes }
+            })
+            .collect();
+        puts.push((key, encode_address_orbital_balance_entries(entries)?));
     }
     if debug {
         eprintln!(
@@ -4832,15 +5312,19 @@ pub fn bulk_update_balances_for_block(
     if !address_contract_send_delta.is_empty() || !address_contract_receive_delta.is_empty() {
         let mut child_contracts = contracts_in_address_amounts(&address_contract_send_delta);
         child_contracts.extend(contracts_in_address_amounts(&address_contract_receive_delta));
-        let factory_by_child = resolve_factory_by_child(provider, child_contracts)?;
+        let factory_by_child = resolve_factory_by_child(provider, child_contracts, factory_hints)?;
         let address_orbital_send_delta =
             rollup_contract_amounts_to_orbitals(&address_contract_send_delta, &factory_by_child);
         let address_orbital_receive_delta =
             rollup_contract_amounts_to_orbitals(&address_contract_receive_delta, &factory_by_child);
+        let alkane_send_volume_delta =
+            volume_deltas_from_address_amounts(&address_contract_send_delta);
+        let alkane_receive_volume_delta =
+            volume_deltas_from_address_amounts(&address_contract_receive_delta);
         let orbital_send_volume_delta =
-            orbital_volume_deltas_from_address_amounts(&address_orbital_send_delta);
+            volume_deltas_from_address_amounts(&address_orbital_send_delta);
         let orbital_receive_volume_delta =
-            orbital_volume_deltas_from_address_amounts(&address_orbital_receive_delta);
+            volume_deltas_from_address_amounts(&address_orbital_receive_delta);
 
         let mut addresses: HashSet<String> = HashSet::new();
         addresses.extend(address_contract_send_delta.keys().cloned());
@@ -4908,18 +5392,36 @@ pub fn bulk_update_balances_for_block(
             }
         }
 
-        apply_orbital_volume_deltas(
+        apply_source_volume_deltas(
+            provider,
+            &table,
+            &mut puts,
+            &alkane_send_volume_delta,
+            SourceVolumeIndex::Alkane,
+            false,
+        )?;
+        apply_source_volume_deltas(
+            provider,
+            &table,
+            &mut puts,
+            &alkane_receive_volume_delta,
+            SourceVolumeIndex::Alkane,
+            true,
+        )?;
+        apply_source_volume_deltas(
             provider,
             &table,
             &mut puts,
             &orbital_send_volume_delta,
+            SourceVolumeIndex::Orbital,
             false,
         )?;
-        apply_orbital_volume_deltas(
+        apply_source_volume_deltas(
             provider,
             &table,
             &mut puts,
             &orbital_receive_volume_delta,
+            SourceVolumeIndex::Orbital,
             true,
         )?;
     }
@@ -6221,12 +6723,12 @@ pub fn get_orbital_holders_for_factory(
     factory: SchemaAlkaneId,
     page: usize,
     limit: usize,
-) -> Result<(usize /*total*/, u128 /*counted children*/, Vec<HolderEntry>)> {
+) -> Result<(usize /*total*/, u128 /*counted children*/, Vec<OrbitalHolderEntry>)> {
     let table = provider.table();
     let len = provider
         .get_raw_value(GetRawValueParams {
             blockhash,
-            key: table.orbital_holder_list_len_key(&factory),
+            key: table.orbital_holder_v2_list_len_key(&factory),
         })?
         .value
         .and_then(|bytes| {
@@ -6240,11 +6742,11 @@ pub fn get_orbital_holders_for_factory(
         })
         .unwrap_or(0);
 
-    let mut all: Vec<HolderEntry> = Vec::new();
+    let mut all: Vec<OrbitalHolderEntry> = Vec::new();
     if len > 0 {
         let mut idx_keys = Vec::with_capacity(len as usize);
         for idx in 0..len {
-            idx_keys.push(table.orbital_holder_list_idx_key(&factory, idx));
+            idx_keys.push(table.orbital_holder_v2_list_idx_key(&factory, idx));
         }
         let idx_vals = provider
             .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
@@ -6254,7 +6756,7 @@ pub fn get_orbital_holders_for_factory(
         for idx_val in idx_vals {
             let Some(raw) = idx_val else { continue };
             let Some(holder) = parse_holder_id_index_bytes(&raw) else { continue };
-            holder_keys.push(table.orbital_holder_key(&factory, &holder));
+            holder_keys.push(table.orbital_holder_v2_key(&factory, &holder));
             holders.push(holder);
         }
 
@@ -6263,13 +6765,14 @@ pub fn get_orbital_holders_for_factory(
             .values;
         for (holder, value) in holders.into_iter().zip(vals.into_iter()) {
             let Some(bytes) = value else { continue };
-            let Ok(amount) = decode_u128_value(&bytes) else {
+            let Ok(mut entry) = decode_orbital_holder_entry(&bytes) else {
                 continue;
             };
-            if amount == 0 {
+            if entry.amount == 0 {
                 continue;
             }
-            all.push(HolderEntry { holder, amount });
+            entry.holder = holder;
+            all.push(entry);
         }
     }
 
@@ -6287,20 +6790,18 @@ pub fn get_orbital_holders_for_factory(
     Ok((total, supply, slice))
 }
 
-pub fn get_orbital_volume_for_factory(
+fn get_source_volume(
     blockhash: StateAt,
     provider: &EssentialsProvider,
-    factory: SchemaAlkaneId,
+    source: SchemaAlkaneId,
+    alkane: SchemaAlkaneId,
+    index: SourceVolumeIndex,
     receive: bool,
     page: usize,
     limit: usize,
 ) -> Result<(usize, Vec<AddressAmountEntry>)> {
     let table = provider.table();
-    let len_key = if receive {
-        table.orbital_receive_volume_list_len_key(&factory)
-    } else {
-        table.orbital_send_volume_list_len_key(&factory)
-    };
+    let len_key = source_volume_list_len_key(&table, index, &source, &alkane, receive);
     let len = provider
         .get_raw_value(GetRawValueParams { blockhash, key: len_key })?
         .value
@@ -6319,11 +6820,8 @@ pub fn get_orbital_volume_for_factory(
     if len > 0 {
         let mut idx_keys = Vec::with_capacity(len as usize);
         for idx in 0..len {
-            idx_keys.push(if receive {
-                table.orbital_receive_volume_list_idx_key(&factory, idx)
-            } else {
-                table.orbital_send_volume_list_idx_key(&factory, idx)
-            });
+            idx_keys
+                .push(source_volume_list_idx_key(&table, index, &source, &alkane, idx, receive));
         }
         let idx_vals = provider
             .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
@@ -6335,11 +6833,8 @@ pub fn get_orbital_volume_for_factory(
             let Ok(address) = std::str::from_utf8(&raw).map(|s| s.to_string()) else {
                 continue;
             };
-            amount_keys.push(if receive {
-                table.orbital_receive_volume_entry_key(&factory, &address)
-            } else {
-                table.orbital_send_volume_entry_key(&factory, &address)
-            });
+            amount_keys
+                .push(source_volume_entry_key(&table, index, &source, &alkane, &address, receive));
             addresses.push(address);
         }
 
@@ -6366,6 +6861,48 @@ pub fn get_orbital_volume_for_factory(
     let end = (off + l).min(total);
     let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
     Ok((total, slice))
+}
+
+pub fn get_orbital_volume_for_factory(
+    blockhash: StateAt,
+    provider: &EssentialsProvider,
+    factory: SchemaAlkaneId,
+    alkane: SchemaAlkaneId,
+    receive: bool,
+    page: usize,
+    limit: usize,
+) -> Result<(usize, Vec<AddressAmountEntry>)> {
+    get_source_volume(
+        blockhash,
+        provider,
+        factory,
+        alkane,
+        SourceVolumeIndex::Orbital,
+        receive,
+        page,
+        limit,
+    )
+}
+
+pub fn get_alkane_volume_for_source(
+    blockhash: StateAt,
+    provider: &EssentialsProvider,
+    source: SchemaAlkaneId,
+    alkane: SchemaAlkaneId,
+    receive: bool,
+    page: usize,
+    limit: usize,
+) -> Result<(usize, Vec<AddressAmountEntry>)> {
+    get_source_volume(
+        blockhash,
+        provider,
+        source,
+        alkane,
+        SourceVolumeIndex::Alkane,
+        receive,
+        page,
+        limit,
+    )
 }
 
 pub fn get_transfer_volume_for_alkane(

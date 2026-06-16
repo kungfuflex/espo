@@ -1,4 +1,5 @@
 pub mod dbpaths;
+pub mod jemalloc_prof;
 pub mod mdb;
 pub mod mempool;
 pub mod mempool_projection;

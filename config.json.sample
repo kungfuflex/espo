@@ -24,7 +24,7 @@
     "trace_workers": 1,
     "hydration_workers": 16,
     "clear_protection_secs": 180,
-    "max_txs": 100000,
+    "max_txs": 50000,
     "template_blocks": 8,
     "block_weight_units": 4000000,
     "zmq_rawtx_url": null,
@@ -38,6 +38,12 @@
     "check_utxos": false,
     "check_alkane_balances": false,
     "check_trace_mismatches": false
+  },
+  "jemalloc_profile": {
+    "enabled": false,
+    "dump_dir": "./jemalloc-profiles",
+    "interval_secs": 1800,
+    "dump_on_shutdown": true
   },
   "debug": false,
   "safe_tip_hook_script": null,

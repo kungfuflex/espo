@@ -6,11 +6,12 @@ use crate::modules::essentials::storage::{
     RpcGetAlkaneAddressTxsParams, RpcGetAlkaneBalanceMetashrewParams,
     RpcGetAlkaneBalanceTxsByTokenParams, RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams,
     RpcGetAlkaneBlockTxsParams, RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams,
-    RpcGetAlkaneTxSummaryParams, RpcGetAllAlkanesParams, RpcGetBlockSummaryParams,
-    RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams, RpcGetFactoryChildrenParams,
-    RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams,
-    RpcGetOrbitalHoldersParams, RpcGetOrbitalVolumesParams, RpcGetOutpointBalancesParams,
-    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcPingParams,
+    RpcGetAlkaneTxSummaryParams, RpcGetAlkaneVolumesParams, RpcGetAllAlkanesParams,
+    RpcGetBlockSummaryParams, RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams,
+    RpcGetFactoryChildrenParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
+    RpcGetMempoolTracesParams, RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams,
+    RpcGetOrbitalVolumesParams, RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams,
+    RpcGetTransferVolumeParams, RpcPingParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
@@ -303,13 +304,44 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             factory: payload
                                 .get("factory")
                                 .or_else(|| payload.get("factory_alkane"))
-                                .or_else(|| payload.get("alkane"))
+                                .or_else(|| payload.get("orbital"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
                         view.rpc_get_orbital_send_volumes(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_orbital_balances = reg.clone();
+        let mdb_orbital_balances = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_orbital_balances
+                .register("get_orbital_balances", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_orbital_balances);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetOrbitalBalancesParams {
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        };
+                        view.rpc_get_orbital_balances(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -334,13 +366,87 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             factory: payload
                                 .get("factory")
                                 .or_else(|| payload.get("factory_alkane"))
-                                .or_else(|| payload.get("alkane"))
+                                .or_else(|| payload.get("orbital"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
                         view.rpc_get_orbital_receive_volumes(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_alkane_send_volumes = reg.clone();
+        let mdb_alkane_send_volumes = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_alkane_send_volumes
+                .register("get_alkane_send_volumes", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_alkane_send_volumes);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetAlkaneVolumesParams {
+                            source_alkane: payload
+                                .get("source_alkane")
+                                .or_else(|| payload.get("source"))
+                                .or_else(|| payload.get("contract"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_get_alkane_send_volumes(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_alkane_receive_volumes = reg.clone();
+        let mdb_alkane_receive_volumes = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_alkane_receive_volumes
+                .register("get_alkane_receive_volumes", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_alkane_receive_volumes);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetAlkaneVolumesParams {
+                            source_alkane: payload
+                                .get("source_alkane")
+                                .or_else(|| payload.get("source"))
+                                .or_else(|| payload.get("contract"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_get_alkane_receive_volumes(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }

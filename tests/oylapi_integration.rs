@@ -88,6 +88,7 @@ fn init_global_config() {
             explorer_networks: None,
             google_analytics_tag: None,
             misc: espo::config::MiscConfig::default(),
+            jemalloc_profile: espo::config::JemallocProfileConfig::default(),
             mempool: espo::config::MempoolConfig::default(),
             modules: std::collections::HashMap::new(),
         };

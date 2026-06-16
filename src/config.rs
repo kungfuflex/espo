@@ -158,7 +158,7 @@ fn default_mempool_clear_protection_secs() -> u64 {
 }
 
 fn default_mempool_max_txs() -> usize {
-    100_000
+    50_000
 }
 
 fn default_mempool_template_blocks() -> usize {
@@ -229,6 +229,51 @@ pub struct StrictModeConfig {
 pub struct MiscConfig {
     #[serde(default)]
     pub show_terminal_ad: bool,
+}
+
+fn default_jemalloc_profile_dump_dir() -> String {
+    "./jemalloc-profiles".to_string()
+}
+
+fn default_jemalloc_profile_interval_secs() -> u64 {
+    1800
+}
+
+fn default_jemalloc_profile_dump_on_shutdown() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JemallocProfileConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_jemalloc_profile_dump_dir")]
+    pub dump_dir: String,
+    #[serde(default = "default_jemalloc_profile_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_jemalloc_profile_dump_on_shutdown")]
+    pub dump_on_shutdown: bool,
+}
+
+impl Default for JemallocProfileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dump_dir: default_jemalloc_profile_dump_dir(),
+            interval_secs: default_jemalloc_profile_interval_secs(),
+            dump_on_shutdown: default_jemalloc_profile_dump_on_shutdown(),
+        }
+    }
+}
+
+impl JemallocProfileConfig {
+    fn normalized(mut self) -> Result<Self> {
+        self.dump_dir = self.dump_dir.trim().to_string();
+        if self.enabled && self.dump_dir.is_empty() {
+            anyhow::bail!("jemalloc_profile.dump_dir must be non-empty when enabled");
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -426,6 +471,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub misc: MiscConfig,
     #[serde(default)]
+    pub jemalloc_profile: JemallocProfileConfig,
+    #[serde(default)]
     pub mempool: MempoolConfig,
     #[serde(default)]
     pub modules: HashMap<String, serde_json::Value>,
@@ -467,6 +514,7 @@ pub struct AppConfig {
     pub explorer_networks: Option<ExplorerNetworks>,
     pub google_analytics_tag: Option<String>,
     pub misc: MiscConfig,
+    pub jemalloc_profile: JemallocProfileConfig,
     pub mempool: MempoolConfig,
     pub modules: HashMap<String, serde_json::Value>,
 }
@@ -504,6 +552,7 @@ impl AppConfig {
         let google_analytics_tag = normalize_optional_string(file.google_analytics_tag);
         let sync_banner = file.sync_banner.and_then(|b| b.normalized());
         let debug_backup = file.debug_backup;
+        let jemalloc_profile = file.jemalloc_profile.normalized()?;
 
         Ok(Self {
             readonly_metashrew_db_dir: file.readonly_metashrew_db_dir,
@@ -540,6 +589,7 @@ impl AppConfig {
             explorer_networks,
             google_analytics_tag,
             misc: file.misc,
+            jemalloc_profile,
             mempool: file.mempool,
             modules: file.modules,
         })

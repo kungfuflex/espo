@@ -1,7 +1,9 @@
 use super::defs::SignedU128;
 use super::lib::{accumulate_alkane_balance_deltas, mint_deltas_from_trace};
 use crate::alkanes::trace::{EspoHostFunctionValues, EspoSandshrewLikeTrace, get_espo_block};
-use crate::config::{AppConfig, MempoolConfig, MiscConfig, init_config_from};
+use crate::config::{
+    AppConfig, JemallocProfileConfig, MempoolConfig, MiscConfig, init_config_from,
+};
 use crate::core::blockfetcher::BlockFetchMode;
 use crate::schemas::SchemaAlkaneId;
 use bitcoin::{Txid, hashes::Hash};
@@ -43,6 +45,7 @@ fn init_test_config_from_run_sh() {
         explorer_networks: None,
         google_analytics_tag: None,
         misc: MiscConfig::default(),
+        jemalloc_profile: JemallocProfileConfig::default(),
         mempool: MempoolConfig::default(),
         modules: HashMap::new(),
     };

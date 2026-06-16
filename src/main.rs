@@ -22,6 +22,10 @@ pub mod schemas;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod utils;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "jemalloc-prof"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
@@ -1040,6 +1044,7 @@ async fn run_indexer_loop(
 async fn main() -> Result<()> {
     tokio::task::block_in_place(init_config)?;
     let cfg = get_config().clone();
+    let mut jemalloc_profiler = runtime::jemalloc_prof::start(&cfg.jemalloc_profile);
     let network = get_network();
     let view_only = cfg.view_only;
     tokio::task::block_in_place(init_block_source)?;
@@ -1148,6 +1153,7 @@ async fn main() -> Result<()> {
         for handle in service_handles.drain(..) {
             handle.abort();
         }
+        jemalloc_profiler.shutdown_dump();
         return Ok(());
     }
 
@@ -1181,6 +1187,7 @@ async fn main() -> Result<()> {
                 eprintln!("[indexer] thread panicked: {err:?}");
                 std::process::abort();
             }
+            jemalloc_profiler.shutdown_dump();
             return Ok(());
         }
 
@@ -1207,6 +1214,7 @@ async fn main() -> Result<()> {
                 eprintln!("[indexer] thread panicked: {err:?}");
                 std::process::abort();
             }
+            jemalloc_profiler.shutdown_dump();
             return Ok(());
         }
 
@@ -1215,6 +1223,7 @@ async fn main() -> Result<()> {
             eprintln!(
                 "[PROCESS] forcing exit after shutdown grace; indexer is not in a db write section"
             );
+            jemalloc_profiler.shutdown_dump();
             std::process::exit(130);
         }
         if db_active && !logged_db_wait {
