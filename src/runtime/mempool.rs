@@ -53,7 +53,6 @@ pub const MEMPOOL_MIN_FEE_RATE_SATS_VBYTE: f64 = 0.5;
 /// --- End tunables ---
 
 const UNCOMMON_GOODS_RUNE_ID: SchemaRuneId = SchemaRuneId { block: 1, tx: 0 };
-const MEMPOOL_EVENT_CHANNEL_CAP: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct MempoolEntry {
@@ -366,7 +365,7 @@ pub fn subscribe_mempool_events() -> broadcast::Receiver<String> {
 
 fn mempool_event_sender() -> &'static broadcast::Sender<String> {
     MEMPOOL_EVENTS.get_or_init(|| {
-        let (sender, _) = broadcast::channel(MEMPOOL_EVENT_CHANNEL_CAP);
+        let (sender, _) = broadcast::channel(128);
         sender
     })
 }
@@ -375,16 +374,6 @@ fn publish_mempool_event(event: &Value) {
     if let Ok(encoded) = serde_json::to_string(event) {
         let _ = mempool_event_sender().send(encoded);
     }
-}
-
-fn publish_mempool_blocks_event(sequence: u64, deltas: &[MempoolBlockDelta]) {
-    publish_mempool_event(&json!({
-        "type": "mempool-blocks",
-        "data": {
-            "sequence": sequence,
-            "deltas": deltas,
-        }
-    }));
 }
 
 fn publish_mempool_entry_event(entry: &MempoolTransactionStruct, event: &str) {
@@ -503,14 +492,6 @@ fn set_hydration_status(hydrating: bool, pending: usize) {
             status.in_sync = true;
         }
     });
-}
-
-fn effective_mempool_max_txs(configured: usize) -> usize {
-    if configured == 0 { MEMPOOL_MAX_TXS } else { configured.min(MEMPOOL_MAX_TXS) }
-}
-
-fn configured_mempool_max_txs() -> usize {
-    effective_mempool_max_txs(get_config().mempool.max_txs)
 }
 
 fn now_ts() -> u64 {
@@ -1796,11 +1777,8 @@ pub fn reset_mempool_store() -> Result<()> {
     if let Ok(mut state) = mempool_state().write() {
         let total = state.txs.len();
         state.txs.clear();
-        state.txs.shrink_to_fit();
         state.templates.clear();
-        state.templates.shrink_to_fit();
         state.deltas.clear();
-        state.deltas.shrink_to_fit();
         state.sequence = state.sequence.saturating_add(1);
         state.status = MempoolSyncStatus {
             phase: MempoolSyncPhase::Starting,
@@ -1818,7 +1796,6 @@ pub fn reset_mempool_store() -> Result<()> {
     }
     if let Ok(mut queue) = trace_queue().lock() {
         queue.clear();
-        queue.shrink_to_fit();
     }
     Ok(())
 }
@@ -1832,39 +1809,7 @@ fn enqueue_trace(txid: Txid) {
 
 fn prune_trace_queue(removed: &HashSet<Txid>) {
     let Ok(mut queue) = trace_queue().lock() else { return };
-    let before = queue.len();
     queue.retain(|txid| !removed.contains(txid));
-    if queue.len() < before {
-        queue.shrink_to_fit();
-    }
-}
-
-fn prune_mempool_tx_limit(state: &mut InMemoryMempool) -> HashSet<Txid> {
-    let limit = configured_mempool_max_txs();
-    let excess = state.txs.len().saturating_sub(limit);
-    let mut removed = HashSet::new();
-    if excess == 0 {
-        return removed;
-    }
-
-    let mut candidates: Vec<(Txid, f64, u64)> = state
-        .txs
-        .iter()
-        .map(|(txid, entry)| (*txid, entry.fee_rate, entry.first_seen))
-        .collect();
-    candidates.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    for (txid, _, _) in candidates.into_iter().take(excess) {
-        let Some(_) = state.txs.remove(&txid) else { continue };
-        removed.insert(txid);
-    }
-    state.txs.shrink_to(limit);
-    removed
 }
 
 fn build_memory_entry(
@@ -2028,20 +1973,9 @@ fn upsert_memory_entry(entry: MempoolTransactionStruct) {
             state.txs.insert(txid, entry);
         }
     }
-    let pruned_for_limit = prune_mempool_tx_limit(&mut state);
-    if !pruned_for_limit.is_empty() {
-        eprintln!(
-            "[mempool] pruned {} low-fee txs to enforce max_txs={}",
-            pruned_for_limit.len(),
-            configured_mempool_max_txs()
-        );
-    }
     state.updated_at = now_ts();
     let event_entry = state.txs.get(&txid).cloned();
     drop(state);
-    if !pruned_for_limit.is_empty() {
-        prune_trace_queue(&pruned_for_limit);
-    }
     if let Some(entry) = event_entry.as_ref() {
         publish_mempool_entry_event(entry, tx_event);
     }
@@ -2053,7 +1987,7 @@ fn upsert_memory_entry(entry: MempoolTransactionStruct) {
         );
         prune_trace_queue(&removed_conflicts);
     }
-    if should_enqueue && event_entry.is_some() {
+    if should_enqueue {
         enqueue_trace(txid);
     }
 }
@@ -2064,11 +1998,8 @@ fn remove_missing_memory_entries(canonical: &HashSet<Txid>) -> usize {
     let removed: HashSet<Txid> =
         state.txs.keys().filter(|txid| !canonical.contains(*txid)).copied().collect();
     state.txs.retain(|txid, _| canonical.contains(txid));
-    let after = state.txs.len();
-    if after < before {
-        state.txs.shrink_to(configured_mempool_max_txs());
-    }
     state.updated_at = now_ts();
+    let after = state.txs.len();
     drop(state);
     if !removed.is_empty() {
         prune_trace_queue(&removed);
@@ -2080,7 +2011,6 @@ fn remove_memory_txid(txid: &Txid) -> bool {
     let Ok(mut state) = mempool_state().write() else { return false };
     let removed = state.txs.remove(txid).is_some();
     if removed {
-        state.txs.shrink_to(configured_mempool_max_txs());
         state.updated_at = now_ts();
     }
     drop(state);
@@ -2729,8 +2659,7 @@ fn recalculate_memory_templates() {
     }
     state.templates = templates;
     state.updated_at = now_ts();
-    let mempool_blocks_sequence = state.sequence;
-    let mempool_blocks_deltas = state.deltas.clone();
+    let snapshot = compact_snapshot_from_state(&state, true);
     drop(state);
     if !updated_txids.is_empty() {
         publish_mempool_event(&json!({
@@ -2752,7 +2681,7 @@ fn recalculate_memory_templates() {
             }
         }));
     }
-    publish_mempool_blocks_event(mempool_blocks_sequence, &mempool_blocks_deltas);
+    publish_mempool_event(&json!({ "type": "mempool-blocks", "data": snapshot }));
     for txid in trace_requeue {
         enqueue_trace(txid);
     }
@@ -2772,8 +2701,7 @@ async fn refresh_memory_mempool(rpc: &CoreClient, network: Network) -> Result<()
     };
     let cfg = get_config().mempool.clone();
     let mut entries: Vec<(&String, &VerboseMempoolEntry)> = verbose.iter().collect();
-    let max_txs = effective_mempool_max_txs(cfg.max_txs);
-    if entries.len() > max_txs {
+    if cfg.max_txs > 0 && entries.len() > cfg.max_txs {
         entries.sort_by(|(_, a), (_, b)| {
             let a_fee = a.fees.as_ref().and_then(|f| f.base).map(btc_to_sat).unwrap_or(0) as f64;
             let b_fee = b.fees.as_ref().and_then(|f| f.base).map(btc_to_sat).unwrap_or(0) as f64;
@@ -2789,7 +2717,7 @@ async fn refresh_memory_mempool(rpc: &CoreClient, network: Network) -> Result<()
                 .unwrap_or(0.0);
             b_rate.partial_cmp(&a_rate).unwrap_or(std::cmp::Ordering::Equal)
         });
-        entries.truncate(max_txs);
+        entries.truncate(cfg.max_txs);
     }
     let mut canonical = HashSet::with_capacity(entries.len());
     for (txid_str, entry) in entries {
@@ -3268,21 +3196,17 @@ pub fn pending_for_address(addr: &str) -> Vec<MempoolEntry> {
 
 pub fn purge_confirmed_txids(txids: &[Txid]) -> Result<usize> {
     let Ok(mut state) = mempool_state().write() else { return Ok(0) };
-    let mut removed_txids = HashSet::new();
     let mut removed = 0usize;
     for txid in txids {
         if state.txs.remove(txid).is_some() {
             removed += 1;
-            removed_txids.insert(*txid);
         }
     }
     if removed > 0 {
-        state.txs.shrink_to(configured_mempool_max_txs());
         state.updated_at = now_ts();
     }
     drop(state);
     if removed > 0 {
-        prune_trace_queue(&removed_txids);
         recalculate_memory_templates();
     }
     Ok(removed)

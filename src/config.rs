@@ -158,7 +158,7 @@ fn default_mempool_clear_protection_secs() -> u64 {
 }
 
 fn default_mempool_max_txs() -> usize {
-    50_000
+    100_000
 }
 
 fn default_mempool_template_blocks() -> usize {

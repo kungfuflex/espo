@@ -24,7 +24,7 @@
     "trace_workers": 1,
     "hydration_workers": 16,
     "clear_protection_secs": 180,
-    "max_txs": 50000,
+    "max_txs": 100000,
     "template_blocks": 8,
     "block_weight_units": 4000000,
     "zmq_rawtx_url": null,
