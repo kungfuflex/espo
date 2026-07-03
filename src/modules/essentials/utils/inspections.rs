@@ -278,7 +278,7 @@ mod tests {
         EspoSandshrewLikeTraceStatus, EspoTrace,
     };
     use crate::schemas::EspoOutpoint;
-    use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+    use alkanes_support::proto::alkanes::AlkanesTrace;
     use bitcoin::block::Header;
     use bitcoin::blockdata::constants::genesis_block;
     use bitcoin::hashes::Hash;

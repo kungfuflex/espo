@@ -31,13 +31,13 @@ futures = "0.3.31"
 bitcoin = "0.32.7"
 prost = "0.12.6"
 maud = "0.26.0"
-wasm-bindgen = "0.2.100"
+wasm-bindgen = "0.2.121"
 
-# All alkanes-rs dependencies from develop branch
-alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
-ordinals = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
-protorune-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
-metashrew-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+# Consensus alkanes-rs dependencies from the canonical v2.2.1 alpha tag.
+alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1" }
+ordinals = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1" }
+protorune-support = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1" }
+metashrew-support = { git = "https://github.com/sandshrewmetaprotocols/metashrew", tag = "v9.0.5-rc.8" }
 
 # Non-WASM dependencies (server, network, DB, CLI, etc.)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -62,19 +62,19 @@ tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
 
 # Required dependencies for alkanes support (from alkanes-rs)
-metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
-protorune = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+metashrew-core = { git = "https://github.com/sandshrewmetaprotocols/metashrew", tag = "v9.0.5-rc.8" }
+protorune = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1" }
 
 # Optional dependencies for test utilities
-alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
+alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1", optional = true }
 metashrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
 rockshrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
 wasmtime = { version = "18.0", features = ["async"], optional = true }
 
 [dev-dependencies]
-alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }
-metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }
-protorune = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }
-alkanes-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
+alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1", features = ["test-utils"] }
+metashrew-core = { git = "https://github.com/sandshrewmetaprotocols/metashrew", tag = "v9.0.5-rc.8", features = ["test-utils"] }
+protorune = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1", features = ["test-utils"] }
+alkanes-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1" }
 tower = { version = "0.5", features = ["util"] }
-wasm-bindgen-test = "0.3.49"
+wasm-bindgen-test = "0.3.71"

@@ -9,8 +9,7 @@ use crate::alkanes::trace::{
 };
 use crate::config::{
     debug_enabled, get_electrum_like, get_espo_db, get_metashrew, get_metashrew_sdb, get_network,
-    is_startup_rollback_replay_height, strict_check_alkane_balances, strict_check_trace_mismatches,
-    strict_check_utxos,
+    strict_check_alkane_balances, strict_check_trace_mismatches, strict_check_utxos,
 };
 use crate::debug;
 use crate::modules::ammdata::config::AmmDataConfig;
@@ -55,6 +54,8 @@ static AMMDATA_MDB: OnceLock<Arc<Mdb>> = OnceLock::new();
 const ALKANES_V217_EDICT_FIX_HEIGHT: u64 = 943_500;
 
 pub(crate) type ProjectionSheet = BTreeMap<SchemaAlkaneId, u128>;
+type AlkaneDeltaMap = HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>;
+type RootDebitCandidateMap = HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, u128>>;
 
 #[allow(dead_code)]
 pub(crate) struct ContractProjectionContext<'a> {
@@ -363,6 +364,38 @@ fn parse_u128_from_str(input: &str) -> Option<u128> {
     }
 }
 
+fn trace_has_root_out_of_fuel_failure(
+    trace: &EspoSandshrewLikeTrace,
+    host_function_values: &EspoHostFunctionValues,
+) -> bool {
+    let cleaned = clean_espo_sandshrew_like_trace(trace, host_function_values);
+    let events = cleaned.as_ref().map(|t| t.events.as_slice()).unwrap_or(&trace.events);
+    let mut depth = 0usize;
+    for ev in events {
+        match ev {
+            EspoSandshrewLikeTraceEvent::Invoke(_) => {
+                depth = depth.saturating_add(1);
+            }
+            EspoSandshrewLikeTraceEvent::Return(ret) => {
+                let is_root = depth == 1;
+                if is_root && ret.status == EspoSandshrewLikeTraceStatus::Failure {
+                    let data = ret.response.data.strip_prefix("0x").unwrap_or(&ret.response.data);
+                    if let Ok(bytes) = hex::decode(data) {
+                        if String::from_utf8_lossy(&bytes)
+                            .contains("all fuel consumed by WebAssembly")
+                        {
+                            return true;
+                        }
+                    }
+                }
+                depth = depth.saturating_sub(1);
+            }
+            EspoSandshrewLikeTraceEvent::Create(_) => {}
+        }
+    }
+    false
+}
+
 pub(crate) fn mint_deltas_from_trace(
     trace: &EspoSandshrewLikeTrace,
     host_function_values: &EspoHostFunctionValues,
@@ -499,7 +532,7 @@ pub(crate) fn accumulate_alkane_balance_deltas(
     trace: &EspoSandshrewLikeTrace,
     _txid: &Txid,
     host_function_values: &EspoHostFunctionValues,
-) -> (bool, HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>) {
+) -> (bool, AlkaneDeltaMap, RootDebitCandidateMap) {
     let debug = debug_enabled();
     let module = "essentials.balances";
     let timer = debug::start_if(debug);
@@ -510,7 +543,7 @@ pub(crate) fn accumulate_alkane_balance_deltas(
                 _txid
             );
         }
-        return (false, HashMap::new());
+        return (false, HashMap::new(), HashMap::new());
     };
     debug::log_elapsed(module, "accumulate.clean_trace", timer);
     if std::env::var_os("ESPO_LOG_HOST_FUNCTION_VALUES").is_some() {
@@ -551,7 +584,7 @@ pub(crate) fn accumulate_alkane_balance_deltas(
         owner: SchemaAlkaneId,
         incoming: BTreeMap<SchemaAlkaneId, u128>,
         parent_normal: Option<SchemaAlkaneId>,
-        deltas: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+        deltas: AlkaneDeltaMap,
     }
 
     // Find the nearest NORMAL frame in the current stack (delegates/statics are skipped).
@@ -564,7 +597,7 @@ pub(crate) fn accumulate_alkane_balance_deltas(
     // Add a signed delta for a (owner, token) pair.
     // Self-token deltas are kept for outflow reporting; balances filter them later.
     fn add_delta(
-        outflows: &mut HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+        outflows: &mut AlkaneDeltaMap,
         owner: SchemaAlkaneId,
         token: SchemaAlkaneId,
         delta: SignedU128,
@@ -584,7 +617,7 @@ pub(crate) fn accumulate_alkane_balance_deltas(
 
     // Apply a transfer (amount of token) from -> to into a delta map.
     fn apply_transfer(
-        outflows: &mut HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+        outflows: &mut AlkaneDeltaMap,
         from: Option<SchemaAlkaneId>,
         to: Option<SchemaAlkaneId>,
         token: SchemaAlkaneId,
@@ -601,11 +634,43 @@ pub(crate) fn accumulate_alkane_balance_deltas(
         }
     }
 
-    // Merge a child's delta map into its parent (used to drop effects on failure/static).
-    fn merge_deltas(
-        target: &mut HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
-        child: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+    fn cancel_positive_delta(
+        outflows: &mut AlkaneDeltaMap,
+        owner: SchemaAlkaneId,
+        token: SchemaAlkaneId,
+        amount: u128,
+    ) -> u128 {
+        let available = outflows
+            .get(&owner)
+            .and_then(|per_token| per_token.get(&token))
+            .map(|delta| {
+                let (negative, amount) = delta.as_parts();
+                if negative { 0 } else { amount }
+            })
+            .unwrap_or(0);
+        let amount = available.min(amount);
+        if amount > 0 {
+            add_delta(outflows, owner, token, SignedU128::negative(amount));
+        }
+        amount
+    }
+
+    fn add_root_debit_candidate(
+        candidates: &mut RootDebitCandidateMap,
+        owner: SchemaAlkaneId,
+        token: SchemaAlkaneId,
+        amount: u128,
     ) {
+        if amount == 0 {
+            return;
+        }
+        let entry = candidates.entry(owner).or_default();
+        *entry.entry(token).or_default() =
+            entry.get(&token).copied().unwrap_or(0).saturating_add(amount);
+    }
+
+    // Merge a child's delta map into its parent (used to drop effects on failure/static).
+    fn merge_deltas(target: &mut AlkaneDeltaMap, child: AlkaneDeltaMap) {
         for (owner, per_token) in child {
             if per_token.is_empty() {
                 continue;
@@ -623,8 +688,8 @@ pub(crate) fn accumulate_alkane_balance_deltas(
         }
     }
 
-    let mut outflows: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>> =
-        HashMap::new();
+    let mut outflows: AlkaneDeltaMap = HashMap::new();
+    let mut root_debit_candidates: RootDebitCandidateMap = HashMap::new();
     let mut stack: Vec<Frame> = Vec::new();
     let mut root_reverted = false;
 
@@ -681,10 +746,6 @@ pub(crate) fn accumulate_alkane_balance_deltas(
                 }
 
                 // Outgoing: transfer from this frame's owner -> nearest normal parent.
-                // A root return has no alkane parent. Its returned alkanes are only a trace
-                // response unless the protostone/output projection persists them separately.
-                // Creating a negative-only owner delta here makes quote/probe style root calls
-                // look like spends and can underflow the contract balance on replay.
                 let outgoing = transfers_to_sheet(&ret.response.alkanes);
                 if frame.parent_normal.is_some() {
                     for (token, amount) in &outgoing {
@@ -695,6 +756,31 @@ pub(crate) fn accumulate_alkane_balance_deltas(
                             *token,
                             *amount,
                         );
+                    }
+                } else {
+                    // Root returns have no alkane parent, but they still consume alkanes
+                    // credited to the root by this trace. Only cancel observed positive
+                    // trace-local deltas here; any remaining response amount is a bounded
+                    // debit candidate that is validated against the persisted balance before
+                    // the block writes are built.
+                    for (token, amount) in &outgoing {
+                        let canceled =
+                            cancel_positive_delta(&mut frame.deltas, frame.owner, *token, *amount);
+                        let remaining = amount.saturating_sub(canceled);
+                        if remaining > 0 && *token != frame.owner {
+                            add_delta(
+                                &mut frame.deltas,
+                                frame.owner,
+                                *token,
+                                SignedU128::negative(remaining),
+                            );
+                            add_root_debit_candidate(
+                                &mut root_debit_candidates,
+                                frame.owner,
+                                *token,
+                                remaining,
+                            );
+                        }
                     }
                 }
 
@@ -712,10 +798,10 @@ pub(crate) fn accumulate_alkane_balance_deltas(
     }
 
     if root_reverted || !stack.is_empty() {
-        return (false, HashMap::new());
+        return (false, HashMap::new(), HashMap::new());
     }
 
-    (true, outflows)
+    (true, outflows, root_debit_candidates)
 }
 
 fn source_amounts_total(sources: &SourceAmounts) -> u128 {
@@ -1703,7 +1789,7 @@ mod attribution_tests {
     }
 
     #[test]
-    fn root_return_without_parent_does_not_debit_contract_balance() {
+    fn root_return_without_parent_marks_bounded_debit_candidate() {
         let owner = alkane(2, 91332);
         let token = alkane(2, 0);
         let trace_json = r#"
@@ -1743,13 +1829,76 @@ mod attribution_tests {
 "#;
         let trace: EspoSandshrewLikeTrace = serde_json::from_str(trace_json).expect("trace json");
         let txid = Txid::from_byte_array([0u8; 32]);
-        let (ok, deltas) =
+        let (ok, deltas, root_debits) =
             accumulate_alkane_balance_deltas(&trace, &txid, &EspoHostFunctionValues::default());
 
         assert!(ok);
+        assert_eq!(
+            deltas.get(&owner).and_then(|per_token| per_token.get(&token)).copied(),
+            Some(SignedU128::negative(10_000_000)),
+            "root response debits are modeled when they can be covered by persisted balance"
+        );
+        assert_eq!(
+            root_debits.get(&owner).and_then(|per_token| per_token.get(&token)).copied(),
+            Some(10_000_000),
+            "negative-only root response debits must stay identifiable as bounded candidates"
+        );
+        assert!(
+            deltas.get(&owner).and_then(|per_token| per_token.get(&owner)).is_none(),
+            "self-token root returns should not create owner balance deltas"
+        );
+    }
+
+    #[test]
+    fn root_return_cancels_trace_local_root_credit() {
+        let owner = alkane(2, 77627);
+        let token = alkane(2, 77087);
+        let trace_json = r#"
+{
+  "outpoint": "2670291efdeca65b1b8329841635be0acb63bbf272c587313b775c50fc7d2640:3",
+  "events": [
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x2", "tx": "0x12f3b"},
+          "caller": {"block": "0x0", "tx": "0x0"},
+          "inputs": [],
+          "incomingAlkanes": [
+            {"id": {"block": "0x2", "tx": "0x12d1f"}, "value": "0x64"}
+          ],
+          "vout": 3
+        },
+        "fuel": 1
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {
+          "alkanes": [
+            {"id": {"block": "0x2", "tx": "0x12d1f"}, "value": "0x64"}
+          ],
+          "data": "0x",
+          "storage": []
+        }
+      }
+    }
+  ]
+}
+"#;
+        let trace: EspoSandshrewLikeTrace = serde_json::from_str(trace_json).expect("trace json");
+        let txid = Txid::from_byte_array([0u8; 32]);
+        let (ok, deltas, root_debits) =
+            accumulate_alkane_balance_deltas(&trace, &txid, &EspoHostFunctionValues::default());
+
+        assert!(ok);
+        assert!(root_debits.is_empty());
         assert!(
             deltas.get(&owner).and_then(|per_token| per_token.get(&token)).is_none(),
-            "root returns should not create negative-only owner/token deltas"
+            "root returns should consume trace-local root credits"
         );
     }
 
@@ -3256,8 +3405,9 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         let mut has_alkane_vin = false;
         let has_traces = atx.traces.as_ref().map_or(false, |t| !t.is_empty());
         let mut holder_alkanes_changed: HashSet<SchemaAlkaneId> = HashSet::new();
-        let mut local_alkane_delta: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>> =
-            HashMap::new();
+        let mut local_alkane_delta: AlkaneDeltaMap = HashMap::new();
+        let mut local_root_debit_candidates: RootDebitCandidateMap = HashMap::new();
+        let mut tx_has_root_out_of_fuel_failure = false;
         let mut tx_mint_deltas: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
 
         let mut add_holder_delta =
@@ -3442,7 +3592,13 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         let traces_for_tx: Vec<EspoTrace> = atx.traces.clone().unwrap_or_default();
         if !traces_for_tx.is_empty() {
             for t in &traces_for_tx {
-                let (ok, deltas) = accumulate_alkane_balance_deltas(
+                if trace_has_root_out_of_fuel_failure(
+                    &t.sandshrew_trace,
+                    &block.host_function_values,
+                ) {
+                    tx_has_root_out_of_fuel_failure = true;
+                }
+                let (ok, deltas, root_debits) = accumulate_alkane_balance_deltas(
                     &t.sandshrew_trace,
                     &txid,
                     &block.host_function_values,
@@ -3462,6 +3618,13 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                             tx_mint_deltas.get(&alkane).copied().unwrap_or(0).saturating_add(delta);
                     }
                 }
+                for (owner, per_token) in root_debits {
+                    let entry = local_root_debit_candidates.entry(owner).or_default();
+                    for (token, amount) in per_token {
+                        *entry.entry(token).or_default() =
+                            entry.get(&token).copied().unwrap_or(0).saturating_add(amount);
+                    }
+                }
                 for (owner, per_token) in deltas {
                     let entry = local_alkane_delta.entry(owner).or_default();
                     for (tok, delta) in per_token {
@@ -3472,6 +3635,111 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                         }
                     }
                 }
+            }
+        }
+        if tx_has_root_out_of_fuel_failure && !local_root_debit_candidates.is_empty() {
+            let mut empty_owners: Vec<SchemaAlkaneId> = Vec::new();
+            for (owner, per_token_candidates) in &local_root_debit_candidates {
+                let entry = local_alkane_delta.entry(*owner).or_default();
+                for (token, amount) in per_token_candidates {
+                    let slot = entry.entry(*token).or_insert_with(SignedU128::zero);
+                    *slot += SignedU128::positive(*amount);
+                    if slot.is_zero() {
+                        entry.remove(token);
+                    }
+                }
+                if entry.is_empty() {
+                    empty_owners.push(*owner);
+                }
+            }
+            for owner in empty_owners {
+                local_alkane_delta.remove(&owner);
+            }
+            local_root_debit_candidates.clear();
+            if debug {
+                eprintln!(
+                    "[balances] skipped root response debit candidates after root out-of-fuel: txid={}",
+                    txid
+                );
+            }
+        }
+        if !local_root_debit_candidates.is_empty() {
+            let mut empty_owners: Vec<SchemaAlkaneId> = Vec::new();
+            for (owner, per_token_candidates) in &local_root_debit_candidates {
+                let Some(per_token_delta) = local_alkane_delta.get_mut(owner) else {
+                    continue;
+                };
+                let mut remove_tokens: Vec<SchemaAlkaneId> = Vec::new();
+                for (token, candidate_amount) in per_token_candidates {
+                    let Some(delta) = per_token_delta.get(token).copied() else {
+                        continue;
+                    };
+                    let (is_negative, mag) = delta.as_parts();
+                    if !is_negative || mag == 0 {
+                        continue;
+                    }
+                    let candidate_amount = (*candidate_amount).min(mag);
+                    if candidate_amount == 0 {
+                        continue;
+                    }
+
+                    let current_raw = provider
+                        .get_raw_value(GetRawValueParams {
+                            blockhash: StateAt::Latest,
+                            key: table.alkane_balance_key(owner, token),
+                        })?
+                        .value;
+                    let mut effective_current = current_raw
+                        .as_ref()
+                        .and_then(|raw| decode_u128_value(raw).ok())
+                        .unwrap_or(0);
+                    if let Some(prior_delta) =
+                        alkane_balance_delta.get(owner).and_then(|per_token| per_token.get(token))
+                    {
+                        effective_current = apply_signed_balance_delta_or_panic(
+                            effective_current,
+                            *prior_delta,
+                            false,
+                            || String::new(),
+                        );
+                    }
+                    if mag <= effective_current {
+                        continue;
+                    }
+
+                    let non_candidate = mag.saturating_sub(candidate_amount);
+                    if non_candidate > effective_current {
+                        continue;
+                    }
+
+                    if debug {
+                        eprintln!(
+                            "[balances] skipped uncovered root response debit: txid={} owner={}:{} token={}:{} current={} requested={} skipped={}",
+                            txid,
+                            owner.block,
+                            owner.tx,
+                            token.block,
+                            token.tx,
+                            effective_current,
+                            mag,
+                            candidate_amount,
+                        );
+                    }
+                    if non_candidate == 0 {
+                        remove_tokens.push(*token);
+                    } else {
+                        per_token_delta.insert(*token, SignedU128::negative(non_candidate));
+                    }
+                }
+                for token in remove_tokens {
+                    per_token_delta.remove(&token);
+                }
+                if per_token_delta.is_empty() {
+                    empty_owners.push(*owner);
+                }
+            }
+            for owner in empty_owners {
+                local_alkane_delta.remove(&owner);
             }
         }
         if !tx_mint_deltas.is_empty() {
@@ -5553,15 +5821,8 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
 
     debug::log_elapsed(module, "build_writes", timer);
     let timer = debug::start_if(debug);
-    let skip_metashrew_strict_checks = is_startup_rollback_replay_height(block.height);
-    let check_balances = check_negative_balances && !skip_metashrew_strict_checks;
-    let check_utxos = strict_check_utxos() && !skip_metashrew_strict_checks;
-    if skip_metashrew_strict_checks && debug {
-        eprintln!(
-            "[balances][strict] metashrew checks paused during startup rollback replay at height {}",
-            block.height
-        );
-    }
+    let check_balances = check_negative_balances;
+    let check_utxos = strict_check_utxos();
     if check_balances || check_utxos {
         let mut changed_pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> = Vec::new();
         if check_balances {

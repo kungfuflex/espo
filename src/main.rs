@@ -33,9 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::config::{
-    DebugBackupConfig, get_block_source, init_block_source, mark_startup_rollback_replay_from,
-};
+use crate::config::{DebugBackupConfig, get_block_source, init_block_source};
 //modules
 use crate::config::get_metashrew_sdb;
 use crate::config::get_network;
@@ -290,11 +288,6 @@ fn apply_startup_rollback(
     let replay_start_height = requested_tip_height
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("rollback height {requested_tip_height} overflows"))?;
-    mark_startup_rollback_replay_from(replay_start_height);
-    eprintln!(
-        "[startup_rollback] metashrew strict checks are paused from replay height {} for this startup run",
-        replay_start_height
-    );
     if replay_start_height == resume_start_height {
         eprintln!(
             "[startup_rollback] requested tip {} already matches current indexed tip {}; no rollback needed",

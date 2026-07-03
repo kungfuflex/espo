@@ -6,9 +6,9 @@ use crate::config::{
 };
 use crate::runtime::sdb::SDB;
 use crate::schemas::SchemaAlkaneId;
-use alkanes_cli_common::alkanes_pb::{AlkanesTrace, AlkanesTraceEvent};
 use alkanes_support::gz;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
+use alkanes_support::proto::alkanes::{AlkanesTrace, AlkanesTraceEvent};
 use anyhow::{Context, Result, anyhow};
 use bitcoin::BlockHash;
 use bitcoin::OutPoint;

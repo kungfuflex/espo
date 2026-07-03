@@ -16,7 +16,8 @@ use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
 use ordinals::Runestone;
 use prost::Message;
-use protorune_support::protostone::{Protostone, Protostones};
+use protorune::protostone::Protostones;
+use protorune_support::protostone::Protostone;
 use reqwest::Client;
 use serde_json::json;
 use std::future::Future;
@@ -250,7 +251,7 @@ mod tests {
         EspoSandshrewLikeTraceStatus, EspoTrace,
     };
     use crate::schemas::EspoOutpoint;
-    use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+    use alkanes_support::proto::alkanes::AlkanesTrace;
     use bitcoin::block::Header;
     use bitcoin::blockdata::constants::genesis_block;
     use bitcoin::hashes::Hash;

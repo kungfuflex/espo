@@ -1,5 +1,5 @@
 use crate::runtime::state_at::StateAt;
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use alkanes_support::proto::alkanes::AlkanesTrace;
 use axum::extract::State;
 use axum::response::Html;
 use bitcoin::Txid;

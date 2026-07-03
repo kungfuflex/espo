@@ -1,4 +1,4 @@
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use alkanes_support::proto::alkanes::AlkanesTrace;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

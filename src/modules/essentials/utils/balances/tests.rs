@@ -571,7 +571,7 @@ fn credits_outflows_for_block_912568_trace() {
 "#;
 
     let trace: EspoSandshrewLikeTrace = serde_json::from_str(trace_json).expect("parse trace");
-    let (ok, deltas) =
+    let (ok, deltas, _) =
         accumulate_alkane_balance_deltas(&trace, &Txid::from_byte_array([0u8; 32]), &host_values);
     assert!(ok);
 

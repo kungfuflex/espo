@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use alkanes_support::proto::alkanes::AlkanesTrace;
 use alloy_primitives::U256;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
