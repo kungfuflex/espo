@@ -33,7 +33,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::config::{DebugBackupConfig, get_block_source, init_block_source};
+use crate::config::{
+    DebugBackupConfig, get_block_source, init_block_source, set_startup_rollback_replay_until,
+};
 //modules
 use crate::config::get_metashrew_sdb;
 use crate::config::get_network;
@@ -295,6 +297,12 @@ fn apply_startup_rollback(
     eprintln!(
         "[startup_rollback] rewinding indexed state from next height {} to {}",
         resume_start_height, requested_height
+    );
+    let replay_until = resume_start_height.saturating_sub(1);
+    set_startup_rollback_replay_until(replay_until);
+    eprintln!(
+        "[startup_rollback] metashrew strict checks are paused for replay heights {}..={}",
+        requested_height, replay_until
     );
     handle_reorg_switch(mods, requested_height)?;
     if let Err(e) = reset_mempool_store() {

@@ -9,7 +9,8 @@ use crate::alkanes::trace::{
 };
 use crate::config::{
     debug_enabled, get_electrum_like, get_espo_db, get_metashrew, get_metashrew_sdb, get_network,
-    strict_check_alkane_balances, strict_check_trace_mismatches, strict_check_utxos,
+    is_startup_rollback_replay_height, strict_check_alkane_balances, strict_check_trace_mismatches,
+    strict_check_utxos,
 };
 use crate::debug;
 use crate::modules::ammdata::config::AmmDataConfig;
@@ -5495,8 +5496,15 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
 
     debug::log_elapsed(module, "build_writes", timer);
     let timer = debug::start_if(debug);
-    let check_balances = check_negative_balances;
-    let check_utxos = strict_check_utxos();
+    let skip_metashrew_strict_checks = is_startup_rollback_replay_height(block.height);
+    let check_balances = check_negative_balances && !skip_metashrew_strict_checks;
+    let check_utxos = strict_check_utxos() && !skip_metashrew_strict_checks;
+    if skip_metashrew_strict_checks && debug {
+        eprintln!(
+            "[balances][strict] metashrew checks paused during startup rollback replay at height {}",
+            block.height
+        );
+    }
     if check_balances || check_utxos {
         let mut changed_pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> = Vec::new();
         if check_balances {
