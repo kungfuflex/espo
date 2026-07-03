@@ -274,41 +274,48 @@ fn module_resume_start_height(mods: &ModuleRegistry, network: bitcoin::Network) 
 
 fn apply_startup_rollback(
     mods: &ModuleRegistry,
-    requested_height: u32,
+    requested_tip_height: u32,
     resume_start_height: u32,
     view_only: bool,
 ) -> Result<u32> {
     if view_only {
         anyhow::bail!("rollback cannot be used with --view-only");
     }
-    if requested_height > resume_start_height {
+    let current_tip_height = resume_start_height.saturating_sub(1);
+    if requested_tip_height > current_tip_height {
         anyhow::bail!(
-            "rollback height {requested_height} is ahead of the current resume height {resume_start_height}; refusing to skip indexed state"
+            "rollback height {requested_tip_height} is ahead of the current indexed tip {current_tip_height}; refusing to skip indexed state"
         );
     }
-    mark_startup_rollback_replay_from(requested_height);
+    let replay_start_height = requested_tip_height
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("rollback height {requested_tip_height} overflows"))?;
+    mark_startup_rollback_replay_from(replay_start_height);
     eprintln!(
-        "[startup_rollback] metashrew strict checks are paused from height {} for this startup run",
-        requested_height
+        "[startup_rollback] metashrew strict checks are paused from replay height {} for this startup run",
+        replay_start_height
     );
-    if requested_height == resume_start_height {
+    if replay_start_height == resume_start_height {
         eprintln!(
-            "[startup_rollback] requested height {} already matches current resume height; no rollback needed",
-            requested_height
+            "[startup_rollback] requested tip {} already matches current indexed tip {}; no rollback needed",
+            requested_tip_height, current_tip_height
         );
         return Ok(resume_start_height);
     }
 
     eprintln!(
-        "[startup_rollback] rewinding indexed state from next height {} to {}",
-        resume_start_height, requested_height
+        "[startup_rollback] rewinding indexed state from current tip {} to {}; indexer will resume at {}",
+        current_tip_height, requested_tip_height, replay_start_height
     );
-    handle_reorg_switch(mods, requested_height)?;
+    handle_reorg_switch(mods, replay_start_height)?;
     if let Err(e) = reset_mempool_store() {
         eprintln!("[mempool] failed to reset store after startup rollback: {e:?}");
     }
-    eprintln!("[startup_rollback] rollback complete; indexer will resume at {requested_height}");
-    Ok(requested_height)
+    eprintln!(
+        "[startup_rollback] rollback complete; retained tip {}; indexer will resume at {}",
+        requested_tip_height, replay_start_height
+    );
+    Ok(replay_start_height)
 }
 
 fn rollback_failed_block(mods: &ModuleRegistry, next_height: u32) -> Result<()> {

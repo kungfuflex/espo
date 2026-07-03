@@ -681,15 +681,21 @@ pub(crate) fn accumulate_alkane_balance_deltas(
                 }
 
                 // Outgoing: transfer from this frame's owner -> nearest normal parent.
+                // A root return has no alkane parent. Its returned alkanes are only a trace
+                // response unless the protostone/output projection persists them separately.
+                // Creating a negative-only owner delta here makes quote/probe style root calls
+                // look like spends and can underflow the contract balance on replay.
                 let outgoing = transfers_to_sheet(&ret.response.alkanes);
-                for (token, amount) in &outgoing {
-                    apply_transfer(
-                        &mut frame.deltas,
-                        Some(frame.owner),
-                        frame.parent_normal,
-                        *token,
-                        *amount,
-                    );
+                if frame.parent_normal.is_some() {
+                    for (token, amount) in &outgoing {
+                        apply_transfer(
+                            &mut frame.deltas,
+                            Some(frame.owner),
+                            frame.parent_normal,
+                            *token,
+                            *amount,
+                        );
+                    }
                 }
 
                 // Merge this frame's (successful) subtree effects upward.
@@ -1694,6 +1700,57 @@ mod attribution_tests {
         }
         add_sources_to_sheet(&mut sheet, token, sources);
         sheet
+    }
+
+    #[test]
+    fn root_return_without_parent_does_not_debit_contract_balance() {
+        let owner = alkane(2, 91332);
+        let token = alkane(2, 0);
+        let trace_json = r#"
+{
+  "outpoint": "9198a67bb28d11dc616e81ef3bed4e7949dd09f04f7592fcd31ea9f2228f6231:4",
+  "events": [
+    {
+      "event": "invoke",
+      "data": {
+        "type": "call",
+        "context": {
+          "myself": {"block": "0x2", "tx": "0x164c4"},
+          "caller": {"block": "0x0", "tx": "0x0"},
+          "inputs": ["0x23", "0x2", "0x0", "0x989680", "0x0", "0x0", "0x0", "0x0"],
+          "incomingAlkanes": [],
+          "vout": 4
+        },
+        "fuel": 4835967
+      }
+    },
+    {
+      "event": "return",
+      "data": {
+        "status": "success",
+        "response": {
+          "alkanes": [
+            {"id": {"block": "0x2", "tx": "0x0"}, "value": "0x989680"},
+            {"id": {"block": "0x2", "tx": "0x164c4"}, "value": "0x1"}
+          ],
+          "data": "0x",
+          "storage": []
+        }
+      }
+    }
+  ]
+}
+"#;
+        let trace: EspoSandshrewLikeTrace = serde_json::from_str(trace_json).expect("trace json");
+        let txid = Txid::from_byte_array([0u8; 32]);
+        let (ok, deltas) =
+            accumulate_alkane_balance_deltas(&trace, &txid, &EspoHostFunctionValues::default());
+
+        assert!(ok);
+        assert!(
+            deltas.get(&owner).and_then(|per_token| per_token.get(&token)).is_none(),
+            "root returns should not create negative-only owner/token deltas"
+        );
     }
 
     fn source_total(sources: &SourceAmounts, source: AttributionSource) -> u128 {
