@@ -256,6 +256,54 @@ fn handle_reorg_switch(mods: &ModuleRegistry, next_height: u32) -> Result<()> {
     Ok(())
 }
 
+fn module_resume_start_height(mods: &ModuleRegistry, network: bitcoin::Network) -> u32 {
+    mods.modules()
+        .iter()
+        .map(|m| {
+            let g = m.get_genesis_block(network);
+            match m.get_index_height() {
+                Some(h) => h.saturating_add(1).max(g),
+                None => g,
+            }
+        })
+        .min()
+        .unwrap_or_else(|| alkanes_genesis_block(network))
+}
+
+fn apply_startup_rollback(
+    mods: &ModuleRegistry,
+    requested_height: u32,
+    resume_start_height: u32,
+    view_only: bool,
+) -> Result<u32> {
+    if view_only {
+        anyhow::bail!("rollback cannot be used with --view-only");
+    }
+    if requested_height > resume_start_height {
+        anyhow::bail!(
+            "rollback height {requested_height} is ahead of the current resume height {resume_start_height}; refusing to skip indexed state"
+        );
+    }
+    if requested_height == resume_start_height {
+        eprintln!(
+            "[startup_rollback] requested height {} already matches current resume height; no rollback needed",
+            requested_height
+        );
+        return Ok(resume_start_height);
+    }
+
+    eprintln!(
+        "[startup_rollback] rewinding indexed state from next height {} to {}",
+        resume_start_height, requested_height
+    );
+    handle_reorg_switch(mods, requested_height)?;
+    if let Err(e) = reset_mempool_store() {
+        eprintln!("[mempool] failed to reset store after startup rollback: {e:?}");
+    }
+    eprintln!("[startup_rollback] rollback complete; indexer will resume at {requested_height}");
+    Ok(requested_height)
+}
+
 fn rollback_failed_block(mods: &ModuleRegistry, next_height: u32) -> Result<()> {
     if let Some(tree) = get_global_tree_db() {
         tree.abort_block();
@@ -1084,6 +1132,26 @@ async fn main() -> Result<()> {
     }
     // mods.register_module(TracesData::new());
 
+    // Decide initial start height (resume at last+1 per module)
+    let mut start_height = module_resume_start_height(&mods, network);
+    let forced_start = std::env::var("ESPO_START_BLOCK")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    if cfg.rollback.is_some() && forced_start.is_some() {
+        anyhow::bail!(
+            "rollback cannot be combined with ESPO_START_BLOCK; use rollback for rollback"
+        );
+    }
+    if let Some(rollback_height) = cfg.rollback {
+        start_height = apply_startup_rollback(&mods, rollback_height, start_height, view_only)?;
+    }
+    if let Some(forced_start) = forced_start {
+        eprintln!(
+            "[indexer] forcing start block from ESPO_START_BLOCK={forced_start}; this does not rewind existing module state"
+        );
+        start_height = forced_start;
+    }
+
     let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
     let loaded = preload_block_summary_cache(&essentials_mdb);
     if loaded > 0 {
@@ -1110,27 +1178,6 @@ async fn main() -> Result<()> {
             }
         }));
         eprintln!("[explorer] listening on {}", explorer_addr);
-    }
-
-    // Decide initial start height (resume at last+1 per module)
-    let mut start_height = mods
-        .modules()
-        .iter()
-        .map(|m| {
-            let g = m.get_genesis_block(network);
-            match m.get_index_height() {
-                Some(h) => h.saturating_add(1).max(g),
-                None => g,
-            }
-        })
-        .min()
-        .unwrap_or_else(|| alkanes_genesis_block(network));
-    if let Some(forced_start) = std::env::var("ESPO_START_BLOCK")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-    {
-        eprintln!("[indexer] forcing start block from ESPO_START_BLOCK={forced_start}");
-        start_height = forced_start;
     }
 
     let height_cell = Arc::new(AtomicU32::new(start_height));

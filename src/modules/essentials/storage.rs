@@ -8762,6 +8762,7 @@ mod tests {
             bitcoind_rpc_pass: "test".to_string(),
             bitcoind_blocks_dir: "/tmp".to_string(),
             reset_mempool_on_startup: false,
+            rollback: None,
             view_only: true,
             db_path: db_dir.path().to_string_lossy().to_string(),
             sdb_poll_ms: 100,

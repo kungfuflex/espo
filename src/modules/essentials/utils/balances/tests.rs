@@ -21,6 +21,7 @@ fn init_test_config_from_run_sh() {
         bitcoind_rpc_pass: "admin".to_string(),
         bitcoind_blocks_dir: "~/.bitcoin/blocks".to_string(),
         reset_mempool_on_startup: true,
+        rollback: None,
         view_only: true,
         db_path: "./db".to_string(),
         sdb_poll_ms: 5000,

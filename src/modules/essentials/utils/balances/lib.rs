@@ -177,6 +177,45 @@ fn profile_family_writes(
     stats
 }
 
+fn apply_signed_balance_delta_or_panic(
+    current: u128,
+    delta: SignedU128,
+    check_negative_balances: bool,
+    panic_message: impl FnOnce() -> String,
+) -> u128 {
+    let (is_negative, amount) = delta.as_parts();
+    if is_negative {
+        if check_negative_balances && amount > current {
+            panic!("{}", panic_message());
+        }
+        current.saturating_sub(amount)
+    } else {
+        current.saturating_add(amount)
+    }
+}
+
+#[cfg(test)]
+mod balance_delta_tests {
+    use super::*;
+
+    #[test]
+    fn negative_balance_clamps_when_check_disabled() {
+        let next = apply_signed_balance_delta_or_panic(5, SignedU128::negative(8), false, || {
+            "should not panic".to_string()
+        });
+
+        assert_eq!(next, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "[balances] negative holder balance detected")]
+    fn negative_balance_panics_when_check_enabled() {
+        let _ = apply_signed_balance_delta_or_panic(5, SignedU128::negative(8), true, || {
+            "[balances] negative holder balance detected".to_string()
+        });
+    }
+}
+
 pub(crate) fn clean_espo_sandshrew_like_trace(
     trace: &EspoSandshrewLikeTrace,
     host_function_values: &EspoHostFunctionValues,
@@ -2863,6 +2902,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
 ) -> Result<()> {
     crate::debug_timer_log!("bulk_update_balances_for_block.total");
     let debug = debug_enabled();
+    let check_negative_balances = strict_check_alkane_balances();
     let module = "essentials.balances";
     let network = get_network();
     let table = provider.table();
@@ -3726,27 +3766,27 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
 
             if let Some(delta_map) = alkane_balance_delta.get(owner) {
                 for (token, delta) in delta_map {
-                    let (is_negative, mag) = delta.as_parts();
+                    let (_, mag) = delta.as_parts();
                     if mag == 0 {
                         continue;
                     }
                     let cur = amounts.get(token).copied().unwrap_or(0);
-                    let updated = if !is_negative {
-                        cur.saturating_add(mag)
-                    } else {
-                        if mag > cur {
+                    let updated = apply_signed_balance_delta_or_panic(
+                        cur,
+                        *delta,
+                        check_negative_balances,
+                        || {
                             let txid_str = alkane_balance_delta_src
                                 .get(&(*owner, *token))
                                 .map(|entry| Txid::from_byte_array(entry.txid))
                                 .map(|t| t.to_string())
                                 .unwrap_or_else(|| "unknown".to_string());
-                            panic!(
+                            format!(
                                 "[balances] negative alkane balance detected (txid={}, owner={}:{}, token={}:{}, cur={}, sub={})",
                                 txid_str, owner.block, owner.tx, token.block, token.tx, cur, mag
-                            );
-                        }
-                        cur - mag
-                    };
+                            )
+                        },
+                    );
                     if updated == 0 {
                         amounts.remove(token);
                     } else {
@@ -4094,18 +4134,18 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                 .value;
             let current =
                 current_raw.as_ref().and_then(|raw| decode_u128_value(raw).ok()).unwrap_or(0);
-            let (is_negative, mag) = delta.as_parts();
-            let next = if is_negative {
-                if mag > current {
-                    panic!(
+            let (_, mag) = delta.as_parts();
+            let next = apply_signed_balance_delta_or_panic(
+                current,
+                *delta,
+                check_negative_balances,
+                || {
+                    format!(
                         "[balances] negative address balance detected (addr={}, token={}:{}, cur={}, sub={})",
                         address, token.block, token.tx, current, mag
-                    );
-                }
-                current - mag
-            } else {
-                current.saturating_add(mag)
-            };
+                    )
+                },
+            );
             puts.push((key, encode_u128_value(next)?));
             if current == 0 && next > 0 {
                 address_added_tokens.entry(address.clone()).or_default().insert(*token);
@@ -4768,18 +4808,18 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             let Some(delta) = per_holder.get(&holder) else {
                 continue;
             };
-            let (is_negative, mag) = delta.as_parts();
-            let next = if is_negative {
-                if mag > cur {
-                    panic!(
+            let (_, mag) = delta.as_parts();
+            let next = apply_signed_balance_delta_or_panic(
+                cur,
+                *delta,
+                check_negative_balances,
+                || {
+                    format!(
                         "[balances] negative holder balance detected (alkane={}:{}, holder={:?}, cur={}, sub={})",
                         alkane.block, alkane.tx, holder, cur, mag
-                    );
-                }
-                cur - mag
-            } else {
-                cur.saturating_add(mag)
-            };
+                    )
+                },
+            );
             if (cur > 0) != (next > 0) {
                 if cur == 0 && next > 0 {
                     added_count = added_count.saturating_add(1);
@@ -5455,7 +5495,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
 
     debug::log_elapsed(module, "build_writes", timer);
     let timer = debug::start_if(debug);
-    let check_balances = strict_check_alkane_balances();
+    let check_balances = check_negative_balances;
     let check_utxos = strict_check_utxos();
     if check_balances || check_utxos {
         let mut changed_pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> = Vec::new();

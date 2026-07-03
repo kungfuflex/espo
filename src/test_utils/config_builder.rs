@@ -33,6 +33,7 @@ impl TestConfigBuilder {
             bitcoind_rpc_pass: "test".to_string(),
             bitcoind_blocks_dir: "/tmp".to_string(), // Placeholder
             reset_mempool_on_startup: false,
+            rollback: None,
             view_only: true, // Default to view-only for tests
             db_path: espo_path,
             sdb_poll_ms: 100, // Fast polling for tests

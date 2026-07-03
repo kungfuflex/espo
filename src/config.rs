@@ -422,6 +422,8 @@ pub struct ConfigFile {
     pub bitcoind_blocks_dir: String,
     #[serde(default)]
     pub reset_mempool_on_startup: bool,
+    #[serde(default)]
+    pub rollback: Option<u32>,
     #[serde(default = "default_db_path")]
     pub db_path: String,
     #[serde(default = "default_sdb_poll_ms")]
@@ -489,6 +491,7 @@ pub struct AppConfig {
     pub bitcoind_rpc_pass: String,
     pub bitcoind_blocks_dir: String,
     pub reset_mempool_on_startup: bool,
+    pub rollback: Option<u32>,
     pub view_only: bool,
     pub db_path: String,
     pub sdb_poll_ms: u16,
@@ -529,6 +532,10 @@ pub struct CliArgs {
     /// Serve existing data without running the indexer or mempool service.
     #[arg(long, default_value_t = false)]
     pub view_only: bool,
+
+    /// On startup only, rewind indexed state so indexing resumes at this height.
+    #[arg(long)]
+    pub rollback: Option<u32>,
 }
 
 fn load_config_file(path: &str) -> Result<ConfigFile> {
@@ -564,6 +571,7 @@ impl AppConfig {
             bitcoind_rpc_pass: file.bitcoind_rpc_pass,
             bitcoind_blocks_dir: file.bitcoind_blocks_dir,
             reset_mempool_on_startup: file.reset_mempool_on_startup,
+            rollback: file.rollback,
             view_only,
             db_path: file.db_path,
             sdb_poll_ms: file.sdb_poll_ms,
@@ -764,7 +772,10 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
 pub fn init_config() -> Result<()> {
     let cli = CliArgs::parse();
-    let cfg = load_config_from_path(&cli.config_path, cli.view_only)?;
+    let mut cfg = load_config_from_path(&cli.config_path, cli.view_only)?;
+    if cli.rollback.is_some() {
+        cfg.rollback = cli.rollback;
+    }
     init_config_from(cfg)
 }
 

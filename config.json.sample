@@ -8,6 +8,7 @@
   "bitcoind_rpc_pass": "rpcpass",
   "bitcoind_blocks_dir": "~/.bitcoin/blocks",
   "reset_mempool_on_startup": false,
+  "rollback": null,
   "db_path": "./db",
   "sdb_poll_ms": 5000,
   "indexer_block_delay_ms": 0,

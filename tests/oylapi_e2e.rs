@@ -90,6 +90,7 @@ mod tests {
             bitcoind_rpc_pass: String::from("test"),
             bitcoind_blocks_dir: blocks_dir.to_str().unwrap().to_string(),
             reset_mempool_on_startup: false,
+            rollback: None,
             view_only: true,
             db_path: db_path.to_str().unwrap().to_string(),
             sdb_poll_ms: 100,
