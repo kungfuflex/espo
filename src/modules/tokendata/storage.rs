@@ -505,6 +505,7 @@ impl TokenDataProvider {
 
     pub fn append_activity_index_values_batch(
         &self,
+        blockhash: StateAt,
         entries: Vec<(Vec<u8>, Vec<u64>)>,
         next_chunk_id: &mut u64,
         puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
@@ -517,10 +518,17 @@ impl TokenDataProvider {
         }
 
         let meta_keys = entries.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
-        let raw_states = self
-            .mdb
-            .multi_get(&meta_keys)
-            .map_err(|e| anyhow!("mdb.multi_get activity index states failed: {e}"))?;
+        let raw_states = match blockhash.resolve(self.view_blockhash) {
+            Some(blockhash) => {
+                self.mdb.multi_get_at_blockhash(&blockhash, &meta_keys).map_err(|e| {
+                    anyhow!("mdb.multi_get_at_blockhash activity index states failed: {e}")
+                })?
+            }
+            None => self
+                .mdb
+                .multi_get(&meta_keys)
+                .map_err(|e| anyhow!("mdb.multi_get activity index states failed: {e}"))?,
+        };
 
         let states = raw_states
             .into_iter()

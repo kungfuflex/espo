@@ -190,6 +190,7 @@ impl EspoModule for TokenData {
                 })
                 .collect::<Vec<_>>();
             provider.append_activity_index_values_batch(
+                StateAt::Block(blockhash),
                 index_appends,
                 &mut next_activity_index_chunk_id,
                 &mut puts,
@@ -458,7 +459,7 @@ fn index_mints(
     for chain in build_mint_chains(block, tx_meta)? {
         for (token, delta) in chain.deltas {
             let pool_prices = price_cache.entry(token).or_insert_with(|| {
-                load_mint_pool_prices(amm_provider, token, block_ts, block.height)
+                load_mint_pool_prices(amm_provider, token, blockhash, block_ts, block.height)
             });
             let mint_price_paid_sats = scale_fee_price_sats(chain.fee_paid_sats, delta);
             let mint_price_paid_usd = scale_fee_price_usd(mint_price_paid_sats, btc_usd_price);
@@ -761,12 +762,13 @@ fn compute_tx_fee_sats(
 fn load_mint_pool_prices(
     amm_provider: &AmmDataProvider,
     token: SchemaAlkaneId,
+    blockhash: bitcoin::BlockHash,
     now_ts: u64,
     height: u32,
 ) -> MintPoolPriceSnapshot {
     let canonical = amm_provider
         .get_canonical_pool_prices(GetCanonicalPoolPricesParams {
-            blockhash: StateAt::Latest,
+            blockhash: StateAt::Block(blockhash),
             token,
             now_ts,
             height: Some(height),
@@ -779,7 +781,7 @@ fn load_mint_pool_prices(
     } else {
         amm_provider
             .get_latest_token_usd_close(GetLatestTokenUsdCloseParams {
-                blockhash: StateAt::Latest,
+                blockhash: StateAt::Block(blockhash),
                 token,
                 timeframe: Timeframe::M10,
             })

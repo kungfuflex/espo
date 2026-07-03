@@ -909,10 +909,11 @@ impl<'a> BlockRunesIndexer<'a> {
     ) -> Result<()> {
         let essentials =
             EssentialsProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"essentials:")));
+        let block_state = StateAt::Block(block.block_header.block_hash());
         let list_id = address_index_list_id_alkane_block_txs(self.height as u64);
         let total = get_address_index_list_len(
             &essentials,
-            StateAt::Latest,
+            block_state,
             AddressIndexListKind::AlkaneBlockTxs,
             &list_id,
         )
@@ -922,7 +923,7 @@ impl<'a> BlockRunesIndexer<'a> {
         }
         let ids = get_address_index_list_range(
             &essentials,
-            StateAt::Latest,
+            block_state,
             AddressIndexListKind::AlkaneBlockTxs,
             &list_id,
             0,
