@@ -292,13 +292,6 @@ impl SubfrostProvider {
         Ok(self.raw_get(key)?.and_then(|v| decode_u64_le(&v)).unwrap_or(0))
     }
 
-    fn read_u64_len_at(&self, key: &[u8], blockhash: StateAt) -> Result<u64> {
-        Ok(self
-            .raw_get_at(key, blockhash.resolve(self.view_blockhash))?
-            .and_then(|v| decode_u64_le(&v))
-            .unwrap_or(0))
-    }
-
     fn read_event_list_all(&self, list_prefix: &[u8]) -> Result<Vec<SchemaWrapEventV1>> {
         let table = self.table();
         let len_key = table.list_length_key(list_prefix);
@@ -401,7 +394,7 @@ impl SubfrostProvider {
 
         let table = self.table();
         let len_key = table.list_length_key(&params.list_prefix);
-        let mut len = self.read_u64_len_at(&len_key, params.blockhash)?;
+        let mut len = self.read_u64_len(&len_key)?;
 
         let mut puts = Vec::with_capacity(params.events.len() + 1);
         for ev in params.events {
@@ -423,7 +416,7 @@ impl SubfrostProvider {
         let table = self.table();
         let all_prefix = table.UNWRAP_REQUESTS_ALL.key().to_vec();
         let all_len_key = table.list_length_key(&all_prefix);
-        let mut all_len = self.read_u64_len_at(&all_len_key, params.blockhash)?;
+        let mut all_len = self.read_u64_len(&all_len_key)?;
         let mut address_lens: HashMap<Vec<u8>, (Vec<u8>, u64)> = HashMap::new();
         let mut pending_refs_by_key: HashMap<Vec<u8>, Vec<UnwrapRequestListRefV1>> = HashMap::new();
         let mut puts = Vec::with_capacity(params.requests.len().saturating_mul(4) + 1);
@@ -437,8 +430,7 @@ impl SubfrostProvider {
             let address_spk = request.address_spk.clone();
             if !address_lens.contains_key(&address_spk) {
                 let prefix = table.unwrap_requests_by_address_prefix(&address_spk);
-                let len =
-                    self.read_u64_len_at(&table.list_length_key(&prefix), params.blockhash)?;
+                let len = self.read_u64_len(&table.list_length_key(&prefix))?;
                 address_lens.insert(address_spk.clone(), (prefix, len));
             }
             let (address_prefix, address_len) =
@@ -452,7 +444,7 @@ impl SubfrostProvider {
                     table.unwrap_request_pending_outpoint_key(&request.txid, request.vout);
                 if !pending_refs_by_key.contains_key(&pending_key) {
                     let existing = self
-                        .raw_get_at(&pending_key, params.blockhash.resolve(self.view_blockhash))?
+                        .raw_get(&pending_key)?
                         .map(|raw| decode_unwrap_request_refs(&raw))
                         .transpose()?
                         .unwrap_or_default();
@@ -495,20 +487,12 @@ impl SubfrostProvider {
         for spend in params.spends {
             let pending_key =
                 table.unwrap_request_pending_outpoint_key(&spend.request_txid, spend.request_vout);
-            let Some(raw_refs) =
-                self.raw_get_at(&pending_key, params.blockhash.resolve(self.view_blockhash))?
-            else {
-                continue;
-            };
+            let Some(raw_refs) = self.raw_get(&pending_key)? else { continue };
             let refs = decode_unwrap_request_refs(&raw_refs)?;
 
             for request_ref in refs {
                 let all_key = table.list_item_key(&all_prefix, request_ref.all_index);
-                let Some(raw_request) =
-                    self.raw_get_at(&all_key, params.blockhash.resolve(self.view_blockhash))?
-                else {
-                    continue;
-                };
+                let Some(raw_request) = self.raw_get(&all_key)? else { continue };
                 let mut request = decode_unwrap_request(&raw_request)?;
                 if request.fulfillment_tx.is_some() {
                     continue;
@@ -541,7 +525,7 @@ impl SubfrostProvider {
         let table = self.table();
         let list_prefix = table.unwrap_total_points_prefix(params.successful);
         let len_key = table.list_length_key(&list_prefix);
-        let mut len = self.read_u64_len_at(&len_key, params.blockhash)?;
+        let mut len = self.read_u64_len(&len_key)?;
 
         let mut puts = Vec::with_capacity(params.points.len() + 1);
         for point in params.points {
@@ -805,18 +789,15 @@ pub struct SetBatchParams {
 }
 
 pub struct BuildEventListAppendsParams {
-    pub blockhash: StateAt,
     pub list_prefix: Vec<u8>,
     pub events: Vec<SchemaWrapEventV1>,
 }
 
 pub struct BuildUnwrapRequestAppendsParams {
-    pub blockhash: StateAt,
     pub requests: Vec<SchemaUnwrapRequestV1>,
 }
 
 pub struct BuildUnwrapRequestFulfillmentUpdatesParams {
-    pub blockhash: StateAt,
     pub spends: Vec<UnwrapRequestSpend>,
 }
 
@@ -835,7 +816,6 @@ pub struct BuildUnwrapRequestFulfillmentUpdatesResult {
 }
 
 pub struct BuildUnwrapTotalPointAppendsParams {
-    pub blockhash: StateAt,
     pub successful: bool,
     pub points: Vec<UnwrapTotalPoint>,
 }
@@ -995,7 +975,6 @@ mod tests {
 
         let puts = provider
             .build_unwrap_request_appends(BuildUnwrapRequestAppendsParams {
-                blockhash: StateAt::Latest,
                 requests: vec![
                     request(1, 10, addr_a.clone(), None),
                     request(2, 20, addr_b.clone(), Some([9; 32])),
@@ -1048,7 +1027,6 @@ mod tests {
 
         let updates = provider
             .build_unwrap_request_fulfillment_updates(BuildUnwrapRequestFulfillmentUpdatesParams {
-                blockhash: StateAt::Latest,
                 spends: vec![UnwrapRequestSpend {
                     request_txid: [1; 32],
                     request_vout: 2,
@@ -1101,7 +1079,6 @@ mod tests {
 
         let puts = provider
             .build_unwrap_request_appends(BuildUnwrapRequestAppendsParams {
-                blockhash: StateAt::Latest,
                 requests: vec![
                     request(3, 10, addr_a.clone(), None),
                     request(3, 10, addr_b.clone(), None),
@@ -1114,7 +1091,6 @@ mod tests {
 
         let updates = provider
             .build_unwrap_request_fulfillment_updates(BuildUnwrapRequestFulfillmentUpdatesParams {
-                blockhash: StateAt::Latest,
                 spends: vec![UnwrapRequestSpend {
                     request_txid: [3; 32],
                     request_vout: 2,

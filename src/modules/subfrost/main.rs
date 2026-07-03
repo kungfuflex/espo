@@ -101,7 +101,7 @@ impl EspoModule for Subfrost {
         let provider = self.provider();
         let table = provider.table();
         let height = block.height;
-        let read_state = StateAt::Block(block.block_header.prev_blockhash);
+        let block_hash = block.block_header.block_hash();
         if let Some(prev) = *self.index_height.read().unwrap() {
             if height <= prev {
                 eprintln!("[SUBFROST] skipping already indexed block #{height} (last={prev})");
@@ -244,48 +244,38 @@ impl EspoModule for Subfrost {
         let mut deletes: Vec<Vec<u8>> = Vec::new();
         if !wrap_events_all.is_empty() {
             puts.extend(provider.build_event_list_appends(BuildEventListAppendsParams {
-                blockhash: read_state,
                 list_prefix: table.WRAP_EVENTS_ALL.key().to_vec(),
                 events: wrap_events_all,
             })?);
         }
         if !unwrap_events_all.is_empty() {
             puts.extend(provider.build_event_list_appends(BuildEventListAppendsParams {
-                blockhash: read_state,
                 list_prefix: table.UNWRAP_EVENTS_ALL.key().to_vec(),
                 events: unwrap_events_all,
             })?);
         }
         for (spk, events) in wrap_events_by_address {
             puts.extend(provider.build_event_list_appends(BuildEventListAppendsParams {
-                blockhash: read_state,
                 list_prefix: table.wrap_events_by_address_prefix(&spk),
                 events,
             })?);
         }
         for (spk, events) in unwrap_events_by_address {
             puts.extend(provider.build_event_list_appends(BuildEventListAppendsParams {
-                blockhash: read_state,
                 list_prefix: table.unwrap_events_by_address_prefix(&spk),
                 events,
             })?);
         }
         if !unwrap_request_spends.is_empty() {
             let updates = provider.build_unwrap_request_fulfillment_updates(
-                BuildUnwrapRequestFulfillmentUpdatesParams {
-                    blockhash: read_state,
-                    spends: unwrap_request_spends,
-                },
+                BuildUnwrapRequestFulfillmentUpdatesParams { spends: unwrap_request_spends },
             )?;
             puts.extend(updates.puts);
             deletes.extend(updates.deletes);
         }
         if !unwrap_requests_all.is_empty() {
             puts.extend(provider.build_unwrap_request_appends(
-                BuildUnwrapRequestAppendsParams {
-                    blockhash: read_state,
-                    requests: unwrap_requests_all,
-                },
+                BuildUnwrapRequestAppendsParams { requests: unwrap_requests_all },
             )?);
         }
 
@@ -298,7 +288,7 @@ impl EspoModule for Subfrost {
             if unwrap_delta_all > 0 || unwrap_delta_success > 0 {
                 let prev_all = provider
                     .get_unwrap_total_latest(super::storage::GetUnwrapTotalLatestParams {
-                        blockhash: read_state,
+                        blockhash: StateAt::Block(block_hash),
                         successful: false,
                         height: None,
                         height_present: false,
@@ -307,7 +297,7 @@ impl EspoModule for Subfrost {
                     .unwrap_or(0);
                 let prev_success = provider
                     .get_unwrap_total_latest(super::storage::GetUnwrapTotalLatestParams {
-                        blockhash: read_state,
+                        blockhash: StateAt::Block(block_hash),
                         successful: true,
                         height: None,
                         height_present: false,
@@ -328,14 +318,12 @@ impl EspoModule for Subfrost {
                 ));
                 puts.extend(provider.build_unwrap_total_point_appends(
                     BuildUnwrapTotalPointAppendsParams {
-                        blockhash: read_state,
                         successful: false,
                         points: vec![UnwrapTotalPoint { height: block.height, total: total_all }],
                     },
                 )?);
                 puts.extend(provider.build_unwrap_total_point_appends(
                     BuildUnwrapTotalPointAppendsParams {
-                        blockhash: read_state,
                         successful: true,
                         points: vec![UnwrapTotalPoint {
                             height: block.height,

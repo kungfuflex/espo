@@ -2626,27 +2626,30 @@ fn add_orbital_child_holder_delta(
 fn hydrate_orbital_children_from_holder_index(
     provider: &EssentialsProvider,
     table: &EssentialsTable<'_>,
-    blockhash: StateAt,
-    self_balance_height: Option<u64>,
     factory: &SchemaAlkaneId,
     holder: &HolderId,
 ) -> Result<BTreeSet<SchemaAlkaneId>> {
     let children = provider
-        .get_factory_children(GetFactoryChildrenParams { blockhash, factory: *factory })?
+        .get_factory_children(GetFactoryChildrenParams {
+            blockhash: StateAt::Latest,
+            factory: *factory,
+        })?
         .children;
     if children.is_empty() {
         return Ok(BTreeSet::new());
     }
 
     let keys: Vec<Vec<u8>> = children.iter().map(|child| table.holder_key(child, holder)).collect();
-    let values = provider.get_multi_values(GetMultiValuesParams { blockhash, keys })?.values;
+    let values = provider
+        .get_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
+        .values;
 
     let mut held = BTreeSet::new();
     for (child, value) in children.into_iter().zip(values.into_iter()) {
         let amount = value.as_ref().and_then(|bytes| decode_u128_value(bytes).ok()).unwrap_or(0);
         if amount > 0
             || matches!(holder, HolderId::Alkane(id) if *id == child)
-                && lookup_self_balance_at(&child, self_balance_height).unwrap_or(0) > 0
+                && lookup_self_balance(&child).unwrap_or(0) > 0
         {
             held.insert(child);
         }
@@ -2772,7 +2775,6 @@ fn apply_source_volume_deltas(
     provider: &EssentialsProvider,
     table: &EssentialsTable<'_>,
     puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    blockhash: StateAt,
     deltas: &SourceTokenAddressAmounts,
     index: SourceVolumeIndex,
     receive: bool,
@@ -2783,7 +2785,7 @@ fn apply_source_volume_deltas(
         }
         let len_key = source_volume_list_len_key(table, index, source, alkane, receive);
         let len = provider
-            .get_raw_value(GetRawValueParams { blockhash, key: len_key.clone() })?
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: len_key.clone() })?
             .value
             .and_then(|bytes| {
                 if bytes.len() == 4 {
@@ -2803,7 +2805,10 @@ fn apply_source_volume_deltas(
             .map(|address| source_volume_entry_key(table, index, source, alkane, address, receive))
             .collect();
         let current_values = provider
-            .get_multi_values(GetMultiValuesParams { blockhash, keys: entry_keys.clone() })?
+            .get_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: entry_keys.clone(),
+            })?
             .values;
 
         let mut appended: Vec<String> = Vec::new();
@@ -2870,7 +2875,6 @@ fn resolve_factory_by_child_from_hints(
 
 fn resolve_factory_by_child(
     provider: &EssentialsProvider,
-    blockhash: StateAt,
     children: HashSet<SchemaAlkaneId>,
     factory_hints: &HashMap<SchemaAlkaneId, SchemaAlkaneId>,
 ) -> Result<HashMap<SchemaAlkaneId, SchemaAlkaneId>> {
@@ -2882,7 +2886,10 @@ fn resolve_factory_by_child(
             continue;
         }
         let Some(record) = provider
-            .get_creation_record(GetCreationRecordParams { blockhash, alkane: child })?
+            .get_creation_record(GetCreationRecordParams {
+                blockhash: StateAt::Latest,
+                alkane: child,
+            })?
             .record
         else {
             continue;
@@ -2958,10 +2965,6 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
     let network = get_network();
     let table = provider.table();
     let blockhash = block.block_header.block_hash().to_byte_array();
-    // Indexing a block must read the parent state and write the current block state.
-    // Using ambient Latest here can bleed active-tip blob/version visibility into rollback replay.
-    let read_state = StateAt::Block(block.block_header.prev_blockhash);
-    let read_height = block.height.checked_sub(1).map(u64::from);
     let mut tx_index_by_txid: HashMap<[u8; 32], u32> =
         HashMap::with_capacity(block.transactions.len());
     for (tx_idx, atx) in block.transactions.iter().enumerate() {
@@ -3134,7 +3137,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         if !external_prev_txids.is_empty() {
             let resolved = resolve_tx_pointer_ids_batch_v2(
                 provider,
-                read_state,
+                StateAt::Latest,
                 external_prev_txids.as_slice(),
             )?;
             for (txid, pointer_id) in external_prev_txids.iter().zip(resolved.into_iter()) {
@@ -3160,7 +3163,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             lookup_pairs_from_outpoints(filtered_external_inputs.iter().copied());
 
         let lookups =
-            get_outpoint_balances_with_spent_batch(read_state, provider, &lookup_outpoints)?;
+            get_outpoint_balances_with_spent_batch(StateAt::Latest, provider, &lookup_outpoints)?;
         populate_outpoint_lookup_maps(
             lookup_outpoints,
             lookups,
@@ -3760,7 +3763,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             let mut amounts: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
             let bal_len = provider
                 .get_raw_value(GetRawValueParams {
-                    blockhash: read_state,
+                    blockhash: StateAt::Latest,
                     key: table.alkane_balance_list_len_key(owner),
                 })?
                 .value
@@ -3781,7 +3784,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                 }
                 let idx_vals = provider
                     .get_multi_values(GetMultiValuesParams {
-                        blockhash: read_state,
+                        blockhash: StateAt::Latest,
                         keys: idx_keys,
                     })?
                     .values;
@@ -3803,7 +3806,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                 }
                 let vals = provider
                     .get_multi_values(GetMultiValuesParams {
-                        blockhash: read_state,
+                        blockhash: StateAt::Latest,
                         keys: bal_keys,
                     })?
                     .values;
@@ -3876,7 +3879,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
     let timer = debug::start_if(debug);
     let latest_traces_prev_len = provider
         .get_raw_value(GetRawValueParams {
-            blockhash: read_state,
+            blockhash: StateAt::Latest,
             key: table.latest_traces_length_key(),
         })?
         .value
@@ -3897,7 +3900,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             keys.push(table.latest_traces_idx_key(idx));
         }
         let vals = provider
-            .get_multi_values(GetMultiValuesParams { blockhash: read_state, keys })?
+            .get_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
             .values;
         for val in vals.into_iter().flatten() {
             if val.len() != 32 {
@@ -4062,7 +4065,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
     if !external_spent_candidates.is_empty() {
         let resolved = resolve_outpoint_ids_batch_v2(
             provider,
-            read_state,
+            StateAt::Latest,
             external_spent_candidates.as_slice(),
         )?;
         for ((txid, vout), id) in external_spent_candidates.iter().zip(resolved.into_iter()) {
@@ -4147,7 +4150,10 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         addrs.sort();
         let keys: Vec<Vec<u8>> = addrs.iter().map(|a| table.addr_spk_key(a)).collect();
         let existing = provider
-            .get_multi_values(GetMultiValuesParams { blockhash: read_state, keys: keys.clone() })?
+            .get_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: keys.clone(),
+            })?
             .values;
         for (idx, addr) in addrs.into_iter().enumerate() {
             let Some(next) = addr_spk_updates.remove(&addr) else {
@@ -4182,7 +4188,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         for (token, delta) in per_token {
             let key = table.address_balance_key(address, token);
             let current_raw = provider
-                .get_raw_value(GetRawValueParams { blockhash: read_state, key: key.clone() })?
+                .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: key.clone() })?
                 .value;
             let current =
                 current_raw.as_ref().and_then(|raw| decode_u128_value(raw).ok()).unwrap_or(0);
@@ -4218,7 +4224,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         }
         let len = provider
             .get_raw_value(GetRawValueParams {
-                blockhash: read_state,
+                blockhash: StateAt::Latest,
                 key: table.address_balance_list_len_key(&address),
             })?
             .value
@@ -4240,7 +4246,10 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                 idx_keys.push(table.address_balance_list_idx_key(&address, idx));
             }
             let idx_vals = provider
-                .get_multi_values(GetMultiValuesParams { blockhash: read_state, keys: idx_keys })?
+                .get_multi_values(GetMultiValuesParams {
+                    blockhash: StateAt::Latest,
+                    keys: idx_keys,
+                })?
                 .values;
             for idx_val in idx_vals {
                 let Some(raw) = idx_val else { continue };
@@ -4265,7 +4274,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             }
             let balance_vals = provider
                 .get_multi_values(GetMultiValuesParams {
-                    blockhash: read_state,
+                    blockhash: StateAt::Latest,
                     keys: balance_keys,
                 })?
                 .values;
@@ -4370,7 +4379,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             for token in &changed_tokens {
                 let current = provider
                     .get_raw_value(GetRawValueParams {
-                        blockhash: read_state,
+                        blockhash: StateAt::Latest,
                         key: table.alkane_balance_key(owner, token),
                     })?
                     .value
@@ -4386,7 +4395,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
 
             let len = provider
                 .get_raw_value(GetRawValueParams {
-                    blockhash: read_state,
+                    blockhash: StateAt::Latest,
                     key: table.alkane_balance_list_len_key(owner),
                 })?
                 .value
@@ -4409,7 +4418,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                 }
                 let idx_vals = provider
                     .get_multi_values(GetMultiValuesParams {
-                        blockhash: read_state,
+                        blockhash: StateAt::Latest,
                         keys: idx_keys,
                     })?
                     .values;
@@ -4436,7 +4445,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                 }
                 let balance_vals = provider
                     .get_multi_values(GetMultiValuesParams {
-                        blockhash: read_state,
+                        blockhash: StateAt::Latest,
                         keys: balance_keys,
                     })?
                     .values;
@@ -4509,7 +4518,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             let height_len_key = table.alkane_balance_by_height_list_len_key(owner, &token);
             let height_len = provider
                 .get_raw_value(GetRawValueParams {
-                    blockhash: read_state,
+                    blockhash: StateAt::Latest,
                     key: height_len_key.clone(),
                 })?
                 .value
@@ -4790,18 +4799,14 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
     // E) Holders deltas
     let holders_full_rebuilds = 0usize;
     let holders_full_rebuild_entries = 0usize;
-    let holder_child_factories = resolve_factory_by_child(
-        provider,
-        read_state,
-        holders_delta.keys().copied().collect(),
-        factory_hints,
-    )?;
+    let holder_child_factories =
+        resolve_factory_by_child(provider, holders_delta.keys().copied().collect(), factory_hints)?;
     let mut orbital_holders_delta: OrbitalChildHolderDeltas = HashMap::new();
     for (alkane, per_holder) in holders_delta.iter() {
         let holders_count_key = table.holders_count_key(alkane);
         let prev_count = provider
             .get_raw_value(GetRawValueParams {
-                blockhash: read_state,
+                blockhash: StateAt::Latest,
                 key: holders_count_key.clone(),
             })?
             .value
@@ -4810,7 +4815,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             .unwrap_or(0);
         let holder_len = provider
             .get_raw_value(GetRawValueParams {
-                blockhash: read_state,
+                blockhash: StateAt::Latest,
                 key: table.holder_list_len_key(alkane),
             })?
             .value
@@ -4833,7 +4838,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         }
         let current_holder_values = provider
             .get_multi_values(GetMultiValuesParams {
-                blockhash: read_state,
+                blockhash: StateAt::Latest,
                 keys: holder_keys.clone(),
             })?
             .values;
@@ -4841,7 +4846,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         let supply_latest_key = table.circulating_supply_latest_key(alkane);
         let prev_supply = provider
             .get_raw_value(GetRawValueParams {
-                blockhash: read_state,
+                blockhash: StateAt::Latest,
                 key: supply_latest_key.clone(),
             })?
             .value
@@ -4913,7 +4918,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         if search_index_enabled {
             let rec = provider
                 .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
-                    blockhash: read_state,
+                    blockhash: StateAt::Latest,
                     alkane: *alkane,
                 })
                 .ok()
@@ -4994,7 +4999,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
     for (factory, per_holder) in orbital_holders_delta.iter() {
         let holder_len = provider
             .get_raw_value(GetRawValueParams {
-                blockhash: read_state,
+                blockhash: StateAt::Latest,
                 key: table.orbital_holder_v2_list_len_key(factory),
             })?
             .value
@@ -5017,7 +5022,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         }
         let current_holder_values = provider
             .get_multi_values(GetMultiValuesParams {
-                blockhash: read_state,
+                blockhash: StateAt::Latest,
                 keys: holder_keys.clone(),
             })?
             .values;
@@ -5036,14 +5041,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             let mut children: BTreeSet<SchemaAlkaneId> = if let Some(entry) = current_entry {
                 entry.alkanes.into_iter().collect()
             } else {
-                hydrate_orbital_children_from_holder_index(
-                    provider,
-                    &table,
-                    read_state,
-                    read_height,
-                    factory,
-                    &holder,
-                )?
+                hydrate_orbital_children_from_holder_index(provider, &table, factory, &holder)?
             };
             if !had_v2_row {
                 if let HolderId::Address(address) = &holder {
@@ -5124,7 +5122,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
     for (address, per_factory_delta) in address_orbital_balance_deltas {
         let key = table.address_orbital_balances_v2_key(&address);
         let current = provider
-            .get_raw_value(GetRawValueParams { blockhash: read_state, key: key.clone() })?
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: key.clone() })?
             .value
             .and_then(|raw| decode_address_orbital_balance_entries(&raw).ok())
             .unwrap_or_default();
@@ -5180,7 +5178,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         for (addr, delta) in per_addr {
             let key = table.transfer_volume_entry_key(alkane, addr);
             let prev_raw = provider
-                .get_raw_value(GetRawValueParams { blockhash: read_state, key: key.clone() })?
+                .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: key.clone() })?
                 .value;
             let had_row = prev_raw.is_some();
             let prev =
@@ -5197,7 +5195,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         }
         let len = provider
             .get_raw_value(GetRawValueParams {
-                blockhash: read_state,
+                blockhash: StateAt::Latest,
                 key: table.transfer_volume_list_len_key(&alkane),
             })?
             .value
@@ -5230,7 +5228,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         for (addr, delta) in per_addr {
             let key = table.total_received_entry_key(alkane, addr);
             let prev_raw = provider
-                .get_raw_value(GetRawValueParams { blockhash: read_state, key: key.clone() })?
+                .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: key.clone() })?
                 .value;
             let had_row = prev_raw.is_some();
             let prev =
@@ -5247,7 +5245,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         }
         let len = provider
             .get_raw_value(GetRawValueParams {
-                blockhash: read_state,
+                blockhash: StateAt::Latest,
                 key: table.total_received_list_len_key(&alkane),
             })?
             .value
@@ -5287,7 +5285,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                     let key = table.address_activity_transfer_key(&addr, alk);
                     let prev_raw = provider
                         .get_raw_value(GetRawValueParams {
-                            blockhash: read_state,
+                            blockhash: StateAt::Latest,
                             key: key.clone(),
                         })?
                         .value;
@@ -5307,7 +5305,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                     let key = table.address_activity_total_received_key(&addr, alk);
                     let prev_raw = provider
                         .get_raw_value(GetRawValueParams {
-                            blockhash: read_state,
+                            blockhash: StateAt::Latest,
                             key: key.clone(),
                         })?
                         .value;
@@ -5329,7 +5327,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             }
             let len = provider
                 .get_raw_value(GetRawValueParams {
-                    blockhash: read_state,
+                    blockhash: StateAt::Latest,
                     key: table.address_activity_transfer_list_len_key(&addr),
                 })?
                 .value
@@ -5371,7 +5369,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             }
             let len = provider
                 .get_raw_value(GetRawValueParams {
-                    blockhash: read_state,
+                    blockhash: StateAt::Latest,
                     key: table.address_activity_total_received_list_len_key(&addr),
                 })?
                 .value
@@ -5412,8 +5410,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
     if !address_contract_send_delta.is_empty() || !address_contract_receive_delta.is_empty() {
         let mut child_contracts = contracts_in_address_amounts(&address_contract_send_delta);
         child_contracts.extend(contracts_in_address_amounts(&address_contract_receive_delta));
-        let factory_by_child =
-            resolve_factory_by_child(provider, read_state, child_contracts, factory_hints)?;
+        let factory_by_child = resolve_factory_by_child(provider, child_contracts, factory_hints)?;
         let address_orbital_send_delta =
             rollup_contract_amounts_to_orbitals(&address_contract_send_delta, &factory_by_child);
         let address_orbital_receive_delta =
@@ -5439,7 +5436,10 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             if let Some(delta) = address_contract_send_delta.get(addr) {
                 let key = table.address_cumulative_send_alkanes_key(addr);
                 let current = provider
-                    .get_raw_value(GetRawValueParams { blockhash: read_state, key: key.clone() })?
+                    .get_raw_value(GetRawValueParams {
+                        blockhash: StateAt::Latest,
+                        key: key.clone(),
+                    })?
                     .value
                     .and_then(|bytes| decode_address_contract_amount_entries(&bytes).ok())
                     .unwrap_or_default();
@@ -5450,7 +5450,10 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             if let Some(delta) = address_contract_receive_delta.get(addr) {
                 let key = table.address_cumulative_receive_alkanes_key(addr);
                 let current = provider
-                    .get_raw_value(GetRawValueParams { blockhash: read_state, key: key.clone() })?
+                    .get_raw_value(GetRawValueParams {
+                        blockhash: StateAt::Latest,
+                        key: key.clone(),
+                    })?
                     .value
                     .and_then(|bytes| decode_address_contract_amount_entries(&bytes).ok())
                     .unwrap_or_default();
@@ -5461,7 +5464,10 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             if let Some(delta) = address_orbital_send_delta.get(addr) {
                 let key = table.address_cumulative_send_orbitals_key(addr);
                 let current = provider
-                    .get_raw_value(GetRawValueParams { blockhash: read_state, key: key.clone() })?
+                    .get_raw_value(GetRawValueParams {
+                        blockhash: StateAt::Latest,
+                        key: key.clone(),
+                    })?
                     .value
                     .and_then(|bytes| decode_address_contract_amount_entries(&bytes).ok())
                     .unwrap_or_default();
@@ -5472,7 +5478,10 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             if let Some(delta) = address_orbital_receive_delta.get(addr) {
                 let key = table.address_cumulative_receive_orbitals_key(addr);
                 let current = provider
-                    .get_raw_value(GetRawValueParams { blockhash: read_state, key: key.clone() })?
+                    .get_raw_value(GetRawValueParams {
+                        blockhash: StateAt::Latest,
+                        key: key.clone(),
+                    })?
                     .value
                     .and_then(|bytes| decode_address_contract_amount_entries(&bytes).ok())
                     .unwrap_or_default();
@@ -5485,7 +5494,6 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             provider,
             &table,
             &mut puts,
-            read_state,
             &alkane_send_volume_delta,
             SourceVolumeIndex::Alkane,
             false,
@@ -5494,7 +5502,6 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             provider,
             &table,
             &mut puts,
-            read_state,
             &alkane_receive_volume_delta,
             SourceVolumeIndex::Alkane,
             true,
@@ -5503,7 +5510,6 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             provider,
             &table,
             &mut puts,
-            read_state,
             &orbital_send_volume_delta,
             SourceVolumeIndex::Orbital,
             false,
@@ -5512,7 +5518,6 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
             provider,
             &table,
             &mut puts,
-            read_state,
             &orbital_receive_volume_delta,
             SourceVolumeIndex::Orbital,
             true,
@@ -5525,7 +5530,10 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         }
         let latest_key = table.total_minted_latest_key(alkane);
         let prev_total = provider
-            .get_raw_value(GetRawValueParams { blockhash: read_state, key: latest_key.clone() })?
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: latest_key.clone(),
+            })?
             .value
             .and_then(|v| decode_u128_value(&v).ok())
             .unwrap_or(0);
@@ -5754,7 +5762,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                                 cached.clone()
                             } else {
                                 let hlen = match provider.get_raw_value(GetRawValueParams {
-                                    blockhash: read_state,
+                                    blockhash: StateAt::Latest,
                                     key: table.alkane_balance_by_height_list_len_key(owner, token),
                                 }) {
                                     Ok(v) => v
@@ -5784,7 +5792,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                                 }
                                 let hidx_vals =
                                     match provider.get_multi_values(GetMultiValuesParams {
-                                        blockhash: read_state,
+                                        blockhash: StateAt::Latest,
                                         keys: hidx_keys,
                                     }) {
                                         Ok(v) => v.values,
@@ -5813,7 +5821,7 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                                     .collect();
                                 let value_rows =
                                     match provider.get_multi_values(GetMultiValuesParams {
-                                        blockhash: read_state,
+                                        blockhash: StateAt::Latest,
                                         keys: value_keys,
                                     }) {
                                         Ok(v) => v.values,
@@ -6201,8 +6209,8 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
     Ok(())
 }
 
-fn lookup_self_balance_at(alk: &SchemaAlkaneId, height: Option<u64>) -> Option<u128> {
-    match get_metashrew().get_reserves_for_alkane(alk, alk, height) {
+fn lookup_self_balance(alk: &SchemaAlkaneId) -> Option<u128> {
+    match get_metashrew().get_reserves_for_alkane(alk, alk, None) {
         Ok(val) => val,
         Err(e) => {
             eprintln!(
@@ -6212,10 +6220,6 @@ fn lookup_self_balance_at(alk: &SchemaAlkaneId, height: Option<u64>) -> Option<u
             None
         }
     }
-}
-
-fn lookup_self_balance(alk: &SchemaAlkaneId) -> Option<u128> {
-    lookup_self_balance_at(alk, None)
 }
 
 pub fn get_balance_for_address(

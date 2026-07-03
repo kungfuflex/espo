@@ -28,7 +28,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 const CANONICAL_TIP_SCAN_BUFFER: u32 = 288;
-const MAX_SDB_POINTER_RESOLVE_DEPTH: u8 = 8;
 
 static LAST_CANONICAL_METASHREW_TIP: AtomicU32 = AtomicU32::new(0);
 
@@ -201,51 +200,25 @@ impl<'a> SdbPointer<'a> {
         }
     }
 
-    fn latest_raw(&self) -> Option<Vec<u8>> {
-        self.get_raw_with_depth(self.key.as_ref(), 0)
-    }
-
-    fn length_key(base: &[u8]) -> Vec<u8> {
+    fn length_with_depth(&self, base: &[u8], depth: u8) -> Option<u64> {
         let mut length_key = Vec::with_capacity(base.len() + 7);
         length_key.extend_from_slice(base);
         length_key.extend_from_slice(b"/length");
-        length_key
-    }
 
-    fn has_length_metadata_for(&self, base: &[u8]) -> bool {
-        let length_key = Self::length_key(base);
-        if self.with_key(&length_key).get_raw().is_some() {
-            return true;
-        }
-        let nested_length_key = Self::length_key(&length_key);
-        self.with_key(&nested_length_key).get_raw().is_some()
-    }
-
-    fn has_length_metadata(&self) -> bool {
-        self.has_length_metadata_for(self.key.as_ref())
-    }
-
-    fn length_with_depth(&self, base: &[u8], depth: u8) -> Option<u64> {
-        let length_key = Self::length_key(base);
         let length_ptr = self.with_key(&length_key);
-
-        // A Metashrew rollback can leave the old direct /length value in place and append the
-        // corrected value as a versioned key under /length/length. Prefer that version chain when
-        // it exists, otherwise a stale length can expose orphaned entries from the abandoned tip.
-        if depth < MAX_SDB_POINTER_RESOLVE_DEPTH && self.has_length_metadata_for(&length_key) {
-            return self
-                .get_raw_with_depth(&length_key, depth + 1)
-                .as_deref()
-                .and_then(parse_length_value);
+        if let Some(bytes) = length_ptr.get_raw() {
+            return parse_length_value(&bytes);
         }
-
-        let bytes = length_ptr.get_raw()?;
+        if depth >= 2 {
+            return None;
+        }
+        let bytes = self.get_raw_with_depth(&length_key, depth + 1)?;
         parse_length_value(&bytes)
     }
 
     fn get_raw_with_depth(&self, base: &[u8], depth: u8) -> Option<Vec<u8>> {
-        if depth > MAX_SDB_POINTER_RESOLVE_DEPTH {
-            return self.with_key(base).get_raw();
+        if depth > 2 {
+            return None;
         }
         if let Some(len) = self.length_with_depth(base, depth) {
             if len == 0 {
@@ -257,17 +230,13 @@ impl<'a> SdbPointer<'a> {
             key.push(b'/');
             key.extend_from_slice(idx.to_string().as_bytes());
             let ptr = self.with_key(&key);
-            if depth < MAX_SDB_POINTER_RESOLVE_DEPTH && ptr.has_length_metadata() {
-                return self.get_raw_with_depth(&key, depth + 1);
-            }
             if let Some(bytes) = ptr.get_raw() {
                 return Some(bytes);
             }
-            return if depth < MAX_SDB_POINTER_RESOLVE_DEPTH {
-                self.get_raw_with_depth(&key, depth + 1)
-            } else {
-                None
-            };
+            if depth >= 2 {
+                return None;
+            }
+            return self.get_raw_with_depth(&key, depth + 1);
         }
         self.with_key(base).get_raw()
     }
@@ -309,119 +278,6 @@ impl<'a> KeyValuePointer for SdbPointer<'a> {
     fn inherits(&mut self, from: &Self) {
         self.sdb = from.sdb;
         self.label = from.label.clone();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rocksdb::{DB, Options};
-    use std::time::Duration;
-    use tempfile::TempDir;
-
-    struct TestSdb {
-        _primary: DB,
-        _primary_dir: TempDir,
-        _secondary_dir: TempDir,
-        sdb: SDB,
-    }
-
-    impl TestSdb {
-        fn new(rows: &[(&[u8], &[u8])]) -> Self {
-            let tmp_root = std::env::current_dir()
-                .expect("current dir")
-                .join("target")
-                .join("metashrew-adapter-tests");
-            std::fs::create_dir_all(&tmp_root).expect("create test temp root");
-            let primary_dir = tempfile::Builder::new()
-                .prefix("primary-")
-                .tempdir_in(&tmp_root)
-                .expect("primary tempdir");
-            let secondary_dir = tempfile::Builder::new()
-                .prefix("secondary-")
-                .tempdir_in(&tmp_root)
-                .expect("secondary tempdir");
-            let mut opts = Options::default();
-            opts.create_if_missing(true);
-            let primary = DB::open(&opts, primary_dir.path()).expect("open primary db");
-            for (key, value) in rows {
-                primary.put(key, value).expect("put primary row");
-            }
-            primary.flush().expect("flush primary db");
-            let sdb =
-                SDB::open(primary_dir.path(), secondary_dir.path(), Duration::from_millis(10))
-                    .expect("open secondary db");
-            sdb.catch_up_now().expect("catch up secondary db");
-            Self {
-                _primary: primary,
-                _primary_dir: primary_dir,
-                _secondary_dir: secondary_dir,
-                sdb,
-            }
-        }
-
-        fn root(&self) -> SdbPointer<'_> {
-            SdbPointer::root(None).with_db(&self.sdb)
-        }
-    }
-
-    #[test]
-    fn pointer_length_prefers_versioned_length_over_stale_direct_length() {
-        let sdb = TestSdb::new(&[
-            (b"/items/length", b"3"),
-            (b"/items/0", b"first"),
-            (b"/items/1", b"second"),
-            (b"/items/2", b"orphan"),
-            (b"/items/length/length", b"1"),
-            (b"/items/length/0", b"2"),
-        ]);
-        let items = sdb.root().keyword("/items");
-
-        assert_eq!(items.length(), 2);
-        let values = items.get_list();
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[0].as_ref().as_slice(), b"first");
-        assert_eq!(values[1].as_ref().as_slice(), b"second");
-    }
-
-    #[test]
-    fn pointer_get_prefers_versioned_item_over_stale_direct_item() {
-        let sdb = TestSdb::new(&[
-            (b"/items/length", b"1"),
-            (b"/items/0", b"stale"),
-            (b"/items/0/length", b"1"),
-            (b"/items/0/0", b"fresh"),
-        ]);
-        let item = sdb.root().keyword("/items").select_index(0);
-
-        assert_eq!(item.get().as_ref().as_slice(), b"fresh");
-    }
-
-    #[test]
-    fn pointer_zero_versioned_length_suppresses_stale_direct_length() {
-        let sdb = TestSdb::new(&[
-            (b"/items/length", b"3"),
-            (b"/items/0", b"first"),
-            (b"/items/1", b"second"),
-            (b"/items/2", b"orphan"),
-            (b"/items/length/length", b"0"),
-        ]);
-        let items = sdb.root().keyword("/items");
-
-        assert_eq!(items.length(), 0);
-        assert!(items.get_list().is_empty());
-    }
-
-    #[test]
-    fn pointer_zero_versioned_item_length_suppresses_stale_direct_item() {
-        let sdb = TestSdb::new(&[
-            (b"/items/length", b"1"),
-            (b"/items/0", b"stale"),
-            (b"/items/0/length", b"0"),
-        ]);
-        let item = sdb.root().keyword("/items").select_index(0);
-
-        assert!(item.get().is_empty());
     }
 }
 
@@ -726,7 +582,7 @@ impl MetashrewAdapter {
         height: u32,
     ) -> Result<Option<[u8; 32]>> {
         let key = format!("/__INTERNAL/height-to-hash/{height}").into_bytes();
-        let Some(raw) = self.root.from_bytes(db, key).latest_raw() else {
+        let Some(raw) = self.root.from_bytes(db, key).get_raw() else {
             return Ok(None);
         };
         if raw.len() != 32 {
@@ -950,7 +806,7 @@ impl MetashrewAdapter {
         };
 
         let read_entry_at = |idx: u32| -> Result<Option<(u64, u128)>> {
-            let entry_bytes = match pointer.select_index(idx).latest_raw() {
+            let entry_bytes = match pointer.select_index(idx).get_raw() {
                 Some(bytes) => bytes,
                 None => return Ok(None),
             };
@@ -1108,7 +964,7 @@ impl MetashrewAdapter {
         let traces = TraceTablesNative::new(&root);
         let by_height = traces.TRACES_BY_HEIGHT_NATIVE.select_value(block);
         let mut outpoints = by_height.get_list();
-        if outpoints.is_empty() && !by_height.has_length_metadata() {
+        if outpoints.is_empty() {
             outpoints = self.scan_lengthless_trace_height_index(db, &by_height, allow_txids)?;
         }
         let list_len = outpoints.len();
@@ -1225,10 +1081,6 @@ impl MetashrewAdapter {
             if let Some(trace) = decode_trace_blob(&trace_bytes) {
                 return Some(trace);
             }
-        }
-
-        if parent.has_length_metadata() {
-            return None;
         }
 
         self.scan_lengthless_trace_blob(db, &parent)
