@@ -32,7 +32,7 @@ static BITCOIND_CLIENT: OnceLock<CoreClient> = OnceLock::new();
 static METASHREW_SDB: OnceLock<std::sync::Arc<SDB>> = OnceLock::new();
 static ESPO_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
 static BLOCK_SOURCE: OnceLock<BlkOrRpcBlockSource> = OnceLock::new();
-static STARTUP_ROLLBACK_REPLAY_UNTIL: AtomicU32 = AtomicU32::new(0);
+static STARTUP_ROLLBACK_REPLAY_FROM: AtomicU32 = AtomicU32::new(u32::MAX);
 
 // NEW: Global bitcoin::Network
 static NETWORK: OnceLock<Network> = OnceLock::new();
@@ -895,16 +895,13 @@ pub fn strict_check_alkane_balances() -> bool {
         .unwrap_or(false)
 }
 
-pub fn set_startup_rollback_replay_until(height: u32) {
-    STARTUP_ROLLBACK_REPLAY_UNTIL.store(height, Ordering::Relaxed);
+pub fn mark_startup_rollback_replay_from(height: u32) {
+    STARTUP_ROLLBACK_REPLAY_FROM.store(height, Ordering::Relaxed);
 }
 
 pub fn is_startup_rollback_replay_height(height: u32) -> bool {
-    let Some(start) = get_config().rollback else {
-        return false;
-    };
-    let until = STARTUP_ROLLBACK_REPLAY_UNTIL.load(Ordering::Relaxed);
-    until >= start && height >= start && height <= until
+    let start = STARTUP_ROLLBACK_REPLAY_FROM.load(Ordering::Relaxed);
+    start != u32::MAX && height >= start
 }
 
 pub fn strict_check_trace_mismatches() -> bool {

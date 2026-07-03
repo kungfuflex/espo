@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::{
-    DebugBackupConfig, get_block_source, init_block_source, set_startup_rollback_replay_until,
+    DebugBackupConfig, get_block_source, init_block_source, mark_startup_rollback_replay_from,
 };
 //modules
 use crate::config::get_metashrew_sdb;
@@ -286,6 +286,11 @@ fn apply_startup_rollback(
             "rollback height {requested_height} is ahead of the current resume height {resume_start_height}; refusing to skip indexed state"
         );
     }
+    mark_startup_rollback_replay_from(requested_height);
+    eprintln!(
+        "[startup_rollback] metashrew strict checks are paused from height {} for this startup run",
+        requested_height
+    );
     if requested_height == resume_start_height {
         eprintln!(
             "[startup_rollback] requested height {} already matches current resume height; no rollback needed",
@@ -297,12 +302,6 @@ fn apply_startup_rollback(
     eprintln!(
         "[startup_rollback] rewinding indexed state from next height {} to {}",
         resume_start_height, requested_height
-    );
-    let replay_until = resume_start_height.saturating_sub(1);
-    set_startup_rollback_replay_until(replay_until);
-    eprintln!(
-        "[startup_rollback] metashrew strict checks are paused for replay heights {}..={}",
-        requested_height, replay_until
     );
     handle_reorg_switch(mods, requested_height)?;
     if let Err(e) = reset_mempool_store() {
