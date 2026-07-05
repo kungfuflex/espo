@@ -1,4 +1,4 @@
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use alkanes_support::proto::alkanes::AlkanesTrace;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -41,7 +41,7 @@ use crate::modules::essentials::storage::{
 };
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_rows_batch,
-    project_tx_output_balances_from_traces,
+    project_tx_output_balances_from_traces_with_projector,
 };
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RunesProvider, TxRuneIo};
@@ -50,6 +50,7 @@ use crate::runtime::mempool::{
     get_mempool_block_transactions_for_targets, pending_action_entries_for_address,
     pending_by_txid, pending_for_address,
 };
+use crate::runtime::mempool_projection::MempoolProjectionRegistry;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
 use crate::utils::electrum_like::{AddressHistoryEntry, ElectrumLikeBackend};
@@ -248,6 +249,7 @@ fn mempool_projected_balances(
 ) -> HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> {
     let mut projected_by_outpoint: HashMap<(Txid, u32), Vec<BalanceEntry>> = HashMap::new();
     let mut projected_by_tx: HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> = HashMap::new();
+    let mut contract_projector = MempoolProjectionRegistry::from_latest_indices();
 
     for item in ordered_txs {
         let mut input_totals: BTreeMap<crate::schemas::SchemaAlkaneId, u128> = BTreeMap::new();
@@ -268,7 +270,12 @@ fn mempool_projected_balances(
             .map(|(alkane, amount)| BalanceEntry { alkane, amount })
             .collect();
         let traces = item.traces.as_deref().unwrap_or(&[]);
-        let projected = project_tx_output_balances_from_traces(&item.tx, traces, input_balances);
+        let projected = project_tx_output_balances_from_traces_with_projector(
+            &item.tx,
+            traces,
+            input_balances,
+            Some(&mut contract_projector),
+        );
         if projected.is_empty() {
             continue;
         }

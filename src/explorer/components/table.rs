@@ -7,7 +7,9 @@ use crate::explorer::components::rune_icon::rune_icon;
 use crate::explorer::components::svg_assets::icon_user;
 use crate::explorer::components::tx_view::icon_bg_style;
 use crate::explorer::paths::explorer_path;
+use crate::explorer::phishing::is_phishing_alkane;
 use crate::modules::runes::storage::RuneEntry;
+use crate::schemas::SchemaAlkaneId;
 
 #[derive(Clone, Debug)]
 pub struct AlkaneTableRow {
@@ -56,6 +58,19 @@ fn comma_count(value: u64) -> String {
 
 fn holder_count(value: u64, compact: bool) -> String {
     if compact { compact_count(value) } else { comma_count(value) }
+}
+
+fn parse_alkane_id(raw: &str) -> Option<SchemaAlkaneId> {
+    let (block, tx) = raw.split_once(':')?;
+    Some(SchemaAlkaneId { block: block.parse().ok()?, tx: tx.parse().ok()? })
+}
+
+fn scam_tag_for_alkane_id(raw: &str) -> Markup {
+    if parse_alkane_id(raw).map(|id| is_phishing_alkane(&id)).unwrap_or(false) {
+        html! { span class="tag scam-tag" { "SCAM" } }
+    } else {
+        html! {}
+    }
 }
 
 /// Table renderer with fixed width last column used for holders lists.
@@ -187,6 +202,7 @@ fn alkanes_table_inner(
                                 }
                                 div class="alkane-meta" {
                                     a class="alk-sym link mono alkane-name-link" href=(explorer_path(&format!("/alkane/{}", row.id))) { (row.name.clone()) }
+                                    (scam_tag_for_alkane_id(&row.id))
                                     div class="muted mono alkane-id" { (row.id.clone()) }
                                 }
                             }

@@ -14,7 +14,7 @@ use crate::modules::essentials::storage::{
 use crate::modules::essentials::utils::creation_meta::{get_cap, get_value_per_mint};
 use crate::modules::essentials::utils::inspections::{
     AlkaneCreationRecord, StoredInspectionResult, created_alkane_records_from_block,
-    inspect_wasm_metadata,
+    inspect_wasm_metadata, trace_succeeded,
 };
 use crate::modules::essentials::utils::names::{
     get_name as get_alkane_name, normalize_alkane_name,
@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // ✅ bring in balances bulk updater
-use crate::modules::essentials::utils::balances::bulk_update_balances_for_block;
+use crate::modules::essentials::utils::balances::bulk_update_balances_for_block_with_factory_hints;
 
 fn parse_short_id(
     id: &crate::alkanes::trace::EspoSandshrewLikeTraceShortId,
@@ -65,6 +65,15 @@ fn decode_u128_le_bytes(bytes: &[u8]) -> Option<u128> {
         buf[..bytes.len()].copy_from_slice(bytes);
     }
     Some(u128::from_le_bytes(buf))
+}
+
+fn decode_alkane_id_le_pair(bytes: &[u8]) -> Option<SchemaAlkaneId> {
+    if bytes.len() < 32 {
+        return None;
+    }
+    let block = decode_u128_le_bytes(&bytes[..16])?;
+    let tx = decode_u128_le_bytes(&bytes[16..32])?;
+    Some(SchemaAlkaneId { block: block.try_into().ok()?, tx: tx.try_into().ok()? })
 }
 
 fn is_orbital_instance(inspection: &StoredInspectionResult) -> bool {
@@ -205,14 +214,15 @@ impl EspoModule for Essentials {
         let mut creation_rows_by_id: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut creation_rows_seq: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut holders_index_rows: HashSet<Vec<u8>> = HashSet::new();
+        let mut factory_child_rows: HashSet<Vec<u8>> = HashSet::new();
         // in-block name/symbol updates detected from storage writes
         let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> = HashMap::new();
         let mut cap_updates: HashMap<SchemaAlkaneId, u128> = HashMap::new();
         let mut mint_updates: HashMap<SchemaAlkaneId, u128> = HashMap::new();
+        let mut factory_hint_updates: HashMap<SchemaAlkaneId, SchemaAlkaneId> = HashMap::new();
         let mut orbital_index_updates: HashMap<SchemaAlkaneId, u128> = HashMap::new();
-        let mut orbital_collection_name_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-        let mut orbital_collection_name_cache: HashMap<SchemaAlkaneId, Option<String>> =
-            HashMap::new();
+        let mut orbital_name_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut orbital_name_cache: HashMap<SchemaAlkaneId, Option<String>> = HashMap::new();
         let mut name_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut symbol_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let add_name_index =
@@ -272,20 +282,36 @@ impl EspoModule for Essentials {
         };
 
         let mut total_pairs_dedup = 0usize;
+        let mut seen_created_storage_alkanes: HashSet<SchemaAlkaneId> = HashSet::new();
 
         for tx in block.transactions.iter() {
             let Some(traces) = tx.traces.as_ref() else { continue };
             for trace in traces.iter() {
-                let mut created_in_trace: HashSet<SchemaAlkaneId> = HashSet::new();
+                if !trace_succeeded(trace) {
+                    continue;
+                }
+                let mut first_creations_in_trace: HashSet<SchemaAlkaneId> = HashSet::new();
+                let mut duplicate_creations_in_trace: HashSet<SchemaAlkaneId> = HashSet::new();
                 for ev in trace.sandshrew_trace.events.iter() {
                     if let EspoSandshrewLikeTraceEvent::Create(create) = ev {
                         if let Some(id) = parse_short_id(create) {
-                            created_in_trace.insert(id);
+                            if seen_created_storage_alkanes.insert(id) {
+                                first_creations_in_trace.insert(id);
+                            } else {
+                                duplicate_creations_in_trace.insert(id);
+                            }
                         }
                     }
                 }
 
                 for (alk, kvs) in trace.storage_changes.iter() {
+                    if duplicate_creations_in_trace.contains(alk)
+                        && !first_creations_in_trace.contains(alk)
+                    {
+                        continue;
+                    }
+                    let first_created_in_trace = first_creations_in_trace.contains(alk);
+                    let duplicate_created_in_trace = duplicate_creations_in_trace.contains(alk);
                     for (skey, (txid, value)) in kvs.iter() {
                         // Key for value row
                         let k_v = table.kv_row_key(alk, skey);
@@ -322,13 +348,17 @@ impl EspoModule for Essentials {
                             };
                         if skey.as_slice() == b"/name" {
                             if let Ok(name) = String::from_utf8(value.clone()) {
-                                push_if_new(&mut meta_updates, *alk, Some(name), None);
+                                if !duplicate_created_in_trace {
+                                    push_if_new(&mut meta_updates, *alk, Some(name), None);
+                                }
                             }
                         } else if skey.as_slice() == b"/symbol" {
                             if let Ok(symbol) = String::from_utf8(value.clone()) {
-                                push_if_new(&mut meta_updates, *alk, None, Some(symbol));
+                                if !duplicate_created_in_trace {
+                                    push_if_new(&mut meta_updates, *alk, None, Some(symbol));
+                                }
                             }
-                        } else if created_in_trace.contains(alk) {
+                        } else if first_created_in_trace {
                             if skey.as_slice() == b"/cap" {
                                 if let Some(cap) = decode_u128_le_bytes(value) {
                                     cap_updates.insert(*alk, cap);
@@ -342,6 +372,10 @@ impl EspoModule for Essentials {
                             } else if skey.as_slice() == b"/index" {
                                 if let Some(idx) = decode_u128_le_bytes(value) {
                                     orbital_index_updates.insert(*alk, idx);
+                                }
+                            } else if skey.as_slice() == b"/factory_id" {
+                                if let Some(factory_id) = decode_alkane_id_le_pair(value) {
+                                    factory_hint_updates.insert(*alk, factory_id);
                                 }
                             }
                         }
@@ -426,7 +460,16 @@ impl EspoModule for Essentials {
         let inspect_timer = debug::start_if(debug);
         let metashrew = get_metashrew();
         for rec in created_records.iter_mut() {
-            match metashrew.get_alkane_wasm_bytes(&rec.alkane) {
+            let wasm_result = if let Some(factory_hint) = factory_hint_updates.get(&rec.alkane) {
+                match metashrew.get_alkane_wasm_bytes_prefer_first_version(factory_hint) {
+                    Ok(Some(value)) => Ok(Some(value)),
+                    Ok(None) => metashrew.get_alkane_wasm_bytes_prefer_first_version(&rec.alkane),
+                    Err(_) => metashrew.get_alkane_wasm_bytes_prefer_first_version(&rec.alkane),
+                }
+            } else {
+                metashrew.get_alkane_wasm_bytes_prefer_first_version(&rec.alkane)
+            };
+            match wasm_result {
                 Ok(Some((wasm_bytes, factory_id))) => {
                     let cached = {
                         let cache = self.inspection_cache.read().unwrap();
@@ -475,24 +518,23 @@ impl EspoModule for Essentials {
                 if is_orbital_instance(inspection) {
                     rec.symbols.clear();
                     let factory_id = inspection.factory_alkane.unwrap_or(rec.alkane);
-                    let mut base_name =
-                        if let Some(cached) = orbital_collection_name_cache.get(&factory_id) {
-                            cached.clone()
-                        } else {
-                            let key = table.orbital_collection_name_key(&factory_id);
-                            let name = provider
-                                .get_raw_value(GetRawValueParams {
-                                    blockhash: StateAt::Block(block_hash),
-                                    key,
-                                })
-                                .ok()
-                                .and_then(|resp| resp.value)
-                                .and_then(|bytes| String::from_utf8(bytes).ok())
-                                .map(|s| s.trim_matches('\0').trim().to_string())
-                                .filter(|s| !s.is_empty());
-                            orbital_collection_name_cache.insert(factory_id, name.clone());
-                            name
-                        };
+                    let mut base_name = if let Some(cached) = orbital_name_cache.get(&factory_id) {
+                        cached.clone()
+                    } else {
+                        let key = table.orbital_name_key(&factory_id);
+                        let name = provider
+                            .get_raw_value(GetRawValueParams {
+                                blockhash: StateAt::Block(block_hash),
+                                key,
+                            })
+                            .ok()
+                            .and_then(|resp| resp.value)
+                            .and_then(|bytes| String::from_utf8(bytes).ok())
+                            .map(|s| s.trim_matches('\0').trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        orbital_name_cache.insert(factory_id, name.clone());
+                        name
+                    };
                     let mut name_from_simulate: Option<String> = None;
 
                     if base_name.is_none() {
@@ -514,13 +556,11 @@ impl EspoModule for Essentials {
                     }
 
                     if let Some(base) = base_name.as_ref() {
-                        let existing =
-                            orbital_collection_name_cache.get(&factory_id).and_then(|v| v.as_ref());
+                        let existing = orbital_name_cache.get(&factory_id).and_then(|v| v.as_ref());
                         if existing.is_none() {
-                            let key = table.orbital_collection_name_key(&factory_id);
-                            orbital_collection_name_rows.insert(key, base.as_bytes().to_vec());
-                            orbital_collection_name_cache
-                                .insert(factory_id, Some(base.to_string()));
+                            let key = table.orbital_name_key(&factory_id);
+                            orbital_name_rows.insert(key, base.as_bytes().to_vec());
+                            orbital_name_cache.insert(factory_id, Some(base.to_string()));
                         }
                         if let Some(idx) = orbital_index_updates.get(&rec.alkane).copied() {
                             let constructed = format!("{base} #{}", idx.saturating_add(1));
@@ -589,10 +629,17 @@ impl EspoModule for Essentials {
         debug::log_elapsed(module, "build_creation_indexes", timer);
         let mut creations_in_block: Vec<SchemaAlkaneId> = Vec::new();
         let mut seen_creations_in_block: HashSet<SchemaAlkaneId> = HashSet::new();
+        let mut balance_factory_hints = factory_hint_updates.clone();
         for rec in created_records.iter() {
             if seen_creations_in_block.insert(rec.alkane) {
                 creations_in_block.push(rec.alkane);
             }
+            if let Some(factory) = rec.inspection.as_ref().and_then(|i| i.factory_alkane) {
+                balance_factory_hints.insert(rec.alkane, factory);
+            }
+        }
+        for (child, factory) in balance_factory_hints.iter() {
+            factory_child_rows.insert(table.alkane_factory_child_key(factory, child));
         }
         // Dedup against existing records to avoid double-counting if re-run.
         let timer = debug::start_if(debug);
@@ -665,6 +712,12 @@ impl EspoModule for Essentials {
                         }
                     }
                     if dirty {
+                        if let Some(factory) =
+                            updated.inspection.as_ref().and_then(|i| i.factory_alkane)
+                        {
+                            factory_child_rows
+                                .insert(table.alkane_factory_child_key(&factory, &updated.alkane));
+                        }
                         let encoded_updated = match encode_creation_record(&updated) {
                             Ok(v) => v,
                             Err(e) => {
@@ -689,6 +742,10 @@ impl EspoModule for Essentials {
                     .insert(table.alkane_creation_seq_key(next_creation_seq), alkane_id_bytes);
                 next_creation_seq = next_creation_seq.saturating_add(1);
                 holders_index_rows.insert(table.alkane_holders_ordered_key(0, &rec.alkane));
+                if let Some(factory) = rec.inspection.as_ref().and_then(|i| i.factory_alkane) {
+                    factory_child_rows
+                        .insert(table.alkane_factory_child_key(&factory, &rec.alkane));
+                }
             }
         }
 
@@ -767,11 +824,12 @@ impl EspoModule for Essentials {
         name_index_keys.sort_unstable();
         let mut symbol_index_keys: Vec<Vec<u8>> = symbol_index_rows.keys().cloned().collect();
         symbol_index_keys.sort_unstable();
-        let mut orbital_collection_name_keys: Vec<Vec<u8>> =
-            orbital_collection_name_rows.keys().cloned().collect();
-        orbital_collection_name_keys.sort_unstable();
+        let mut orbital_name_keys: Vec<Vec<u8>> = orbital_name_rows.keys().cloned().collect();
+        orbital_name_keys.sort_unstable();
         let mut holders_index_keys: Vec<Vec<u8>> = holders_index_rows.into_iter().collect();
         holders_index_keys.sort_unstable();
+        let mut factory_child_keys: Vec<Vec<u8>> = factory_child_rows.into_iter().collect();
+        factory_child_keys.sort_unstable();
         let mut creation_count_row: Option<[u8; 8]> = None;
         if new_creations_added > 0 {
             creation_count_row = Some(next_creation_seq.to_le_bytes());
@@ -806,12 +864,15 @@ impl EspoModule for Essentials {
                 puts.push((k.clone(), v.clone()));
             }
         }
-        for k in &orbital_collection_name_keys {
-            if let Some(v) = orbital_collection_name_rows.get(k) {
+        for k in &orbital_name_keys {
+            if let Some(v) = orbital_name_rows.get(k) {
                 puts.push((k.clone(), v.clone()));
             }
         }
         for k in &holders_index_keys {
+            puts.push((k.clone(), Vec::new()));
+        }
+        for k in &factory_child_keys {
             puts.push((k.clone(), Vec::new()));
         }
         if let Some(count_bytes) = creation_count_row {
@@ -854,7 +915,11 @@ impl EspoModule for Essentials {
                 block.transactions.len()
             );
         }
-        if let Err(e) = bulk_update_balances_for_block(provider, &block) {
+        if let Err(e) = bulk_update_balances_for_block_with_factory_hints(
+            provider,
+            &block,
+            &balance_factory_hints,
+        ) {
             eprintln!(
                 "[ESSENTIALS] bulk_update_balances_for_block failed at block #{}: {e}",
                 block.height

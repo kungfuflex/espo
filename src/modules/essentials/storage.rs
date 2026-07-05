@@ -7,11 +7,13 @@ use crate::config::{
 };
 use crate::modules::essentials::utils::balances::{
     SignedU128, get_address_activity_for_address, get_alkane_balances,
-    get_alkane_balances_at_or_before, get_balance_for_address, get_holders_for_alkane,
+    get_alkane_balances_at_or_before, get_alkane_volume_for_source, get_balance_for_address,
+    get_holders_for_alkane, get_orbital_holders_for_factory, get_orbital_volume_for_factory,
     get_outpoint_address, get_outpoint_balances_with_spent_batch, get_total_received_for_alkane,
     get_transfer_volume_for_alkane,
 };
 use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
+use crate::modules::essentials::utils::names::display_alkane_name;
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RuneBalance, RunesProvider};
 use crate::runtime::mdb::{Mdb, MdbBatch};
@@ -31,7 +33,8 @@ use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
+    MempoolBlockTx, MempoolEntry, get_mempool_index_transactions_ordered_by_block_and_fee,
+    get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
 };
 use crate::utils::electrum_like::{AddressHistoryEntry, AddressUtxo, ElectrumLikeBackend};
 pub use crate::utils::fee_rates::{BlockFeeRateSummary, compute_block_fee_rate_summary};
@@ -463,11 +466,12 @@ pub struct EssentialsTable<'a> {
     pub ALKANE_INFO: KvPointer<'a>,
     pub ALKANE_NAME_INDEX: ListPointer<'a>,
     pub ALKANE_SYMBOL_INDEX: ListPointer<'a>,
-    pub ORBITAL_COLLECTION_NAME: KvPointer<'a>,
+    pub ORBITAL_NAME: KvPointer<'a>,
     pub ALKANE_CREATION_BY_ID: KvPointer<'a>,
     pub ALKANE_CREATION_SEQ: KvPointer<'a>,
     pub ALKANE_CREATION_COUNT: KvPointer<'a>,
     pub ALKANE_CREATIONS_IN_BLOCK: KvPointer<'a>,
+    pub ALKANE_FACTORY_CHILDREN: ListPointer<'a>,
     pub CIRCULATING_SUPPLY: KvPointer<'a>,
     pub CIRCULATING_SUPPLY_LATEST: KvPointer<'a>,
     pub TOTAL_MINTED: KvPointer<'a>,
@@ -506,11 +510,12 @@ impl<'a> EssentialsTable<'a> {
             ALKANE_INFO: root.keyword("/alkane_info/"),
             ALKANE_NAME_INDEX: root.list_keyword("/alkanes/name/"),
             ALKANE_SYMBOL_INDEX: root.list_keyword("/alkanes/symbol/"),
-            ORBITAL_COLLECTION_NAME: root.keyword("/orbitals/collection/name/"),
+            ORBITAL_NAME: root.keyword("/orbitals/name/"),
             ALKANE_CREATION_BY_ID: root.keyword("/alkanes/creation/id/"),
             ALKANE_CREATION_SEQ: root.keyword("/alkanes/creation/seq/v1/"),
             ALKANE_CREATION_COUNT: root.keyword("/alkanes/creation/count"),
             ALKANE_CREATIONS_IN_BLOCK: root.keyword("/alkanes/creation/in_block/v2/"),
+            ALKANE_FACTORY_CHILDREN: root.list_keyword("/alkanes/factory_children/v1/"),
             CIRCULATING_SUPPLY: root.keyword("/circulating_supply/v1/"),
             CIRCULATING_SUPPLY_LATEST: root.keyword("/circulating_supply/latest/"),
             TOTAL_MINTED: root.keyword("/total_minted/v1/"),
@@ -970,6 +975,74 @@ impl<'a> EssentialsTable<'a> {
         Some((alkane, holder))
     }
 
+    pub fn orbital_holder_prefix(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 17);
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(factory));
+        key.extend_from_slice(b"/orbital_holder/");
+        key
+    }
+
+    pub fn orbital_holder_key(&self, factory: &SchemaAlkaneId, holder: &HolderId) -> Vec<u8> {
+        let mut key = self.orbital_holder_prefix(factory);
+        key.extend_from_slice(&holder_id_bytes(holder));
+        key
+    }
+
+    pub fn orbital_holder_list_prefix(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 21);
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(factory));
+        key.extend_from_slice(b"/orbital_holder_idx/");
+        key
+    }
+
+    pub fn orbital_holder_list_len_key(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut key = self.orbital_holder_list_prefix(factory);
+        key.extend_from_slice(b"length");
+        key
+    }
+
+    pub fn orbital_holder_list_idx_key(&self, factory: &SchemaAlkaneId, idx: u32) -> Vec<u8> {
+        let mut key = self.orbital_holder_list_prefix(factory);
+        key.extend_from_slice(&idx.to_be_bytes());
+        key
+    }
+
+    pub fn orbital_holder_v2_prefix(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 20);
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(factory));
+        key.extend_from_slice(b"/orbital_holder_v2/");
+        key
+    }
+
+    pub fn orbital_holder_v2_key(&self, factory: &SchemaAlkaneId, holder: &HolderId) -> Vec<u8> {
+        let mut key = self.orbital_holder_v2_prefix(factory);
+        key.extend_from_slice(&holder_id_bytes(holder));
+        key
+    }
+
+    pub fn orbital_holder_v2_list_prefix(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 24);
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(factory));
+        key.extend_from_slice(b"/orbital_holder_v2_idx/");
+        key
+    }
+
+    pub fn orbital_holder_v2_list_len_key(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut key = self.orbital_holder_v2_list_prefix(factory);
+        key.extend_from_slice(b"length");
+        key
+    }
+
+    pub fn orbital_holder_v2_list_idx_key(&self, factory: &SchemaAlkaneId, idx: u32) -> Vec<u8> {
+        let mut key = self.orbital_holder_v2_list_prefix(factory);
+        key.extend_from_slice(&idx.to_be_bytes());
+        key
+    }
+
     pub fn transfer_volume_prefix(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
         let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 18);
         key.extend_from_slice(ALKANE_V2_PREFIX);
@@ -1106,6 +1179,250 @@ impl<'a> EssentialsTable<'a> {
 
     pub fn address_activity_total_received_list_idx_key(&self, address: &str, idx: u32) -> Vec<u8> {
         let mut key = self.address_activity_total_received_list_prefix(address);
+        key.extend_from_slice(&idx.to_be_bytes());
+        key
+    }
+
+    pub fn address_cumulative_send_alkanes_key(&self, address: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ADDRESS_V2_PREFIX.len() + address.len() + 35);
+        key.extend_from_slice(ADDRESS_V2_PREFIX);
+        key.extend_from_slice(address.as_bytes());
+        key.extend_from_slice(b"/alkane/cumulative_send_alkanes");
+        key
+    }
+
+    pub fn address_cumulative_receive_alkanes_key(&self, address: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ADDRESS_V2_PREFIX.len() + address.len() + 38);
+        key.extend_from_slice(ADDRESS_V2_PREFIX);
+        key.extend_from_slice(address.as_bytes());
+        key.extend_from_slice(b"/alkane/cumulative_receive_alkanes");
+        key
+    }
+
+    pub fn address_cumulative_send_orbitals_key(&self, address: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ADDRESS_V2_PREFIX.len() + address.len() + 36);
+        key.extend_from_slice(ADDRESS_V2_PREFIX);
+        key.extend_from_slice(address.as_bytes());
+        key.extend_from_slice(b"/alkane/cumulative_send_orbitals");
+        key
+    }
+
+    pub fn address_cumulative_receive_orbitals_key(&self, address: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ADDRESS_V2_PREFIX.len() + address.len() + 39);
+        key.extend_from_slice(ADDRESS_V2_PREFIX);
+        key.extend_from_slice(address.as_bytes());
+        key.extend_from_slice(b"/alkane/cumulative_receive_orbitals");
+        key
+    }
+
+    pub fn address_orbital_balances_v2_key(&self, address: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ADDRESS_V2_PREFIX.len() + address.len() + 30);
+        key.extend_from_slice(ADDRESS_V2_PREFIX);
+        key.extend_from_slice(address.as_bytes());
+        key.extend_from_slice(b"/alkane/orbital_balances_v2");
+        key
+    }
+
+    pub fn orbital_send_volume_entry_key(
+        &self,
+        factory: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+        address: &str,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 25 + 12 + 1 + address.len());
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(factory));
+        key.extend_from_slice(b"/orbital_send_volume/v2/");
+        key.extend_from_slice(&encode_alkane_id_be(alkane));
+        key.extend_from_slice(b"/");
+        key.extend_from_slice(address.as_bytes());
+        key
+    }
+
+    pub fn orbital_send_volume_list_prefix(
+        &self,
+        factory: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 29 + 12 + 1);
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(factory));
+        key.extend_from_slice(b"/orbital_send_volume_idx/v2/");
+        key.extend_from_slice(&encode_alkane_id_be(alkane));
+        key.extend_from_slice(b"/");
+        key
+    }
+
+    pub fn orbital_send_volume_list_len_key(
+        &self,
+        factory: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut key = self.orbital_send_volume_list_prefix(factory, alkane);
+        key.extend_from_slice(b"length");
+        key
+    }
+
+    pub fn orbital_send_volume_list_idx_key(
+        &self,
+        factory: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+        idx: u32,
+    ) -> Vec<u8> {
+        let mut key = self.orbital_send_volume_list_prefix(factory, alkane);
+        key.extend_from_slice(&idx.to_be_bytes());
+        key
+    }
+
+    pub fn orbital_receive_volume_entry_key(
+        &self,
+        factory: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+        address: &str,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 28 + 12 + 1 + address.len());
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(factory));
+        key.extend_from_slice(b"/orbital_receive_volume/v2/");
+        key.extend_from_slice(&encode_alkane_id_be(alkane));
+        key.extend_from_slice(b"/");
+        key.extend_from_slice(address.as_bytes());
+        key
+    }
+
+    pub fn orbital_receive_volume_list_prefix(
+        &self,
+        factory: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 32 + 12 + 1);
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(factory));
+        key.extend_from_slice(b"/orbital_receive_volume_idx/v2/");
+        key.extend_from_slice(&encode_alkane_id_be(alkane));
+        key.extend_from_slice(b"/");
+        key
+    }
+
+    pub fn orbital_receive_volume_list_len_key(
+        &self,
+        factory: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut key = self.orbital_receive_volume_list_prefix(factory, alkane);
+        key.extend_from_slice(b"length");
+        key
+    }
+
+    pub fn orbital_receive_volume_list_idx_key(
+        &self,
+        factory: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+        idx: u32,
+    ) -> Vec<u8> {
+        let mut key = self.orbital_receive_volume_list_prefix(factory, alkane);
+        key.extend_from_slice(&idx.to_be_bytes());
+        key
+    }
+
+    pub fn alkane_send_volume_entry_key(
+        &self,
+        source: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+        address: &str,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 24 + 12 + 1 + address.len());
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(source));
+        key.extend_from_slice(b"/alkane_send_volume/v2/");
+        key.extend_from_slice(&encode_alkane_id_be(alkane));
+        key.extend_from_slice(b"/");
+        key.extend_from_slice(address.as_bytes());
+        key
+    }
+
+    pub fn alkane_send_volume_list_prefix(
+        &self,
+        source: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 28 + 12 + 1);
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(source));
+        key.extend_from_slice(b"/alkane_send_volume_idx/v2/");
+        key.extend_from_slice(&encode_alkane_id_be(alkane));
+        key.extend_from_slice(b"/");
+        key
+    }
+
+    pub fn alkane_send_volume_list_len_key(
+        &self,
+        source: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut key = self.alkane_send_volume_list_prefix(source, alkane);
+        key.extend_from_slice(b"length");
+        key
+    }
+
+    pub fn alkane_send_volume_list_idx_key(
+        &self,
+        source: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+        idx: u32,
+    ) -> Vec<u8> {
+        let mut key = self.alkane_send_volume_list_prefix(source, alkane);
+        key.extend_from_slice(&idx.to_be_bytes());
+        key
+    }
+
+    pub fn alkane_receive_volume_entry_key(
+        &self,
+        source: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+        address: &str,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 27 + 12 + 1 + address.len());
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(source));
+        key.extend_from_slice(b"/alkane_receive_volume/v2/");
+        key.extend_from_slice(&encode_alkane_id_be(alkane));
+        key.extend_from_slice(b"/");
+        key.extend_from_slice(address.as_bytes());
+        key
+    }
+
+    pub fn alkane_receive_volume_list_prefix(
+        &self,
+        source: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 31 + 12 + 1);
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(&encode_alkane_id_be(source));
+        key.extend_from_slice(b"/alkane_receive_volume_idx/v2/");
+        key.extend_from_slice(&encode_alkane_id_be(alkane));
+        key.extend_from_slice(b"/");
+        key
+    }
+
+    pub fn alkane_receive_volume_list_len_key(
+        &self,
+        source: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut key = self.alkane_receive_volume_list_prefix(source, alkane);
+        key.extend_from_slice(b"length");
+        key
+    }
+
+    pub fn alkane_receive_volume_list_idx_key(
+        &self,
+        source: &SchemaAlkaneId,
+        alkane: &SchemaAlkaneId,
+        idx: u32,
+    ) -> Vec<u8> {
+        let mut key = self.alkane_receive_volume_list_prefix(source, alkane);
         key.extend_from_slice(&idx.to_be_bytes());
         key
     }
@@ -1552,11 +1869,11 @@ impl<'a> EssentialsTable<'a> {
         self.ALKANE_SYMBOL_INDEX.select(symbol_prefix.as_bytes()).key().to_vec()
     }
 
-    pub fn orbital_collection_name_key(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+    pub fn orbital_name_key(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
         let mut suffix = Vec::with_capacity(12);
         suffix.extend_from_slice(&factory.block.to_be_bytes());
         suffix.extend_from_slice(&factory.tx.to_be_bytes());
-        self.ORBITAL_COLLECTION_NAME.select(&suffix).key().to_vec()
+        self.ORBITAL_NAME.select(&suffix).key().to_vec()
     }
 
     pub fn alkane_holders_ordered_key(&self, count: u64, alkane: &SchemaAlkaneId) -> Vec<u8> {
@@ -1699,6 +2016,28 @@ impl<'a> EssentialsTable<'a> {
 
     pub fn alkane_creations_in_block_key(&self, height: u32) -> Vec<u8> {
         self.ALKANE_CREATIONS_IN_BLOCK.select(&height.to_be_bytes()).key().to_vec()
+    }
+
+    pub fn alkane_factory_child_key(
+        &self,
+        factory: &SchemaAlkaneId,
+        child: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1 + 12);
+        suffix.extend_from_slice(&factory.block.to_be_bytes());
+        suffix.extend_from_slice(&factory.tx.to_be_bytes());
+        suffix.push(b'/');
+        suffix.extend_from_slice(&child.block.to_be_bytes());
+        suffix.extend_from_slice(&child.tx.to_be_bytes());
+        self.ALKANE_FACTORY_CHILDREN.select(&suffix).key().to_vec()
+    }
+
+    pub fn alkane_factory_children_prefix(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1);
+        suffix.extend_from_slice(&factory.block.to_be_bytes());
+        suffix.extend_from_slice(&factory.tx.to_be_bytes());
+        suffix.push(b'/');
+        self.ALKANE_FACTORY_CHILDREN.select(&suffix).key().to_vec()
     }
 
     pub fn alkane_tx_summary_key(&self, txid: &[u8; 32]) -> Vec<u8> {
@@ -2542,6 +2881,45 @@ impl EssentialsProvider {
         Ok(GetCreationIdsInBlockResult { alkanes })
     }
 
+    pub fn get_factory_children(
+        &self,
+        params: GetFactoryChildrenParams,
+    ) -> Result<GetFactoryChildrenResult> {
+        crate::debug_timer_log!("get_factory_children");
+        let table = self.table();
+        let prefix = table.alkane_factory_children_prefix(&params.factory);
+        let children = self.read_factory_children_from_index(&prefix, params.blockhash)?;
+
+        Ok(GetFactoryChildrenResult { children })
+    }
+
+    fn read_factory_children_from_index(
+        &self,
+        prefix: &[u8],
+        blockhash: StateAt,
+    ) -> Result<Vec<SchemaAlkaneId>> {
+        let keys = self
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+                blockhash,
+                prefix: prefix.to_vec(),
+            })
+            .map(|res| res.keys)
+            .unwrap_or_default();
+        let mut children = Vec::new();
+        for key in keys {
+            if key.len() < prefix.len() + 12 {
+                continue;
+            }
+            let Some(child) = decode_alkane_id_be(&key[prefix.len()..]) else {
+                continue;
+            };
+            children.push(child);
+        }
+        children.sort_by(|a, b| a.block.cmp(&b.block).then_with(|| a.tx.cmp(&b.tx)));
+        children.dedup();
+        Ok(children)
+    }
+
     pub fn get_holders_count(
         &self,
         params: GetHoldersCountParams,
@@ -2918,60 +3296,30 @@ impl EssentialsProvider {
         let page = params.page.unwrap_or(1).max(1) as usize;
         let limit = params.limit.unwrap_or(100).max(1) as usize;
         let address = params.address.as_deref().and_then(normalize_address);
+        let min_fee_paid = params.fee_paid.filter(|value| value.is_finite() && *value >= 0.0);
 
-        let mut items: Vec<Value> = Vec::new();
-        let mut total_traces: usize = 0;
-
-        let has_more = if let Some(addr) = address {
-            let pending = self
-                .get_mempool_pending_for_address(GetMempoolPendingForAddressParams {
-                    blockhash: StateAt::Latest,
-                    address: addr.clone(),
-                })
-                .map(|resp| resp.entries)
-                .unwrap_or_default();
-            let pending_len = pending.len();
-            let offset = limit.saturating_mul(page.saturating_sub(1));
-            for (idx, entry) in pending.into_iter().enumerate() {
-                if idx < offset {
-                    continue;
-                }
-                if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
-                    continue;
-                }
-                if items.len() >= limit {
-                    break;
-                }
-                if let Some(t) = entry.traces.as_ref() {
-                    total_traces += t.len();
-                }
-                items.push(mem_entry_to_json(&entry));
-            }
-            pending_len > offset + items.len()
-        } else {
-            let seen_page = self
-                .get_mempool_seen_page(GetMempoolSeenPageParams {
-                    blockhash: StateAt::Latest,
-                    page,
-                    limit,
-                })
-                .unwrap_or(GetMempoolSeenPageResult { txids: Vec::new(), has_more: false });
-            for txid in seen_page.txids {
-                let entry = self
-                    .get_mempool_entry(GetMempoolEntryParams { blockhash: StateAt::Latest, txid })
-                    .ok()
-                    .and_then(|resp| resp.entry);
-                let Some(entry) = entry else { continue };
-                if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
-                    continue;
-                }
-                if let Some(t) = entry.traces.as_ref() {
-                    total_traces += t.len();
-                }
-                items.push(mem_entry_to_json(&entry));
-            }
-            seen_page.has_more
-        };
+        let filtered = get_mempool_index_transactions_ordered_by_block_and_fee()
+            .into_iter()
+            .filter(|entry| entry.traces.as_ref().is_some_and(|traces| !traces.is_empty()))
+            .filter(|entry| {
+                address
+                    .as_ref()
+                    .map_or(true, |addr| entry.addresses.iter().any(|candidate| candidate == addr))
+            })
+            .filter(|entry| min_fee_paid.map_or(true, |fee_paid| entry.fee_rate >= fee_paid))
+            .collect::<Vec<_>>();
+        let total_traces = filtered
+            .iter()
+            .map(|entry| entry.traces.as_ref().map_or(0, Vec::len))
+            .sum::<usize>();
+        let offset = limit.saturating_mul(page.saturating_sub(1));
+        let items = filtered
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(mem_block_tx_to_json)
+            .collect::<Vec<_>>();
+        let has_more = offset.saturating_add(items.len()) < filtered.len();
 
         Ok(RpcGetMempoolTracesResult {
             value: json!({
@@ -2980,6 +3328,7 @@ impl EssentialsProvider {
                 "limit": limit,
                 "has_more": has_more,
                 "total": total_traces,
+                "tx_total": filtered.len(),
                 "items": items,
             }),
         })
@@ -3141,7 +3490,7 @@ impl EssentialsProvider {
                 .map(|hc| hc.count)
                 .unwrap_or(0);
             let inspection_json = rec.inspection.as_ref().map(inspection_to_json);
-            let name = rec.names.first().cloned();
+            let name = display_alkane_name(&rec.names);
             let symbol = rec.symbols.first().cloned();
             items.push(json!({
                 "alkane": format!("{}:{}", rec.alkane.block, rec.alkane.tx),
@@ -3226,7 +3575,7 @@ impl EssentialsProvider {
                 .unwrap_or(0)
             });
         let inspection_json = record.inspection.as_ref().map(inspection_to_json);
-        let name = record.names.first().cloned();
+        let name = display_alkane_name(&record.names);
         let symbol = record.symbols.first().cloned();
 
         Ok(RpcGetAlkaneInfoResult {
@@ -3243,6 +3592,43 @@ impl EssentialsProvider {
                 "symbols": record.symbols,
                 "holder_count": holder_count,
                 "inspection": inspection_json,
+            }),
+        })
+    }
+
+    pub fn rpc_get_factory_children(
+        &self,
+        params: RpcGetFactoryChildrenParams,
+    ) -> Result<RpcGetFactoryChildrenResult> {
+        let Some(factory_raw) = params.factory.as_deref() else {
+            return Ok(RpcGetFactoryChildrenResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_factory",
+                    "hint": "provide factory as \"<block>:<tx>\" (hex ok)"
+                }),
+            });
+        };
+        let Some(factory) = parse_alkane_from_str(factory_raw) else {
+            return Ok(RpcGetFactoryChildrenResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_factory",
+                    "hint": "provide factory as \"<block>:<tx>\" (hex ok)"
+                }),
+            });
+        };
+        let children = self
+            .get_factory_children(GetFactoryChildrenParams { blockhash: StateAt::Latest, factory })?
+            .children;
+        Ok(RpcGetFactoryChildrenResult {
+            value: json!({
+                "ok": true,
+                "factory": format!("{}:{}", factory.block, factory.tx),
+                "children": children
+                    .iter()
+                    .map(|child| format!("{}:{}", child.block, child.tx))
+                    .collect::<Vec<_>>(),
             }),
         })
     }
@@ -3373,6 +3759,245 @@ impl EssentialsProvider {
                 "items": items
             }),
         })
+    }
+
+    pub fn rpc_get_orbital_holders(
+        &self,
+        params: RpcGetOrbitalHoldersParams,
+    ) -> Result<RpcGetOrbitalHoldersResult> {
+        let Some(factory_raw) = params.factory.as_deref() else {
+            return Ok(RpcGetOrbitalHoldersResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_factory"}),
+            });
+        };
+        let Some(factory) = parse_alkane_from_str(factory_raw) else {
+            return Ok(RpcGetOrbitalHoldersResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_factory"}),
+            });
+        };
+
+        let limit = params.limit.unwrap_or(100).max(1) as usize;
+        let page = params.page.unwrap_or(1).max(1) as usize;
+
+        let (total, _supply, slice) =
+            match get_orbital_holders_for_factory(StateAt::Latest, self, factory, page, limit) {
+                Ok(tup) => tup,
+                Err(_) => {
+                    return Ok(RpcGetOrbitalHoldersResult {
+                        value: json!({"ok": false, "error": "internal_error"}),
+                    });
+                }
+            };
+
+        let has_more = page.saturating_mul(limit) < total;
+        let items: Vec<Value> = slice
+            .into_iter()
+            .map(|h| {
+                let alkanes: Vec<Value> = h
+                    .alkanes
+                    .into_iter()
+                    .map(|id| Value::String(format!("{}:{}", id.block, id.tx)))
+                    .collect();
+                match h.holder {
+                    HolderId::Address(addr) => json!({
+                        "type": "address",
+                        "address": addr,
+                        "amount": h.amount.to_string(),
+                        "alkanes": alkanes
+                    }),
+                    HolderId::Alkane(id) => json!({
+                        "type": "alkane",
+                        "alkane": format!("{}:{}", id.block, id.tx),
+                        "amount": h.amount.to_string(),
+                        "alkanes": alkanes
+                    }),
+                }
+            })
+            .collect();
+
+        Ok(RpcGetOrbitalHoldersResult {
+            value: json!({
+                "ok": true,
+                "factory": format!("{}:{}", factory.block, factory.tx),
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "has_more": has_more,
+                "items": items
+            }),
+        })
+    }
+
+    fn rpc_get_orbital_volumes(
+        &self,
+        params: RpcGetOrbitalVolumesParams,
+        receive: bool,
+    ) -> Result<RpcGetOrbitalVolumesResult> {
+        let Some(factory_raw) = params.factory.as_deref() else {
+            return Ok(RpcGetOrbitalVolumesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_factory"}),
+            });
+        };
+        let Some(factory) = parse_alkane_from_str(factory_raw) else {
+            return Ok(RpcGetOrbitalVolumesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_factory"}),
+            });
+        };
+        let Some(alkane_raw) = params.alkane.as_deref() else {
+            return Ok(RpcGetOrbitalVolumesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_alkane"}),
+            });
+        };
+        let Some(alkane) = parse_alkane_from_str(alkane_raw) else {
+            return Ok(RpcGetOrbitalVolumesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_alkane"}),
+            });
+        };
+
+        let limit = params.limit.unwrap_or(100).max(1) as usize;
+        let page = params.page.unwrap_or(1).max(1) as usize;
+
+        let (total, slice) = match get_orbital_volume_for_factory(
+            StateAt::Latest,
+            self,
+            factory,
+            alkane,
+            receive,
+            page,
+            limit,
+        ) {
+            Ok(tup) => tup,
+            Err(_) => {
+                return Ok(RpcGetOrbitalVolumesResult {
+                    value: json!({"ok": false, "error": "internal_error"}),
+                });
+            }
+        };
+
+        let has_more = page.saturating_mul(limit) < total;
+        let items: Vec<Value> = slice
+            .into_iter()
+            .map(|entry| {
+                json!({
+                    "address": entry.address,
+                    "amount": entry.amount.to_string()
+                })
+            })
+            .collect();
+
+        Ok(RpcGetOrbitalVolumesResult {
+            value: json!({
+                "ok": true,
+                "factory": format!("{}:{}", factory.block, factory.tx),
+                "alkane": format!("{}:{}", alkane.block, alkane.tx),
+                "kind": if receive { "receive" } else { "send" },
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "has_more": has_more,
+                "items": items
+            }),
+        })
+    }
+
+    pub fn rpc_get_orbital_send_volumes(
+        &self,
+        params: RpcGetOrbitalVolumesParams,
+    ) -> Result<RpcGetOrbitalVolumesResult> {
+        self.rpc_get_orbital_volumes(params, false)
+    }
+
+    pub fn rpc_get_orbital_receive_volumes(
+        &self,
+        params: RpcGetOrbitalVolumesParams,
+    ) -> Result<RpcGetOrbitalVolumesResult> {
+        self.rpc_get_orbital_volumes(params, true)
+    }
+
+    fn rpc_get_alkane_volumes(
+        &self,
+        params: RpcGetAlkaneVolumesParams,
+        receive: bool,
+    ) -> Result<RpcGetAlkaneVolumesResult> {
+        let Some(source_raw) = params.source_alkane.as_deref() else {
+            return Ok(RpcGetAlkaneVolumesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_source_alkane"}),
+            });
+        };
+        let Some(source) = parse_alkane_from_str(source_raw) else {
+            return Ok(RpcGetAlkaneVolumesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_source_alkane"}),
+            });
+        };
+        let Some(alkane_raw) = params.alkane.as_deref() else {
+            return Ok(RpcGetAlkaneVolumesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_alkane"}),
+            });
+        };
+        let Some(alkane) = parse_alkane_from_str(alkane_raw) else {
+            return Ok(RpcGetAlkaneVolumesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_alkane"}),
+            });
+        };
+
+        let limit = params.limit.unwrap_or(100).max(1) as usize;
+        let page = params.page.unwrap_or(1).max(1) as usize;
+
+        let (total, slice) = match get_alkane_volume_for_source(
+            StateAt::Latest,
+            self,
+            source,
+            alkane,
+            receive,
+            page,
+            limit,
+        ) {
+            Ok(tup) => tup,
+            Err(_) => {
+                return Ok(RpcGetAlkaneVolumesResult {
+                    value: json!({"ok": false, "error": "internal_error"}),
+                });
+            }
+        };
+
+        let has_more = page.saturating_mul(limit) < total;
+        let items: Vec<Value> = slice
+            .into_iter()
+            .map(|entry| {
+                json!({
+                    "address": entry.address,
+                    "amount": entry.amount.to_string()
+                })
+            })
+            .collect();
+
+        Ok(RpcGetAlkaneVolumesResult {
+            value: json!({
+                "ok": true,
+                "source_alkane": format!("{}:{}", source.block, source.tx),
+                "alkane": format!("{}:{}", alkane.block, alkane.tx),
+                "kind": if receive { "receive" } else { "send" },
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "has_more": has_more,
+                "items": items
+            }),
+        })
+    }
+
+    pub fn rpc_get_alkane_send_volumes(
+        &self,
+        params: RpcGetAlkaneVolumesParams,
+    ) -> Result<RpcGetAlkaneVolumesResult> {
+        self.rpc_get_alkane_volumes(params, false)
+    }
+
+    pub fn rpc_get_alkane_receive_volumes(
+        &self,
+        params: RpcGetAlkaneVolumesParams,
+    ) -> Result<RpcGetAlkaneVolumesResult> {
+        self.rpc_get_alkane_volumes(params, true)
     }
 
     pub fn rpc_get_transfer_volume(
@@ -3579,6 +4204,150 @@ impl EssentialsProvider {
                 "address": address,
                 "transfer_volume": Value::Object(transfer_volume),
                 "total_received": Value::Object(total_received),
+            }),
+        })
+    }
+
+    fn rpc_get_address_cumulative_alkanes(
+        &self,
+        params: RpcGetAddressCumulativeAlkanesParams,
+        receive: bool,
+        orbital: bool,
+    ) -> Result<RpcGetAddressCumulativeAlkanesResult> {
+        let Some(address_raw) = params.address.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return Ok(RpcGetAddressCumulativeAlkanesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_address"}),
+            });
+        };
+        let Some(address) = normalize_address(address_raw) else {
+            return Ok(RpcGetAddressCumulativeAlkanesResult {
+                value: json!({"ok": false, "error": "invalid_address_format"}),
+            });
+        };
+
+        let key = if orbital && receive {
+            self.table().address_cumulative_receive_orbitals_key(&address)
+        } else if orbital {
+            self.table().address_cumulative_send_orbitals_key(&address)
+        } else if receive {
+            self.table().address_cumulative_receive_alkanes_key(&address)
+        } else {
+            self.table().address_cumulative_send_alkanes_key(&address)
+        };
+        let entries = match self
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+            .value
+        {
+            Some(raw) => decode_address_contract_amount_entries(&raw).unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        let items: Vec<Value> = entries
+            .into_iter()
+            .filter(|entry| entry.amount > 0)
+            .map(|entry| {
+                let mut item = Map::new();
+                item.insert(
+                    if orbital { "orbital" } else { "source_alkane" }.to_string(),
+                    Value::String(format!("{}:{}", entry.contract.block, entry.contract.tx)),
+                );
+                item.insert(
+                    "alkane".to_string(),
+                    Value::String(format!("{}:{}", entry.alkane.block, entry.alkane.tx)),
+                );
+                item.insert("amount".to_string(), Value::String(entry.amount.to_string()));
+                Value::Object(item)
+            })
+            .collect();
+
+        Ok(RpcGetAddressCumulativeAlkanesResult {
+            value: json!({
+                "ok": true,
+                "address": address,
+                "kind": if receive { "receive" } else { "send" },
+                "items": items
+            }),
+        })
+    }
+
+    pub fn rpc_address_cumulative_send_alkanes(
+        &self,
+        params: RpcGetAddressCumulativeAlkanesParams,
+    ) -> Result<RpcGetAddressCumulativeAlkanesResult> {
+        self.rpc_get_address_cumulative_alkanes(params, false, false)
+    }
+
+    pub fn rpc_address_cumulative_receive_alkanes(
+        &self,
+        params: RpcGetAddressCumulativeAlkanesParams,
+    ) -> Result<RpcGetAddressCumulativeAlkanesResult> {
+        self.rpc_get_address_cumulative_alkanes(params, true, false)
+    }
+
+    pub fn rpc_address_cumulative_send_orbitals(
+        &self,
+        params: RpcGetAddressCumulativeAlkanesParams,
+    ) -> Result<RpcGetAddressCumulativeAlkanesResult> {
+        self.rpc_get_address_cumulative_alkanes(params, false, true)
+    }
+
+    pub fn rpc_address_cumulative_receive_orbitals(
+        &self,
+        params: RpcGetAddressCumulativeAlkanesParams,
+    ) -> Result<RpcGetAddressCumulativeAlkanesResult> {
+        self.rpc_get_address_cumulative_alkanes(params, true, true)
+    }
+
+    pub fn rpc_get_orbital_balances(
+        &self,
+        params: RpcGetOrbitalBalancesParams,
+    ) -> Result<RpcGetOrbitalBalancesResult> {
+        let Some(address_raw) = params.address.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return Ok(RpcGetOrbitalBalancesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_address"}),
+            });
+        };
+        let Some(address) = normalize_address(address_raw) else {
+            return Ok(RpcGetOrbitalBalancesResult {
+                value: json!({"ok": false, "error": "invalid_address_format"}),
+            });
+        };
+
+        let key = self.table().address_orbital_balances_v2_key(&address);
+        let entries = match self
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+            .value
+        {
+            Some(raw) => decode_address_orbital_balance_entries(&raw).unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        let mut balances: Map<String, Value> = Map::new();
+        for entry in entries {
+            if entry.amount == 0 {
+                continue;
+            }
+            let alkanes: Vec<Value> = entry
+                .alkanes
+                .into_iter()
+                .map(|id| Value::String(format!("{}:{}", id.block, id.tx)))
+                .collect();
+            balances.insert(
+                format!("{}:{}", entry.factory.block, entry.factory.tx),
+                json!({
+                    "amount": entry.amount.to_string(),
+                    "alkanes": alkanes
+                }),
+            );
+        }
+
+        Ok(RpcGetOrbitalBalancesResult {
+            value: json!({
+                "ok": true,
+                "address": address,
+                "balances": Value::Object(balances)
             }),
         })
     }
@@ -4809,6 +5578,30 @@ impl EssentialsProvider {
             .max(1)
             .min(MAX_PAGE_LIMIT as u64) as usize;
         let only_alkane_txs = params.only_alkane_txs.unwrap_or(true);
+        let alkane_filter = if let Some(raw_filter) =
+            params.filter.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            if !only_alkane_txs {
+                return Ok(RpcGetAddressTransactionsResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "filter_requires_only_alkane_txs",
+                    }),
+                });
+            }
+            let Some(alkane) = parse_alkane_from_str(raw_filter) else {
+                return Ok(RpcGetAddressTransactionsResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "invalid_filter",
+                        "detail": "filter must be an alkane id like \"2:0\"",
+                    }),
+                });
+            };
+            Some(alkane)
+        } else {
+            None
+        };
         let network = get_network();
         let page_offset = page.saturating_sub(1).try_into().unwrap_or(usize::MAX);
         let off = limit.saturating_mul(page_offset);
@@ -4831,11 +5624,19 @@ impl EssentialsProvider {
             .filter(|entry| {
                 !only_alkane_txs || entry.traces.as_ref().map_or(false, |t| !t.is_empty())
             })
+            .filter(|entry| {
+                alkane_filter.as_ref().map_or(true, |filter| {
+                    entry.traces.as_ref().map_or(false, |traces| {
+                        espo_traces_first_invoke_matches_filter(traces, filter)
+                    })
+                })
+            })
             .collect();
         let pending_total = pending_filtered.len();
         let pending_slice_start = off.min(pending_total);
         let pending_slice_end = (off + limit).min(pending_total);
         let pending_set: HashSet<Txid> = pending_filtered.iter().map(|entry| entry.txid).collect();
+        let mut filtered_has_more = alkane_filter.is_some() && pending_slice_end < pending_total;
 
         let mut tx_renders: Vec<AddressTxRender> = Vec::new();
         for entry in pending_filtered
@@ -4858,7 +5659,7 @@ impl EssentialsProvider {
             .get_blockchain_info()
             .ok()
             .map(|info| info.blocks as u64);
-        let mut confirmed_total = if only_alkane_txs {
+        let confirmed_index_total = if only_alkane_txs {
             get_address_index_list_len(
                 self,
                 StateAt::Latest,
@@ -4869,10 +5670,101 @@ impl EssentialsProvider {
         } else {
             0
         };
+        let mut confirmed_total = if alkane_filter.is_some() { 0 } else { confirmed_index_total };
 
         if only_alkane_txs {
             let confirmed_offset = off.saturating_sub(pending_total);
-            if remaining_slots > 0 {
+            if let Some(filter) = alkane_filter.as_ref() {
+                let target_matches =
+                    confirmed_offset.saturating_add(remaining_slots).saturating_add(1);
+                if target_matches > 0 && !filtered_has_more {
+                    let scan_chunk = get_address_index_chunk_size().max(256) as u64;
+                    let mut range_end = confirmed_index_total as u64;
+                    let mut matches: Vec<(Txid, AlkaneTxSummary)> = Vec::new();
+
+                    while range_end > 0 && matches.len() < target_matches {
+                        let range_start = range_end.saturating_sub(scan_chunk);
+                        let ids = get_address_index_list_range(
+                            self,
+                            StateAt::Latest,
+                            AddressIndexListKind::AlkaneTxs,
+                            &address,
+                            range_start,
+                            range_end,
+                        )
+                        .unwrap_or_default();
+
+                        for id in ids.into_iter().rev() {
+                            let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
+                                continue;
+                            };
+                            if !sandshrew_traces_first_invoke_matches_filter(&blob.traces, filter) {
+                                continue;
+                            }
+                            let txid = Txid::from_byte_array(blob.txid);
+                            let summary = tx_summary_from_pointer_blob(blob);
+                            matches.push((txid, summary));
+                            if matches.len() >= target_matches {
+                                break;
+                            }
+                        }
+
+                        range_end = range_start;
+                    }
+
+                    let page_match_end = confirmed_offset.saturating_add(remaining_slots);
+                    filtered_has_more = matches.len() > page_match_end;
+                    if remaining_slots > 0 {
+                        let page_matches = matches
+                            .into_iter()
+                            .skip(confirmed_offset)
+                            .take(remaining_slots)
+                            .collect::<Vec<_>>();
+                        let txids: Vec<Txid> =
+                            page_matches.iter().map(|(txid, _summary)| *txid).collect();
+                        if !txids.is_empty() {
+                            let raw_txs =
+                                electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+
+                            for (idx, (txid, summary)) in page_matches.into_iter().enumerate() {
+                                let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                                if raw.is_empty() {
+                                    continue;
+                                }
+                                let tx: Transaction = match deserialize(&raw) {
+                                    Ok(value) => value,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[rpc_get_address_transactions] failed to decode tx {}: {e}",
+                                            txid
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let confirmations = {
+                                    let h = summary.height as u64;
+                                    if h == 0 {
+                                        None
+                                    } else {
+                                        chain_tip.and_then(|tip| {
+                                            if tip >= h { Some(tip - h + 1) } else { None }
+                                        })
+                                    }
+                                };
+                                let traces = traces_from_summary(&txid, &summary);
+                                tx_renders.push(AddressTxRender {
+                                    txid,
+                                    tx,
+                                    traces: (!traces.is_empty()).then_some(traces),
+                                    confirmations,
+                                    is_mempool: false,
+                                    summary: Some(summary),
+                                });
+                            }
+                        }
+                    }
+                }
+            } else if remaining_slots > 0 {
                 let confirmed_slice_start = confirmed_offset.min(confirmed_total);
                 let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
 
@@ -5048,8 +5940,12 @@ impl EssentialsProvider {
                 "address": address,
                 "page": page,
                 "limit": limit,
-                "total": tx_total,
-                "has_more": (off + tx_renders.len()) < tx_total,
+                "total": if alkane_filter.is_some() { Value::Null } else { json!(tx_total) },
+                "has_more": if alkane_filter.is_some() {
+                    filtered_has_more
+                } else {
+                    (off + tx_renders.len()) < tx_total
+                },
                 "transactions": transactions,
             }),
         })
@@ -5297,6 +6193,16 @@ pub struct GetCreationIdsInBlockResult {
     pub alkanes: Vec<SchemaAlkaneId>,
 }
 
+pub struct GetFactoryChildrenParams {
+    pub blockhash: StateAt,
+
+    pub factory: SchemaAlkaneId,
+}
+
+pub struct GetFactoryChildrenResult {
+    pub children: Vec<SchemaAlkaneId>,
+}
+
 pub struct GetHoldersCountParams {
     pub blockhash: StateAt,
 
@@ -5417,6 +6323,7 @@ pub struct RpcGetMempoolTracesParams {
     pub page: Option<u64>,
     pub limit: Option<u64>,
     pub address: Option<String>,
+    pub fee_paid: Option<f64>,
 }
 
 pub struct RpcGetMempoolTracesResult {
@@ -5452,6 +6359,14 @@ pub struct RpcGetAlkaneInfoResult {
     pub value: Value,
 }
 
+pub struct RpcGetFactoryChildrenParams {
+    pub factory: Option<String>,
+}
+
+pub struct RpcGetFactoryChildrenResult {
+    pub value: Value,
+}
+
 pub struct RpcGetBlockSummaryParams {
     pub height: Option<u64>,
 }
@@ -5467,6 +6382,46 @@ pub struct RpcGetHoldersParams {
 }
 
 pub struct RpcGetHoldersResult {
+    pub value: Value,
+}
+
+pub struct RpcGetOrbitalHoldersParams {
+    pub factory: Option<String>,
+    pub page: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+pub struct RpcGetOrbitalHoldersResult {
+    pub value: Value,
+}
+
+pub struct RpcGetOrbitalVolumesParams {
+    pub factory: Option<String>,
+    pub alkane: Option<String>,
+    pub page: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+pub struct RpcGetOrbitalVolumesResult {
+    pub value: Value,
+}
+
+pub struct RpcGetOrbitalBalancesParams {
+    pub address: Option<String>,
+}
+
+pub struct RpcGetOrbitalBalancesResult {
+    pub value: Value,
+}
+
+pub struct RpcGetAlkaneVolumesParams {
+    pub source_alkane: Option<String>,
+    pub alkane: Option<String>,
+    pub page: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+pub struct RpcGetAlkaneVolumesResult {
     pub value: Value,
 }
 
@@ -5505,6 +6460,14 @@ pub struct RpcGetAddressActivityParams {
 }
 
 pub struct RpcGetAddressActivityResult {
+    pub value: Value,
+}
+
+pub struct RpcGetAddressCumulativeAlkanesParams {
+    pub address: Option<String>,
+}
+
+pub struct RpcGetAddressCumulativeAlkanesResult {
     pub value: Value,
 }
 
@@ -5635,6 +6598,7 @@ pub struct RpcGetAddressTransactionsParams {
     pub page: Option<u64>,
     pub limit: Option<u64>,
     pub only_alkane_txs: Option<bool>,
+    pub filter: Option<String>,
 }
 
 pub struct RpcGetAddressTransactionsResult {
@@ -5667,6 +6631,22 @@ pub struct HolderEntry {
     pub amount: u128,
 }
 
+/// Entry in orbital holders index: one holder and the child Alkanes it owns for a factory.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct OrbitalHolderEntry {
+    pub holder: HolderId,
+    pub amount: u128,
+    pub alkanes: Vec<SchemaAlkaneId>,
+}
+
+/// Per-address orbital balance entry: one factory and the child Alkanes held by the address.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct AddressOrbitalBalanceEntry {
+    pub factory: SchemaAlkaneId,
+    pub amount: u128,
+    pub alkanes: Vec<SchemaAlkaneId>,
+}
+
 /// Entry in per-alkane address activity indexes.
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct AddressAmountEntry {
@@ -5679,6 +6659,14 @@ pub struct AddressAmountEntry {
 pub struct AddressActivityEntry {
     pub transfer_volume: BTreeMap<SchemaAlkaneId, u128>,
     pub total_received: BTreeMap<SchemaAlkaneId, u128>,
+}
+
+/// One cumulative contract-attributed amount for an address.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct AddressContractAmountEntry {
+    pub contract: SchemaAlkaneId,
+    pub alkane: SchemaAlkaneId,
+    pub amount: u128,
 }
 
 /// One alkane balance record inside a single outpoint (BORSH)
@@ -6957,6 +7945,48 @@ pub fn decode_holders_vec(bytes: &[u8]) -> Result<Vec<HolderEntry>> {
         .collect())
 }
 
+fn normalize_alkane_id_vec(alkanes: &mut Vec<SchemaAlkaneId>) {
+    alkanes.sort();
+    alkanes.dedup();
+}
+
+pub fn decode_orbital_holder_entry(bytes: &[u8]) -> Result<OrbitalHolderEntry> {
+    let mut entry = OrbitalHolderEntry::try_from_slice(bytes)?;
+    normalize_alkane_id_vec(&mut entry.alkanes);
+    entry.amount = entry.alkanes.len() as u128;
+    Ok(entry)
+}
+
+pub fn encode_orbital_holder_entry(mut entry: OrbitalHolderEntry) -> Result<Vec<u8>> {
+    normalize_alkane_id_vec(&mut entry.alkanes);
+    entry.amount = entry.alkanes.len() as u128;
+    Ok(borsh::to_vec(&entry)?)
+}
+
+pub fn decode_address_orbital_balance_entries(
+    bytes: &[u8],
+) -> Result<Vec<AddressOrbitalBalanceEntry>> {
+    let mut entries = Vec::<AddressOrbitalBalanceEntry>::try_from_slice(bytes)?;
+    for entry in &mut entries {
+        normalize_alkane_id_vec(&mut entry.alkanes);
+        entry.amount = entry.alkanes.len() as u128;
+    }
+    entries.sort_by(|a, b| a.factory.cmp(&b.factory));
+    Ok(entries)
+}
+
+pub fn encode_address_orbital_balance_entries(
+    mut entries: Vec<AddressOrbitalBalanceEntry>,
+) -> Result<Vec<u8>> {
+    for entry in &mut entries {
+        normalize_alkane_id_vec(&mut entry.alkanes);
+        entry.amount = entry.alkanes.len() as u128;
+    }
+    entries.retain(|entry| !entry.alkanes.is_empty());
+    entries.sort_by(|a, b| a.factory.cmp(&b.factory));
+    Ok(borsh::to_vec(&entries)?)
+}
+
 pub fn decode_address_amount_vec(bytes: &[u8]) -> Result<Vec<AddressAmountEntry>> {
     Ok(Vec::<AddressAmountEntry>::try_from_slice(bytes)?)
 }
@@ -6971,6 +8001,18 @@ pub fn decode_address_activity_entry(bytes: &[u8]) -> Result<AddressActivityEntr
 
 pub fn encode_address_activity_entry(entry: &AddressActivityEntry) -> Result<Vec<u8>> {
     Ok(borsh::to_vec(entry)?)
+}
+
+pub fn decode_address_contract_amount_entries(
+    bytes: &[u8],
+) -> Result<Vec<AddressContractAmountEntry>> {
+    Ok(Vec::<AddressContractAmountEntry>::try_from_slice(bytes)?)
+}
+
+pub fn encode_address_contract_amount_entries(
+    entries: &Vec<AddressContractAmountEntry>,
+) -> Result<Vec<u8>> {
+    encode_vec(entries)
 }
 
 pub fn encode_alkane_info(info: &AlkaneInfo) -> Result<Vec<u8>> {
@@ -7177,36 +8219,68 @@ pub(crate) fn load_tx_summary_v2(
     let mut txid_arr = [0u8; 32];
     txid_arr.copy_from_slice(txid.as_byte_array());
     let packed = load_tx_packed_outflow_v2(provider, txid)?;
-    let mut outflows = Vec::with_capacity(packed.outflows.len());
-    for (_owner, outflow_map) in packed.outflows {
-        outflows.push(AlkaneBalanceTxEntry {
-            txid: txid_arr,
-            height: packed.height,
-            outflow: outflow_map,
-        });
-    }
-    Some(AlkaneTxSummary { txid: txid_arr, traces: packed.traces, outflows, height: packed.height })
+    Some(tx_summary_from_parts(txid_arr, packed.height, packed.traces, packed.outflows))
 }
 
-fn mem_entry_to_json(entry: &MempoolEntry) -> Value {
-    let mut traces_json: Vec<Value> = Vec::new();
-    if let Some(traces) = entry.traces.as_ref() {
-        for t in traces {
-            let events_val = prettyify_protobuf_trace_json(&t.protobuf_trace)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .unwrap_or(Value::Null);
-            traces_json.push(json!({
-                "outpoint": format!("{}:{}", entry.txid, t.outpoint.vout),
-                "events": events_val,
-            }));
-        }
+fn tx_summary_from_pointer_blob(blob: TxPointerBlobV3) -> AlkaneTxSummary {
+    tx_summary_from_parts(blob.txid, blob.height, blob.traces, blob.outflows)
+}
+
+fn tx_summary_from_parts(
+    txid: [u8; 32],
+    height: u32,
+    traces: Vec<EspoSandshrewLikeTrace>,
+    outflows_by_owner: BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+) -> AlkaneTxSummary {
+    let mut outflows = Vec::with_capacity(outflows_by_owner.len());
+    for (_owner, outflow_map) in outflows_by_owner {
+        outflows.push(AlkaneBalanceTxEntry { txid, height, outflow: outflow_map });
     }
+    AlkaneTxSummary { txid, traces, outflows, height }
+}
+
+fn mem_block_tx_to_json(entry: &MempoolBlockTx) -> Value {
+    let traces_json = entry
+        .traces
+        .as_ref()
+        .map(|traces| {
+            traces
+                .iter()
+                .map(|trace| mempool_trace_to_json(&entry.txid, trace))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let protostones = entry.protostones.iter().map(protostone_to_value).collect::<Vec<_>>();
+    let mempool_block = entry.position.as_ref().map(|position| position.block);
+    let mempool_position_vsize = entry.position.as_ref().map(|position| position.vsize);
 
     json!({
         "txid": entry.txid.to_string(),
         "first_seen": entry.first_seen,
+        "mempool_block": mempool_block,
+        "mempool_position_vsize": mempool_position_vsize,
+        "fee_sat": entry.fee_sat,
+        "vsize": entry.vsize,
+        "fee_paid": entry.fee_rate,
+        "fee_rate": entry.fee_rate,
+        "readiness": &entry.readiness,
+        "defer_alkane_trace_status": entry.defer_alkane_trace_status,
+        "has_protostones": !protostones.is_empty(),
+        "hasProtostones": !protostones.is_empty(),
+        "protostone": Value::Array(protostones.clone()),
+        "protostones": Value::Array(protostones),
         "traces": traces_json,
+    })
+}
+
+fn mempool_trace_to_json(txid: &Txid, trace: &EspoTrace) -> Value {
+    let events_val = prettyify_protobuf_trace_json(&trace.protobuf_trace)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(Value::Null);
+    json!({
+        "outpoint": format!("{}:{}", txid, trace.outpoint.vout),
+        "events": events_val,
     })
 }
 
@@ -7428,6 +8502,51 @@ fn traces_from_summary(txid: &Txid, summary: &AlkaneTxSummary) -> Vec<EspoTrace>
         .collect()
 }
 
+fn sandshrew_traces_first_invoke_matches_filter(
+    traces: &[EspoSandshrewLikeTrace],
+    filter: &SchemaAlkaneId,
+) -> bool {
+    let Some(trace) = traces.first() else {
+        return false;
+    };
+    trace_first_invoke_matches_filter(&trace.events, filter)
+}
+
+fn espo_traces_first_invoke_matches_filter(traces: &[EspoTrace], filter: &SchemaAlkaneId) -> bool {
+    let Some(trace) = traces.first() else {
+        return false;
+    };
+    trace_first_invoke_matches_filter(&trace.sandshrew_trace.events, filter)
+}
+
+fn trace_first_invoke_matches_filter(
+    events: &[EspoSandshrewLikeTraceEvent],
+    filter: &SchemaAlkaneId,
+) -> bool {
+    let Some(EspoSandshrewLikeTraceEvent::Invoke(invoke)) = events.first() else {
+        return false;
+    };
+    parse_trace_id_u32(&invoke.context.myself.block) == Some(filter.block)
+        && parse_trace_id_u64(&invoke.context.myself.tx) == Some(filter.tx)
+}
+
+fn parse_trace_id_u32(s: &str) -> Option<u32> {
+    parse_trace_id_u128(s)?.try_into().ok()
+}
+
+fn parse_trace_id_u64(s: &str) -> Option<u64> {
+    parse_trace_id_u128(s)?.try_into().ok()
+}
+
+fn parse_trace_id_u128(s: &str) -> Option<u128> {
+    let s = s.trim();
+    if let Some(x) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u128::from_str_radix(x, 16).ok()
+    } else {
+        s.parse::<u128>().ok()
+    }
+}
+
 fn sandshrew_to_espo_trace(txid: &Txid, trace: &EspoSandshrewLikeTrace) -> Option<EspoTrace> {
     let (txid_hex, vout_s) = trace.outpoint.split_once(':')?;
     let vout = vout_s.parse::<u32>().ok()?;
@@ -7557,9 +8676,15 @@ fn u128_le_or_null(b: &[u8]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        AppConfig, JemallocProfileConfig, MempoolConfig, MiscConfig, get_network, init_config_from,
+    };
+    use crate::core::blockfetcher::BlockFetchMode;
     use crate::runtime::tree_db::{get_global_tree_db, init_global_tree_db};
-    use bitcoin::BlockHash;
+    use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
+    use bitcoin::{Address, BlockHash, Network};
     use rocksdb::{DB, Options};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -7622,6 +8747,494 @@ mod tests {
         // Keep tempdir alive for process lifetime in tests.
         std::mem::forget(dir);
         EssentialsProvider::new(mdb)
+    }
+
+    fn init_test_config_for_addresses() -> Network {
+        let cfg_dir = TempDir::new().expect("temp config dir");
+        let db_dir = TempDir::new().expect("temp espo db dir");
+        let cfg = AppConfig {
+            readonly_metashrew_db_dir: cfg_dir.path().to_string_lossy().to_string(),
+            electrum_rpc_url: None,
+            metashrew_rpc_url: "http://127.0.0.1:7044".to_string(),
+            electrs_esplora_url: Some("http://127.0.0.1:4332".to_string()),
+            bitcoind_rpc_url: "http://127.0.0.1:8332".to_string(),
+            bitcoind_rpc_user: "test".to_string(),
+            bitcoind_rpc_pass: "test".to_string(),
+            bitcoind_blocks_dir: "/tmp".to_string(),
+            reset_mempool_on_startup: false,
+            rollback: None,
+            view_only: true,
+            db_path: db_dir.path().to_string_lossy().to_string(),
+            sdb_poll_ms: 100,
+            indexer_block_delay_ms: 0,
+            port: 0,
+            explorer_host: None,
+            explorer_base_path: "/".to_string(),
+            explorer_pizza_tv_endpoint: "https://tv.pizza.fun".to_string(),
+            explorer_amm_prefix: "https://www.oyl.io/swap".to_string(),
+            sync_banner: None,
+            network: Network::Regtest,
+            metashrew_db_label: None,
+            strict_mode: None,
+            debug: false,
+            debug_ignore_ms: 0,
+            debug_backup: None,
+            safe_tip_hook_script: None,
+            block_source_mode: BlockFetchMode::RpcOnly,
+            compact_tx_trace_rows: true,
+            address_index_chunk_size: 512,
+            trace_read_workers: 8,
+            recover_missing_traces_by_txid: false,
+            explorer_networks: None,
+            google_analytics_tag: None,
+            misc: MiscConfig::default(),
+            jemalloc_profile: JemallocProfileConfig::default(),
+            mempool: MempoolConfig::default(),
+            modules: HashMap::new(),
+        };
+        let _ = init_config_from(cfg);
+        std::mem::forget(cfg_dir);
+        std::mem::forget(db_dir);
+        get_network()
+    }
+
+    fn test_address_for_network(network: Network) -> String {
+        let key = XOnlyPublicKey::from_slice(
+            &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .expect("decode xonly key"),
+        )
+        .expect("xonly key");
+        let secp = Secp256k1::verification_only();
+        Address::p2tr(&secp, key, None, network).to_string()
+    }
+
+    #[test]
+    fn factory_children_reads_indexed_children_only() {
+        let provider = new_provider_with_tempdb();
+        let table = provider.table();
+        let factory = SchemaAlkaneId { block: 4, tx: 780_993 };
+        let child_a = SchemaAlkaneId { block: 2, tx: 80_663 };
+        let child_b = SchemaAlkaneId { block: 2, tx: 80_664 };
+        let other = SchemaAlkaneId { block: 2, tx: 80_665 };
+
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (table.alkane_factory_child_key(&factory, &child_b), Vec::new()),
+                    (table.alkane_factory_child_key(&factory, &child_a), Vec::new()),
+                    (
+                        table.alkane_factory_child_key(&SchemaAlkaneId { block: 4, tx: 1 }, &other),
+                        Vec::new(),
+                    ),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write factory children");
+
+        let result = provider
+            .get_factory_children(GetFactoryChildrenParams { blockhash: StateAt::Latest, factory })
+            .expect("factory children");
+
+        assert_eq!(result.children, vec![child_a, child_b]);
+    }
+
+    #[test]
+    fn rpc_get_orbital_holders_reads_indexed_factory_holders() {
+        let provider = new_provider_with_tempdb();
+        let table = provider.table();
+        let factory = SchemaAlkaneId { block: 4, tx: 780_993 };
+        let addr_a = HolderId::Address("addr_a".to_string());
+        let addr_b = HolderId::Address("addr_b".to_string());
+        let alkane_holder = HolderId::Alkane(SchemaAlkaneId { block: 9, tx: 9 });
+        let stale = HolderId::Address("stale".to_string());
+        let child_a = SchemaAlkaneId { block: 2, tx: 1 };
+        let child_b = SchemaAlkaneId { block: 2, tx: 2 };
+        let child_c = SchemaAlkaneId { block: 2, tx: 3 };
+        let child_d = SchemaAlkaneId { block: 2, tx: 4 };
+        let child_e = SchemaAlkaneId { block: 2, tx: 5 };
+        let child_f = SchemaAlkaneId { block: 2, tx: 6 };
+
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    // Legacy count-only rows must be ignored by the v2 reader.
+                    (table.orbital_holder_key(&factory, &addr_b), encode_u128_value(1).unwrap()),
+                    (table.orbital_holder_list_idx_key(&factory, 0), holder_id_bytes(&addr_b)),
+                    (table.orbital_holder_list_len_key(&factory), 1u32.to_le_bytes().to_vec()),
+                    (
+                        table.orbital_holder_v2_key(&factory, &addr_b),
+                        encode_orbital_holder_entry(OrbitalHolderEntry {
+                            holder: addr_b.clone(),
+                            amount: 1,
+                            alkanes: vec![child_a],
+                        })
+                        .unwrap(),
+                    ),
+                    (
+                        table.orbital_holder_v2_key(&factory, &addr_a),
+                        encode_orbital_holder_entry(OrbitalHolderEntry {
+                            holder: addr_a.clone(),
+                            amount: 3,
+                            alkanes: vec![child_b, child_c, child_d],
+                        })
+                        .unwrap(),
+                    ),
+                    (
+                        table.orbital_holder_v2_key(&factory, &alkane_holder),
+                        encode_orbital_holder_entry(OrbitalHolderEntry {
+                            holder: alkane_holder.clone(),
+                            amount: 2,
+                            alkanes: vec![child_e, child_f],
+                        })
+                        .unwrap(),
+                    ),
+                    (
+                        table.orbital_holder_v2_key(&factory, &stale),
+                        encode_orbital_holder_entry(OrbitalHolderEntry {
+                            holder: stale.clone(),
+                            amount: 0,
+                            alkanes: Vec::new(),
+                        })
+                        .unwrap(),
+                    ),
+                    (table.orbital_holder_v2_list_idx_key(&factory, 0), holder_id_bytes(&addr_b)),
+                    (table.orbital_holder_v2_list_idx_key(&factory, 1), holder_id_bytes(&stale)),
+                    (
+                        table.orbital_holder_v2_list_idx_key(&factory, 2),
+                        holder_id_bytes(&alkane_holder),
+                    ),
+                    (table.orbital_holder_v2_list_idx_key(&factory, 3), holder_id_bytes(&addr_a)),
+                    (table.orbital_holder_v2_list_len_key(&factory), 4u32.to_le_bytes().to_vec()),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write orbital holder rows");
+
+        let result = provider
+            .rpc_get_orbital_holders(RpcGetOrbitalHoldersParams {
+                factory: Some("4:780993".to_string()),
+                page: Some(1),
+                limit: Some(2),
+            })
+            .expect("rpc orbital holders")
+            .value;
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["factory"], "4:780993");
+        assert_eq!(result["total"], 3);
+        assert_eq!(result["has_more"], true);
+        assert_eq!(result["items"][0]["type"], "address");
+        assert_eq!(result["items"][0]["address"], "addr_a");
+        assert_eq!(result["items"][0]["amount"], "3");
+        assert_eq!(result["items"][0]["alkanes"], json!(["2:2", "2:3", "2:4"]));
+        assert_eq!(result["items"][1]["type"], "alkane");
+        assert_eq!(result["items"][1]["alkane"], "9:9");
+        assert_eq!(result["items"][1]["amount"], "2");
+        assert_eq!(result["items"][1]["alkanes"], json!(["2:5", "2:6"]));
+    }
+
+    #[test]
+    fn rpc_get_orbital_balances_reads_address_factory_child_lists() {
+        let provider = new_provider_with_tempdb();
+        let table = provider.table();
+        let address = test_address_for_network(init_test_config_for_addresses());
+        let factory_a = SchemaAlkaneId { block: 4, tx: 520 };
+        let factory_b = SchemaAlkaneId { block: 4, tx: 65522 };
+
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![(
+                    table.address_orbital_balances_v2_key(&address),
+                    encode_address_orbital_balance_entries(vec![
+                        AddressOrbitalBalanceEntry {
+                            factory: factory_a,
+                            amount: 2,
+                            alkanes: vec![
+                                SchemaAlkaneId { block: 2, tx: 77_631 },
+                                SchemaAlkaneId { block: 2, tx: 77_635 },
+                            ],
+                        },
+                        AddressOrbitalBalanceEntry {
+                            factory: factory_b,
+                            amount: 1,
+                            alkanes: vec![SchemaAlkaneId { block: 2, tx: 80_663 }],
+                        },
+                    ])
+                    .unwrap(),
+                )],
+                deletes: Vec::new(),
+            })
+            .expect("write address orbital balances");
+
+        let result = provider
+            .rpc_get_orbital_balances(RpcGetOrbitalBalancesParams {
+                address: Some(address.to_string()),
+            })
+            .expect("rpc orbital balances")
+            .value;
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["address"], address);
+        assert_eq!(result["balances"]["4:520"]["amount"], "2");
+        assert_eq!(result["balances"]["4:520"]["alkanes"], json!(["2:77631", "2:77635"]));
+        assert_eq!(result["balances"]["4:65522"]["amount"], "1");
+        assert_eq!(result["balances"]["4:65522"]["alkanes"], json!(["2:80663"]));
+    }
+
+    #[test]
+    fn rpc_get_orbital_volumes_reads_indexed_factory_address_volumes() {
+        let provider = new_provider_with_tempdb();
+        let table = provider.table();
+        let factory = SchemaAlkaneId { block: 4, tx: 780_993 };
+        let alkane = SchemaAlkaneId { block: 2, tx: 0 };
+        let other_alkane = SchemaAlkaneId { block: 4, tx: 3 };
+
+        fn legacy_orbital_volume_entry_key(
+            factory: &SchemaAlkaneId,
+            address: &str,
+            receive: bool,
+        ) -> Vec<u8> {
+            let mut key = Vec::new();
+            key.extend_from_slice(ALKANE_V2_PREFIX);
+            key.extend_from_slice(&encode_alkane_id_be(factory));
+            if receive {
+                key.extend_from_slice(b"/orbital_receive_volume/");
+            } else {
+                key.extend_from_slice(b"/orbital_send_volume/");
+            }
+            key.extend_from_slice(address.as_bytes());
+            key
+        }
+
+        fn legacy_orbital_volume_list_prefix(factory: &SchemaAlkaneId, receive: bool) -> Vec<u8> {
+            let mut key = Vec::new();
+            key.extend_from_slice(ALKANE_V2_PREFIX);
+            key.extend_from_slice(&encode_alkane_id_be(factory));
+            if receive {
+                key.extend_from_slice(b"/orbital_receive_volume_idx/");
+            } else {
+                key.extend_from_slice(b"/orbital_send_volume_idx/");
+            }
+            key
+        }
+
+        fn legacy_orbital_volume_list_len_key(factory: &SchemaAlkaneId, receive: bool) -> Vec<u8> {
+            let mut key = legacy_orbital_volume_list_prefix(factory, receive);
+            key.extend_from_slice(b"length");
+            key
+        }
+
+        fn legacy_orbital_volume_list_idx_key(
+            factory: &SchemaAlkaneId,
+            idx: u32,
+            receive: bool,
+        ) -> Vec<u8> {
+            let mut key = legacy_orbital_volume_list_prefix(factory, receive);
+            key.extend_from_slice(&idx.to_be_bytes());
+            key
+        }
+
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (
+                        legacy_orbital_volume_entry_key(&factory, "legacy", false),
+                        encode_u128_value(99).unwrap(),
+                    ),
+                    (legacy_orbital_volume_list_idx_key(&factory, 0, false), b"legacy".to_vec()),
+                    (
+                        legacy_orbital_volume_list_len_key(&factory, false),
+                        1u32.to_le_bytes().to_vec(),
+                    ),
+                    (
+                        table.orbital_send_volume_entry_key(&factory, &alkane, "addr_b"),
+                        encode_u128_value(1).unwrap(),
+                    ),
+                    (
+                        table.orbital_send_volume_entry_key(&factory, &alkane, "addr_a"),
+                        encode_u128_value(3).unwrap(),
+                    ),
+                    (
+                        table.orbital_send_volume_entry_key(&factory, &alkane, "stale"),
+                        encode_u128_value(0).unwrap(),
+                    ),
+                    (
+                        table.orbital_send_volume_entry_key(&factory, &other_alkane, "addr_z"),
+                        encode_u128_value(100).unwrap(),
+                    ),
+                    (
+                        table.orbital_send_volume_list_idx_key(&factory, &alkane, 0),
+                        b"addr_b".to_vec(),
+                    ),
+                    (
+                        table.orbital_send_volume_list_idx_key(&factory, &alkane, 1),
+                        b"stale".to_vec(),
+                    ),
+                    (
+                        table.orbital_send_volume_list_idx_key(&factory, &alkane, 2),
+                        b"addr_a".to_vec(),
+                    ),
+                    (
+                        table.orbital_send_volume_list_len_key(&factory, &alkane),
+                        3u32.to_le_bytes().to_vec(),
+                    ),
+                    (
+                        table.orbital_send_volume_list_idx_key(&factory, &other_alkane, 0),
+                        b"addr_z".to_vec(),
+                    ),
+                    (
+                        table.orbital_send_volume_list_len_key(&factory, &other_alkane),
+                        1u32.to_le_bytes().to_vec(),
+                    ),
+                    (
+                        table.orbital_receive_volume_entry_key(&factory, &alkane, "addr_c"),
+                        encode_u128_value(9).unwrap(),
+                    ),
+                    (
+                        table.orbital_receive_volume_list_idx_key(&factory, &alkane, 0),
+                        b"addr_c".to_vec(),
+                    ),
+                    (
+                        table.orbital_receive_volume_list_len_key(&factory, &alkane),
+                        1u32.to_le_bytes().to_vec(),
+                    ),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write orbital volume rows");
+
+        let send = provider
+            .rpc_get_orbital_send_volumes(RpcGetOrbitalVolumesParams {
+                factory: Some("4:780993".to_string()),
+                alkane: Some("2:0".to_string()),
+                page: Some(1),
+                limit: Some(1),
+            })
+            .expect("rpc orbital send volumes")
+            .value;
+        assert_eq!(send["ok"], true);
+        assert_eq!(send["factory"], "4:780993");
+        assert_eq!(send["alkane"], "2:0");
+        assert_eq!(send["kind"], "send");
+        assert_eq!(send["total"], 2);
+        assert_eq!(send["has_more"], true);
+        assert_eq!(send["items"][0]["address"], "addr_a");
+        assert_eq!(send["items"][0]["amount"], "3");
+
+        let receive = provider
+            .rpc_get_orbital_receive_volumes(RpcGetOrbitalVolumesParams {
+                factory: Some("4:780993".to_string()),
+                alkane: Some("2:0".to_string()),
+                page: Some(1),
+                limit: Some(10),
+            })
+            .expect("rpc orbital receive volumes")
+            .value;
+        assert_eq!(receive["ok"], true);
+        assert_eq!(receive["kind"], "receive");
+        assert_eq!(receive["total"], 1);
+        assert_eq!(receive["items"][0]["address"], "addr_c");
+        assert_eq!(receive["items"][0]["amount"], "9");
+    }
+
+    #[test]
+    fn rpc_get_alkane_volumes_reads_indexed_source_token_address_volumes() {
+        let provider = new_provider_with_tempdb();
+        let table = provider.table();
+        let source = SchemaAlkaneId { block: 2, tx: 1 };
+        let alkane = SchemaAlkaneId { block: 4, tx: 3 };
+        let other_alkane = SchemaAlkaneId { block: 4, tx: 4 };
+
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (
+                        table.alkane_send_volume_entry_key(&source, &alkane, "addr_b"),
+                        encode_u128_value(2).unwrap(),
+                    ),
+                    (
+                        table.alkane_send_volume_entry_key(&source, &alkane, "addr_a"),
+                        encode_u128_value(6).unwrap(),
+                    ),
+                    (
+                        table.alkane_send_volume_entry_key(&source, &other_alkane, "addr_z"),
+                        encode_u128_value(100).unwrap(),
+                    ),
+                    (
+                        table.alkane_send_volume_list_idx_key(&source, &alkane, 0),
+                        b"addr_b".to_vec(),
+                    ),
+                    (
+                        table.alkane_send_volume_list_idx_key(&source, &alkane, 1),
+                        b"addr_a".to_vec(),
+                    ),
+                    (
+                        table.alkane_send_volume_list_len_key(&source, &alkane),
+                        2u32.to_le_bytes().to_vec(),
+                    ),
+                    (
+                        table.alkane_send_volume_list_idx_key(&source, &other_alkane, 0),
+                        b"addr_z".to_vec(),
+                    ),
+                    (
+                        table.alkane_send_volume_list_len_key(&source, &other_alkane),
+                        1u32.to_le_bytes().to_vec(),
+                    ),
+                    (
+                        table.alkane_receive_volume_entry_key(&source, &alkane, "addr_c"),
+                        encode_u128_value(5).unwrap(),
+                    ),
+                    (
+                        table.alkane_receive_volume_list_idx_key(&source, &alkane, 0),
+                        b"addr_c".to_vec(),
+                    ),
+                    (
+                        table.alkane_receive_volume_list_len_key(&source, &alkane),
+                        1u32.to_le_bytes().to_vec(),
+                    ),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write alkane volume rows");
+
+        let send = provider
+            .rpc_get_alkane_send_volumes(RpcGetAlkaneVolumesParams {
+                source_alkane: Some("2:1".to_string()),
+                alkane: Some("4:3".to_string()),
+                page: Some(1),
+                limit: Some(10),
+            })
+            .expect("rpc alkane send volumes")
+            .value;
+        assert_eq!(send["ok"], true);
+        assert_eq!(send["source_alkane"], "2:1");
+        assert_eq!(send["alkane"], "4:3");
+        assert_eq!(send["kind"], "send");
+        assert_eq!(send["total"], 2);
+        assert_eq!(send["items"][0]["address"], "addr_a");
+        assert_eq!(send["items"][0]["amount"], "6");
+        assert_eq!(send["items"][1]["address"], "addr_b");
+        assert_eq!(send["items"][1]["amount"], "2");
+
+        let receive = provider
+            .rpc_get_alkane_receive_volumes(RpcGetAlkaneVolumesParams {
+                source_alkane: Some("2:1".to_string()),
+                alkane: Some("4:3".to_string()),
+                page: Some(1),
+                limit: Some(10),
+            })
+            .expect("rpc alkane receive volumes")
+            .value;
+        assert_eq!(receive["ok"], true);
+        assert_eq!(receive["kind"], "receive");
+        assert_eq!(receive["total"], 1);
+        assert_eq!(receive["items"][0]["address"], "addr_c");
+        assert_eq!(receive["items"][0]["amount"], "5");
     }
 
     #[test]

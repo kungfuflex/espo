@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use alkanes_support::proto::alkanes::AlkanesTrace;
 use alloy_primitives::U256;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -43,7 +43,8 @@ use crate::modules::essentials::storage::{
     load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
-    OutpointLookup, get_outpoint_balances_with_spent_batch, project_tx_output_balances_from_traces,
+    OutpointLookup, get_outpoint_balances_with_spent_batch,
+    project_tx_output_balances_from_traces_with_projector,
 };
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RunesProvider, SchemaRuneId};
@@ -52,8 +53,9 @@ use crate::runtime::mempool::{
     MempoolBlockTx, MempoolTxFilter, get_mempool_block_detail, get_mempool_block_spenders,
     get_mempool_block_transactions_for_targets, get_mempool_transactions,
 };
+use crate::runtime::mempool_projection::MempoolProjectionRegistry;
 use crate::runtime::state_at::StateAt;
-use crate::schemas::EspoOutpoint;
+use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 
 fn format_with_commas(n: u64) -> String {
     let mut s = n.to_string();
@@ -293,6 +295,7 @@ pub(crate) fn mempool_block_projected_balances(
 ) -> HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> {
     let mut projected_by_outpoint: HashMap<(Txid, u32), Vec<BalanceEntry>> = HashMap::new();
     let mut projected_by_tx: HashMap<Txid, HashMap<u32, Vec<BalanceEntry>>> = HashMap::new();
+    let mut contract_projector = MempoolProjectionRegistry::from_latest_indices();
 
     for item in ordered_txs {
         let mut input_totals: BTreeMap<crate::schemas::SchemaAlkaneId, u128> = BTreeMap::new();
@@ -313,10 +316,16 @@ pub(crate) fn mempool_block_projected_balances(
             .map(|(alkane, amount)| BalanceEntry { alkane, amount })
             .collect();
         let traces = item.traces.as_deref().unwrap_or(&[]);
-        let projected = project_tx_output_balances_from_traces(&item.tx, traces, input_balances);
+        let projected = project_tx_output_balances_from_traces_with_projector(
+            &item.tx,
+            traces,
+            input_balances,
+            Some(&mut contract_projector),
+        );
         if projected.is_empty() {
             continue;
         }
+        let projected = sanitize_diesel_ug_projection(item, projected);
 
         for (vout, entries) in &projected {
             projected_by_outpoint.insert((item.txid, *vout), entries.clone());
@@ -325,6 +334,38 @@ pub(crate) fn mempool_block_projected_balances(
     }
 
     projected_by_tx
+}
+
+fn sanitize_diesel_ug_projection(
+    item: &MempoolBlockTx,
+    mut projected: HashMap<u32, Vec<BalanceEntry>>,
+) -> HashMap<u32, Vec<BalanceEntry>> {
+    const DIESEL_ID: SchemaAlkaneId = SchemaAlkaneId { block: 2, tx: 0 };
+    let has_ug_mint = item
+        .rune_io
+        .as_ref()
+        .map(|io| io.minted.iter().any(|minted| minted.id.block == 1 && minted.id.tx == 0))
+        .unwrap_or(false);
+    if !has_ug_mint {
+        return projected;
+    }
+
+    for entries in projected.values_mut() {
+        let diesel_rows = entries.iter().filter(|entry| entry.alkane == DIESEL_ID).count();
+        if diesel_rows <= 1 {
+            continue;
+        }
+        let mut removed_one_unit = false;
+        entries.retain(|entry| {
+            if !removed_one_unit && entry.alkane == DIESEL_ID && entry.amount == 1 {
+                removed_one_unit = true;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    projected
 }
 
 pub async fn block_page(
@@ -1176,8 +1217,21 @@ pub async fn mempool_block_page(
     .unwrap_or_default();
     let projected_balances_by_tx =
         mempool_block_projected_balances(&projection_txs_for_balances, &outpoint_map);
+    let projected_balances_by_outpoint: HashMap<(Txid, u32), Vec<BalanceEntry>> =
+        projected_balances_by_tx
+            .iter()
+            .flat_map(|(txid, outputs)| {
+                outputs.iter().map(|(vout, balances)| ((*txid, *vout), balances.clone()))
+            })
+            .collect();
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
-        outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
+        let mut lookup = outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default();
+        if lookup.balances.is_empty() {
+            if let Some(projected) = projected_balances_by_outpoint.get(&(*txid, vout)) {
+                lookup.balances = projected.clone();
+            }
+        }
+        lookup
     };
     let outspends_map: std::collections::HashMap<Txid, Vec<Option<Txid>>> = {
         let mempool_spenders = get_mempool_block_spenders(template_index).unwrap_or_default();

@@ -8,6 +8,7 @@
   "bitcoind_rpc_pass": "rpcpass",
   "bitcoind_blocks_dir": "~/.bitcoin/blocks",
   "reset_mempool_on_startup": false,
+  "rollback": null,
   "db_path": "./db",
   "sdb_poll_ms": 5000,
   "indexer_block_delay_ms": 0,
@@ -15,8 +16,10 @@
   "explorer_host": "127.0.0.1:8081",
   "explorer_base_path": "/",
   "google_analytics_tag": null,
+  "sync_banner": null,
   "mempool": {
     "enabled": true,
+    "populate_with_views": false,
     "raw_poll_secs": 60,
     "template_poll_secs": 10,
     "trace_workers": 1,
@@ -36,6 +39,12 @@
     "check_utxos": false,
     "check_alkane_balances": false,
     "check_trace_mismatches": false
+  },
+  "jemalloc_profile": {
+    "enabled": false,
+    "dump_dir": "./jemalloc-profiles",
+    "interval_secs": 1800,
+    "dump_on_shutdown": true
   },
   "debug": false,
   "safe_tip_hook_script": null,

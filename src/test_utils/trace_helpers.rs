@@ -176,12 +176,13 @@ fn build_espo_traces(
     Ok(traces)
 }
 
+use alkanes_support::id::AlkaneId;
+use alkanes_support::proto::alkanes::AlkanesTrace;
+
 /// Mock trace builders for testing
 ///
 /// Since alkanes.wasm computes traces on-demand via view functions (not stored in DB),
 /// we manually construct traces for testing purposes.
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
-use alkanes_support::id::AlkaneId;
 
 /// Helper to encode AlkaneId as 32-byte little-endian (for storage values)
 pub fn encode_alkane_id_le(id: &AlkaneId) -> Vec<u8> {

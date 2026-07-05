@@ -23,9 +23,9 @@ const MAX_INTERNAL_KEYS: usize = 128;
 // Legacy fixed-page size kept only for backward-compatible decoding.
 const NODE_PAGE_BYTES: usize = 16 * 1024;
 // Batch in-memory node cache controls (OOM protection under very large blocks).
-const BATCH_PENDING_GC_INTERVAL: usize = 1024;
+const BATCH_PENDING_GC_INTERVAL: usize = 8192;
 const BATCH_PENDING_SOFT_LIMIT: usize = 25_000;
-const BATCH_PENDING_SOFT_GC_INTERVAL: usize = 2048;
+const BATCH_PENDING_SOFT_GC_INTERVAL: usize = 4096;
 const BATCH_PENDING_HARD_LIMIT: usize = 50_000;
 
 #[derive(Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]

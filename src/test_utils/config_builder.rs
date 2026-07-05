@@ -1,4 +1,6 @@
-use crate::config::{AppConfig, MempoolConfig, MiscConfig, StrictModeConfig};
+use crate::config::{
+    AppConfig, JemallocProfileConfig, MempoolConfig, MiscConfig, StrictModeConfig,
+};
 use crate::core::blockfetcher::BlockFetchMode;
 use bitcoin::Network;
 use std::collections::HashMap;
@@ -31,6 +33,7 @@ impl TestConfigBuilder {
             bitcoind_rpc_pass: "test".to_string(),
             bitcoind_blocks_dir: "/tmp".to_string(), // Placeholder
             reset_mempool_on_startup: false,
+            rollback: None,
             view_only: true, // Default to view-only for tests
             db_path: espo_path,
             sdb_poll_ms: 100, // Fast polling for tests
@@ -40,6 +43,7 @@ impl TestConfigBuilder {
             explorer_base_path: "/".to_string(),
             explorer_pizza_tv_endpoint: "https://tv.pizza.fun".to_string(),
             explorer_amm_prefix: "https://www.oyl.io/swap".to_string(),
+            sync_banner: None,
             network: Network::Regtest, // Default to regtest
             metashrew_db_label: None,
             strict_mode: None,
@@ -55,6 +59,7 @@ impl TestConfigBuilder {
             explorer_networks: None,
             google_analytics_tag: None,
             misc: MiscConfig::default(),
+            jemalloc_profile: JemallocProfileConfig::default(),
             mempool: MempoolConfig::default(),
             modules: HashMap::new(),
         };

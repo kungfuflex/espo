@@ -22,6 +22,10 @@ pub mod schemas;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod utils;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "jemalloc-prof"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
@@ -253,6 +257,61 @@ fn handle_reorg_switch(mods: &ModuleRegistry, next_height: u32) -> Result<()> {
     Ok(())
 }
 
+fn module_resume_start_height(mods: &ModuleRegistry, network: bitcoin::Network) -> u32 {
+    mods.modules()
+        .iter()
+        .map(|m| {
+            let g = m.get_genesis_block(network);
+            match m.get_index_height() {
+                Some(h) => h.saturating_add(1).max(g),
+                None => g,
+            }
+        })
+        .min()
+        .unwrap_or_else(|| alkanes_genesis_block(network))
+}
+
+fn apply_startup_rollback(
+    mods: &ModuleRegistry,
+    requested_tip_height: u32,
+    resume_start_height: u32,
+    view_only: bool,
+) -> Result<u32> {
+    if view_only {
+        anyhow::bail!("rollback cannot be used with --view-only");
+    }
+    let current_tip_height = resume_start_height.saturating_sub(1);
+    if requested_tip_height > current_tip_height {
+        anyhow::bail!(
+            "rollback height {requested_tip_height} is ahead of the current indexed tip {current_tip_height}; refusing to skip indexed state"
+        );
+    }
+    let replay_start_height = requested_tip_height
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("rollback height {requested_tip_height} overflows"))?;
+    if replay_start_height == resume_start_height {
+        eprintln!(
+            "[startup_rollback] requested tip {} already matches current indexed tip {}; no rollback needed",
+            requested_tip_height, current_tip_height
+        );
+        return Ok(resume_start_height);
+    }
+
+    eprintln!(
+        "[startup_rollback] rewinding indexed state from current tip {} to {}; indexer will resume at {}",
+        current_tip_height, requested_tip_height, replay_start_height
+    );
+    handle_reorg_switch(mods, replay_start_height)?;
+    if let Err(e) = reset_mempool_store() {
+        eprintln!("[mempool] failed to reset store after startup rollback: {e:?}");
+    }
+    eprintln!(
+        "[startup_rollback] rollback complete; retained tip {}; indexer will resume at {}",
+        requested_tip_height, replay_start_height
+    );
+    Ok(replay_start_height)
+}
+
 fn rollback_failed_block(mods: &ModuleRegistry, next_height: u32) -> Result<()> {
     if let Some(tree) = get_global_tree_db() {
         tree.abort_block();
@@ -370,6 +429,18 @@ fn detect_first_divergence_height(
                 return None;
             }
         };
+
+        // No stored hash at this height means it simply is NOT INDEXED YET
+        // (fresh start / still catching up), not a chain divergence. Absence is
+        // not evidence of a reorg — only a STORED hash that mismatches the chain
+        // is. Without this, a fresh indexer at genesis (height 0, hash not yet
+        // committed) falls through to the `h == genesis_height` arm below,
+        // returns Some(genesis_height), and the reorg poller rewinds it to
+        // genesis every cycle — livelocking at block 0 on any genesis_height=0
+        // chain (signet / regtest).
+        if indexed_hash.is_none() {
+            return None;
+        }
 
         if matches!(indexed_hash, Some(stored) if stored == chain_hash) {
             if h == check_tip {
@@ -1041,6 +1112,7 @@ async fn run_indexer_loop(
 async fn main() -> Result<()> {
     tokio::task::block_in_place(init_config)?;
     let cfg = get_config().clone();
+    let mut jemalloc_profiler = runtime::jemalloc_prof::start(&cfg.jemalloc_profile);
     let network = get_network();
     let view_only = cfg.view_only;
     tokio::task::block_in_place(init_block_source)?;
@@ -1083,6 +1155,26 @@ async fn main() -> Result<()> {
     }
     // mods.register_module(TracesData::new());
 
+    // Decide initial start height (resume at last+1 per module)
+    let mut start_height = module_resume_start_height(&mods, network);
+    let forced_start = std::env::var("ESPO_START_BLOCK")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    if cfg.rollback.is_some() && forced_start.is_some() {
+        anyhow::bail!(
+            "rollback cannot be combined with ESPO_START_BLOCK; use rollback for rollback"
+        );
+    }
+    if let Some(rollback_height) = cfg.rollback {
+        start_height = apply_startup_rollback(&mods, rollback_height, start_height, view_only)?;
+    }
+    if let Some(forced_start) = forced_start {
+        eprintln!(
+            "[indexer] forcing start block from ESPO_START_BLOCK={forced_start}; this does not rewind existing module state"
+        );
+        start_height = forced_start;
+    }
+
     let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
     let loaded = preload_block_summary_cache(&essentials_mdb);
     if loaded > 0 {
@@ -1111,27 +1203,6 @@ async fn main() -> Result<()> {
         eprintln!("[explorer] listening on {}", explorer_addr);
     }
 
-    // Decide initial start height (resume at last+1 per module)
-    let mut start_height = mods
-        .modules()
-        .iter()
-        .map(|m| {
-            let g = m.get_genesis_block(network);
-            match m.get_index_height() {
-                Some(h) => h.saturating_add(1).max(g),
-                None => g,
-            }
-        })
-        .min()
-        .unwrap_or_else(|| alkanes_genesis_block(network));
-    if let Some(forced_start) = std::env::var("ESPO_START_BLOCK")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-    {
-        eprintln!("[indexer] forcing start block from ESPO_START_BLOCK={forced_start}");
-        start_height = forced_start;
-    }
-
     let height_cell = Arc::new(AtomicU32::new(start_height));
 
     ESPO_HEIGHT
@@ -1152,6 +1223,7 @@ async fn main() -> Result<()> {
         for handle in service_handles.drain(..) {
             handle.abort();
         }
+        jemalloc_profiler.shutdown_dump();
         return Ok(());
     }
 
@@ -1185,6 +1257,7 @@ async fn main() -> Result<()> {
                 eprintln!("[indexer] thread panicked: {err:?}");
                 std::process::abort();
             }
+            jemalloc_profiler.shutdown_dump();
             return Ok(());
         }
 
@@ -1211,6 +1284,7 @@ async fn main() -> Result<()> {
                 eprintln!("[indexer] thread panicked: {err:?}");
                 std::process::abort();
             }
+            jemalloc_profiler.shutdown_dump();
             return Ok(());
         }
 
@@ -1219,6 +1293,7 @@ async fn main() -> Result<()> {
             eprintln!(
                 "[PROCESS] forcing exit after shutdown grace; indexer is not in a db write section"
             );
+            jemalloc_profiler.shutdown_dump();
             std::process::exit(130);
         }
         if db_active && !logged_db_wait {

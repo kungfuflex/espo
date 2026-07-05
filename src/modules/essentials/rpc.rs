@@ -1,14 +1,16 @@
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::storage::{
     EssentialsProvider, RpcGetAddressActivityParams, RpcGetAddressBalancesParams,
-    RpcGetAddressOutpointsParams, RpcGetAddressSpendableOutpointsParams,
-    RpcGetAddressTransactionsParams, RpcGetAlkaneAddressTxsParams,
-    RpcGetAlkaneBalanceMetashrewParams, RpcGetAlkaneBalanceTxsByTokenParams,
-    RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams, RpcGetAlkaneBlockTxsParams,
-    RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams, RpcGetAlkaneTxSummaryParams,
-    RpcGetAllAlkanesParams, RpcGetBlockSummaryParams, RpcGetBlockTracesParams,
-    RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
-    RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams,
+    RpcGetAddressCumulativeAlkanesParams, RpcGetAddressOutpointsParams,
+    RpcGetAddressSpendableOutpointsParams, RpcGetAddressTransactionsParams,
+    RpcGetAlkaneAddressTxsParams, RpcGetAlkaneBalanceMetashrewParams,
+    RpcGetAlkaneBalanceTxsByTokenParams, RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams,
+    RpcGetAlkaneBlockTxsParams, RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams,
+    RpcGetAlkaneTxSummaryParams, RpcGetAlkaneVolumesParams, RpcGetAllAlkanesParams,
+    RpcGetBlockSummaryParams, RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams,
+    RpcGetFactoryChildrenParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
+    RpcGetMempoolTracesParams, RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams,
+    RpcGetOrbitalVolumesParams, RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams,
     RpcGetTransferVolumeParams, RpcPingParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
@@ -58,6 +60,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty()),
+                            fee_paid: payload.get("fee_paid").and_then(|v| v.as_f64()),
                         };
                         view.rpc_get_mempool_traces(params)
                             .map(|resp| resp.value)
@@ -173,6 +176,35 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
     }
 
     {
+        let reg_factory_children = reg.clone();
+        let mdb_factory_children = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_factory_children
+                .register("get_factory_children", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_factory_children);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetFactoryChildrenParams {
+                            factory: payload
+                                .get("factory")
+                                .or_else(|| payload.get("factory_alkane"))
+                                .or_else(|| payload.get("alkane"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        };
+                        view.rpc_get_factory_children(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
         let reg_summary = reg.clone();
         let mdb_summary = Arc::clone(&mdb);
         tokio::spawn(async move {
@@ -217,6 +249,204 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
                         view.rpc_get_holders(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_orbital_holders = reg.clone();
+        let mdb_orbital_holders = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_orbital_holders
+                .register("get_orbital_holders", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_orbital_holders);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetOrbitalHoldersParams {
+                            factory: payload
+                                .get("factory")
+                                .or_else(|| payload.get("factory_alkane"))
+                                .or_else(|| payload.get("alkane"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_get_orbital_holders(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_orbital_send_volumes = reg.clone();
+        let mdb_orbital_send_volumes = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_orbital_send_volumes
+                .register("get_orbital_send_volumes", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_orbital_send_volumes);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetOrbitalVolumesParams {
+                            factory: payload
+                                .get("factory")
+                                .or_else(|| payload.get("factory_alkane"))
+                                .or_else(|| payload.get("orbital"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_get_orbital_send_volumes(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_orbital_balances = reg.clone();
+        let mdb_orbital_balances = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_orbital_balances
+                .register("get_orbital_balances", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_orbital_balances);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetOrbitalBalancesParams {
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        };
+                        view.rpc_get_orbital_balances(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_orbital_receive_volumes = reg.clone();
+        let mdb_orbital_receive_volumes = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_orbital_receive_volumes
+                .register("get_orbital_receive_volumes", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_orbital_receive_volumes);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetOrbitalVolumesParams {
+                            factory: payload
+                                .get("factory")
+                                .or_else(|| payload.get("factory_alkane"))
+                                .or_else(|| payload.get("orbital"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_get_orbital_receive_volumes(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_alkane_send_volumes = reg.clone();
+        let mdb_alkane_send_volumes = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_alkane_send_volumes
+                .register("get_alkane_send_volumes", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_alkane_send_volumes);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetAlkaneVolumesParams {
+                            source_alkane: payload
+                                .get("source_alkane")
+                                .or_else(|| payload.get("source"))
+                                .or_else(|| payload.get("contract"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_get_alkane_send_volumes(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_alkane_receive_volumes = reg.clone();
+        let mdb_alkane_receive_volumes = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_alkane_receive_volumes
+                .register("get_alkane_receive_volumes", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_alkane_receive_volumes);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetAlkaneVolumesParams {
+                            source_alkane: payload
+                                .get("source_alkane")
+                                .or_else(|| payload.get("source"))
+                                .or_else(|| payload.get("contract"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_get_alkane_receive_volumes(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -331,6 +561,114 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.to_string()),
                         };
                         view.rpc_get_address_activity(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_send_alkanes = reg.clone();
+        let mdb_send_alkanes = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_send_alkanes
+                .register("address_cumulative_send_alkanes", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_send_alkanes);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetAddressCumulativeAlkanesParams {
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        };
+                        view.rpc_address_cumulative_send_alkanes(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_receive_alkanes = reg.clone();
+        let mdb_receive_alkanes = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_receive_alkanes
+                .register("address_cumulative_receive_alkanes", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_receive_alkanes);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetAddressCumulativeAlkanesParams {
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        };
+                        view.rpc_address_cumulative_receive_alkanes(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_send_orbitals = reg.clone();
+        let mdb_send_orbitals = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_send_orbitals
+                .register("address_cumulative_send_orbitals", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_send_orbitals);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetAddressCumulativeAlkanesParams {
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        };
+                        view.rpc_address_cumulative_send_orbitals(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_receive_orbitals = reg.clone();
+        let mdb_receive_orbitals = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_receive_orbitals
+                .register("address_cumulative_receive_orbitals", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_receive_orbitals);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetAddressCumulativeAlkanesParams {
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        };
+                        view.rpc_address_cumulative_receive_orbitals(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -736,6 +1074,11 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             only_alkane_txs: payload
                                 .get("only_alkane_txs")
                                 .and_then(|v| v.as_bool()),
+                            filter: payload
+                                .get("filter")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty()),
                         };
                         view.rpc_get_address_transactions(params)
                             .map(|resp| resp.value)

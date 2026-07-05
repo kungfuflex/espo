@@ -5,6 +5,7 @@ pub mod i18n;
 pub mod mining_pools;
 mod pages;
 pub mod paths;
+pub mod phishing;
 
 use std::net::SocketAddr;
 

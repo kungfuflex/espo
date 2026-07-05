@@ -1,7 +1,7 @@
 use super::schemas::{SchemaTokenActivityV1, TokenActivityKind};
 use super::storage::{
-    GetAddressActivityPageParams, GetTokenActivityPageParams, SortDir, TokenActivityScope,
-    TokenActivitySortField, TokenDataProvider,
+    GetAddressActivityPageParams, GetTokenActivityPageParams, SortDir,
+    TokenActivityQuoteAmountFilter, TokenActivityScope, TokenActivitySortField, TokenDataProvider,
 };
 use crate::config::get_network;
 use crate::modules::ammdata::consts::{PRICE_SCALE, SATS_PER_BTC};
@@ -61,6 +61,21 @@ fn parse_time(raw: Option<&serde_json::Value>) -> Option<Option<u64>> {
             }
             if let Some(s) = v.as_str() {
                 return s.trim().parse::<u64>().ok().map(Some);
+            }
+            None
+        }
+    }
+}
+
+fn parse_u128(raw: Option<&serde_json::Value>) -> Option<Option<u128>> {
+    match raw {
+        None => Some(None),
+        Some(v) => {
+            if let Some(n) = v.as_u64() {
+                return Some(Some(n as u128));
+            }
+            if let Some(s) = v.as_str() {
+                return s.trim().parse::<u128>().ok().map(Some);
             }
             None
         }
@@ -197,6 +212,24 @@ pub fn register_rpc(
                     };
                     let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(50);
                     let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
+                    let quote_amount_filter = match (
+                        payload
+                            .get("canonical_quote")
+                            .or_else(|| payload.get("quote"))
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_id),
+                        parse_u128(
+                            payload
+                                .get("min_quote_amount")
+                                .or_else(|| payload.get("min_amount"))
+                                .or_else(|| payload.get("amount")),
+                        ),
+                    ) {
+                        (Some(quote), Some(Some(min_amount))) => {
+                            Some(TokenActivityQuoteAmountFilter { quote, min_amount })
+                        }
+                        _ => None,
+                    };
                     let Some(start_time) = parse_time(
                         payload
                             .get("start_time")
@@ -250,6 +283,7 @@ pub fn register_rpc(
                         dir: parse_dir(payload.get("dir").and_then(|v| v.as_str())),
                         start_time,
                         end_time,
+                        quote_amount_filter,
                     }) {
                         Ok(resp) => {
                             let btc_price_cache =

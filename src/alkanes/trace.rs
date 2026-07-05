@@ -10,10 +10,10 @@ use crate::core::blockfetcher::BlockSource;
 use crate::schemas::EspoOutpoint;
 use crate::schemas::SchemaAlkaneId;
 use crate::utils::fee_rates::BlockFeeRateSummary;
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId;
 use alkanes_support::proto::alkanes;
+use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result};
 use bitcoin::block::Header;
 use bitcoin::consensus::Encodable;
@@ -200,8 +200,6 @@ pub fn extract_alkane_storage(
                     }
                 }
                 Event::CreateAlkane(_create) => {}
-                Event::ReceiveIntent(_) => {}
-                Event::ValueTransfer(_) => {}
             }
         }
     }
@@ -305,9 +303,6 @@ pub fn protobuf_trace_events(trace: &AlkanesTrace) -> Result<Vec<EspoSandshrewLi
                         create.new_alkane.as_ref(),
                     )));
                 }
-
-                Event::ReceiveIntent(_) => {}
-                Event::ValueTransfer(_) => {}
             }
         }
     }

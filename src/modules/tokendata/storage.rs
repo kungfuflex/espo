@@ -503,6 +503,81 @@ impl TokenDataProvider {
             .map_err(|e| anyhow!("blob_mdb.bulk_write failed: {e}"))
     }
 
+    pub fn append_activity_index_values_batch(
+        &self,
+        entries: Vec<(Vec<u8>, Vec<u64>)>,
+        next_chunk_id: &mut u64,
+        puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        blob_puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        let entries =
+            entries.into_iter().filter(|(_, values)| !values.is_empty()).collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let meta_keys = entries.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        let raw_states = self
+            .mdb
+            .multi_get(&meta_keys)
+            .map_err(|e| anyhow!("mdb.multi_get activity index states failed: {e}"))?;
+
+        let states = raw_states
+            .into_iter()
+            .map(|raw| {
+                raw.and_then(|bytes| decode_activity_index_state(&bytes))
+                    .unwrap_or_else(|| InlineOrExternalU64V1::Inline { items: Vec::new() })
+            })
+            .collect::<Vec<_>>();
+
+        let table = self.table();
+        let mut last_chunk_keys = Vec::new();
+        let mut last_chunk_slots = Vec::new();
+        for (idx, state) in states.iter().enumerate() {
+            let InlineOrExternalU64V1::External { chunk_ids, len, chunk_size } = state else {
+                continue;
+            };
+            if chunk_ids.is_empty() || entries[idx].1.is_empty() {
+                continue;
+            }
+            let chunk_size_usize = usize::try_from(*chunk_size).unwrap_or(0).max(1);
+            let rem = usize::try_from(len % chunk_size_usize as u64).unwrap_or(0);
+            if rem == 0 {
+                continue;
+            }
+            let last_chunk_id = *chunk_ids.last().unwrap_or(&0);
+            last_chunk_slots.push(idx);
+            last_chunk_keys.push(table.activity_index_chunk_blob_key(last_chunk_id));
+        }
+
+        let last_chunk_values = if last_chunk_keys.is_empty() {
+            Vec::new()
+        } else {
+            self.raw_blob_multi_get(&last_chunk_keys)?
+        };
+        let mut preloaded_last_chunks = vec![None; entries.len()];
+        for (slot, raw) in last_chunk_slots.into_iter().zip(last_chunk_values.into_iter()) {
+            preloaded_last_chunks[slot] = Some(raw);
+        }
+
+        for (((meta_key, values), state), preloaded_last_chunk) in entries
+            .into_iter()
+            .zip(states.into_iter())
+            .zip(preloaded_last_chunks.into_iter())
+        {
+            self.append_activity_index_values_with_state(
+                meta_key,
+                &values,
+                state,
+                preloaded_last_chunk,
+                next_chunk_id,
+                puts,
+                blob_puts,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn reset_all_data(&self) -> Result<()> {
         const DELETE_CHUNK_SIZE: usize = 10_000;
 
@@ -568,6 +643,27 @@ impl TokenDataProvider {
             .and_then(|raw| decode_activity_index_state(&raw))
             .unwrap_or_else(|| InlineOrExternalU64V1::Inline { items: Vec::new() });
 
+        self.append_activity_index_values_with_state(
+            meta_key,
+            values,
+            current,
+            None,
+            next_chunk_id,
+            puts,
+            blob_puts,
+        )
+    }
+
+    fn append_activity_index_values_with_state(
+        &self,
+        meta_key: Vec<u8>,
+        values: &[u64],
+        current: InlineOrExternalU64V1,
+        preloaded_last_chunk: Option<Option<Vec<u8>>>,
+        next_chunk_id: &mut u64,
+        puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        blob_puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<u64> {
         if values.is_empty() {
             return Ok(activity_index_total(&current));
         }
@@ -611,10 +707,12 @@ impl TokenDataProvider {
                     if rem > 0 {
                         let last_chunk_id = *chunk_ids.last().unwrap_or(&0);
                         let last_key = table.activity_index_chunk_blob_key(last_chunk_id);
-                        let mut last_items = self
-                            .raw_blob_get(&last_key)?
-                            .map(|raw| decode_u64_chunk(&raw))
-                            .unwrap_or_default();
+                        let last_raw = match preloaded_last_chunk {
+                            Some(raw) => raw,
+                            None => self.raw_blob_get(&last_key)?,
+                        };
+                        let mut last_items =
+                            last_raw.map(|raw| decode_u64_chunk(&raw)).unwrap_or_default();
                         if last_items.len() > rem {
                             last_items.truncate(rem);
                         }
@@ -944,6 +1042,7 @@ impl TokenDataProvider {
             params.limit,
             params.start_time,
             params.end_time,
+            params.quote_amount_filter,
         )
     }
 
@@ -984,6 +1083,7 @@ impl TokenDataProvider {
             params.limit,
             params.start_time,
             params.end_time,
+            None,
         )
     }
 
@@ -1000,8 +1100,26 @@ impl TokenDataProvider {
         limit: usize,
         start_time: Option<u64>,
         end_time: Option<u64>,
+        quote_amount_filter: Option<TokenActivityQuoteAmountFilter>,
     ) -> Result<GetTokenActivityPageResult> {
         let blockhash = blockhash.resolve(self.view_blockhash);
+        if quote_amount_filter.is_some()
+            && kind.is_none()
+            && start_time.is_none()
+            && end_time.is_none()
+            && source_sort == requested_sort
+        {
+            return self.get_filtered_activity_page_from_prefix(
+                prefix,
+                timestamp_prefix,
+                blockhash,
+                source_sort,
+                dir,
+                offset,
+                limit,
+                quote_amount_filter,
+            );
+        }
         if matches!(source_sort, TokenActivitySortField::Timestamp)
             && matches!(requested_sort, TokenActivitySortField::Timestamp)
             && kind.is_none()
@@ -1149,6 +1267,7 @@ impl TokenDataProvider {
             .filter(|(entry, _)| {
                 timeframe_applied || end_time.map(|e| entry.timestamp <= e).unwrap_or(true)
             })
+            .filter(|(entry, _)| row_matches_quote_amount_filter(entry, quote_amount_filter))
             .collect();
 
         match requested_sort {
@@ -1169,6 +1288,106 @@ impl TokenDataProvider {
         };
         let page = entries.into_iter().skip(offset).take(limit).map(|(entry, _)| entry).collect();
         Ok(GetTokenActivityPageResult { entries: page, total })
+    }
+
+    fn get_filtered_activity_page_from_prefix(
+        &self,
+        prefix: Vec<u8>,
+        timestamp_prefix: Vec<u8>,
+        blockhash: Option<BlockHash>,
+        source_sort: TokenActivitySortField,
+        dir: SortDir,
+        offset: usize,
+        limit: usize,
+        quote_amount_filter: Option<TokenActivityQuoteAmountFilter>,
+    ) -> Result<GetTokenActivityPageResult> {
+        if limit == 0 {
+            return Ok(GetTokenActivityPageResult { entries: Vec::new(), total: 0 });
+        }
+
+        let mut seen = 0usize;
+        let mut out = Vec::with_capacity(limit.saturating_add(1));
+        let batch = limit.max(128).min(512);
+
+        match source_sort {
+            TokenActivitySortField::Timestamp => {
+                let total_unfiltered =
+                    self.get_activity_index_total(&timestamp_prefix, blockhash)?;
+                let mut scan_offset = 0usize;
+                while scan_offset < total_unfiltered && out.len() <= limit {
+                    let take = batch.min(total_unfiltered.saturating_sub(scan_offset));
+                    let (ids, _) = self.get_activity_index_row_ids_page(
+                        &prefix,
+                        blockhash,
+                        scan_offset,
+                        take,
+                        dir,
+                    )?;
+                    if ids.is_empty() {
+                        break;
+                    }
+                    scan_offset = scan_offset.saturating_add(ids.len());
+                    for row in self.get_activity_rows_by_ids(&ids)? {
+                        if !row_matches_quote_amount_filter(&row, quote_amount_filter) {
+                            continue;
+                        }
+                        if seen < offset {
+                            seen = seen.saturating_add(1);
+                            continue;
+                        }
+                        out.push(row);
+                        if out.len() > limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            TokenActivitySortField::Amount => {
+                let end_exclusive = prefix_end_exclusive(&prefix);
+                let mut scan_offset = 0usize;
+                loop {
+                    let page = self.raw_scan_range_entries_page(
+                        &prefix,
+                        end_exclusive.as_deref(),
+                        blockhash,
+                        scan_offset,
+                        batch,
+                        matches!(dir, SortDir::Desc),
+                    )?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    scan_offset = scan_offset.saturating_add(page.len());
+                    let ids = page
+                        .into_iter()
+                        .filter_map(|(_, value)| decode_u64_value(&value).ok())
+                        .collect::<Vec<_>>();
+                    for row in self.get_activity_rows_by_ids(&ids)? {
+                        if !row_matches_quote_amount_filter(&row, quote_amount_filter) {
+                            continue;
+                        }
+                        if seen < offset {
+                            seen = seen.saturating_add(1);
+                            continue;
+                        }
+                        out.push(row);
+                        if out.len() > limit {
+                            break;
+                        }
+                    }
+                    if out.len() > limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let has_more = out.len() > limit;
+        if has_more {
+            out.truncate(limit);
+        }
+        let total = offset.saturating_add(out.len()).saturating_add(if has_more { 1 } else { 0 });
+        Ok(GetTokenActivityPageResult { entries: out, total })
     }
 }
 
@@ -1206,6 +1425,13 @@ pub struct GetTokenActivityPageParams {
     pub dir: SortDir,
     pub start_time: Option<u64>,
     pub end_time: Option<u64>,
+    pub quote_amount_filter: Option<TokenActivityQuoteAmountFilter>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenActivityQuoteAmountFilter {
+    pub quote: SchemaAlkaneId,
+    pub min_amount: u128,
 }
 
 fn decode_height_tail(bytes: &[u8]) -> Option<u32> {
@@ -1297,6 +1523,18 @@ fn timestamp_sort_tuple(row: &SchemaTokenActivityV1) -> (u64, u32, [u8; 32]) {
 
 fn amount_sort_tuple(row: &SchemaTokenActivityV1) -> (u128, u64, u32, [u8; 32]) {
     (amount_from_row(row), row.timestamp, 0, row.txid)
+}
+
+fn row_matches_quote_amount_filter(
+    row: &SchemaTokenActivityV1,
+    filter: Option<TokenActivityQuoteAmountFilter>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    row.source == TokenActivitySource::Market
+        && row.counter_token == Some(filter.quote)
+        && row.counter_delta.unsigned_abs() >= filter.min_amount
 }
 
 pub fn scopes_for_source(source: TokenActivitySource) -> [TokenActivityScope; 2] {

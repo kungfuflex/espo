@@ -90,6 +90,7 @@ mod tests {
             bitcoind_rpc_pass: String::from("test"),
             bitcoind_blocks_dir: blocks_dir.to_str().unwrap().to_string(),
             reset_mempool_on_startup: false,
+            rollback: None,
             view_only: true,
             db_path: db_path.to_str().unwrap().to_string(),
             sdb_poll_ms: 100,
@@ -98,6 +99,8 @@ mod tests {
             explorer_host: None,
             explorer_base_path: String::from("/"),
             explorer_pizza_tv_endpoint: String::from("https://tv.pizza.fun"),
+            explorer_amm_prefix: String::from("https://www.oyl.io/swap"),
+            sync_banner: None,
             network: bitcoin::Network::Regtest,
             metashrew_db_label: None,
             strict_mode: None,
@@ -113,6 +116,8 @@ mod tests {
             explorer_networks: None,
             google_analytics_tag: None,
             misc: espo::config::MiscConfig::default(),
+            jemalloc_profile: espo::config::JemallocProfileConfig::default(),
+            mempool: espo::config::MempoolConfig::default(),
             modules: std::collections::HashMap::new(),
         };
 

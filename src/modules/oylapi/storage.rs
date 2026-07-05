@@ -9,16 +9,17 @@ use crate::modules::ammdata::schemas::{
     SchemaTokenMetricsV1, Timeframe,
 };
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, AmmHistoryEntry, GetActivityEntryParams, GetAddressPoolBurnsPageParams,
-    GetAddressPoolCreationsPageParams, GetAddressPoolMintsPageParams,
-    GetAddressPoolSwapsPageParams, GetAddressTokenSwapsPageParams, GetCanonicalPoolPricesParams,
-    GetFactoryPoolsParams, GetIndexHeightParams, GetLatestBtcUsdPriceParams,
-    GetLatestTokenUsdCloseParams, GetListEntriesDescParams, GetPoolActivityEntriesParams,
-    GetPoolCreationInfoParams, GetPoolCreationsPageParams, GetPoolDefsParams, GetPoolFactoryParams,
-    GetPoolIdsByNamePrefixParams, GetPoolLpSupplyLatestParams, GetPoolMetricsParams,
-    GetPoolMetricsV2Params, GetTokenDerivedMetricsByIdParams,
-    GetTokenDerivedMetricsIndexCountParams, GetTokenDerivedMetricsIndexPageParams,
-    GetTokenDerivedMetricsParams, GetTokenDerivedSearchIndexPageParams, GetTokenMetricsByIdParams,
+    ActivityEntryLookup, AmmDataProvider, AmmHistoryEntry, GetActivityEntriesParams,
+    GetAddressPoolBurnsPageParams, GetAddressPoolCreationsPageParams,
+    GetAddressPoolMintsPageParams, GetAddressPoolSwapsPageParams, GetAddressTokenSwapsPageParams,
+    GetCanonicalPoolPricesParams, GetFactoryPoolsParams, GetIndexHeightParams,
+    GetLatestBtcUsdPriceParams, GetLatestTokenUsdCloseParams, GetListEntriesDescParams,
+    GetPoolActivityEntriesParams, GetPoolCreationInfoParams, GetPoolCreationsPageParams,
+    GetPoolDefsParams, GetPoolFactoryParams, GetPoolIdsByNamePrefixParams,
+    GetPoolLpSupplyLatestParams, GetPoolMetricsParams, GetPoolMetricsV2Params,
+    GetTokenDerivedMetricsByIdParams, GetTokenDerivedMetricsIndexCountParams,
+    GetTokenDerivedMetricsIndexPageParams, GetTokenDerivedMetricsParams,
+    GetTokenDerivedSearchIndexPageParams, GetTokenMetricsByIdParams,
     GetTokenMetricsIndexCountParams, GetTokenMetricsIndexPageParams, GetTokenMetricsParams,
     GetTokenPoolsParams, GetTokenSearchIndexPageParams, GetTokenSwapsPageParams, SearchIndexField,
     TokenMetricsIndexField, decode_full_candle_v1,
@@ -1371,36 +1372,33 @@ pub async fn get_token_swap_history(
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut swaps = Vec::new();
-    for entry in resp.entries {
-        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
-            blockhash: blockhash.clone(),
-            pool: entry.pool,
-            ts: entry.ts,
-            seq: entry.seq,
-        }) {
-            Ok(res) => match res.entry {
-                Some(v) => v,
-                None => continue,
-            },
-            Err(err) => return internal_error(err),
-        };
+    let lookups: Vec<ActivityEntryLookup> = resp
+        .entries
+        .iter()
+        .map(|entry| ActivityEntryLookup { pool: entry.pool, ts: entry.ts, seq: entry.seq })
+        .collect();
+    let activities = match load_activity_entries(blockhash.clone(), state, lookups) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    for (lookup, activity) in activities {
         if successful.unwrap_or(false) && !activity.success {
             continue;
         }
-        let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
+        let defs = if let Some(cached) = defs_cache.get(&lookup.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { blockhash: blockhash.clone(), pool: entry.pool })
-            {
+            let defs_resp = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+                blockhash: blockhash.clone(),
+                pool: lookup.pool,
+            }) {
                 Ok(res) => res,
                 Err(err) => return internal_error(err),
             };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
-            defs_cache.insert(entry.pool, defs);
+            defs_cache.insert(lookup.pool, defs);
             defs
         };
         let Some((sold_id, bought_id, sold_amt, bought_amt)) =
@@ -1411,8 +1409,8 @@ pub async fn get_token_swap_history(
         let address = address_from_spk_bytes(&activity.address_spk);
         swaps.push(json!({
             "transactionId": txid_hex(activity.txid),
-            "poolBlockId": entry.pool.block.to_string(),
-            "poolTxId": entry.pool.tx.to_string(),
+            "poolBlockId": lookup.pool.block.to_string(),
+            "poolTxId": lookup.pool.tx.to_string(),
             "soldTokenBlockId": sold_id.block.to_string(),
             "soldTokenTxId": sold_id.tx.to_string(),
             "boughtTokenBlockId": bought_id.block.to_string(),
@@ -1639,42 +1637,39 @@ pub async fn get_pool_creation_history(
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
-    for entry in resp.entries {
-        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
-            blockhash: blockhash.clone(),
-            pool: entry.pool,
-            ts: entry.ts,
-            seq: entry.seq,
-        }) {
-            Ok(res) => match res.entry {
-                Some(v) => v,
-                None => continue,
-            },
-            Err(err) => return internal_error(err),
-        };
+    let lookups: Vec<ActivityEntryLookup> = resp
+        .entries
+        .iter()
+        .map(|entry| ActivityEntryLookup { pool: entry.pool, ts: entry.ts, seq: entry.seq })
+        .collect();
+    let activities = match load_activity_entries(blockhash.clone(), state, lookups) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    for (lookup, activity) in activities {
         if successful.unwrap_or(false) && !activity.success {
             continue;
         }
-        let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
+        let defs = if let Some(cached) = defs_cache.get(&lookup.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { blockhash: blockhash.clone(), pool: entry.pool })
-            {
+            let defs_resp = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+                blockhash: blockhash.clone(),
+                pool: lookup.pool,
+            }) {
                 Ok(res) => res,
                 Err(err) => return internal_error(err),
             };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
-            defs_cache.insert(entry.pool, defs);
+            defs_cache.insert(lookup.pool, defs);
             defs
         };
 
         let creation_info = match state.ammdata.get_pool_creation_info(GetPoolCreationInfoParams {
             blockhash: blockhash.clone(),
-            pool: entry.pool,
+            pool: lookup.pool,
         }) {
             Ok(res) => res.info,
             Err(err) => return internal_error(err),
@@ -1698,8 +1693,8 @@ pub async fn get_pool_creation_history(
 
         items.push(json!({
             "transactionId": txid_hex(activity.txid),
-            "poolBlockId": entry.pool.block.to_string(),
-            "poolTxId": entry.pool.tx.to_string(),
+            "poolBlockId": lookup.pool.block.to_string(),
+            "poolTxId": lookup.pool.tx.to_string(),
             "token0BlockId": defs.base_alkane_id.block.to_string(),
             "token0TxId": defs.base_alkane_id.tx.to_string(),
             "token1BlockId": defs.quote_alkane_id.block.to_string(),
@@ -1775,19 +1770,16 @@ pub async fn get_address_swap_history_for_pool(
     };
 
     let mut items = Vec::new();
-    for entry in resp.entries {
-        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
-            blockhash: blockhash.clone(),
-            pool,
-            ts: entry.ts,
-            seq: entry.seq,
-        }) {
-            Ok(res) => match res.entry {
-                Some(v) => v,
-                None => continue,
-            },
-            Err(err) => return internal_error(err),
-        };
+    let lookups: Vec<ActivityEntryLookup> = resp
+        .entries
+        .iter()
+        .map(|entry| ActivityEntryLookup { pool, ts: entry.ts, seq: entry.seq })
+        .collect();
+    let activities = match load_activity_entries(blockhash.clone(), state, lookups) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    for (_lookup, activity) in activities {
         if successful.unwrap_or(false) && !activity.success {
             continue;
         }
@@ -1860,36 +1852,33 @@ pub async fn get_address_swap_history_for_token(
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
-    for entry in resp.entries {
-        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
-            blockhash: blockhash.clone(),
-            pool: entry.pool,
-            ts: entry.ts,
-            seq: entry.seq,
-        }) {
-            Ok(res) => match res.entry {
-                Some(v) => v,
-                None => continue,
-            },
-            Err(err) => return internal_error(err),
-        };
+    let lookups: Vec<ActivityEntryLookup> = resp
+        .entries
+        .iter()
+        .map(|entry| ActivityEntryLookup { pool: entry.pool, ts: entry.ts, seq: entry.seq })
+        .collect();
+    let activities = match load_activity_entries(blockhash.clone(), state, lookups) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    for (lookup, activity) in activities {
         if successful.unwrap_or(false) && !activity.success {
             continue;
         }
-        let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
+        let defs = if let Some(cached) = defs_cache.get(&lookup.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { blockhash: blockhash.clone(), pool: entry.pool })
-            {
+            let defs_resp = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+                blockhash: blockhash.clone(),
+                pool: lookup.pool,
+            }) {
                 Ok(res) => res,
                 Err(err) => return internal_error(err),
             };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
-            defs_cache.insert(entry.pool, defs);
+            defs_cache.insert(lookup.pool, defs);
             defs
         };
         let Some((sold_id, bought_id, sold_amt, bought_amt)) =
@@ -1900,8 +1889,8 @@ pub async fn get_address_swap_history_for_token(
         let address = address_from_spk_bytes(&activity.address_spk);
         items.push(json!({
             "transactionId": txid_hex(activity.txid),
-            "poolBlockId": entry.pool.block.to_string(),
-            "poolTxId": entry.pool.tx.to_string(),
+            "poolBlockId": lookup.pool.block.to_string(),
+            "poolTxId": lookup.pool.tx.to_string(),
             "soldTokenBlockId": sold_id.block.to_string(),
             "soldTokenTxId": sold_id.tx.to_string(),
             "boughtTokenBlockId": bought_id.block.to_string(),
@@ -1958,42 +1947,39 @@ pub async fn get_address_pool_creation_history(
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
-    for entry in resp.entries {
-        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
-            blockhash: blockhash.clone(),
-            pool: entry.pool,
-            ts: entry.ts,
-            seq: entry.seq,
-        }) {
-            Ok(res) => match res.entry {
-                Some(v) => v,
-                None => continue,
-            },
-            Err(err) => return internal_error(err),
-        };
+    let lookups: Vec<ActivityEntryLookup> = resp
+        .entries
+        .iter()
+        .map(|entry| ActivityEntryLookup { pool: entry.pool, ts: entry.ts, seq: entry.seq })
+        .collect();
+    let activities = match load_activity_entries(blockhash.clone(), state, lookups) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    for (lookup, activity) in activities {
         if successful.unwrap_or(false) && !activity.success {
             continue;
         }
-        let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
+        let defs = if let Some(cached) = defs_cache.get(&lookup.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { blockhash: blockhash.clone(), pool: entry.pool })
-            {
+            let defs_resp = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+                blockhash: blockhash.clone(),
+                pool: lookup.pool,
+            }) {
                 Ok(res) => res,
                 Err(err) => return internal_error(err),
             };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
-            defs_cache.insert(entry.pool, defs);
+            defs_cache.insert(lookup.pool, defs);
             defs
         };
 
         let creation_info = match state.ammdata.get_pool_creation_info(GetPoolCreationInfoParams {
             blockhash: blockhash.clone(),
-            pool: entry.pool,
+            pool: lookup.pool,
         }) {
             Ok(res) => res.info,
             Err(err) => return internal_error(err),
@@ -2017,8 +2003,8 @@ pub async fn get_address_pool_creation_history(
 
         items.push(json!({
             "transactionId": txid_hex(activity.txid),
-            "poolBlockId": entry.pool.block.to_string(),
-            "poolTxId": entry.pool.tx.to_string(),
+            "poolBlockId": lookup.pool.block.to_string(),
+            "poolTxId": lookup.pool.tx.to_string(),
             "token0BlockId": defs.base_alkane_id.block.to_string(),
             "token0TxId": defs.base_alkane_id.tx.to_string(),
             "token1BlockId": defs.quote_alkane_id.block.to_string(),
@@ -2073,42 +2059,39 @@ pub async fn get_address_pool_mint_history(
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
-    for entry in resp.entries {
-        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
-            blockhash: blockhash.clone(),
-            pool: entry.pool,
-            ts: entry.ts,
-            seq: entry.seq,
-        }) {
-            Ok(res) => match res.entry {
-                Some(v) => v,
-                None => continue,
-            },
-            Err(err) => return internal_error(err),
-        };
+    let lookups: Vec<ActivityEntryLookup> = resp
+        .entries
+        .iter()
+        .map(|entry| ActivityEntryLookup { pool: entry.pool, ts: entry.ts, seq: entry.seq })
+        .collect();
+    let activities = match load_activity_entries(blockhash.clone(), state, lookups) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    for (lookup, activity) in activities {
         if successful.unwrap_or(false) && !activity.success {
             continue;
         }
-        let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
+        let defs = if let Some(cached) = defs_cache.get(&lookup.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { blockhash: blockhash.clone(), pool: entry.pool })
-            {
+            let defs_resp = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+                blockhash: blockhash.clone(),
+                pool: lookup.pool,
+            }) {
                 Ok(res) => res,
                 Err(err) => return internal_error(err),
             };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
-            defs_cache.insert(entry.pool, defs);
+            defs_cache.insert(lookup.pool, defs);
             defs
         };
 
         let lp_supply = match state.ammdata.get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams {
             blockhash: blockhash.clone(),
-            pool: entry.pool,
+            pool: lookup.pool,
         }) {
             Ok(res) => res.supply,
             Err(err) => return internal_error(err),
@@ -2116,8 +2099,8 @@ pub async fn get_address_pool_mint_history(
         let address = address_from_spk_bytes(&activity.address_spk);
         items.push(json!({
             "transactionId": txid_hex(activity.txid),
-            "poolBlockId": entry.pool.block.to_string(),
-            "poolTxId": entry.pool.tx.to_string(),
+            "poolBlockId": lookup.pool.block.to_string(),
+            "poolTxId": lookup.pool.tx.to_string(),
             "token0BlockId": defs.base_alkane_id.block.to_string(),
             "token0TxId": defs.base_alkane_id.tx.to_string(),
             "token1BlockId": defs.quote_alkane_id.block.to_string(),
@@ -2172,42 +2155,39 @@ pub async fn get_address_pool_burn_history(
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
-    for entry in resp.entries {
-        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
-            blockhash: blockhash.clone(),
-            pool: entry.pool,
-            ts: entry.ts,
-            seq: entry.seq,
-        }) {
-            Ok(res) => match res.entry {
-                Some(v) => v,
-                None => continue,
-            },
-            Err(err) => return internal_error(err),
-        };
+    let lookups: Vec<ActivityEntryLookup> = resp
+        .entries
+        .iter()
+        .map(|entry| ActivityEntryLookup { pool: entry.pool, ts: entry.ts, seq: entry.seq })
+        .collect();
+    let activities = match load_activity_entries(blockhash.clone(), state, lookups) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    for (lookup, activity) in activities {
         if successful.unwrap_or(false) && !activity.success {
             continue;
         }
-        let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
+        let defs = if let Some(cached) = defs_cache.get(&lookup.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { blockhash: blockhash.clone(), pool: entry.pool })
-            {
+            let defs_resp = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+                blockhash: blockhash.clone(),
+                pool: lookup.pool,
+            }) {
                 Ok(res) => res,
                 Err(err) => return internal_error(err),
             };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
-            defs_cache.insert(entry.pool, defs);
+            defs_cache.insert(lookup.pool, defs);
             defs
         };
 
         let lp_supply = match state.ammdata.get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams {
             blockhash: blockhash.clone(),
-            pool: entry.pool,
+            pool: lookup.pool,
         }) {
             Ok(res) => res.supply,
             Err(err) => return internal_error(err),
@@ -2215,8 +2195,8 @@ pub async fn get_address_pool_burn_history(
         let address = address_from_spk_bytes(&activity.address_spk);
         items.push(json!({
             "transactionId": txid_hex(activity.txid),
-            "poolBlockId": entry.pool.block.to_string(),
-            "poolTxId": entry.pool.tx.to_string(),
+            "poolBlockId": lookup.pool.block.to_string(),
+            "poolTxId": lookup.pool.tx.to_string(),
             "token0BlockId": defs.base_alkane_id.block.to_string(),
             "token0TxId": defs.base_alkane_id.tx.to_string(),
             "token1BlockId": defs.quote_alkane_id.block.to_string(),
@@ -3412,6 +3392,24 @@ fn latest_token_usd_close(
         .map(|res| res.close)
 }
 
+fn load_activity_entries(
+    blockhash: StateAt,
+    state: &OylApiState,
+    lookups: Vec<ActivityEntryLookup>,
+) -> Result<Vec<(ActivityEntryLookup, SchemaActivityV1)>> {
+    if lookups.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resp = state
+        .ammdata
+        .get_activity_entries(GetActivityEntriesParams { blockhash, entries: lookups.clone() })?;
+    Ok(lookups
+        .into_iter()
+        .zip(resp.entries)
+        .filter_map(|(lookup, entry)| entry.map(|activity| (lookup, activity)))
+        .collect())
+}
+
 fn token_metrics(
     blockhash: StateAt,
     state: &OylApiState,
@@ -3603,9 +3601,7 @@ fn collect_amm_history_items(
         })?
         .entries;
 
-    let mut total = 0usize;
-    let mut out = Vec::new();
-    let mut seen = 0usize;
+    let mut parsed = Vec::new();
     for (k, _v) in entries {
         let Some(entry) = parse_amm_history_key(&prefix, &k) else {
             continue;
@@ -3615,21 +3611,37 @@ fn collect_amm_history_items(
                 continue;
             }
         }
-        let res = state.ammdata.get_activity_entry(GetActivityEntryParams {
-            blockhash: blockhash.clone(),
-            pool: entry.pool,
-            ts: entry.ts,
-            seq: entry.seq,
-        })?;
-        let activity = match res.entry {
-            Some(activity) => activity,
-            None => continue,
+        parsed.push(entry);
+    }
+
+    let needs_pre_page_filter = successful_only || include_total;
+    let candidates: Vec<AmmHistoryEntry> = if needs_pre_page_filter {
+        parsed
+    } else {
+        parsed.into_iter().skip(offset).take(limit).collect()
+    };
+    let lookups: Vec<ActivityEntryLookup> = candidates
+        .iter()
+        .map(|entry| ActivityEntryLookup { pool: entry.pool, ts: entry.ts, seq: entry.seq })
+        .collect();
+    let activity_resp = state.ammdata.get_activity_entries(GetActivityEntriesParams {
+        blockhash: blockhash.clone(),
+        entries: lookups,
+    })?;
+
+    let mut total = 0usize;
+    let mut out = Vec::new();
+    let mut seen = 0usize;
+    let effective_offset = if needs_pre_page_filter { offset } else { 0 };
+    for (entry, activity) in candidates.into_iter().zip(activity_resp.entries.into_iter()) {
+        let Some(activity) = activity else {
+            continue;
         };
         if successful_only && !activity.success {
             continue;
         }
         total += 1;
-        if seen < offset {
+        if seen < effective_offset {
             seen += 1;
             continue;
         }

@@ -173,6 +173,10 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
+fn default_sync_banner_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExplorerNetworks {
     #[serde(default)]
@@ -227,10 +231,95 @@ pub struct MiscConfig {
     pub show_terminal_ad: bool,
 }
 
+fn default_jemalloc_profile_dump_dir() -> String {
+    "./jemalloc-profiles".to_string()
+}
+
+fn default_jemalloc_profile_interval_secs() -> u64 {
+    1800
+}
+
+fn default_jemalloc_profile_dump_on_shutdown() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JemallocProfileConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_jemalloc_profile_dump_dir")]
+    pub dump_dir: String,
+    #[serde(default = "default_jemalloc_profile_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default = "default_jemalloc_profile_dump_on_shutdown")]
+    pub dump_on_shutdown: bool,
+}
+
+impl Default for JemallocProfileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dump_dir: default_jemalloc_profile_dump_dir(),
+            interval_secs: default_jemalloc_profile_interval_secs(),
+            dump_on_shutdown: default_jemalloc_profile_dump_on_shutdown(),
+        }
+    }
+}
+
+impl JemallocProfileConfig {
+    fn normalized(mut self) -> Result<Self> {
+        self.dump_dir = self.dump_dir.trim().to_string();
+        if self.enabled && self.dump_dir.is_empty() {
+            anyhow::bail!("jemalloc_profile.dump_dir must be non-empty when enabled");
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncBannerConfig {
+    #[serde(default = "default_sync_banner_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub message_zh: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub link_text: Option<String>,
+    #[serde(default)]
+    pub link_text_zh: Option<String>,
+}
+
+impl SyncBannerConfig {
+    fn normalized(self) -> Option<Self> {
+        if !self.enabled {
+            return None;
+        }
+
+        let message = self.message.trim().to_string();
+        if message.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            enabled: self.enabled,
+            message,
+            message_zh: normalize_optional_string(self.message_zh),
+            url: normalize_optional_string(self.url),
+            link_text: normalize_optional_string(self.link_text),
+            link_text_zh: normalize_optional_string(self.link_text_zh),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MempoolConfig {
     #[serde(default = "default_mempool_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub populate_with_views: bool,
     #[serde(default = "default_mempool_raw_poll_secs")]
     pub raw_poll_secs: u64,
     #[serde(default = "default_mempool_template_poll_secs")]
@@ -261,6 +350,7 @@ impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
             enabled: default_mempool_enabled(),
+            populate_with_views: false,
             raw_poll_secs: default_mempool_raw_poll_secs(),
             template_poll_secs: default_mempool_template_poll_secs(),
             trace_workers: default_mempool_trace_workers(),
@@ -332,6 +422,8 @@ pub struct ConfigFile {
     pub bitcoind_blocks_dir: String,
     #[serde(default)]
     pub reset_mempool_on_startup: bool,
+    #[serde(default)]
+    pub rollback: Option<u32>,
     #[serde(default = "default_db_path")]
     pub db_path: String,
     #[serde(default = "default_sdb_poll_ms")]
@@ -348,6 +440,8 @@ pub struct ConfigFile {
     pub explorer_pizza_tv_endpoint: String,
     #[serde(default = "default_explorer_amm_prefix")]
     pub explorer_amm_prefix: String,
+    #[serde(default)]
+    pub sync_banner: Option<SyncBannerConfig>,
     #[serde(default = "default_network")]
     pub network: String,
     #[serde(default)]
@@ -379,6 +473,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub misc: MiscConfig,
     #[serde(default)]
+    pub jemalloc_profile: JemallocProfileConfig,
+    #[serde(default)]
     pub mempool: MempoolConfig,
     #[serde(default)]
     pub modules: HashMap<String, serde_json::Value>,
@@ -395,6 +491,7 @@ pub struct AppConfig {
     pub bitcoind_rpc_pass: String,
     pub bitcoind_blocks_dir: String,
     pub reset_mempool_on_startup: bool,
+    pub rollback: Option<u32>,
     pub view_only: bool,
     pub db_path: String,
     pub sdb_poll_ms: u16,
@@ -404,6 +501,7 @@ pub struct AppConfig {
     pub explorer_base_path: String,
     pub explorer_pizza_tv_endpoint: String,
     pub explorer_amm_prefix: String,
+    pub sync_banner: Option<SyncBannerConfig>,
     pub network: Network,
     pub metashrew_db_label: Option<String>,
     pub strict_mode: Option<StrictModeConfig>,
@@ -419,6 +517,7 @@ pub struct AppConfig {
     pub explorer_networks: Option<ExplorerNetworks>,
     pub google_analytics_tag: Option<String>,
     pub misc: MiscConfig,
+    pub jemalloc_profile: JemallocProfileConfig,
     pub mempool: MempoolConfig,
     pub modules: HashMap<String, serde_json::Value>,
 }
@@ -433,6 +532,10 @@ pub struct CliArgs {
     /// Serve existing data without running the indexer or mempool service.
     #[arg(long, default_value_t = false)]
     pub view_only: bool,
+
+    /// On startup only, rewind indexed state so indexing resumes at this height.
+    #[arg(long)]
+    pub rollback: Option<u32>,
 }
 
 fn load_config_file(path: &str) -> Result<ConfigFile> {
@@ -454,7 +557,9 @@ impl AppConfig {
             .unwrap_or_else(default_explorer_amm_prefix);
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
         let google_analytics_tag = normalize_optional_string(file.google_analytics_tag);
+        let sync_banner = file.sync_banner.and_then(|b| b.normalized());
         let debug_backup = file.debug_backup;
+        let jemalloc_profile = file.jemalloc_profile.normalized()?;
 
         Ok(Self {
             readonly_metashrew_db_dir: file.readonly_metashrew_db_dir,
@@ -466,6 +571,7 @@ impl AppConfig {
             bitcoind_rpc_pass: file.bitcoind_rpc_pass,
             bitcoind_blocks_dir: file.bitcoind_blocks_dir,
             reset_mempool_on_startup: file.reset_mempool_on_startup,
+            rollback: file.rollback,
             view_only,
             db_path: file.db_path,
             sdb_poll_ms: file.sdb_poll_ms,
@@ -475,6 +581,7 @@ impl AppConfig {
             explorer_base_path,
             explorer_pizza_tv_endpoint,
             explorer_amm_prefix,
+            sync_banner,
             network,
             metashrew_db_label: normalize_optional_string(file.metashrew_db_label),
             strict_mode: file.strict_mode,
@@ -490,6 +597,7 @@ impl AppConfig {
             explorer_networks,
             google_analytics_tag,
             misc: file.misc,
+            jemalloc_profile,
             mempool: file.mempool,
             modules: file.modules,
         })
@@ -664,7 +772,10 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
 pub fn init_config() -> Result<()> {
     let cli = CliArgs::parse();
-    let cfg = load_config_from_path(&cli.config_path, cli.view_only)?;
+    let mut cfg = load_config_from_path(&cli.config_path, cli.view_only)?;
+    if cli.rollback.is_some() {
+        cfg.rollback = cli.rollback;
+    }
     init_config_from(cfg)
 }
 
@@ -819,6 +930,10 @@ pub fn get_explorer_pizza_tv_endpoint() -> &'static str {
 
 pub fn get_explorer_amm_prefix() -> &'static str {
     &get_config().explorer_amm_prefix
+}
+
+pub fn get_sync_banner() -> Option<&'static SyncBannerConfig> {
+    get_config().sync_banner.as_ref()
 }
 
 pub fn get_explorer_networks() -> Option<&'static ExplorerNetworks> {

@@ -17,6 +17,7 @@ required-features = ["binary"]
 [features]
 # Feature that's only available for non-WASM builds
 binary = []
+jemalloc-prof = ["binary", "dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "tikv-jemallocator/profiling"]
 test-utils = ["alkanes", "metashrew-runtime", "rockshrew-runtime", "wasmtime", "protorune/test-utils"]
 
 [dependencies]
@@ -30,7 +31,7 @@ futures = "0.3.31"
 bitcoin = "0.32.7"
 prost = "0.12.6"
 maud = "0.26.0"
-wasm-bindgen = "0.2.100"
+wasm-bindgen = "0.2.121"
 
 # All alkanes-rs dependencies from develop branch
 alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
@@ -57,6 +58,8 @@ bitcoincore-rpc = "0.19.0"
 tower-http = { version = "0.5", features = ["cors"] }
 alkanes-cli-common = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 zmq = "0.10"
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
 
 # Required dependencies for alkanes support (from alkanes-rs)
 metashrew-core = { git = "https://github.com/kungfuflex/metashrew", branch = "develop" }
@@ -74,4 +77,4 @@ metashrew-core = { git = "https://github.com/kungfuflex/metashrew", branch = "de
 protorune = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }
 alkanes-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 tower = { version = "0.5", features = ["util"] }
-wasm-bindgen-test = "0.3.49"
+wasm-bindgen-test = "0.3.71"

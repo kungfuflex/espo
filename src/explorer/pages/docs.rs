@@ -421,6 +421,34 @@ fn method_notes(method: &MethodDoc) -> Vec<String> {
             "Sort fields are route-specific. Unsupported values fall back to the handler default or return a validation error, depending on the route.",
         );
     }
+    if contains_any(&combined, &["canonical_quote", "min_quote_amount", "min_amount"]) {
+        push_note(
+            &mut notes,
+            "`canonical_quote`/`quote` filters token activity to rows whose counter token is that Alkane id. `min_quote_amount`/`min_amount` is a raw 1e8-scaled token amount, such as `100000` for 0.001 frBTC.",
+        );
+    }
+    if method.title == "essentials.get_address_transactions" {
+        push_note(
+            &mut notes,
+            "`only_alkane_txs` defaults to true. Set it to false only when you want the full Bitcoin address history instead of the Alkane transaction index.",
+        );
+        push_note(
+            &mut notes,
+            "`filter` accepts an Alkane id such as `2:0` and is valid only when `only_alkane_txs` is true or omitted.",
+        );
+        push_note(
+            &mut notes,
+            "Filtered results match Alkane transactions whose first trace event is an `invoke` where `context.myself` equals the requested Alkane id.",
+        );
+        push_note(
+            &mut notes,
+            "The filter is applied at request time by scanning the existing address Alkane transaction list until the requested page is filled. It does not require a new index.",
+        );
+        push_note(
+            &mut notes,
+            "When `filter` is provided, `total` is `null` because the filtered total is not known without scanning the complete address history. Use `has_more` for pagination.",
+        );
+    }
     if combined.contains("include_outpoints") {
         push_note(
             &mut notes,
@@ -486,18 +514,31 @@ fn docs_modules() -> Vec<ModuleDoc> {
             methods: vec![
                 rpc_doc(
                     "essentials.get_mempool_traces",
-                    "Returns paged Alkane traces currently observed in the mempool, optionally filtered by address.",
-                    json!({ "page": 1, "limit": 10, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    "Returns paged Alkane traces from the in-memory projected mempool index, optionally filtered by address and minimum sats/vbyte paid via fee_paid. Results are ordered by projected mempool block with the next block first, then by fee paid within that block.",
+                    json!({ "page": 1, "limit": 10, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "fee_paid": 2.16 }),
                     json!({
                         "ok": true,
                         "page": 1,
                         "limit": 10,
                         "has_more": false,
                         "total": 1,
+                        "tx_total": 1,
                         "items": [{
                             "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90",
-                            "fee": 1540,
+                            "mempool_block": 0,
+                            "fee_sat": 1540,
+                            "fee_paid": 10.0,
+                            "fee_rate": 10.0,
                             "vsize": 154,
+                            "protostone": [{
+                                "protocol_tag": 1,
+                                "message": "02000000000000000000000000000000",
+                                "edicts": [],
+                                "pointer": null,
+                                "refund": null,
+                                "from": null,
+                                "burn": null
+                            }],
                             "traces": [{
                                 "outpoint": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90:0",
                                 "events": [{ "event": "invoke", "data": { "context": { "myself": { "block": "0x2", "tx": "0x0" } } } }]
@@ -530,6 +571,12 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     json!({ "ok": true, "alkane": "2:0", "name": "DIESEL", "symbol": "diesel", "holder_count": 6409, "creation_height": 880000 }),
                 ),
                 rpc_doc(
+                    "essentials.get_factory_children",
+                    "Returns child Alkane IDs indexed for a factory Alkane. The index is populated from creation records as new blocks are indexed; historical children appear after a reindex.",
+                    json!({ "factory": "4:780993" }),
+                    json!({ "ok": true, "factory": "4:780993", "children": ["2:80663"] }),
+                ),
+                rpc_doc(
                     "essentials.get_block_summary",
                     "Returns the indexed Alkane summary for a block height.",
                     json!({ "height": 946000 }),
@@ -540,6 +587,18 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     "Returns holders and balances for an Alkane.",
                     json!({ "alkane": "2:0", "page": 1, "limit": 1 }),
                     json!({ "ok": true, "alkane": "2:0", "page": 1, "limit": 1, "total": 6409, "items": [{ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "amount": "30950001348973" }] }),
+                ),
+                rpc_doc(
+                    "essentials.get_orbital_holders",
+                    "Returns holders for an orbital factory, counting each child Alkane held as one unit and listing the child Alkane IDs held by each holder.",
+                    json!({ "factory": "4:780993", "page": 1, "limit": 1 }),
+                    json!({ "ok": true, "factory": "4:780993", "page": 1, "limit": 1, "total": 249, "items": [{ "type": "address", "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "amount": "3", "alkanes": ["2:80663", "2:80664", "2:80665"] }] }),
+                ),
+                rpc_doc(
+                    "essentials.get_orbital_balances",
+                    "Returns orbital child Alkane balances held by an address, keyed by factory Alkane.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "balances": { "4:780993": { "amount": "3", "alkanes": ["2:80663", "2:80664", "2:80665"] } } }),
                 ),
                 rpc_doc(
                     "essentials.get_transfer_volume",
@@ -564,6 +623,54 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     "Returns Alkane activity detected for a Bitcoin address.",
                     json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
                     json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "total_received": { "2:0": "357260014838703" }, "transfer_volume": { "2:0": "357810014838703" } }),
+                ),
+                rpc_doc(
+                    "essentials.address_cumulative_send_alkanes",
+                    "Returns cumulative address sends attributed to source Alkanes and tokens.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "kind": "send", "items": [{ "source_alkane": "2:0", "alkane": "2:0", "amount": "715000000" }] }),
+                ),
+                rpc_doc(
+                    "essentials.address_cumulative_receive_alkanes",
+                    "Returns cumulative address receives attributed to source Alkanes and tokens.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "kind": "receive", "items": [{ "source_alkane": "2:0", "alkane": "2:0", "amount": "312500000" }] }),
+                ),
+                rpc_doc(
+                    "essentials.address_cumulative_send_orbitals",
+                    "Returns cumulative address sends attributed to factory orbitals and tokens.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "kind": "send", "items": [{ "orbital": "2:0", "alkane": "4:3", "amount": "1" }] }),
+                ),
+                rpc_doc(
+                    "essentials.address_cumulative_receive_orbitals",
+                    "Returns cumulative address receives attributed to factory orbitals and tokens.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "kind": "receive", "items": [{ "orbital": "2:0", "alkane": "4:3", "amount": "1" }] }),
+                ),
+                rpc_doc(
+                    "essentials.get_orbital_send_volumes",
+                    "Ranks addresses by cumulative send volume attributed to an orbital for one Alkane token.",
+                    json!({ "factory": "4:780993", "alkane": "2:0", "page": 1, "limit": 1 }),
+                    json!({ "ok": true, "factory": "4:780993", "alkane": "2:0", "kind": "send", "page": 1, "limit": 1, "total": 249, "items": [{ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "amount": "12" }] }),
+                ),
+                rpc_doc(
+                    "essentials.get_orbital_receive_volumes",
+                    "Ranks addresses by cumulative receive volume attributed to an orbital for one Alkane token.",
+                    json!({ "factory": "4:780993", "alkane": "2:0", "page": 1, "limit": 1 }),
+                    json!({ "ok": true, "factory": "4:780993", "alkane": "2:0", "kind": "receive", "page": 1, "limit": 1, "total": 249, "items": [{ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "amount": "12" }] }),
+                ),
+                rpc_doc(
+                    "essentials.get_alkane_send_volumes",
+                    "Ranks addresses by cumulative send volume attributed to one source Alkane for one Alkane token.",
+                    json!({ "source_alkane": "2:1", "alkane": "4:3", "page": 1, "limit": 1 }),
+                    json!({ "ok": true, "source_alkane": "2:1", "alkane": "4:3", "kind": "send", "page": 1, "limit": 1, "total": 249, "items": [{ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "amount": "12" }] }),
+                ),
+                rpc_doc(
+                    "essentials.get_alkane_receive_volumes",
+                    "Ranks addresses by cumulative receive volume attributed to one source Alkane for one Alkane token.",
+                    json!({ "source_alkane": "2:1", "alkane": "4:3", "page": 1, "limit": 1 }),
+                    json!({ "ok": true, "source_alkane": "2:1", "alkane": "4:3", "kind": "receive", "page": 1, "limit": 1, "total": 249, "items": [{ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "amount": "12" }] }),
                 ),
                 rpc_doc(
                     "essentials.get_address_balances",
@@ -690,9 +797,9 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_address_transactions",
-                    "Returns Bitcoin transactions for an address and can be narrowed to Alkane transactions.",
-                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "only_alkane_txs": true }),
-                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "total": 19, "transactions": [{ "txid": "e212e704173d61d19a280de3af2f6a5166ecf95e9a2a98f74ceeeb3de323ea1c", "blockHeight": 939827, "confirmed": true }] }),
+                    "Returns Bitcoin transactions for an address and can be narrowed to Alkane transactions. When `filter` is provided with `only_alkane_txs`, it scans Alkane transactions until the requested page is filled and returns `total: null`.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "only_alkane_txs": true, "filter": "2:0" }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "total": null, "transactions": [{ "txid": "e212e704173d61d19a280de3af2f6a5166ecf95e9a2a98f74ceeeb3de323ea1c", "blockHeight": 939827, "confirmed": true }] }),
                 ),
                 rpc_doc(
                     "essentials.get_alkane_latest_traces",
@@ -1191,19 +1298,34 @@ fn docs_modules() -> Vec<ModuleDoc> {
             methods: vec![
                 rpc_doc(
                     "tokendata.get_token_activity",
-                    "Returns token activity for one Alkane across market and mint sources.",
-                    json!({ "token": "2:0", "page": 1, "limit": 10, "from": 1700000000, "to": 1800000000, "scope": "all" }),
+                    "Returns token activity for one Alkane across market and mint sources. Market reads can be filtered to a canonical quote pool with a minimum quote-side amount.",
+                    json!({
+                        "token": "2:68479",
+                        "page": 1,
+                        "limit": 10,
+                        "from": 1700000000,
+                        "to": 1800000000,
+                        "filter": "market",
+                        "sort_by": "timestamp",
+                        "dir": "desc",
+                        "canonical_quote": "32:0",
+                        "min_quote_amount": "100000"
+                    }),
                     json!({
                         "ok": true,
-                        "total": 3824968,
+                        "total": 11,
                         "entries": [{
-                            "kind": "mint",
+                            "kind": "buy",
+                            "source": "market",
                             "height": 951279,
                             "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90",
-                            "token": "2:0",
-                            "amount": "1000000",
-                            "mint_price_paid_sats": 1540,
-                            "chain_txids": ["f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90"]
+                            "token": "2:68479",
+                            "pool": "2:90001",
+                            "counter_token": "32:0",
+                            "token_delta": "250000000000",
+                            "counter_delta": "-100000",
+                            "chain_txids": ["f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90"],
+                            "success": true
                         }]
                     }),
                 ),

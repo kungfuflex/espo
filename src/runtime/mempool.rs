@@ -1,6 +1,7 @@
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, extract_alkane_storage,
-    protobuf_trace_events,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceInvokeContext,
+    EspoSandshrewLikeTraceInvokeData, EspoSandshrewLikeTraceShortId, EspoTrace,
+    extract_alkane_storage, protobuf_trace_events,
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use crate::config::{
@@ -17,14 +18,14 @@ use crate::modules::runes::transfer::{
     OutputRuneSheets, RuneSheet, RunestoneTransfer, TransferRules,
 };
 use crate::runtime::mdb::Mdb;
+use crate::runtime::shutdown::is_shutdown_requested;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result};
-use bitcoin::blockdata::script::Instruction;
 use bitcoin::consensus::Encodable;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Network, OutPoint, Transaction, Txid, opcodes};
+use bitcoin::{Address, Network, OutPoint, Transaction, Txid};
 use bitcoincore_rpc::RpcApi;
 use futures::{StreamExt, stream};
 use ordinals::{Artifact, Edict, RuneId, Runestone};
@@ -47,7 +48,7 @@ use tokio::sync::broadcast;
 pub const MEMPOOL_POLL_SECS: u64 = 5;
 pub const MEMPOOL_VIEW_BATCH_SIZE: usize = 10;
 pub const MEMPOOL_LOG_STEP: usize = 100;
-pub const MEMPOOL_MAX_TXS: usize = 50_000;
+pub const MEMPOOL_MAX_TXS: usize = 200_000;
 pub const MEMPOOL_MIN_FEE_RATE_SATS_VBYTE: f64 = 0.5;
 /// --- End tunables ---
 
@@ -143,8 +144,11 @@ pub struct MempoolBlockDelta {
 pub struct MempoolBlockTx {
     pub txid: Txid,
     pub tx: Transaction,
+    pub protostones: Vec<Protostone>,
     pub traces: Option<Vec<EspoTrace>>,
     pub rune_io: Option<TxRuneIo>,
+    pub addresses: Vec<String>,
+    pub first_seen: u64,
     pub fee_sat: u64,
     pub vsize: u64,
     pub fee_rate: f64,
@@ -501,18 +505,7 @@ fn protostones_for_tx(tx: &Transaction) -> Vec<Protostone> {
     }
 }
 
-fn tx_has_runestone_carrier(tx: &Transaction) -> bool {
-    tx.output.iter().any(|output| {
-        let mut instructions = output.script_pubkey.instructions();
-        matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_RETURN))))
-            && matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_PUSHNUM_13))))
-    })
-}
-
 fn is_uncommon_goods_mint_tx(tx: &Transaction) -> bool {
-    if !tx_has_runestone_carrier(tx) {
-        return false;
-    }
     Runestone::decipher(tx)
         .as_ref()
         .and_then(|artifact| artifact.mint())
@@ -731,7 +724,7 @@ fn project_rune_io_for_block(
         let Some(tx) = txs.get(txid).and_then(|entry| entry.tx.as_ref()) else {
             continue;
         };
-        let artifact = tx_has_runestone_carrier(tx).then(|| Runestone::decipher(tx)).flatten();
+        let artifact = Runestone::decipher(tx);
         let mut io = TxRuneIo::default();
         let mut unallocated: RuneSheet<SchemaRuneId> = BTreeMap::new();
 
@@ -906,6 +899,64 @@ fn diesel_trace_for_tx(
     let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::default();
     let storage_changes = extract_alkane_storage(&protobuf_trace, tx).unwrap_or_default();
     Some(vec![EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }])
+}
+
+fn trace_short_id_from_schema(id: &SchemaAlkaneId) -> EspoSandshrewLikeTraceShortId {
+    EspoSandshrewLikeTraceShortId { block: hex_u128(id.block as u128), tx: hex_u128(id.tx as u128) }
+}
+
+fn fast_trace_for_protostone(
+    txid: &Txid,
+    tx: &Transaction,
+    vout: u32,
+    protostone: &Protostone,
+) -> Option<EspoTrace> {
+    let cellpack = cellpack_from_protostone(protostone)?;
+    let contract_id = SchemaAlkaneId {
+        block: cellpack.target.block.try_into().ok()?,
+        tx: cellpack.target.tx.try_into().ok()?,
+    };
+    let invoke = EspoSandshrewLikeTraceEvent::Invoke(EspoSandshrewLikeTraceInvokeData {
+        typ: "call".to_string(),
+        context: EspoSandshrewLikeTraceInvokeContext {
+            myself: trace_short_id_from_schema(&contract_id),
+            caller: EspoSandshrewLikeTraceShortId {
+                block: "0x0".to_string(),
+                tx: "0x0".to_string(),
+            },
+            inputs: cellpack.inputs.iter().map(|value| hex_u128(*value)).collect(),
+            incoming_alkanes: Vec::new(),
+            vout,
+        },
+        fuel: 0,
+    });
+    let sandshrew_trace =
+        EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events: vec![invoke] };
+    let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::default();
+    let storage_changes = extract_alkane_storage(&protobuf_trace, tx).unwrap_or_default();
+    let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
+
+    Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })
+}
+
+fn fast_traces_for_tx(
+    txid: &Txid,
+    tx: &Transaction,
+    protostones: &[Protostone],
+) -> Option<Vec<EspoTrace>> {
+    if protostones.is_empty() {
+        return None;
+    }
+
+    let base = shadow_base(tx);
+    let traces = protostones
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, protostone)| {
+            fast_trace_for_protostone(txid, tx, base + idx as u32, protostone)
+        })
+        .collect();
+    Some(traces)
 }
 
 fn combined_traces(entry: &MempoolTransactionStruct) -> Option<Vec<EspoTrace>> {
@@ -1289,27 +1340,6 @@ pub fn get_mempool_block_detail(
             MempoolTxFilter::Rune => entry_has_rune_action(entry),
         }
     });
-    ordered.sort_by(|a, b| {
-        let aa = state.txs.get(a);
-        let bb = state.txs.get(b);
-        let a_rate = package_rates
-            .get(a)
-            .copied()
-            .or_else(|| aa.map(|tx| tx.fee_rate))
-            .unwrap_or_default();
-        let b_rate = package_rates
-            .get(b)
-            .copied()
-            .or_else(|| bb.map(|tx| tx.fee_rate))
-            .unwrap_or_default();
-        let a_fee = aa.map(|tx| tx.fee_sat).unwrap_or_default();
-        let b_fee = bb.map(|tx| tx.fee_sat).unwrap_or_default();
-        b_rate
-            .partial_cmp(&a_rate)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b_fee.cmp(&a_fee))
-            .then_with(|| a.cmp(b))
-    });
     let tx_total = ordered.len();
     let off = limit.saturating_mul(page.saturating_sub(1));
     let end = off.saturating_add(limit).min(tx_total);
@@ -1322,8 +1352,11 @@ pub fn get_mempool_block_detail(
                 Some(MempoolBlockTx {
                     txid: *txid,
                     tx,
+                    protostones: entry.protostones.clone(),
                     traces: combined_traces(entry),
                     rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
@@ -1359,8 +1392,11 @@ pub fn get_mempool_block_ordered_transactions(index: usize) -> Option<Vec<Mempoo
                 Some(MempoolBlockTx {
                     txid: *txid,
                     tx,
+                    protostones: entry.protostones.clone(),
                     traces: combined_traces(entry),
                     rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
@@ -1371,6 +1407,55 @@ pub fn get_mempool_block_ordered_transactions(index: usize) -> Option<Vec<Mempoo
             })
             .collect(),
     )
+}
+
+pub fn get_mempool_index_transactions_ordered_by_block_and_fee() -> Vec<MempoolBlockTx> {
+    let Ok(state) = mempool_state().read() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for template in &state.templates {
+        let ordered: Vec<Txid> = template
+            .transaction_ids
+            .iter()
+            .filter_map(|txid_str| Txid::from_str(txid_str).ok())
+            .collect();
+        let package_rates =
+            package_effective_rates_for_block(&ordered, &state.txs, &HashMap::new());
+        let mut block_txs = ordered
+            .iter()
+            .filter_map(|txid| {
+                let entry = state.txs.get(txid)?;
+                let tx = entry.tx.clone()?;
+                Some(MempoolBlockTx {
+                    txid: *txid,
+                    tx,
+                    protostones: entry.protostones.clone(),
+                    traces: combined_traces(entry),
+                    rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
+                    fee_sat: entry.fee_sat,
+                    vsize: entry.vsize,
+                    fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
+                    position: entry.position.clone(),
+                    readiness: derive_readiness(entry),
+                    defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
+                })
+            })
+            .collect::<Vec<_>>();
+        block_txs.sort_by(|left, right| {
+            right
+                .fee_sat
+                .cmp(&left.fee_sat)
+                .then_with(|| {
+                    right.fee_rate.partial_cmp(&left.fee_rate).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.txid.cmp(&right.txid))
+        });
+        out.extend(block_txs);
+    }
+    out
 }
 
 pub fn get_mempool_block_transactions_for_targets(
@@ -1417,8 +1502,11 @@ pub fn get_mempool_block_transactions_for_targets(
                 Some(MempoolBlockTx {
                     txid: *txid,
                     tx,
+                    protostones: entry.protostones.clone(),
                     traces: combined_traces(entry),
                     rune_io: entry.rune_io.clone(),
+                    addresses: entry.addresses.clone(),
+                    first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
                     fee_rate: entry.fee_rate,
@@ -1494,6 +1582,25 @@ fn decode_trace_hex(
     Ok(Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }))
 }
 
+fn compact_view_error(error: &Value) -> String {
+    let code = error.get("code").and_then(|v| v.as_i64());
+    let message = error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| error.as_str().unwrap_or("unknown metashrew_view error"))
+        .lines()
+        .next()
+        .unwrap_or("unknown metashrew_view error");
+    let mut summary: String = message.chars().take(300).collect();
+    if message.chars().count() > 300 {
+        summary.push_str("...");
+    }
+    match code {
+        Some(code) => format!("code {code}: {summary}"),
+        None => summary,
+    }
+}
+
 async fn view_traces_for_tx(
     http: &Client,
     view_url: &str,
@@ -1501,6 +1608,9 @@ async fn view_traces_for_tx(
     tx: &Transaction,
     protostone_count: usize,
 ) -> Option<Vec<EspoTrace>> {
+    if is_shutdown_requested() {
+        return None;
+    }
     if protostone_count == 0 {
         return None;
     }
@@ -1515,6 +1625,9 @@ async fn view_traces_for_tx(
     let mut traces: Vec<EspoTrace> = Vec::new();
     let mut had_error = false;
     for batch in jobs.chunks(MEMPOOL_VIEW_BATCH_SIZE) {
+        if is_shutdown_requested() {
+            return None;
+        }
         let owned_batch: Vec<(u32, String)> = batch.to_vec();
         let futs = stream::iter(owned_batch.into_iter().map(|(vout, input_hex)| {
             let body = json!({
@@ -1531,50 +1644,73 @@ async fn view_traces_for_tx(
             let view_url = view_url.to_string();
             let txid = *txid;
             async move {
+                if is_shutdown_requested() {
+                    return Err(());
+                }
                 let resp_json: Value = match http.post(&view_url).json(&body).send().await {
                     Ok(r) => match r.error_for_status() {
                         Ok(ok) => match ok.json().await {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!(
-                                    "[mempool] view response decode failed for {}@{}: {:?}",
-                                    txid, vout, e
-                                );
+                                if !is_shutdown_requested() {
+                                    eprintln!(
+                                        "[mempool] view response decode failed for {}@{}: {:?}",
+                                        txid, vout, e
+                                    );
+                                }
                                 return Err(());
                             }
                         },
                         Err(e) => {
-                            eprintln!("[mempool] view HTTP error for {}@{}: {:?}", txid, vout, e);
+                            if !is_shutdown_requested() {
+                                eprintln!(
+                                    "[mempool] view HTTP error for {}@{}: {:?}",
+                                    txid, vout, e
+                                );
+                            }
                             return Err(());
                         }
                     },
                     Err(e) => {
-                        eprintln!("[mempool] view POST failed for {}@{}: {:?}", txid, vout, e);
+                        if !is_shutdown_requested() {
+                            eprintln!("[mempool] view POST failed for {}@{}: {:?}", txid, vout, e);
+                        }
                         return Err(());
                     }
                 };
 
                 if let Some(error) = resp_json.get("error") {
-                    eprintln!(
-                        "[mempool] metashrew_view trace error for {}@{}: {}",
-                        txid, vout, error
-                    );
+                    if !is_shutdown_requested() {
+                        eprintln!(
+                            "[mempool] metashrew_view trace failed for {}@{}: {}",
+                            txid,
+                            vout,
+                            compact_view_error(error)
+                        );
+                    }
                     return Err(());
                 }
                 let result_hex = resp_json.get("result").and_then(|v| v.as_str()).or_else(|| {
                     resp_json.get("result").and_then(|v| v.get("trace")).and_then(|v| v.as_str())
                 });
                 let Some(result_hex) = result_hex else {
-                    eprintln!(
-                        "[mempool] metashrew_view trace missing result for {}@{}",
-                        txid, vout
-                    );
+                    if !is_shutdown_requested() {
+                        eprintln!(
+                            "[mempool] metashrew_view trace missing result for {}@{}",
+                            txid, vout
+                        );
+                    }
                     return Err(());
                 };
                 match decode_trace_hex(result_hex, &txid, tx, vout) {
                     Ok(trace) => Ok(trace),
                     Err(e) => {
-                        eprintln!("[mempool] decode view trace {}@{} failed: {:?}", txid, vout, e);
+                        if !is_shutdown_requested() {
+                            eprintln!(
+                                "[mempool] decode view trace {}@{} failed: {:?}",
+                                txid, vout, e
+                            );
+                        }
                         Err(())
                     }
                 }
@@ -2761,8 +2897,11 @@ fn start_mempool_hydration(network: Network) {
     });
 }
 
-async fn trace_worker(http: Client, view_url: String) {
+async fn trace_worker(http: Client, view_url: String, populate_with_views: bool) {
     loop {
+        if is_shutdown_requested() {
+            break;
+        }
         let next = trace_queue().lock().ok().and_then(|mut queue| queue.pop_front());
         let Some(txid) = next else {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2779,8 +2918,14 @@ async fn trace_worker(http: Client, view_url: String) {
         if entry.fixed_trace.is_some() {
             continue;
         }
-        let traces =
-            view_traces_for_tx(&http, &view_url, &txid, transaction, entry.protostones.len()).await;
+        if is_shutdown_requested() {
+            break;
+        }
+        let traces = if populate_with_views {
+            view_traces_for_tx(&http, &view_url, &txid, transaction, entry.protostones.len()).await
+        } else {
+            fast_traces_for_tx(&txid, transaction, &entry.protostones)
+        };
         if let Some(traces) = traces {
             let mut event_entry = None;
             if let Ok(mut state) = mempool_state().write() {
@@ -2926,8 +3071,8 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     }
 
     eprintln!(
-        "[mempool] service starting (raw_poll={}s, template_poll={}s, view_url={})",
-        cfg.raw_poll_secs, cfg.template_poll_secs, view_url
+        "[mempool] service starting (raw_poll={}s, template_poll={}s, populate_with_views={}, view_url={})",
+        cfg.raw_poll_secs, cfg.template_poll_secs, cfg.populate_with_views, view_url
     );
 
     eprintln!("[mempool] startup getrawmempool refresh");
@@ -2943,7 +3088,7 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     }
 
     for _ in 0..cfg.trace_workers.max(1) {
-        tokio::spawn(trace_worker(http.clone(), view_url.clone()));
+        tokio::spawn(trace_worker(http.clone(), view_url.clone(), cfg.populate_with_views));
     }
 
     let template_poll = Duration::from_secs(cfg.template_poll_secs.max(1));
@@ -2951,6 +3096,9 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     let mut last_raw_refresh = SystemTime::now();
 
     loop {
+        if is_shutdown_requested() {
+            return Ok(());
+        }
         let should_refresh = last_raw_refresh.elapsed().unwrap_or_default() >= raw_poll;
         if should_refresh {
             eprintln!("[mempool] canonical getrawmempool refresh");
@@ -3085,4 +3233,87 @@ pub fn purge_confirmed_from_chain() -> Result<usize> {
         eprintln!("[mempool] purged {} confirmed txs from store", removed);
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alkanes_support::cellpack::Cellpack;
+    use alkanes_support::id::AlkaneId;
+    use bitcoin::{
+        Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime, transaction::Version,
+    };
+
+    fn sample_tx() -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() }],
+        }
+    }
+
+    fn cellpack_protostone(target: AlkaneId, inputs: Vec<u128>) -> Protostone {
+        let cellpack = Cellpack { target, inputs };
+        Protostone {
+            burn: None,
+            message: cellpack.encipher(),
+            edicts: Vec::new(),
+            refund: None,
+            pointer: None,
+            from: None,
+            protocol_tag: 1,
+        }
+    }
+
+    #[test]
+    fn fast_traces_for_tx_builds_summary_from_protostone_cellpack() {
+        let tx = sample_tx();
+        let txid = tx.compute_txid();
+        let protostone = cellpack_protostone(AlkaneId { block: 4, tx: 797 }, vec![42, 99, 1000]);
+
+        let traces = fast_traces_for_tx(&txid, &tx, &[protostone]).expect("fast traces");
+
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].sandshrew_trace.outpoint, format!("{}:2", txid));
+        assert!(traces[0].protobuf_trace.events.is_empty());
+        assert_eq!(traces[0].outpoint.vout, 2);
+        assert_eq!(traces[0].outpoint.txid, txid.to_byte_array().to_vec());
+
+        let EspoSandshrewLikeTraceEvent::Invoke(invoke) = &traces[0].sandshrew_trace.events[0]
+        else {
+            panic!("expected invoke event");
+        };
+        assert_eq!(invoke.typ, "call");
+        assert_eq!(invoke.context.myself.block, "0x4");
+        assert_eq!(invoke.context.myself.tx, "0x31d");
+        assert_eq!(invoke.context.caller.block, "0x0");
+        assert_eq!(invoke.context.caller.tx, "0x0");
+        assert_eq!(invoke.context.inputs, vec!["0x2a", "0x63", "0x3e8"]);
+        assert_eq!(invoke.context.vout, 2);
+    }
+
+    #[test]
+    fn fast_traces_for_tx_marks_non_cellpack_protostones_processed() {
+        let tx = sample_tx();
+        let txid = tx.compute_txid();
+        let protostone = Protostone {
+            burn: None,
+            message: Vec::new(),
+            edicts: Vec::new(),
+            refund: None,
+            pointer: None,
+            from: None,
+            protocol_tag: 1,
+        };
+
+        let traces = fast_traces_for_tx(&txid, &tx, &[protostone]).expect("fast traces");
+
+        assert!(traces.is_empty());
+    }
 }

@@ -24,12 +24,14 @@ use crate::explorer::components::tx_view::{
 use crate::explorer::pages::common::{fmt_alkane_amount, format_integer};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{current_language, explorer_path};
+use crate::explorer::phishing::{is_phishing_alkane, phishing_warning_for};
 use crate::modules::ammdata::config::AmmDataConfig;
-use crate::modules::ammdata::consts::{PRICE_SCALE, SATS_PER_BTC};
+use crate::modules::ammdata::consts::{AMOUNT_SCALE, FRBTC_ALKANE_ID, PRICE_SCALE, SATS_PER_BTC};
 use crate::modules::ammdata::schemas::{SchemaTokenMetricsV1, Timeframe};
 use crate::modules::ammdata::storage::{
     AmmDataProvider, AmmDataTable, GetLatestBtcUsdPriceParams, GetListKeysByPrefixParams,
-    GetTokenDerivedMetricsParams, GetTokenMetricsParams, parse_change_basis_points,
+    GetPoolDefsParams, GetTokenDerivedMetricsParams, GetTokenMetricsParams, GetTokenPoolsParams,
+    parse_change_basis_points,
 };
 use crate::modules::essentials::storage::{
     BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
@@ -43,8 +45,8 @@ use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, loa
 use crate::modules::pizzafun::storage::{GetSeriesByAlkaneParams, PizzafunProvider};
 use crate::modules::tokendata::schemas::{SchemaTokenActivityV1, TokenActivityKind};
 use crate::modules::tokendata::storage::{
-    GetTokenActivityPageParams, SortDir as TokenActivitySortDir, TokenActivityScope,
-    TokenActivitySortField, TokenDataProvider,
+    GetTokenActivityPageParams, SortDir as TokenActivitySortDir, TokenActivityQuoteAmountFilter,
+    TokenActivityScope, TokenActivitySortField, TokenDataProvider,
 };
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
@@ -58,6 +60,7 @@ const ADDR_SUFFIX_LEN: usize = 8;
 const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
 const KV_KEY_BEACON: &[u8] = b"/beacon";
 const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward", 36863)];
+const DIESEL_ALKANE_ID: SchemaAlkaneId = SchemaAlkaneId { block: 2, tx: 0 };
 
 #[derive(Deserialize)]
 pub struct PageQuery {
@@ -66,6 +69,8 @@ pub struct PageQuery {
     pub order: Option<String>,
     pub dir: Option<String>,
     pub filter: Option<String>,
+    pub quote: Option<String>,
+    pub min: Option<String>,
     pub page: Option<usize>,
     pub limit: Option<usize>,
 }
@@ -130,13 +135,24 @@ fn activity_tab_url(
     order: ActivityOrder,
     dir: ActivityDir,
     filter: ActivityFilter,
+    quote: Option<ActivityQuoteFilter>,
+    min_amount: Option<u128>,
 ) -> String {
-    explorer_path(&format!(
+    let mut url = format!(
         "/alkane/{alk_str}?tab=activity&order={}&dir={}&filter={}&page={page}&limit={limit}",
         order.as_query(),
         dir.as_query(),
         filter.as_query(),
-    ))
+    );
+    if let Some(quote) = quote {
+        url.push_str("&quote=");
+        url.push_str(quote.as_query());
+    }
+    if let Some(min_amount) = min_amount {
+        url.push_str("&min=");
+        url.push_str(&min_amount.to_string());
+    }
+    explorer_path(&url)
 }
 
 fn alkane_tab_autoscroll_script() -> Markup {
@@ -478,6 +494,77 @@ impl ActivityFilter {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivityQuoteFilter {
+    Diesel,
+    FrBtc,
+}
+
+impl ActivityQuoteFilter {
+    fn from_query(raw: Option<&str>) -> Option<Self> {
+        match raw.map(|s| s.trim().to_ascii_lowercase()) {
+            Some(s) if s == "diesel" || s == "2:0" => Some(Self::Diesel),
+            Some(s) if s == "frbtc" || s == "32:0" => Some(Self::FrBtc),
+            _ => None,
+        }
+    }
+
+    fn from_id(id: SchemaAlkaneId) -> Option<Self> {
+        if id == DIESEL_ALKANE_ID {
+            Some(Self::Diesel)
+        } else if id == FRBTC_ALKANE_ID {
+            Some(Self::FrBtc)
+        } else {
+            None
+        }
+    }
+
+    fn as_query(self) -> &'static str {
+        match self {
+            Self::Diesel => "diesel",
+            Self::FrBtc => "frbtc",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Diesel => "DIESEL",
+            Self::FrBtc => "frBTC",
+        }
+    }
+
+    fn id(self) -> SchemaAlkaneId {
+        match self {
+            Self::Diesel => DIESEL_ALKANE_ID,
+            Self::FrBtc => FRBTC_ALKANE_ID,
+        }
+    }
+
+    fn amount_options(self) -> &'static [u128] {
+        match self {
+            Self::Diesel => &[
+                AMOUNT_SCALE,
+                5 * AMOUNT_SCALE,
+                10 * AMOUNT_SCALE,
+                25 * AMOUNT_SCALE,
+                100 * AMOUNT_SCALE,
+                500 * AMOUNT_SCALE,
+                1000 * AMOUNT_SCALE,
+            ],
+            Self::FrBtc => &[
+                50_000,
+                100_000,
+                500_000,
+                1_000_000,
+                10_000_000,
+                25_000_000,
+                50_000_000,
+                AMOUNT_SCALE,
+            ],
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AlkaneBalanceChartToken {
     alkane_id: String,
@@ -634,7 +721,8 @@ pub async fn alkane_page(
     let activity_order = ActivityOrder::from_query(q.order.as_deref());
     let activity_dir = ActivityDir::from_query(q.dir.as_deref());
     let activity_filter = ActivityFilter::from_query(q.filter.as_deref());
-    let all_range_label = if current_language().is_chinese() { "全部" } else { "All" };
+    let is_chinese_page = current_language().is_chinese();
+    let all_range_label = if is_chinese_page { "全部" } else { "All" };
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let alk_str = format!("{}:{}", alk.block, alk.tx);
@@ -668,6 +756,7 @@ pub async fn alkane_page(
             dir: TokenActivitySortDir::Desc,
             start_time: None,
             end_time: None,
+            quote_amount_filter: None,
         })
         .map(|res| res.total > 0)
         .unwrap_or(false);
@@ -726,6 +815,57 @@ pub async fn alkane_page(
     let coin_label = meta.name.value.clone();
     let holders_count = total;
     let supply_f64 = circulating_supply as f64;
+    let mut activity_quote_options = Vec::new();
+    if activity_filter == ActivityFilter::Market {
+        let pools = amm_provider
+            .get_token_pools(GetTokenPoolsParams { blockhash: StateAt::Latest, token: alk })
+            .ok()
+            .map(|res| res.pools)
+            .unwrap_or_default();
+        for pool in pools {
+            let Some(defs) = amm_provider
+                .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool })
+                .ok()
+                .and_then(|res| res.defs)
+            else {
+                continue;
+            };
+            let counter = if defs.base_alkane_id == alk {
+                defs.quote_alkane_id
+            } else if defs.quote_alkane_id == alk {
+                defs.base_alkane_id
+            } else {
+                continue;
+            };
+            if let Some(option) = ActivityQuoteFilter::from_id(counter) {
+                if !activity_quote_options.contains(&option) {
+                    activity_quote_options.push(option);
+                }
+            }
+        }
+        activity_quote_options.sort_by_key(|option| match option {
+            ActivityQuoteFilter::Diesel => 0u8,
+            ActivityQuoteFilter::FrBtc => 1u8,
+        });
+    }
+    let selected_activity_quote = ActivityQuoteFilter::from_query(q.quote.as_deref())
+        .filter(|quote| activity_quote_options.contains(quote))
+        .or_else(|| activity_quote_options.first().copied());
+    let selected_activity_min_amount = selected_activity_quote.and_then(|quote| {
+        let options = quote.amount_options();
+        q.min
+            .as_deref()
+            .and_then(|raw| raw.parse::<u128>().ok())
+            .filter(|amount| options.contains(amount))
+            .or_else(|| options.first().copied())
+    });
+    let token_activity_quote_filter = selected_activity_quote
+        .zip(selected_activity_min_amount)
+        .and_then(|(quote, min_amount)| {
+            (activity_filter == ActivityFilter::Market)
+                .then_some(TokenActivityQuoteAmountFilter { quote: quote.id(), min_amount })
+        });
+    let token_activity_filtered_by_quote = token_activity_quote_filter.is_some();
 
     let derived_quotes: Vec<SchemaAlkaneId> = AmmDataConfig::load_from_global_config()
         .ok()
@@ -798,6 +938,7 @@ pub async fn alkane_page(
     let chart_hidden = if tv_iframe_src.is_some() { "0" } else { "1" };
     let market_has_summary = if market_summary.is_some() { "1" } else { "0" };
     let buy_url = alkane_buy_url(&alk_str);
+    let phishing_warning = phishing_warning_for(&alk);
 
     let inspection = creation_record.as_ref().and_then(|r| r.inspection.as_ref());
     let mut inspect_source = inspection.cloned();
@@ -866,6 +1007,7 @@ pub async fn alkane_page(
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(h.amount)) }
                         a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk_str}"))) { (coin_label.clone()) }
+                        (scam_tag_for(&alk))
                     }
                 },
                 html! {
@@ -970,6 +1112,7 @@ pub async fn alkane_page(
                         }
                         span class="alk-amt mono" { (fmt_activity_amount(entry.amount)) }
                         a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk_str}"))) { (coin_label.clone()) }
+                        (scam_tag_for(&alk))
                     }
                 },
             ]
@@ -1001,6 +1144,7 @@ pub async fn alkane_page(
                     dir: activity_dir.storage_dir(),
                     start_time: None,
                     end_time: None,
+                    quote_amount_filter: token_activity_quote_filter,
                 })
                 .ok();
             let total = page_result.as_ref().map(|res| res.total).unwrap_or(0);
@@ -1046,7 +1190,16 @@ pub async fn alkane_page(
             .iter()
             .map(|opt| DropdownItem {
                 label: opt.label().to_string(),
-                href: activity_tab_url(&alk_str, 1, limit, *opt, activity_dir, activity_filter),
+                href: activity_tab_url(
+                    &alk_str,
+                    1,
+                    limit,
+                    *opt,
+                    activity_dir,
+                    activity_filter,
+                    selected_activity_quote,
+                    selected_activity_min_amount,
+                ),
                 icon: None,
                 selected: *opt == activity_order,
             })
@@ -1060,7 +1213,16 @@ pub async fn alkane_page(
             .iter()
             .map(|opt| DropdownItem {
                 label: opt.label().to_string(),
-                href: activity_tab_url(&alk_str, 1, limit, activity_order, *opt, activity_filter),
+                href: activity_tab_url(
+                    &alk_str,
+                    1,
+                    limit,
+                    activity_order,
+                    *opt,
+                    activity_filter,
+                    selected_activity_quote,
+                    selected_activity_min_amount,
+                ),
                 icon: None,
                 selected: *opt == activity_dir,
             })
@@ -1074,12 +1236,111 @@ pub async fn alkane_page(
             .iter()
             .map(|opt| DropdownItem {
                 label: opt.label().to_string(),
-                href: activity_tab_url(&alk_str, 1, limit, activity_order, activity_dir, *opt),
+                href: activity_tab_url(
+                    &alk_str,
+                    1,
+                    limit,
+                    activity_order,
+                    activity_dir,
+                    *opt,
+                    selected_activity_quote,
+                    selected_activity_min_amount,
+                ),
                 icon: None,
                 selected: *opt == activity_filter,
             })
             .collect(),
     });
+    let activity_quote_filter_markup =
+        if activity_filter == ActivityFilter::Market && selected_activity_quote.is_some() {
+            let selected_quote = selected_activity_quote.unwrap();
+            let selected_quote_id = selected_quote.id();
+            let selected_quote_meta =
+                alkane_meta(&selected_quote_id, &mut kv_cache, &state.essentials_mdb);
+            let selected_quote_icon = dropdown_token_icon(
+                &selected_quote_meta.icon_url,
+                &token_fallback_letter(
+                    &selected_quote_meta.name.value,
+                    &format!("{}:{}", selected_quote_id.block, selected_quote_id.tx),
+                ),
+            );
+            let quote_dropdown = dropdown(DropdownProps {
+                label: Some(selected_quote.label().to_string()),
+                selected_icon: Some(selected_quote_icon),
+                aria_label: Some("Filter token activity quote".to_string()),
+                items: activity_quote_options
+                    .iter()
+                    .map(|opt| {
+                        let opt_id = opt.id();
+                        let opt_meta = alkane_meta(&opt_id, &mut kv_cache, &state.essentials_mdb);
+                        let opt_fallback = token_fallback_letter(
+                            &opt_meta.name.value,
+                            &format!("{}:{}", opt_id.block, opt_id.tx),
+                        );
+                        let opt_min = opt.amount_options().first().copied();
+                        DropdownItem {
+                            label: opt.label().to_string(),
+                            href: activity_tab_url(
+                                &alk_str,
+                                1,
+                                limit,
+                                activity_order,
+                                activity_dir,
+                                activity_filter,
+                                Some(*opt),
+                                opt_min,
+                            ),
+                            icon: Some(dropdown_token_icon(&opt_meta.icon_url, &opt_fallback)),
+                            selected: *opt == selected_quote,
+                        }
+                    })
+                    .collect(),
+            });
+            let amount_dropdown = dropdown(DropdownProps {
+                label: selected_activity_min_amount
+                    .map(|amount| activity_quote_amount_label(selected_quote, amount)),
+                selected_icon: Some(dropdown_token_icon(
+                    &selected_quote_meta.icon_url,
+                    &token_fallback_letter(
+                        &selected_quote_meta.name.value,
+                        &format!("{}:{}", selected_quote_id.block, selected_quote_id.tx),
+                    ),
+                )),
+                aria_label: Some("Filter token activity minimum quote amount".to_string()),
+                items: selected_quote
+                    .amount_options()
+                    .iter()
+                    .map(|amount| DropdownItem {
+                        label: activity_quote_amount_label(selected_quote, *amount),
+                        href: activity_tab_url(
+                            &alk_str,
+                            1,
+                            limit,
+                            activity_order,
+                            activity_dir,
+                            activity_filter,
+                            Some(selected_quote),
+                            Some(*amount),
+                        ),
+                        icon: Some(dropdown_token_icon(
+                            &selected_quote_meta.icon_url,
+                            &token_fallback_letter(
+                                &selected_quote_meta.name.value,
+                                &format!("{}:{}", selected_quote_id.block, selected_quote_id.tx),
+                            ),
+                        )),
+                        selected: Some(*amount) == selected_activity_min_amount,
+                    })
+                    .collect(),
+            });
+            html! {
+                span class="muted" { "Filter by:" }
+                (quote_dropdown)
+                (amount_dropdown)
+            }
+        } else {
+            html! {}
+        };
 
     let token_activity_rows: Vec<Vec<Markup>> = token_activity_entries
         .into_iter()
@@ -1097,6 +1358,7 @@ pub async fn alkane_page(
                 html! {
                     div class="alkane-token-activity-pool" {
                         a class="link" href=(explorer_path(&format!("/alkane/{pool_id}"))) { (pool_label) }
+                        (scam_tag_for(&pool))
                     }
                 }
             } else {
@@ -1172,10 +1434,12 @@ pub async fn alkane_page(
                             }
                             span class="alk-amt mono" { (fmt_signed_alkane_amount(entry.token_delta)) }
                             a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk_str}"))) { (coin_label.clone()) }
+                            (scam_tag_for(&alk))
                         }
                         @if let Some(price_paid_usd) = entry.mint_price_paid_usd.as_ref() {
                             div class="alkane-token-activity-flow-line neutral" {
                                 span class="alkane-token-activity-price-paid" { "Price paid: $" (price_paid_usd) " / " (coin_label.clone()) }
+                                (scam_tag_for(&alk))
                             }
                         }
                         @if let Some((counter_token, counter_delta)) = entry.counter {
@@ -1201,6 +1465,7 @@ pub async fn alkane_page(
                                 }
                                 span class="alk-amt mono" { (fmt_signed_alkane_amount(counter_delta)) }
                                 a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{counter_id}"))) { (counter_label) }
+                                (scam_tag_for(&counter_token))
                             }
                         }
                     }
@@ -1237,9 +1502,58 @@ pub async fn alkane_page(
                         span class="alk-icon-letter" { (fallback_letter) }
                     }
                     div class="alkane-hero-text" {
-                        span class="alkane-tag" { "ALKANE" }
+                        div class="alkane-hero-tags" {
+                            span class="alkane-tag" { "ALKANE" }
+                            @if phishing_warning.map(|warning| warning.is_scam()).unwrap_or(false) {
+                                span class="alkane-tag scam-tag" { "SCAM" }
+                            }
+                        }
                         h1 class="alkane-hero-title" { (display_name.clone()) }
                         span class="alkane-hero-id mono" { (alk_str.clone()) }
+                    }
+                }
+
+                @if let Some(warning) = phishing_warning {
+                    @let note = if is_chinese_page { warning.note_zh } else { warning.note_en };
+                    @if warning.is_scam() {
+                        div class="alkane-phishing-warning" role="alert" {
+                            div class="alkane-phishing-warning-head" {
+                                @if is_chinese_page {
+                                    span { "钓鱼风险警告" }
+                                } @else {
+                                    span { "PHISHING WARNING" }
+                                }
+                            }
+                            @if is_chinese_page {
+                                p lang="zh-Hans" { "该 Alkane 已被标记为钓鱼或诈骗活动。除非你完全理解风险，否则请勿交易、转账或与其交互。" }
+                                @if !note.trim().is_empty() {
+                                    p lang="zh-Hans" {
+                                        span class="alkane-phishing-warning-label" { "危险: " }
+                                        (linked_note_text(note))
+                                    }
+                                }
+                            } @else {
+                                p { "This alkane has been flagged as phishing or scam activity. Do not trade, transfer, or interact with it unless you fully understand the risk." }
+                                @if !note.trim().is_empty() {
+                                    p {
+                                        span class="alkane-phishing-warning-label" { "DANGER: " }
+                                        (linked_note_text(note))
+                                    }
+                                }
+                            }
+                        }
+                    } @else if !note.trim().is_empty() {
+                        div class="alkane-phishing-warning reduced" role="note" {
+                            @if is_chinese_page {
+                                p lang="zh-Hans" {
+                                    (linked_note_text(note))
+                                }
+                            } @else {
+                                p {
+                                    (linked_note_text(note))
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1277,6 +1591,7 @@ pub async fn alkane_page(
                                     span class="alkane-stat-label" { "Symbol" }
                                     div class="alkane-stat-line" {
                                         span class="alkane-stat-value" { (meta.symbol.clone()) }
+                                        (scam_tag_for(&alk))
                                     }
                                 }
                                 div class="alkane-stat" {
@@ -1444,7 +1759,16 @@ pub async fn alkane_page(
                         div class="alkane-tab-list" {
                             @if has_token_activity {
                                 a class=(format!("alkane-tab{}", if tab == AlkaneTab::Activity { " active" } else { "" }))
-                                    href=(activity_tab_url(&alk_str, 1, limit, activity_order, activity_dir, activity_filter)) {
+                                    href=(activity_tab_url(
+                                        &alk_str,
+                                        1,
+                                        limit,
+                                        activity_order,
+                                        activity_dir,
+                                        activity_filter,
+                                        selected_activity_quote,
+                                        selected_activity_min_amount,
+                                    )) {
                                     "Activity"
                                 }
                             }
@@ -1570,45 +1894,54 @@ pub async fn alkane_page(
                                     (activity_sort_dropdown)
                                     (activity_dir_dropdown)
                                     (activity_filter_dropdown)
+                                    (activity_quote_filter_markup)
                                 }
                                 (token_activity_table_markup)
                                 div class="pager" {
-                                    @if token_activity_has_prev {
-                                        a class="pill iconbtn" href=(activity_tab_url(&alk_str, 1, limit, activity_order, activity_dir, activity_filter)) aria-label="First page" {
-                                            (icon_pager_first())
+                                    @if !token_activity_filtered_by_quote {
+                                        @if token_activity_has_prev {
+                                            a class="pill iconbtn" href=(activity_tab_url(&alk_str, 1, limit, activity_order, activity_dir, activity_filter, selected_activity_quote, selected_activity_min_amount)) aria-label="First page" {
+                                                (icon_pager_first())
+                                            }
+                                        } @else {
+                                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                                         }
-                                    } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                                     }
                                     @if token_activity_has_prev {
-                                        a class="pill iconbtn" href=(activity_tab_url(&alk_str, page - 1, limit, activity_order, activity_dir, activity_filter)) aria-label="Previous page" {
+                                        a class="pill iconbtn" href=(activity_tab_url(&alk_str, page - 1, limit, activity_order, activity_dir, activity_filter, selected_activity_quote, selected_activity_min_amount)) aria-label="Previous page" {
                                             (icon_pager_left())
                                         }
                                     } @else {
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                                     }
-                                    span class="pager-meta muted" { "Showing "
-                                        (format_integer(if token_activity_total > 0 { token_activity_display_start as u128 } else { 0 }))
-                                        @if token_activity_total > 0 {
-                                            "-"
-                                            (format_integer(token_activity_display_end as u128))
+                                    @if token_activity_filtered_by_quote {
+                                        span class="pager-meta muted" { "Page " (format_integer(page as u128)) }
+                                    } @else {
+                                        span class="pager-meta muted" { "Showing "
+                                            (format_integer(if token_activity_total > 0 { token_activity_display_start as u128 } else { 0 }))
+                                            @if token_activity_total > 0 {
+                                                "-"
+                                                (format_integer(token_activity_display_end as u128))
+                                            }
+                                            " / "
+                                            (format_integer(token_activity_total as u128))
                                         }
-                                        " / "
-                                        (format_integer(token_activity_total as u128))
                                     }
                                     @if token_activity_has_next {
-                                        a class="pill iconbtn" href=(activity_tab_url(&alk_str, page + 1, limit, activity_order, activity_dir, activity_filter)) aria-label="Next page" {
+                                        a class="pill iconbtn" href=(activity_tab_url(&alk_str, page + 1, limit, activity_order, activity_dir, activity_filter, selected_activity_quote, selected_activity_min_amount)) aria-label="Next page" {
                                             (icon_pager_right())
                                         }
                                     } @else {
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                                     }
-                                    @if token_activity_has_next {
-                                        a class="pill iconbtn" href=(activity_tab_url(&alk_str, token_activity_last_page, limit, activity_order, activity_dir, activity_filter)) aria-label="Last page" {
-                                            (icon_pager_last())
+                                    @if !token_activity_filtered_by_quote {
+                                        @if token_activity_has_next {
+                                            a class="pill iconbtn" href=(activity_tab_url(&alk_str, token_activity_last_page, limit, activity_order, activity_dir, activity_filter, selected_activity_quote, selected_activity_min_amount)) aria-label="Last page" {
+                                                (icon_pager_last())
+                                            }
+                                        } @else {
+                                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                                         }
-                                    } @else {
-                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                                     }
                                 }
                             } @else {
@@ -1739,6 +2072,72 @@ fn addr_prefix_suffix(addr: &str) -> (String, String) {
     (prefix, suffix)
 }
 
+fn scam_tag_for(alk: &SchemaAlkaneId) -> Markup {
+    if is_phishing_alkane(alk) {
+        html! { span class="tag scam-tag" { "SCAM" } }
+    } else {
+        html! {}
+    }
+}
+
+fn next_url_start(text: &str) -> Option<usize> {
+    match (text.find("https://"), text.find("http://")) {
+        (Some(https), Some(http)) => Some(https.min(http)),
+        (Some(https), None) => Some(https),
+        (None, Some(http)) => Some(http),
+        (None, None) => None,
+    }
+}
+
+fn url_token_end(text: &str, start: usize) -> usize {
+    text[start..]
+        .char_indices()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(start + idx))
+        .unwrap_or(text.len())
+}
+
+fn linked_note_text(note: &str) -> Markup {
+    let mut parts: Vec<Markup> = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(start_rel) = next_url_start(&note[cursor..]) {
+        let start = cursor + start_rel;
+        if cursor < start {
+            parts.push(html! { (&note[cursor..start]) });
+        }
+
+        let token_end = url_token_end(note, start);
+        let token = &note[start..token_end];
+        let url = token.trim_end_matches(|c| {
+            matches!(c, '.' | ',' | ';' | '!' | ')' | ']' | '。' | '，' | '）' | '】')
+        });
+        let trailing = &note[start + url.len()..token_end];
+
+        if url != "https://" && url != "http://" {
+            parts.push(html! {
+                a class="link" href=(url) target="_blank" rel="noopener noreferrer" { (url) }
+            });
+            if !trailing.is_empty() {
+                parts.push(html! { (trailing) });
+            }
+        } else {
+            parts.push(html! { (token) });
+        }
+
+        cursor = token_end;
+    }
+
+    if cursor < note.len() {
+        parts.push(html! { (&note[cursor..]) });
+    }
+
+    html! {
+        @for part in parts {
+            (part)
+        }
+    }
+}
+
 fn url_escape_component(raw: &str) -> String {
     // Minimal percent-encoding for URL query components.
     let mut out = String::with_capacity(raw.len());
@@ -1817,6 +2216,19 @@ fn token_short_label(
     } else {
         meta.symbol
     }
+}
+
+fn dropdown_token_icon(icon_url: &str, fallback: &str) -> Markup {
+    html! {
+        span class="dropdown-token-icon-wrap" aria-hidden="true" {
+            span class="alk-icon-img" style=(icon_bg_style(icon_url)) {}
+            span class="alk-icon-letter" { (fallback) }
+        }
+    }
+}
+
+fn activity_quote_amount_label(quote: ActivityQuoteFilter, amount: u128) -> String {
+    format!(">= {} {}", fmt_alkane_amount(amount), quote.label())
 }
 
 fn build_token_activity_render_entry(

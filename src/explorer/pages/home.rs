@@ -1,5 +1,5 @@
 use crate::runtime::state_at::StateAt;
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use alkanes_support::proto::alkanes::AlkanesTrace;
 use axum::extract::State;
 use axum::response::Html;
 use bitcoin::Txid;
@@ -25,6 +25,7 @@ use crate::modules::essentials::storage::{
     AlkaneTxSummary, EssentialsProvider, EssentialsTable, GetHoldersOrderedPageParams,
     HoldersCountEntry, load_creation_record, load_tx_summary_v2,
 };
+use crate::modules::essentials::utils::names::display_alkane_name;
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::RunesProvider;
 use crate::schemas::EspoOutpoint;
@@ -69,12 +70,7 @@ fn load_top_alkanes_by_holders(
             .unwrap_or(0);
 
         let id = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
-        let name = rec
-            .names
-            .first()
-            .map(|s| s.to_string())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "Unnamed".to_string());
+        let name = display_alkane_name(&rec.names).unwrap_or_else(|| "Unnamed".to_string());
         let icon_url = alkane_icon_url(&rec.alkane, mdb);
         let fallback = if name == "Unnamed" {
             '?'

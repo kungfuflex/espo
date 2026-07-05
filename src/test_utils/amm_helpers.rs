@@ -302,7 +302,8 @@ fn init_with_cellpack_pairs_w_input(
 
         // Create a Runestone with a Protostone containing the cellpack
         use ordinals::Runestone;
-        use protorune_support::protostone::{Protostone, Protostones};
+        use protorune::protostone::Protostones;
+        use protorune_support::protostone::Protostone;
 
         let protostone = Protostone {
             burn: None,
