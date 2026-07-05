@@ -963,10 +963,14 @@ impl MetashrewAdapter {
         let root = self.root_ptr(db);
         let traces = TraceTablesNative::new(&root);
         let by_height = traces.TRACES_BY_HEIGHT_NATIVE.select_value(block);
-        let mut outpoints = by_height.get_list();
-        if outpoints.is_empty() {
-            outpoints = self.scan_lengthless_trace_height_index(db, &by_height, allow_txids)?;
-        }
+        // `by_height.get_list()` reads the trace-by-height `/length` value as a
+        // raw u32 (metashrew-support ByteView) and PANICS on the develop
+        // metashrew's length encoding ("incorrect length: TryFromSliceError")
+        // for any height that actually has traces — killing the indexer thread.
+        // The lengthless prefix scan reconstructs the same outpoint list from the
+        // `/N` entries without touching the `/length` key, so use it directly
+        // (it was already the fallback for the empty-length case).
+        let outpoints = self.scan_lengthless_trace_height_index(db, &by_height, allow_txids)?;
         let list_len = outpoints.len();
 
         let mut missing_trace_blobs = 0usize;
