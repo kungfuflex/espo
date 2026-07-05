@@ -51,12 +51,12 @@ const MAINNET_RUNES_GENESIS: u32 = 840_000;
 const GENESIS_RUNE_ID: SchemaRuneId = SchemaRuneId { block: 1, tx: 0 };
 
 pub fn runes_genesis_block(network: Network) -> u32 {
-    match network {
+    crate::consts::genesis_with_override(match network {
         Network::Bitcoin => MAINNET_RUNES_GENESIS,
         Network::Testnet => Rune::first_rune_height(Network::Testnet),
         Network::Regtest | Network::Signet => 0,
         _ => 0,
-    }
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]

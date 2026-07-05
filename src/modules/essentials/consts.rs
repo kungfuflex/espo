@@ -8,10 +8,10 @@ use bitcoin::Network;
 //911,610 -> 914,180 -> outpoint 638873ac37b73e6dbd58e8b8c379bbb023624a317966a1172f3add0c0f077021:0 has a balance of 160.69 diesel (tests if reverts affect balance state)
 
 pub fn essentials_genesis_block(network: Network) -> u32 {
-    match network {
+    crate::consts::genesis_with_override(match network {
         Network::Bitcoin => 880_000,
         _ => 0,
-    }
+    })
 }
 
 pub const ESSENTIALS_GENESIS_INSPECTIONS: &[(u32, u64, Option<(&str, &str)>)] =

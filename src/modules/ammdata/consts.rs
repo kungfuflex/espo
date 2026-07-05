@@ -3,10 +3,10 @@ use anyhow::{Result, anyhow};
 use bitcoin::Network;
 
 pub fn ammdata_genesis_block(network: Network) -> u32 {
-    match network {
+    crate::consts::genesis_with_override(match network {
         Network::Bitcoin => 904_647,
         _ => 0,
-    }
+    })
 }
 
 pub fn get_amm_contract(network: Network) -> Result<SchemaAlkaneId> {
