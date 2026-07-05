@@ -200,6 +200,9 @@ pub fn extract_alkane_storage(
                     }
                 }
                 Event::CreateAlkane(_create) => {}
+                // New develop-branch trace events (kungfuflex/alkanes-rs) that
+                // carry no storage delta — nothing to accumulate here.
+                Event::ReceiveIntent(_) | Event::ValueTransfer(_) => {}
             }
         }
     }
@@ -303,6 +306,11 @@ pub fn protobuf_trace_events(trace: &AlkanesTrace) -> Result<Vec<EspoSandshrewLi
                         create.new_alkane.as_ref(),
                     )));
                 }
+                // New develop-branch trace events (kungfuflex/alkanes-rs). espo's
+                // sandshrew-like trace model has no mapping for them yet, so they
+                // are omitted from the rendered trace rather than failing the
+                // build. Revisit if the explorer needs to surface them.
+                Event::ReceiveIntent(_) | Event::ValueTransfer(_) => {}
             }
         }
     }
