@@ -364,38 +364,6 @@ fn parse_u128_from_str(input: &str) -> Option<u128> {
     }
 }
 
-fn trace_has_root_out_of_fuel_failure(
-    trace: &EspoSandshrewLikeTrace,
-    host_function_values: &EspoHostFunctionValues,
-) -> bool {
-    let cleaned = clean_espo_sandshrew_like_trace(trace, host_function_values);
-    let events = cleaned.as_ref().map(|t| t.events.as_slice()).unwrap_or(&trace.events);
-    let mut depth = 0usize;
-    for ev in events {
-        match ev {
-            EspoSandshrewLikeTraceEvent::Invoke(_) => {
-                depth = depth.saturating_add(1);
-            }
-            EspoSandshrewLikeTraceEvent::Return(ret) => {
-                let is_root = depth == 1;
-                if is_root && ret.status == EspoSandshrewLikeTraceStatus::Failure {
-                    let data = ret.response.data.strip_prefix("0x").unwrap_or(&ret.response.data);
-                    if let Ok(bytes) = hex::decode(data) {
-                        if String::from_utf8_lossy(&bytes)
-                            .contains("all fuel consumed by WebAssembly")
-                        {
-                            return true;
-                        }
-                    }
-                }
-                depth = depth.saturating_sub(1);
-            }
-            EspoSandshrewLikeTraceEvent::Create(_) => {}
-        }
-    }
-    false
-}
-
 pub(crate) fn mint_deltas_from_trace(
     trace: &EspoSandshrewLikeTrace,
     host_function_values: &EspoHostFunctionValues,
@@ -3407,7 +3375,6 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         let mut holder_alkanes_changed: HashSet<SchemaAlkaneId> = HashSet::new();
         let mut local_alkane_delta: AlkaneDeltaMap = HashMap::new();
         let mut local_root_debit_candidates: RootDebitCandidateMap = HashMap::new();
-        let mut tx_has_root_out_of_fuel_failure = false;
         let mut tx_mint_deltas: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
 
         let mut add_holder_delta =
@@ -3592,12 +3559,6 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         let traces_for_tx: Vec<EspoTrace> = atx.traces.clone().unwrap_or_default();
         if !traces_for_tx.is_empty() {
             for t in &traces_for_tx {
-                if trace_has_root_out_of_fuel_failure(
-                    &t.sandshrew_trace,
-                    &block.host_function_values,
-                ) {
-                    tx_has_root_out_of_fuel_failure = true;
-                }
                 let (ok, deltas, root_debits) = accumulate_alkane_balance_deltas(
                     &t.sandshrew_trace,
                     &txid,
@@ -3637,32 +3598,12 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                 }
             }
         }
-        if tx_has_root_out_of_fuel_failure && !local_root_debit_candidates.is_empty() {
-            let mut empty_owners: Vec<SchemaAlkaneId> = Vec::new();
-            for (owner, per_token_candidates) in &local_root_debit_candidates {
-                let entry = local_alkane_delta.entry(*owner).or_default();
-                for (token, amount) in per_token_candidates {
-                    let slot = entry.entry(*token).or_insert_with(SignedU128::zero);
-                    *slot += SignedU128::positive(*amount);
-                    if slot.is_zero() {
-                        entry.remove(token);
-                    }
-                }
-                if entry.is_empty() {
-                    empty_owners.push(*owner);
-                }
-            }
-            for owner in empty_owners {
-                local_alkane_delta.remove(&owner);
-            }
-            local_root_debit_candidates.clear();
-            if debug {
-                eprintln!(
-                    "[balances] skipped root response debit candidates after root out-of-fuel: txid={}",
-                    txid
-                );
-            }
-        }
+        // NOTE: a protostone that fails with "all fuel consumed by WebAssembly" only
+        // rolls back its own message (protorune checkpoints/rollbacks per protostone
+        // and refunds that protostone's inputs). Successful sibling protostones in the
+        // same transaction keep their commits — including root response debits — so an
+        // out-of-fuel failure in one protostone must NOT cancel debit candidates
+        // accumulated from the other traces of the same tx.
         if !local_root_debit_candidates.is_empty() {
             let mut empty_owners: Vec<SchemaAlkaneId> = Vec::new();
             for (owner, per_token_candidates) in &local_root_debit_candidates {
