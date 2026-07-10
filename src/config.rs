@@ -71,6 +71,29 @@ fn parse_block_fetch_mode(s: &str) -> std::result::Result<BlockFetchMode, String
     }
 }
 
+/// Which on-disk / RPC alkanes trace layout espo expects from the metashrew it
+/// reads. The by-alkane fork can index against two incompatible metashrew trace
+/// encodings:
+///   - `V2`: the standard / release alkanes layout (e.g. metashrew v2.2.x). Bare
+///     protobuf `Outpoint` trace-view input; standard trace-by-height index.
+///   - `V3`: the develop-branch (kungfuflex/alkanes-rs) layout. Height-prefixed
+///     trace-view input; the "lengthless" TRACES_BY_HEIGHT index.
+/// Defaults to `V2` (matches the release metashrew currently in the pool).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TraceFormat {
+    #[default]
+    V2,
+    V3,
+}
+
+fn parse_trace_format(s: &str) -> std::result::Result<TraceFormat, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "v2" | "2" | "standard" | "release" => Ok(TraceFormat::V2),
+        "v3" | "3" | "develop" => Ok(TraceFormat::V3),
+        other => Err(format!("invalid value for trace format '{other}': use v2 | v3")),
+    }
+}
+
 fn normalize_explorer_base_path(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed == "/" {
@@ -458,6 +481,10 @@ pub struct ConfigFile {
     pub safe_tip_hook_script: Option<String>,
     #[serde(default = "default_block_source_mode")]
     pub block_source_mode: String,
+    /// Alkanes trace layout to read: "v2" (standard/release metashrew) or "v3"
+    /// (develop metashrew). Overridden by the `--format` CLI flag. Defaults v2.
+    #[serde(default)]
+    pub trace_format: Option<String>,
     #[serde(default = "default_compact_tx_trace_rows")]
     pub compact_tx_trace_rows: bool,
     #[serde(default = "default_address_index_chunk_size")]
@@ -510,6 +537,7 @@ pub struct AppConfig {
     pub debug_backup: Option<DebugBackupConfig>,
     pub safe_tip_hook_script: Option<String>,
     pub block_source_mode: BlockFetchMode,
+    pub trace_format: TraceFormat,
     pub compact_tx_trace_rows: bool,
     pub address_index_chunk_size: u32,
     pub trace_read_workers: u16,
@@ -536,6 +564,12 @@ pub struct CliArgs {
     /// On startup only, rewind indexed state so indexing resumes at this height.
     #[arg(long)]
     pub rollback: Option<u32>,
+
+    /// Alkanes trace layout to read from metashrew: `v2` (standard/release
+    /// metashrew, the default) or `v3` (develop metashrew). Overrides the
+    /// config-file `trace_format`.
+    #[arg(long, value_enum)]
+    pub format: Option<TraceFormat>,
 }
 
 fn load_config_file(path: &str) -> Result<ConfigFile> {
@@ -590,6 +624,13 @@ impl AppConfig {
             debug_backup,
             safe_tip_hook_script: normalize_optional_string(file.safe_tip_hook_script),
             block_source_mode,
+            trace_format: file
+                .trace_format
+                .as_deref()
+                .map(parse_trace_format)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!(e))?
+                .unwrap_or_default(),
             compact_tx_trace_rows: file.compact_tx_trace_rows,
             address_index_chunk_size: file.address_index_chunk_size,
             trace_read_workers: file.trace_read_workers,
@@ -776,6 +817,9 @@ pub fn init_config() -> Result<()> {
     if cli.rollback.is_some() {
         cfg.rollback = cli.rollback;
     }
+    if let Some(fmt) = cli.format {
+        cfg.trace_format = fmt;
+    }
     init_config_from(cfg)
 }
 
@@ -900,6 +944,12 @@ pub fn strict_check_trace_mismatches() -> bool {
         .as_ref()
         .map(|cfg| cfg.check_trace_mismatches)
         .unwrap_or(false)
+}
+
+/// The alkanes trace layout espo should read (v2 = standard/release metashrew,
+/// v3 = develop metashrew). Set via `--format` or config-file `trace_format`.
+pub fn trace_format() -> TraceFormat {
+    get_config().trace_format
 }
 
 pub fn debug_enabled() -> bool {

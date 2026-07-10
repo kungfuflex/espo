@@ -55,6 +55,7 @@ impl TestConfigBuilder {
             compact_tx_trace_rows: true,
             address_index_chunk_size: 512,
             trace_read_workers: 8,
+            trace_format: Default::default(),
             recover_missing_traces_by_txid: false,
             explorer_networks: None,
             google_analytics_tag: None,

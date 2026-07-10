@@ -1,8 +1,8 @@
 use crate::alkanes::defs::AlkaneMessageContext;
 use crate::alkanes::trace::PartialEspoTrace;
 use crate::config::{
-    get_bitcoind_rpc_client, get_metashrew_sdb, get_trace_read_workers,
-    strict_check_trace_mismatches,
+    TraceFormat, get_bitcoind_rpc_client, get_metashrew_sdb, get_trace_read_workers,
+    strict_check_trace_mismatches, trace_format,
 };
 use crate::runtime::sdb::SDB;
 use crate::schemas::SchemaAlkaneId;
@@ -963,14 +963,20 @@ impl MetashrewAdapter {
         let root = self.root_ptr(db);
         let traces = TraceTablesNative::new(&root);
         let by_height = traces.TRACES_BY_HEIGHT_NATIVE.select_value(block);
-        // `by_height.get_list()` reads the trace-by-height `/length` value as a
-        // raw u32 (metashrew-support ByteView) and PANICS on the develop
-        // metashrew's length encoding ("incorrect length: TryFromSliceError")
-        // for any height that actually has traces — killing the indexer thread.
-        // The lengthless prefix scan reconstructs the same outpoint list from the
-        // `/N` entries without touching the `/length` key, so use it directly
-        // (it was already the fallback for the empty-length case).
-        let outpoints = self.scan_lengthless_trace_height_index(db, &by_height, allow_txids)?;
+        // Trace-by-height list read depends on the metashrew trace layout:
+        //   V2 (standard/release metashrew): the `/length` key is a proper u32, so
+        //       the stock `get_list()` (which reads `/length` then `/0../N-1`) works.
+        //   V3 (develop metashrew): `get_list()` reads `/length` as a raw u32 and
+        //       PANICS on the develop length encoding ("incorrect length:
+        //       TryFromSliceError") for any height that actually has traces —
+        //       killing the indexer thread. The lengthless prefix scan
+        //       reconstructs the same outpoint list from the `/N` entries without
+        //       touching `/length`.
+        // (`allow_txids` is applied downstream per-outpoint in both modes.)
+        let outpoints = match trace_format() {
+            TraceFormat::V2 => by_height.get_list(),
+            TraceFormat::V3 => self.scan_lengthless_trace_height_index(db, &by_height, allow_txids)?,
+        };
         let list_len = outpoints.len();
 
         let mut missing_trace_blobs = 0usize;
@@ -1087,7 +1093,13 @@ impl MetashrewAdapter {
             }
         }
 
-        self.scan_lengthless_trace_blob(db, &parent)
+        // V2 (standard metashrew) stores the blob directly under the outpoint key,
+        // so the `.get()` above is authoritative. The `/N`-suffix lengthless scan
+        // is only needed for V3 (develop metashrew) trace-blob storage.
+        match trace_format() {
+            TraceFormat::V2 => None,
+            TraceFormat::V3 => self.scan_lengthless_trace_blob(db, &parent),
+        }
     }
 
     fn scan_lengthless_trace_blob(

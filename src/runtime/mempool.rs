@@ -5,8 +5,8 @@ use crate::alkanes::trace::{
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use crate::config::{
-    get_bitcoind_rpc_client, get_config, get_espo_db, get_last_safe_tip, get_metashrew_rpc_url,
-    get_network,
+    TraceFormat, get_bitcoind_rpc_client, get_config, get_espo_db, get_last_safe_tip,
+    get_metashrew_rpc_url, get_network, trace_format,
 };
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider};
 use crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch;
@@ -1573,13 +1573,27 @@ fn decode_trace_hex(
     }
     let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::decode(bytes.as_slice())
         .with_context(|| "failed to decode view trace protobuf")?;
+
+    Ok(Some(build_espo_trace(protobuf_trace, txid, tx, vout)?))
+}
+
+/// Builds an `EspoTrace` from an already-decoded `AlkanesTrace`. Shared by
+/// the V3 `metashrew_view`/`trace` path (`decode_trace_hex`) and the V2
+/// `simulatetransaction` path (which receives the `AlkanesTrace` inline in
+/// the response), so both produce byte-identical downstream trace structs.
+fn build_espo_trace(
+    protobuf_trace: alkanes_support::proto::alkanes::AlkanesTrace,
+    txid: &Txid,
+    tx: &Transaction,
+    vout: u32,
+) -> Result<EspoTrace> {
     let events = protobuf_trace_events(&protobuf_trace)?;
 
     let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events };
     let storage_changes = extract_alkane_storage(&protobuf_trace, tx)?;
     let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
 
-    Ok(Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }))
+    Ok(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })
 }
 
 fn compact_view_error(error: &Value) -> String {
@@ -1601,7 +1615,207 @@ fn compact_view_error(error: &Value) -> String {
     }
 }
 
+/// Fetches unconfirmed-tx traces, dispatching on the configured trace format.
+///
+/// - `V3` (develop-metashrew): the height-prefixed `trace` `metashrew_view`
+///   (`view_traces_for_tx_v3`), one view call per protostone outpoint.
+/// - `V2` (alkanes-rs v2.2.1-rc.3): the `simulatetransaction` `metashrew_view`
+///   (`simulate_traces_for_tx`). The height-prefixed `trace` input panics
+///   alkanes.wasm on rc.3, so V2 must simulate instead.
 async fn view_traces_for_tx(
+    http: &Client,
+    view_url: &str,
+    txid: &Txid,
+    tx: &Transaction,
+    protostone_count: usize,
+) -> Option<Vec<EspoTrace>> {
+    match trace_format() {
+        TraceFormat::V2 => {
+            simulate_traces_for_tx(http, view_url, txid, tx, protostone_count).await
+        }
+        TraceFormat::V3 => {
+            view_traces_for_tx_v3(http, view_url, txid, tx, protostone_count).await
+        }
+    }
+}
+
+/// V2 (alkanes-rs v2.2.1-rc.3) mempool trace path.
+///
+/// Calls the `simulatetransaction` metashrew view (wasm export
+/// `simulatetransaction()` in alkanes-rs; input is a `SimulateTransactionRequest`
+/// proto carrying the raw consensus-encoded tx). The view deciphers the
+/// runestone, derives `alkane_inputs` from the spent outpoints' live state,
+/// synthesizes a faux block, runs every protostone, and returns a
+/// `SimulateTransactionResponse` whose `protostones[i].trace` is the same
+/// `AlkanesTrace` the confirmed/V3 path decodes.
+///
+/// Choice of simulatetransaction over simulateblock: the mempool worker
+/// drives traces one tx at a time (`view_traces_for_tx` is invoked per tx, as
+/// the old `metashrew_preview` preview-block path was), and a single
+/// simulatetransaction call already returns EVERY protostone trace for the tx
+/// in one round-trip — strictly fewer than V3's one-view-call-per-outpoint.
+/// simulateblock would only help if we batched the whole mempool block in one
+/// call, which would require restructuring the per-tx worker; not worth it.
+async fn simulate_traces_for_tx(
+    http: &Client,
+    view_url: &str,
+    txid: &Txid,
+    tx: &Transaction,
+    protostone_count: usize,
+) -> Option<Vec<EspoTrace>> {
+    if is_shutdown_requested() {
+        return None;
+    }
+    if protostone_count == 0 {
+        return None;
+    }
+
+    // Raw consensus-encoded tx — the view reconstructs everything else itself.
+    let mut tx_bytes: Vec<u8> = Vec::new();
+    if let Err(e) = tx.consensus_encode(&mut tx_bytes) {
+        if !is_shutdown_requested() {
+            eprintln!("[mempool] simulate consensus-encode failed for {}: {:?}", txid, e);
+        }
+        return None;
+    }
+
+    let request = alkanes_support::proto::alkanes::SimulateTransactionRequest {
+        height: get_last_safe_tip().unwrap_or_default() as u64,
+        transaction: tx_bytes,
+        storage_overrides: Vec::new(),
+    };
+    let input_hex = format!("0x{}", hex::encode(request.encode_to_vec()));
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": txid.to_string(),
+        "method": "metashrew_view",
+        "params": [
+            "simulatetransaction",
+            input_hex,
+            "latest",
+        ]
+    });
+
+    let resp_json: Value = match http.post(view_url).json(&body).send().await {
+        Ok(r) => match r.error_for_status() {
+            Ok(ok) => match ok.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    if !is_shutdown_requested() {
+                        eprintln!(
+                            "[mempool] simulate response decode failed for {}: {:?}",
+                            txid, e
+                        );
+                    }
+                    return None;
+                }
+            },
+            Err(e) => {
+                if !is_shutdown_requested() {
+                    eprintln!("[mempool] simulate HTTP error for {}: {:?}", txid, e);
+                }
+                return None;
+            }
+        },
+        Err(e) => {
+            if !is_shutdown_requested() {
+                eprintln!("[mempool] simulate POST failed for {}: {:?}", txid, e);
+            }
+            return None;
+        }
+    };
+
+    if let Some(error) = resp_json.get("error") {
+        if !is_shutdown_requested() {
+            eprintln!(
+                "[mempool] simulatetransaction failed for {}: {}",
+                txid,
+                compact_view_error(error)
+            );
+        }
+        return None;
+    }
+
+    let Some(result_hex) = resp_json.get("result").and_then(|v| v.as_str()) else {
+        if !is_shutdown_requested() {
+            eprintln!("[mempool] simulatetransaction missing result for {}", txid);
+        }
+        return None;
+    };
+
+    let trimmed = result_hex.strip_prefix("0x").unwrap_or(result_hex);
+    let bytes = match hex::decode(trimmed) {
+        Ok(b) => b,
+        Err(e) => {
+            if !is_shutdown_requested() {
+                eprintln!("[mempool] simulate result hex decode failed for {}: {:?}", txid, e);
+            }
+            return None;
+        }
+    };
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let response = match alkanes_support::proto::alkanes::SimulateTransactionResponse::decode(
+        bytes.as_slice(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            if !is_shutdown_requested() {
+                eprintln!(
+                    "[mempool] decode SimulateTransactionResponse for {} failed: {:?}",
+                    txid, e
+                );
+            }
+            return None;
+        }
+    };
+
+    // A non-empty top-level `error` means the sandbox could not run the tx at
+    // all (e.g. no runestone) — no traces to surface.
+    if !response.error.is_empty() {
+        if !is_shutdown_requested() {
+            eprintln!(
+                "[mempool] simulatetransaction error for {}: {}",
+                txid,
+                response.error.lines().next().unwrap_or(response.error.as_str())
+            );
+        }
+        return None;
+    }
+
+    let base = shadow_base(tx);
+    let mut traces: Vec<EspoTrace> = Vec::with_capacity(response.protostones.len());
+    for (idx, protostone) in response.protostones.into_iter().enumerate() {
+        // Prefer the vout echoed on the protostone's outpoint; fall back to the
+        // shadow vout the V3/confirmed path uses (outputs + 1 + protostone idx).
+        let vout = protostone
+            .outpoint
+            .as_ref()
+            .map(|o| o.vout)
+            .unwrap_or_else(|| base + idx as u32);
+        let Some(protobuf_trace) = protostone.trace else {
+            continue;
+        };
+        match build_espo_trace(protobuf_trace, txid, tx, vout) {
+            Ok(t) => traces.push(t),
+            Err(e) => {
+                if !is_shutdown_requested() {
+                    eprintln!(
+                        "[mempool] build simulate trace {}@{} failed: {:?}",
+                        txid, vout, e
+                    );
+                }
+            }
+        }
+    }
+
+    if traces.is_empty() { None } else { Some(traces) }
+}
+
+async fn view_traces_for_tx_v3(
     http: &Client,
     view_url: &str,
     txid: &Txid,

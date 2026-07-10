@@ -8781,6 +8781,7 @@ mod tests {
             debug_backup: None,
             safe_tip_hook_script: None,
             block_source_mode: BlockFetchMode::RpcOnly,
+            trace_format: Default::default(),
             compact_tx_trace_rows: true,
             address_index_chunk_size: 512,
             trace_read_workers: 8,
