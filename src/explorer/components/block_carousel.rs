@@ -1,3 +1,4 @@
+use bitcoin::Network;
 use maud::{Markup, PreEscaped, html};
 
 use crate::config::get_config;
@@ -26,7 +27,11 @@ fn block_carousel_inner(
     let ws_path = mempool_cfg.websocket_path.as_deref().unwrap_or("/api/events/ws").to_string();
     let ws_path_js = format!("{:?}", ws_path);
     let ws_enabled_js = mempool_cfg.websocket_enabled;
-    let mempool_slot_count = mempool_cfg.template_blocks.max(1);
+    let mempool_block_interval_secs = if get_config().network == Network::Regtest {
+        mempool_cfg.regtest_block_interval_secs
+    } else {
+        600
+    };
     let selected_mempool_js = selected_mempool_index
         .map(|idx| idx.to_string())
         .unwrap_or_else(|| "null".to_string());
@@ -44,7 +49,7 @@ fn block_carousel_inner(
   const POOL_ICONS = {pool_icons_js};
   const eventsPath = {ws_path_js};
   const eventsEnabled = {ws_enabled_js};
-  const MEMPOOL_SLOT_COUNT = {mempool_slot_count};
+  const MEMPOOL_BLOCK_INTERVAL_SECS = {mempool_block_interval_secs};
   const RUNES_ENABLED = {runes_enabled_js};
   const MEMPOOL_BLOCKS_ENABLED = {mempool_blocks_enabled_js};
   const LIVE_TIP_ANIMATION_ENABLED = MEMPOOL_BLOCKS_ENABLED;
@@ -329,8 +334,12 @@ fn block_carousel_inner(
   function renderMempoolBlock(block) {{
     const href = `${{basePrefix}}/mempool-block/${{block.index + 1}}`;
     const isCurrent = Number(block.index) === selectedMempoolIndex;
-    const etaMinutes = (Number(block.index) + 1) * 10;
-    const etaLabel = isChinese ? `约 ${{etaMinutes}} 分钟后` : `in ~${{etaMinutes}} minutes`;
+    const etaSeconds = (Number(block.index) + 1) * MEMPOOL_BLOCK_INTERVAL_SECS;
+    const useMinutes = etaSeconds % 60 === 0;
+    const etaAmount = useMinutes ? etaSeconds / 60 : etaSeconds;
+    const etaLabel = isChinese
+      ? `约 ${{etaAmount}} ${{useMinutes ? '分钟' : '秒'}}后`
+      : `in ~${{etaAmount}} ${{useMinutes ? (etaAmount === 1 ? 'minute' : 'minutes') : (etaAmount === 1 ? 'second' : 'seconds')}}`;
     return `
       <div class="bc-slide bc-mempool-slide" data-mempool-index="${{block.index}}" data-bc-key="mempool:${{block.index}}">
         <div class="bc-top"></div>
@@ -344,16 +353,6 @@ fn block_carousel_inner(
           ${{isCurrent ? '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>' : ''}}
         </a>
         <div class="bc-pool-slot"></div>
-      </div>
-    `;
-  }}
-
-  function renderMempoolSkeleton(index) {{
-    return `
-      <div class="bc-slide bc-mempool-slide bc-mempool-placeholder" data-mempool-index="${{index}}" data-bc-key="mempool:${{index}}">
-        <div class="bc-top"></div>
-        <div class="bc-card bc-card-skeleton bc-mempool-card" aria-hidden="true"></div>
-        <div class="bc-pool-slot" aria-hidden="true"></div>
       </div>
     `;
   }}
@@ -372,77 +371,19 @@ fn block_carousel_inner(
 
   function render() {{
     blocks.sort((a, b) => b.height - a.height);
-    const mempoolByIndex = new Map(mempoolBlocks.map((block) => [Number(block.index), block]));
+    const populatedMempoolBlocks = mempoolBlocks
+      .filter((block) => Number(block.tx_count) > 0)
+      .sort((a, b) => Number(b.index) - Number(a.index));
     const html = [];
     for (let i = 0; i < pendingLeft + bufferLeft; i++) html.push(renderSkeleton('left', i));
-    if (shouldRenderMempoolSide()) {{
-      for (let i = MEMPOOL_SLOT_COUNT - 1; i >= 0; i--) {{
-        const block = mempoolByIndex.get(i);
-        html.push(block ? renderMempoolBlock(block) : renderMempoolSkeleton(i));
-      }}
+    if (shouldRenderMempoolSide() && populatedMempoolBlocks.length) {{
+      for (const block of populatedMempoolBlocks) html.push(renderMempoolBlock(block));
       html.push(renderBoundary());
     }}
     for (const block of blocks) html.push(renderBlock(block));
     for (let i = 0; i < pendingRight + bufferRight; i++) html.push(renderSkeleton('right', i));
     track.innerHTML = html.join('');
     refreshRelativeTimes();
-  }}
-
-  function htmlToElement(markup) {{
-    const template = document.createElement('template');
-    template.innerHTML = markup.trim();
-    return template.content.firstElementChild;
-  }}
-
-  function syncAttributes(target, source) {{
-    Array.from(target.attributes).forEach((attr) => {{
-      if (!source.hasAttribute(attr.name)) target.removeAttribute(attr.name);
-    }});
-    Array.from(source.attributes).forEach((attr) => {{
-      if (target.getAttribute(attr.name) !== attr.value) {{
-        target.setAttribute(attr.name, attr.value);
-      }}
-    }});
-  }}
-
-  function updateMempoolSlide(existing, next) {{
-    if (!existing || !next) return false;
-    syncAttributes(existing, next);
-    existing.className = next.className;
-
-    const existingTop = existing.querySelector('.bc-top');
-    const nextTop = next.querySelector('.bc-top');
-    if (existingTop && nextTop) existingTop.innerHTML = nextTop.innerHTML;
-
-    const existingPool = existing.querySelector('.bc-pool-slot');
-    const nextPool = next.querySelector('.bc-pool-slot');
-    if (existingPool && nextPool) existingPool.innerHTML = nextPool.innerHTML;
-
-    const existingCard = existing.querySelector('.bc-card');
-    const nextCard = next.querySelector('.bc-card');
-    if (!existingCard || !nextCard || existingCard.tagName !== nextCard.tagName) {{
-      existing.replaceWith(next);
-      return false;
-    }}
-
-    syncAttributes(existingCard, nextCard);
-    existingCard.className = nextCard.className;
-
-    const existingFace = existingCard.querySelector('.bc-face');
-    const nextFace = nextCard.querySelector('.bc-face');
-    if (existingFace && nextFace) {{
-      existingFace.innerHTML = nextFace.innerHTML;
-      refreshRelativeTimes();
-    }} else {{
-      existingCard.innerHTML = nextCard.innerHTML;
-      refreshRelativeTimes();
-      return true;
-    }}
-
-    existingCard.querySelectorAll('.bc-indicator').forEach((indicator) => indicator.remove());
-    const nextIndicator = nextCard.querySelector('.bc-indicator');
-    if (nextIndicator) existingCard.appendChild(nextIndicator.cloneNode(true));
-    return true;
   }}
 
   function captureCarouselPositions() {{
@@ -514,19 +455,7 @@ fn block_carousel_inner(
   }}
 
   function renderMempoolUpdate() {{
-    const mempoolByIndex = new Map(mempoolBlocks.map((block) => [Number(block.index), block]));
-    for (let i = MEMPOOL_SLOT_COUNT - 1; i >= 0; i--) {{
-      const key = `mempool:${{i}}`;
-      const existing = track.querySelector(`[data-bc-key="${{key}}"]`);
-      const block = mempoolByIndex.get(i);
-      const next = htmlToElement(block ? renderMempoolBlock(block) : renderMempoolSkeleton(i));
-      if (!existing) {{
-        const boundary = track.querySelector('[data-bc-boundary]');
-        if (boundary) track.insertBefore(next, boundary);
-        continue;
-      }}
-      updateMempoolSlide(existing, next);
-    }}
+    renderPreservingAnchor(`[data-height="${{selectedHeight}}"]`);
     updateResetButton();
     queueEdgeCheck();
   }}
@@ -1288,7 +1217,7 @@ fn block_carousel_inner(
         base_path_js = base_path_js,
         pool_icons_js = pool_icons_js,
         ws_path_js = ws_path_js,
-        mempool_slot_count = mempool_slot_count,
+        mempool_block_interval_secs = mempool_block_interval_secs,
         selected_mempool_js = selected_mempool_js,
         is_chinese = is_chinese,
         runes_enabled_js = runes_enabled_js,

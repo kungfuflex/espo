@@ -31,6 +31,7 @@ impl TestConfigBuilder {
             bitcoind_rpc_url: "http://127.0.0.1:8332".to_string(),  // Placeholder
             bitcoind_rpc_user: "test".to_string(),
             bitcoind_rpc_pass: "test".to_string(),
+            b8_faucet_url: None,
             bitcoind_blocks_dir: "/tmp".to_string(), // Placeholder
             reset_mempool_on_startup: false,
             rollback: None,

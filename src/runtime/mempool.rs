@@ -1064,28 +1064,6 @@ fn block_summary(template: &MempoolBlockTemplate) -> MempoolBlockSummary {
     }
 }
 
-fn empty_mempool_block_template() -> MempoolBlockTemplate {
-    MempoolBlockTemplate {
-        index: 0,
-        tx_count: 0,
-        trace_count: 0,
-        weight: 0,
-        vsize: 0,
-        total_fees: 0,
-        median_fee_rate: Some(0.0),
-        min_fee_rate: Some(0.0),
-        max_fee_rate: Some(0.0),
-        fee_range: Vec::new(),
-        transaction_ids: Vec::new(),
-    }
-}
-
-fn ensure_empty_mempool_block_template(templates: &mut Vec<MempoolBlockTemplate>) {
-    if templates.is_empty() {
-        templates.push(empty_mempool_block_template());
-    }
-}
-
 fn compact_snapshot_from_state(
     state: &InMemoryMempool,
     include_deltas: bool,
@@ -2530,7 +2508,7 @@ fn recalculate_memory_templates() {
         rune_io: Option<TxRuneIo>,
     }
 
-    let mut templates = Vec::with_capacity(template_txids.len().max(1));
+    let mut templates = Vec::with_capacity(template_txids.len());
     let mut tx_updates: HashMap<Txid, TemplateTxUpdate> = HashMap::new();
     for (index, txids) in template_txids.iter().enumerate() {
         let package_rates =
@@ -2611,8 +2589,6 @@ fn recalculate_memory_templates() {
             transaction_ids: txids.iter().map(ToString::to_string).collect(),
         });
     }
-    ensure_empty_mempool_block_template(&mut templates);
-
     let Ok(mut state) = mempool_state().write() else { return };
     let previous_templates = state.templates.clone();
     let templates_changed = previous_templates != templates;
@@ -3324,19 +3300,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_mempool_template_has_zero_fee_rates() {
-        let mut templates = Vec::new();
+    fn calculate_block_templates_returns_no_blocks_for_empty_mempool() {
+        let txs = HashMap::new();
 
-        ensure_empty_mempool_block_template(&mut templates);
+        let (blocks, rates) = calculate_block_templates(&txs, 8, 1_000_000);
 
-        assert_eq!(templates.len(), 1);
-        assert_eq!(templates[0].index, 0);
-        assert_eq!(templates[0].tx_count, 0);
-        assert_eq!(templates[0].trace_count, 0);
-        assert_eq!(templates[0].median_fee_rate, Some(0.0));
-        assert_eq!(templates[0].min_fee_rate, Some(0.0));
-        assert_eq!(templates[0].max_fee_rate, Some(0.0));
-        assert!(templates[0].transaction_ids.is_empty());
+        assert!(blocks.is_empty());
+        assert!(rates.is_empty());
     }
 
     #[test]

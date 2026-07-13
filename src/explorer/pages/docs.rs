@@ -1806,6 +1806,39 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
         ),
         http_doc(
             "GET",
+            "/api/faucet/status",
+            "Returns B8 faucet availability, payout amount, rolling 24-hour usage, and configured caps when the regtest faucet is enabled.",
+            json!({}),
+            json!({
+                "id": 1,
+                "jsonrpc": "2.0",
+                "result": {
+                    "amount": 1.0,
+                    "claims_last_24h": 2,
+                    "enabled": true,
+                    "max_per_address_per_day": 10.0,
+                    "max_per_day": 500.0,
+                    "max_per_ip_per_day": 10.0,
+                    "sent_last_24h": 2.0
+                }
+            }),
+        ),
+        http_doc(
+            "POST",
+            "/api/faucet/send",
+            "Requests the configured B8 faucet payout for one regtest address. Available only on regtest when b8_faucet_url is configured.",
+            json!({ "address": "bcrt1q..." }),
+            json!({
+                "id": 1,
+                "jsonrpc": "2.0",
+                "result": {
+                    "amount": 1.0,
+                    "txid": "7be14a09c9..."
+                }
+            }),
+        ),
+        http_doc(
+            "GET",
             "/api/search/guess?q=2%3A0",
             "Returns search suggestions and target type guesses.",
             json!({}),

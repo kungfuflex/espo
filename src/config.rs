@@ -169,6 +169,10 @@ fn default_mempool_block_weight_units() -> u64 {
     4_000_000
 }
 
+fn default_regtest_block_interval_secs() -> u64 {
+    600
+}
+
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
@@ -336,6 +340,8 @@ pub struct MempoolConfig {
     pub template_blocks: usize,
     #[serde(default = "default_mempool_block_weight_units")]
     pub block_weight_units: u64,
+    #[serde(default = "default_regtest_block_interval_secs")]
+    pub regtest_block_interval_secs: u64,
     #[serde(default)]
     pub zmq_rawtx_url: Option<String>,
     #[serde(default)]
@@ -359,6 +365,7 @@ impl Default for MempoolConfig {
             max_txs: default_mempool_max_txs(),
             template_blocks: default_mempool_template_blocks(),
             block_weight_units: default_mempool_block_weight_units(),
+            regtest_block_interval_secs: default_regtest_block_interval_secs(),
             zmq_rawtx_url: None,
             zmq_sequence_url: None,
             websocket_enabled: false,
@@ -418,6 +425,8 @@ pub struct ConfigFile {
     pub bitcoind_rpc_user: String,
     #[serde(default)]
     pub bitcoind_rpc_pass: String,
+    #[serde(default)]
+    pub b8_faucet_url: Option<String>,
     #[serde(default = "default_bitcoind_blocks_dir")]
     pub bitcoind_blocks_dir: String,
     #[serde(default)]
@@ -489,6 +498,7 @@ pub struct AppConfig {
     pub bitcoind_rpc_url: String,
     pub bitcoind_rpc_user: String,
     pub bitcoind_rpc_pass: String,
+    pub b8_faucet_url: Option<String>,
     pub bitcoind_blocks_dir: String,
     pub reset_mempool_on_startup: bool,
     pub rollback: Option<u32>,
@@ -569,6 +579,7 @@ impl AppConfig {
             bitcoind_rpc_url: file.bitcoind_rpc_url,
             bitcoind_rpc_user: file.bitcoind_rpc_user,
             bitcoind_rpc_pass: file.bitcoind_rpc_pass,
+            b8_faucet_url: normalize_optional_string(file.b8_faucet_url),
             bitcoind_blocks_dir: file.bitcoind_blocks_dir,
             reset_mempool_on_startup: file.reset_mempool_on_startup,
             rollback: file.rollback,
@@ -671,6 +682,9 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
     }
     if cfg.trace_read_workers == 0 {
         anyhow::bail!("trace_read_workers must be greater than 0");
+    }
+    if cfg.mempool.regtest_block_interval_secs == 0 {
+        anyhow::bail!("mempool.regtest_block_interval_secs must be greater than 0");
     }
 
     cfg.explorer_base_path = normalize_explorer_base_path(&cfg.explorer_base_path)?;

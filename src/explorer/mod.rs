@@ -1,6 +1,7 @@
 mod api;
 pub mod components;
 pub mod consts;
+mod faucet;
 pub mod i18n;
 pub mod mining_pools;
 mod pages;
@@ -28,6 +29,7 @@ use pages::alkane::alkane_page;
 use pages::alkanes::alkanes_page;
 use pages::block::{block_page, mempool_block_page};
 use pages::docs::docs_page;
+use pages::faucet::faucet_page;
 use pages::home::home_page;
 use pages::rune::{rune_icon_asset, rune_page};
 use pages::runes::runes_page;
@@ -41,6 +43,7 @@ use crate::config::{
 };
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use components::layout::{favicon, style, waves_light};
+use faucet::{faucet_enabled, faucet_send, faucet_status};
 use paths::with_language;
 
 pub fn explorer_router(state: ExplorerState) -> Router {
@@ -58,6 +61,9 @@ pub fn explorer_router(state: ExplorerState) -> Router {
     if runes_enabled {
         pages = pages.route("/rune/{rune}", get(rune_page)).route("/runes", get(runes_page));
     }
+    if faucet_enabled() {
+        pages = pages.route("/faucet", get(faucet_page));
+    }
 
     let mut api = Router::new()
         .route("/api/blocks/carousel", get(carousel_blocks))
@@ -72,6 +78,11 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/api/address/chart", get(address_chart));
     if runes_enabled {
         api = api.route("/api/rune/holders/export", get(rune_holders_export));
+    }
+    if faucet_enabled() {
+        api = api
+            .route("/api/faucet/status", get(faucet_status))
+            .route("/api/faucet/send", post(faucet_send));
     }
     let mempool_cfg = &get_config().mempool;
     if mempool_cfg.websocket_enabled {
@@ -119,7 +130,7 @@ pub async fn run_explorer(addr: SocketAddr) -> anyhow::Result<()> {
         Router::new().nest(base_path, explorer_router(state))
     };
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -159,6 +170,10 @@ async fn sitemap_xml() -> impl IntoResponse {
     if runes_enabled_from_global_config() {
         paths.push("/runes".to_string());
         paths.push("/zh/runes".to_string());
+    }
+    if faucet_enabled() {
+        paths.push("/faucet".to_string());
+        paths.push("/zh/faucet".to_string());
     }
     for height in (latest_start..=tip).rev() {
         paths.push(format!("/block/{height}"));

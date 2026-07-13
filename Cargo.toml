@@ -67,8 +67,8 @@ protorune = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-al
 
 # Optional dependencies for test utilities
 alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", tag = "v2.2.1-alpha.1", optional = true }
-metashrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
-rockshrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
+metashrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "50b4c70ac0705838cd7dbfa1058c9cbb584e3b3a", optional = true }
+rockshrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "50b4c70ac0705838cd7dbfa1058c9cbb584e3b3a", optional = true }
 wasmtime = { version = "18.0", features = ["async"], optional = true }
 
 [dev-dependencies]
