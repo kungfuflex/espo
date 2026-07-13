@@ -1268,6 +1268,7 @@ a:hover {
 .faucet-limit {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 5px;
   margin: -2px 0 2px;
   color: var(--muted);
