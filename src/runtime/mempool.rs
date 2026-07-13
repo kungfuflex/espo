@@ -1064,6 +1064,28 @@ fn block_summary(template: &MempoolBlockTemplate) -> MempoolBlockSummary {
     }
 }
 
+fn empty_mempool_block_template() -> MempoolBlockTemplate {
+    MempoolBlockTemplate {
+        index: 0,
+        tx_count: 0,
+        trace_count: 0,
+        weight: 0,
+        vsize: 0,
+        total_fees: 0,
+        median_fee_rate: Some(0.0),
+        min_fee_rate: Some(0.0),
+        max_fee_rate: Some(0.0),
+        fee_range: Vec::new(),
+        transaction_ids: Vec::new(),
+    }
+}
+
+fn ensure_empty_mempool_block_template(templates: &mut Vec<MempoolBlockTemplate>) {
+    if templates.is_empty() {
+        templates.push(empty_mempool_block_template());
+    }
+}
+
 fn compact_snapshot_from_state(
     state: &InMemoryMempool,
     include_deltas: bool,
@@ -2508,7 +2530,7 @@ fn recalculate_memory_templates() {
         rune_io: Option<TxRuneIo>,
     }
 
-    let mut templates = Vec::with_capacity(template_txids.len());
+    let mut templates = Vec::with_capacity(template_txids.len().max(1));
     let mut tx_updates: HashMap<Txid, TemplateTxUpdate> = HashMap::new();
     for (index, txids) in template_txids.iter().enumerate() {
         let package_rates =
@@ -2589,6 +2611,7 @@ fn recalculate_memory_templates() {
             transaction_ids: txids.iter().map(ToString::to_string).collect(),
         });
     }
+    ensure_empty_mempool_block_template(&mut templates);
 
     let Ok(mut state) = mempool_state().write() else { return };
     let previous_templates = state.templates.clone();
@@ -3269,6 +3292,65 @@ mod tests {
             from: None,
             protocol_tag: 1,
         }
+    }
+
+    fn mempool_transaction(seed: u8, vsize: u64, fee_sat: u64) -> (Txid, MempoolTransactionStruct) {
+        let txid = Txid::from_byte_array([seed; 32]);
+        (
+            txid,
+            MempoolTransactionStruct {
+                txid,
+                tx: None,
+                protostones: Vec::new(),
+                fixed_trace: None,
+                fixed_trace_context: None,
+                diesel_trace: None,
+                rune_io: None,
+                first_seen: 0,
+                fee_sat,
+                weight: vsize.saturating_mul(4),
+                vsize,
+                fee_rate: fee_sat as f64 / vsize.max(1) as f64,
+                inputs: Vec::new(),
+                spent_outpoints: Vec::new(),
+                addresses: Vec::new(),
+                is_diesel_mint: false,
+                is_ug_mint: false,
+                template_index: None,
+                position: None,
+                readiness: MempoolTxReadiness::MetadataOnly,
+            },
+        )
+    }
+
+    #[test]
+    fn empty_mempool_template_has_zero_fee_rates() {
+        let mut templates = Vec::new();
+
+        ensure_empty_mempool_block_template(&mut templates);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].index, 0);
+        assert_eq!(templates[0].tx_count, 0);
+        assert_eq!(templates[0].trace_count, 0);
+        assert_eq!(templates[0].median_fee_rate, Some(0.0));
+        assert_eq!(templates[0].min_fee_rate, Some(0.0));
+        assert_eq!(templates[0].max_fee_rate, Some(0.0));
+        assert!(templates[0].transaction_ids.is_empty());
+    }
+
+    #[test]
+    fn calculate_block_templates_returns_only_populated_blocks_needed() {
+        let txs: HashMap<_, _> = [1, 2, 3]
+            .into_iter()
+            .map(|seed| mempool_transaction(seed, 100_000, 100_000))
+            .collect();
+
+        let (blocks, _) = calculate_block_templates(&txs, 8, 1_000_000);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.iter().map(Vec::len).sum::<usize>(), 3);
+        assert!(blocks.iter().all(|block| !block.is_empty()));
     }
 
     #[test]
