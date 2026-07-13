@@ -371,13 +371,12 @@ fn block_carousel_inner(
 
   function render() {{
     blocks.sort((a, b) => b.height - a.height);
-    const populatedMempoolBlocks = mempoolBlocks
-      .filter((block) => Number(block.tx_count) > 0)
+    const renderedMempoolBlocks = [...mempoolBlocks]
       .sort((a, b) => Number(b.index) - Number(a.index));
     const html = [];
     for (let i = 0; i < pendingLeft + bufferLeft; i++) html.push(renderSkeleton('left', i));
-    if (shouldRenderMempoolSide() && populatedMempoolBlocks.length) {{
-      for (const block of populatedMempoolBlocks) html.push(renderMempoolBlock(block));
+    if (shouldRenderMempoolSide() && renderedMempoolBlocks.length) {{
+      for (const block of renderedMempoolBlocks) html.push(renderMempoolBlock(block));
       html.push(renderBoundary());
     }}
     for (const block of blocks) html.push(renderBlock(block));

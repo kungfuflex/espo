@@ -2,6 +2,7 @@ use axum::response::Html;
 use maud::{PreEscaped, html};
 
 use crate::explorer::components::layout::layout_with_meta;
+use crate::explorer::components::svg_assets::icon_testnet;
 use crate::explorer::paths::explorer_path;
 
 pub async fn faucet_page() -> Html<String> {
@@ -19,10 +20,7 @@ pub async fn faucet_page() -> Html<String> {
   const amountInput = form.querySelector('[data-faucet-amount]');
   const submitButton = form.querySelector('[data-faucet-submit]');
   const message = form.querySelector('[data-faucet-message]');
-  const limits = form.querySelector('[data-faucet-limits]');
-  const claims = form.querySelector('[data-faucet-claims]');
-  const sent = form.querySelector('[data-faucet-sent]');
-  const addressLimit = form.querySelector('[data-faucet-address-limit]');
+  const limit = form.querySelector('[data-faucet-limit]');
   const ipLimit = form.querySelector('[data-faucet-ip-limit]');
 
   const statusUrl = {status_url_js};
@@ -58,13 +56,10 @@ pub async fn faucet_page() -> Html<String> {
       const status = data.result;
       faucetEnabled = status.enabled === true;
       amountInput.value = number(status.amount);
-      claims.textContent = number(status.claims_last_24h);
-      sent.textContent = `${{number(status.sent_last_24h)}} / ${{number(status.max_per_day)}} rBTC`;
-      addressLimit.textContent = `${{number(status.max_per_address_per_day)}} rBTC`;
-      ipLimit.textContent = `${{number(status.max_per_ip_per_day)}} rBTC`;
-      limits.hidden = false;
+      ipLimit.textContent = number(status.max_per_ip_per_day);
+      limit.hidden = false;
       submitButton.disabled = !faucetEnabled;
-      setMessage(faucetEnabled ? 'Faucet available' : 'Faucet disabled', faucetEnabled ? 'success' : 'warning');
+      setMessage(faucetEnabled ? '' : 'Faucet disabled', faucetEnabled ? '' : 'warning');
     }} catch (error) {{
       faucetEnabled = false;
       submitButton.disabled = true;
@@ -77,7 +72,7 @@ pub async fn faucet_page() -> Html<String> {
     if (!faucetEnabled || !form.reportValidity()) return;
 
     submitButton.disabled = true;
-    setMessage('Sending rBTC...');
+    setMessage('Sending funds...');
     try {{
       const response = await fetch(sendUrl, {{
         method: 'POST',
@@ -94,7 +89,7 @@ pub async fn faucet_page() -> Html<String> {
       await loadStatus();
       message.textContent = '';
       message.dataset.tone = 'success';
-      message.append(document.createTextNode(`${{number(result.amount)}} rBTC sent · `));
+      message.append(document.createTextNode(`${{number(result.amount)}} sent · `));
       const link = document.createElement('a');
       link.href = `${{txPrefix}}${{encodeURIComponent(result.txid)}}`;
       link.textContent = result.txid;
@@ -148,20 +143,20 @@ pub async fn faucet_page() -> Html<String> {
                             readonly
                             aria-readonly="true"
                             data-faucet-amount="";
-                        span class="faucet-currency" { "rBTC" }
+                        span class="faucet-currency" aria-hidden="true" { (icon_testnet()) }
+                    }
+
+                    p class="faucet-limit" hidden data-faucet-limit="" {
+                        "Limit: "
+                        span data-faucet-ip-limit="" {}
+                        span class="faucet-limit-icon" aria-hidden="true" { (icon_testnet()) }
+                        " per day"
                     }
 
                     button class="faucet-submit" type="submit" disabled data-faucet-submit="" {
-                        "Request rBTC"
+                        "Request funds"
                     }
                     p class="faucet-message" role="status" aria-live="polite" data-faucet-message="" {}
-
-                    dl class="faucet-limits" hidden data-faucet-limits="" {
-                        div { dt { "Claims (24h)" } dd data-faucet-claims="" {} }
-                        div { dt { "Sent / daily cap" } dd data-faucet-sent="" {} }
-                        div { dt { "Address cap" } dd data-faucet-address-limit="" {} }
-                        div { dt { "IP cap" } dd data-faucet-ip-limit="" {} }
-                    }
                 }
             }
             (script)

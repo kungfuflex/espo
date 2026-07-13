@@ -1248,7 +1248,7 @@ a:hover {
   position: relative;
 }
 .faucet-amount-input {
-  padding-right: 68px;
+  padding-right: 52px;
   color: var(--muted);
 }
 .faucet-currency {
@@ -1256,9 +1256,30 @@ a:hover {
   top: 50%;
   right: 12px;
   transform: translateY(-50%);
-  color: var(--text);
-  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
   pointer-events: none;
+}
+.faucet-currency .network-svg,
+.faucet-limit-icon .network-svg {
+  width: 20px;
+  height: 20px;
+}
+.faucet-limit {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: -2px 0 2px;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+}
+.faucet-limit[hidden] {
+  display: none;
+}
+.faucet-limit-icon {
+  display: inline-flex;
+  align-items: center;
 }
 .faucet-submit {
   align-self: flex-start;
@@ -1287,37 +1308,9 @@ a:hover {
 .faucet-message a {
   color: inherit;
 }
-.faucet-limits {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px 20px;
-  margin: 6px 0 0;
-  padding-top: 16px;
-  border-top: 1px solid var(--panel2);
-}
-.faucet-limits[hidden] {
-  display: none;
-}
-.faucet-limits div {
-  min-width: 0;
-}
-.faucet-limits dt {
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 600;
-}
-.faucet-limits dd {
-  margin: 2px 0 0;
-  color: var(--text);
-  font-weight: 600;
-  overflow-wrap: anywhere;
-}
 @media (max-width: 520px) {
   .faucet-tool {
     padding: 16px;
-  }
-  .faucet-limits {
-    grid-template-columns: 1fr;
   }
   .faucet-submit {
     width: 100%;

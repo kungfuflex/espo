@@ -1064,6 +1064,25 @@ fn block_summary(template: &MempoolBlockTemplate) -> MempoolBlockSummary {
     }
 }
 
+fn ensure_regtest_mempool_template(templates: &mut Vec<MempoolBlockTemplate>, network: Network) {
+    if network != Network::Regtest || !templates.is_empty() {
+        return;
+    }
+    templates.push(MempoolBlockTemplate {
+        index: 0,
+        tx_count: 0,
+        trace_count: 0,
+        weight: 0,
+        vsize: 0,
+        total_fees: 0,
+        median_fee_rate: Some(0.0),
+        min_fee_rate: Some(0.0),
+        max_fee_rate: Some(0.0),
+        fee_range: Vec::new(),
+        transaction_ids: Vec::new(),
+    });
+}
+
 fn compact_snapshot_from_state(
     state: &InMemoryMempool,
     include_deltas: bool,
@@ -2589,6 +2608,7 @@ fn recalculate_memory_templates() {
             transaction_ids: txids.iter().map(ToString::to_string).collect(),
         });
     }
+    ensure_regtest_mempool_template(&mut templates, get_network());
     let Ok(mut state) = mempool_state().write() else { return };
     let previous_templates = state.templates.clone();
     let templates_changed = previous_templates != templates;
@@ -3307,6 +3327,27 @@ mod tests {
 
         assert!(blocks.is_empty());
         assert!(rates.is_empty());
+    }
+
+    #[test]
+    fn regtest_keeps_one_empty_mempool_template() {
+        let mut templates = Vec::new();
+
+        ensure_regtest_mempool_template(&mut templates, Network::Regtest);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].index, 0);
+        assert_eq!(templates[0].tx_count, 0);
+        assert!(templates[0].transaction_ids.is_empty());
+    }
+
+    #[test]
+    fn mainnet_does_not_add_empty_mempool_template() {
+        let mut templates = Vec::new();
+
+        ensure_regtest_mempool_template(&mut templates, Network::Bitcoin);
+
+        assert!(templates.is_empty());
     }
 
     #[test]
