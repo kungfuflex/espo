@@ -1218,6 +1218,29 @@ a:hover {
   border-radius: 8px;
   background: var(--panel);
 }
+.faucet-available {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 16px;
+  font-weight: 600;
+}
+.faucet-available[hidden] {
+  display: none;
+}
+.faucet-available strong {
+  color: var(--text);
+}
+.faucet-available-icon {
+  display: inline-flex;
+  align-items: center;
+}
+.faucet-available-icon .network-svg {
+  width: 20px;
+  height: 20px;
+}
 .faucet-form {
   display: flex;
   flex-direction: column;
@@ -1270,7 +1293,7 @@ a:hover {
   align-items: center;
   justify-content: flex-end;
   gap: 5px;
-  margin: -2px 0 2px;
+  margin-top: 10px;
   color: var(--muted);
   font-size: 14px;
   font-weight: 600;

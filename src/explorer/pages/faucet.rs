@@ -20,6 +20,8 @@ pub async fn faucet_page() -> Html<String> {
   const amountInput = form.querySelector('[data-faucet-amount]');
   const submitButton = form.querySelector('[data-faucet-submit]');
   const message = form.querySelector('[data-faucet-message]');
+  const available = document.querySelector('[data-faucet-available]');
+  const availableAmount = available.querySelector('[data-faucet-available-amount]');
   const limit = form.querySelector('[data-faucet-limit]');
   const ipLimit = form.querySelector('[data-faucet-ip-limit]');
 
@@ -56,6 +58,9 @@ pub async fn faucet_page() -> Html<String> {
       const status = data.result;
       faucetEnabled = status.enabled === true;
       amountInput.value = number(status.amount);
+      const totalAvailable = Number(status.total_available);
+      available.hidden = !Number.isFinite(totalAvailable);
+      availableAmount.textContent = number(totalAvailable);
       ipLimit.textContent = number(status.max_per_ip_per_day);
       limit.hidden = false;
       submitButton.disabled = !faucetEnabled;
@@ -118,6 +123,11 @@ pub async fn faucet_page() -> Html<String> {
         html! {
             div class="row" {
                 h1 class="h1" { "Regtest Faucet" }
+            }
+            p class="faucet-available" hidden data-faucet-available="" {
+                "Available: "
+                strong data-faucet-available-amount="" {}
+                span class="faucet-available-icon" aria-hidden="true" { (icon_testnet()) }
             }
             section class="faucet-tool" {
                 form class="faucet-form" data-faucet-form="" {

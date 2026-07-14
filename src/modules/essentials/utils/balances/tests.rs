@@ -20,6 +20,7 @@ fn init_test_config_from_run_sh() {
         bitcoind_rpc_user: "admin".to_string(),
         bitcoind_rpc_pass: "admin".to_string(),
         b8_faucet_url: None,
+        hosts: Default::default(),
         bitcoind_blocks_dir: "~/.bitcoin/blocks".to_string(),
         reset_mempool_on_startup: true,
         rollback: None,

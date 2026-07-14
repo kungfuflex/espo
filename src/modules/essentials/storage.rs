@@ -8761,6 +8761,7 @@ mod tests {
             bitcoind_rpc_user: "test".to_string(),
             bitcoind_rpc_pass: "test".to_string(),
             b8_faucet_url: None,
+            hosts: Default::default(),
             bitcoind_blocks_dir: "/tmp".to_string(),
             reset_mempool_on_startup: false,
             rollback: None,

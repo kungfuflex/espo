@@ -216,6 +216,64 @@ impl ExplorerNetworks {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HostsConfig {
+    #[serde(default)]
+    pub explorer_host: Option<String>,
+    #[serde(default)]
+    pub rpc_host: Option<String>,
+    #[serde(default)]
+    pub oyl_api_host: Option<String>,
+}
+
+impl HostsConfig {
+    fn normalized(self) -> Self {
+        Self {
+            explorer_host: normalize_optional_string(self.explorer_host),
+            rpc_host: normalize_optional_string(self.rpc_host),
+            oyl_api_host: normalize_optional_string(self.oyl_api_host),
+        }
+    }
+}
+
+#[cfg(test)]
+mod hosts_config_tests {
+    use super::{ConfigFile, HostsConfig};
+
+    #[test]
+    fn hosts_object_and_fields_are_optional() {
+        let file: ConfigFile = serde_json::from_value(serde_json::json!({
+            "readonly_metashrew_db_dir": "/tmp/metashrew",
+            "metashrew_rpc_url": "http://127.0.0.1:7145",
+            "bitcoind_rpc_url": "http://127.0.0.1:8332"
+        }))
+        .unwrap();
+        let hosts: HostsConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+
+        assert!(file.hosts.explorer_host.is_none());
+        assert!(file.hosts.rpc_host.is_none());
+        assert!(file.hosts.oyl_api_host.is_none());
+        assert!(hosts.explorer_host.is_none());
+        assert!(hosts.rpc_host.is_none());
+        assert!(hosts.oyl_api_host.is_none());
+    }
+
+    #[test]
+    fn hosts_are_trimmed_and_blank_values_are_ignored() {
+        let hosts = serde_json::from_value::<HostsConfig>(serde_json::json!({
+            "explorer_host": " https://explorer.example.com ",
+            "rpc_host": "   ",
+            "oyl_api_host": "https://oyl.example.com"
+        }))
+        .unwrap()
+        .normalized();
+
+        assert_eq!(hosts.explorer_host.as_deref(), Some("https://explorer.example.com"));
+        assert!(hosts.rpc_host.is_none());
+        assert_eq!(hosts.oyl_api_host.as_deref(), Some("https://oyl.example.com"));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DebugBackupConfig {
     pub blocks: Vec<u32>,
@@ -427,6 +485,8 @@ pub struct ConfigFile {
     pub bitcoind_rpc_pass: String,
     #[serde(default)]
     pub b8_faucet_url: Option<String>,
+    #[serde(default)]
+    pub hosts: HostsConfig,
     #[serde(default = "default_bitcoind_blocks_dir")]
     pub bitcoind_blocks_dir: String,
     #[serde(default)]
@@ -499,6 +559,7 @@ pub struct AppConfig {
     pub bitcoind_rpc_user: String,
     pub bitcoind_rpc_pass: String,
     pub b8_faucet_url: Option<String>,
+    pub hosts: HostsConfig,
     pub bitcoind_blocks_dir: String,
     pub reset_mempool_on_startup: bool,
     pub rollback: Option<u32>,
@@ -580,6 +641,7 @@ impl AppConfig {
             bitcoind_rpc_user: file.bitcoind_rpc_user,
             bitcoind_rpc_pass: file.bitcoind_rpc_pass,
             b8_faucet_url: normalize_optional_string(file.b8_faucet_url),
+            hosts: file.hosts.normalized(),
             bitcoind_blocks_dir: file.bitcoind_blocks_dir,
             reset_mempool_on_startup: file.reset_mempool_on_startup,
             rollback: file.rollback,

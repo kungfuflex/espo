@@ -122,6 +122,7 @@ const EN_TO_ZH: &[(&str, &str)] = &[
     ("Regtest Faucet", "回归测试网水龙头"),
     ("Regtest address", "回归测试网地址"),
     ("Amount per claim", "每次领取金额"),
+    ("Available: ", "可用余额："),
     ("Request funds", "领取资金"),
     ("Limit: ", "限额："),
     (" per day", " 每日"),

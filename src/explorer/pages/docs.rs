@@ -2,11 +2,29 @@ use axum::response::Html;
 use maud::{Markup, PreEscaped, html};
 use serde_json::json;
 
+use crate::config::get_config;
 use crate::explorer::components::header::{HeaderProps, header};
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::tx_view::json_viewer;
 
 const HTTP_BASE: &str = "https://api.alkanode.com";
+
+fn docs_host(configured: Option<&str>) -> &str {
+    configured.unwrap_or(HTTP_BASE).trim_end_matches('/')
+}
+
+fn docs_endpoint(host: Option<&str>, path: &str) -> String {
+    format!("{}{}", docs_host(host), path)
+}
+
+fn rpc_docs_endpoint() -> String {
+    rpc_endpoint(get_config().hosts.rpc_host.as_deref())
+}
+
+fn rpc_endpoint(configured: Option<&str>) -> String {
+    let host = docs_host(configured);
+    if host.ends_with("/rpc") { host.to_string() } else { format!("{host}/rpc") }
+}
 
 struct ModuleDoc {
     slug: &'static str,
@@ -1460,7 +1478,7 @@ fn rpc_doc(
         badge: "JSON-RPC".to_string(),
         transport: "JSON-RPC",
         description,
-        query_prefix: Some(format!("POST {HTTP_BASE}/rpc")),
+        query_prefix: Some(format!("POST {}", rpc_docs_endpoint())),
         query_fallback: pretty(&request),
         query_json: Some(request),
         response_fallback: pretty(&response),
@@ -1475,7 +1493,42 @@ fn http_doc(
     body: serde_json::Value,
     response: serde_json::Value,
 ) -> MethodDoc {
-    let endpoint = format!("{HTTP_BASE}{path}");
+    http_doc_for_host(
+        get_config().hosts.oyl_api_host.as_deref(),
+        http_method,
+        path,
+        description,
+        body,
+        response,
+    )
+}
+
+fn explorer_http_doc(
+    http_method: &'static str,
+    path: &'static str,
+    description: &'static str,
+    body: serde_json::Value,
+    response: serde_json::Value,
+) -> MethodDoc {
+    http_doc_for_host(
+        get_config().hosts.explorer_host.as_deref(),
+        http_method,
+        path,
+        description,
+        body,
+        response,
+    )
+}
+
+fn http_doc_for_host(
+    host: Option<&str>,
+    http_method: &'static str,
+    path: &'static str,
+    description: &'static str,
+    body: serde_json::Value,
+    response: serde_json::Value,
+) -> MethodDoc {
+    let endpoint = docs_endpoint(host, path);
     let query =
         if http_method == "GET" { format!("{http_method} {endpoint}") } else { pretty(&body) };
     MethodDoc {
@@ -1502,7 +1555,7 @@ fn ws_doc(
     payload: serde_json::Value,
     response: serde_json::Value,
 ) -> MethodDoc {
-    let endpoint = format!("{HTTP_BASE}{path}");
+    let endpoint = docs_endpoint(get_config().hosts.explorer_host.as_deref(), path);
     MethodDoc {
         anchor: anchor_for(path),
         title: path.to_string(),
@@ -1754,6 +1807,7 @@ fn oyl_http_docs() -> Vec<MethodDoc> {
 }
 
 fn explorer_http_docs() -> Vec<MethodDoc> {
+    let http_doc = explorer_http_doc;
     vec![
         http_doc(
             "GET",
@@ -1807,7 +1861,7 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
         http_doc(
             "GET",
             "/api/faucet/status",
-            "Returns B8 faucet availability, payout amount, rolling 24-hour usage, and configured caps when the regtest faucet is enabled.",
+            "Returns the B8 faucet's spendable balance, availability, payout amount, rolling 24-hour usage, and configured caps when the regtest faucet is enabled.",
             json!({}),
             json!({
                 "id": 1,
@@ -1816,6 +1870,7 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
                     "amount": 1.0,
                     "claims_last_24h": 2,
                     "enabled": true,
+                    "total_available": 149.5,
                     "max_per_address_per_day": 10.0,
                     "max_per_day": 500.0,
                     "max_per_ip_per_day": 10.0,
@@ -1911,6 +1966,33 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
 
 fn pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HTTP_BASE, docs_endpoint, rpc_endpoint};
+
+    #[test]
+    fn documentation_endpoints_use_configured_hosts_without_double_slashes() {
+        assert_eq!(
+            docs_endpoint(Some("https://explorer.example.com/"), "/api/blocks"),
+            "https://explorer.example.com/api/blocks"
+        );
+        assert_eq!(
+            docs_endpoint(Some("https://oyl.example.com"), "/get-bitcoin-price"),
+            "https://oyl.example.com/get-bitcoin-price"
+        );
+    }
+
+    #[test]
+    fn rpc_endpoint_accepts_a_host_or_complete_rpc_endpoint() {
+        assert_eq!(rpc_endpoint(Some("https://rpc.example.com/")), "https://rpc.example.com/rpc");
+        assert_eq!(
+            rpc_endpoint(Some("https://rpc.example.com/rpc")),
+            "https://rpc.example.com/rpc"
+        );
+        assert_eq!(rpc_endpoint(None), format!("{HTTP_BASE}/rpc"));
+    }
 }
 
 fn anchor_for(raw: &str) -> String {

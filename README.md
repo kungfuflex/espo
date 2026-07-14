@@ -31,6 +31,20 @@ after the binary is built, configure `config.json` (see `sample.config.json`) an
 
 To serve the current database without running the indexer or mempool service, append `--view-only` to the command. This keeps the RPC server (and explorer if enabled) available for read-only access to the existing data.
 
+The explorer API documentation can use deployment-specific public hosts. The `hosts` object and each field are optional; omitted values fall back to `https://api.alkanode.com`.
+
+```json
+{
+  "hosts": {
+    "explorer_host": "https://explorer.example.com",
+    "rpc_host": "https://rpc.example.com",
+    "oyl_api_host": "https://oyl.example.com"
+  }
+}
+```
+
+Espo appends `/rpc` to `rpc_host` unless it already ends in `/rpc`. Explorer and Oyl API paths are appended to their corresponding hosts.
+
 To manually roll back on startup and resume indexing from a chosen height, set `rollback` in `config.json` or pass `--rollback <height>`. Espo rewinds indexed state to the parent of that height before the RPC/explorer servers start, then indexes forward from the requested height. This path uses the normal module reorg hooks, including runes undo journals.
 
 Espo will build indicies for the .blk files in your bitcoin blocks directory and start indexing, with a fallback to the bitcoin RPC. I have only tested espo on my machine which has 32 cores adn 192gb of ram, and I achieve an index in a little less than 2 hours. On older hardware you can expect an index between 6-12 hours.
