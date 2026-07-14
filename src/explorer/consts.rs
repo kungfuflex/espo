@@ -24,7 +24,7 @@ const MAINNET_FACTORY_ICON_BLACKLIST: &[&str] =
 // --- Regtest overrides (extend as needed) ---
 const REGTEST_ALKANE_NAME_OVERRIDES: &[(&str, &str, &str)] = &[];
 const REGTEST_ICON_OVERRIDES: &[(&str, &str)] = &[("32:0", FRBTC_ICON_URL)];
-const REGTEST_CONTRACT_NAME_OVERRIDES: &[(&str, &str)] = &[];
+const REGTEST_CONTRACT_NAME_OVERRIDES: &[(&str, &str)] = &[("4:65522", "Oyl AMM")];
 const REGTEST_FACTORY_ICON_BLACKLIST: &[&str] = &[];
 
 pub fn alkane_name_overrides() -> &'static [(&'static str, &'static str, &'static str)] {
@@ -62,12 +62,22 @@ pub fn alkane_factory_icon_blacklist() -> &'static [&'static str] {
 
 #[cfg(test)]
 mod tests {
-    use super::{FRBTC_ICON_URL, MAINNET_ICON_OVERRIDES, REGTEST_ICON_OVERRIDES};
+    use super::{
+        FRBTC_ICON_URL, MAINNET_CONTRACT_NAME_OVERRIDES, MAINNET_ICON_OVERRIDES,
+        REGTEST_CONTRACT_NAME_OVERRIDES, REGTEST_ICON_OVERRIDES,
+    };
 
     #[test]
     fn frbtc_icon_is_overridden_on_mainnet_and_regtest() {
         for overrides in [MAINNET_ICON_OVERRIDES, REGTEST_ICON_OVERRIDES] {
             assert!(overrides.contains(&("32:0", FRBTC_ICON_URL)));
+        }
+    }
+
+    #[test]
+    fn oyl_amm_name_is_overridden_on_mainnet_and_regtest() {
+        for overrides in [MAINNET_CONTRACT_NAME_OVERRIDES, REGTEST_CONTRACT_NAME_OVERRIDES] {
+            assert!(overrides.contains(&("4:65522", "Oyl AMM")));
         }
     }
 }

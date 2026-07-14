@@ -72,7 +72,7 @@ fn block_carousel_inner(
   const EDGE_THRESHOLD = 320;
   const LEFT_BUFFER_VIEWPORTS = 2;
   const RIGHT_BUFFER_VIEWPORTS = 2;
-  const WINDOW_VIEWPORTS_LEFT = 1;
+  const WINDOW_VIEWPORTS_LEFT = 2;
   const WINDOW_VIEWPORTS_RIGHT = 2;
   const MIN_VIEWPORT_BLOCKS = 10;
   const MIN_WINDOW_BLOCKS = 36;
@@ -111,6 +111,7 @@ fn block_carousel_inner(
   let lastTipAnimationAt = 0;
   let followLatest = selectedMempoolIndex !== null || current === espoTip;
   let suppressFollowScrollUntil = 0;
+  let edgeLoadingArmed = false;
 
   let isDragging = false;
   let dragStartX = 0;
@@ -680,6 +681,7 @@ fn block_carousel_inner(
   }}
 
   function markUserNavigated() {{
+    edgeLoadingArmed = true;
     if (performance.now() < suppressFollowScrollUntil) return;
     followLatest = false;
     selectedConfirmedHeight = null;
@@ -1122,6 +1124,7 @@ fn block_carousel_inner(
     updateSelectedHeight();
     if (!programmaticScrollRaf) pruneBlocksAroundViewport();
     updateResetButton();
+    if (!edgeLoadingArmed) return;
     const realRemainingLeft = realLeftEdge() - scroller.scrollLeft;
     const shouldFetchLeft = realRemainingLeft <= Math.max(EDGE_THRESHOLD, scroller.clientWidth * 1.5);
     ensureLeftBufferAhead();
