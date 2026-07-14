@@ -7,7 +7,7 @@ use crate::config::get_network;
 
 pub const ALKANE_TOKEN_ICON_BASE: &str = "https://cdn.ordiscan.com/alkanes";
 pub const ALKANE_CONTRACT_ICON_BASE: &str = "https://cdn.ordiscan.com/alkanes";
-const FRBTC_ICON_URL: &str = "https://i.ibb.co/rKhJpQ93/frbtc-improved.png";
+const FRBTC_ICON_URL: &str = "https://i.ibb.co/6cR2hC05/frbtc-improved-1.png";
 
 // --- Mainnet overrides ---
 const MAINNET_ALKANE_NAME_OVERRIDES: &[(&str, &str, &str)] =
