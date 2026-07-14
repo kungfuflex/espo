@@ -1232,6 +1232,7 @@ a:hover {
 }
 .faucet-available strong {
   color: var(--text);
+  font-weight: 500;
 }
 .faucet-available-icon {
   display: inline-flex;

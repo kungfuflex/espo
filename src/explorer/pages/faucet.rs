@@ -126,8 +126,8 @@ pub async fn faucet_page() -> Html<String> {
             }
             p class="faucet-available" hidden data-faucet-available="" {
                 "Available: "
-                strong data-faucet-available-amount="" {}
                 span class="faucet-available-icon" aria-hidden="true" { (icon_testnet()) }
+                strong data-faucet-available-amount="" {}
             }
             section class="faucet-tool" {
                 form class="faucet-form" data-faucet-form="" {
@@ -158,8 +158,8 @@ pub async fn faucet_page() -> Html<String> {
 
                     p class="faucet-limit" hidden data-faucet-limit="" {
                         "Limit: "
-                        span data-faucet-ip-limit="" {}
                         span class="faucet-limit-icon" aria-hidden="true" { (icon_testnet()) }
+                        span data-faucet-ip-limit="" {}
                         " per day"
                     }
 
