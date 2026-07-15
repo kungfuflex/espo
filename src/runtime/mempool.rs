@@ -297,6 +297,7 @@ struct InMemoryMempool {
     templates: Vec<MempoolBlockTemplate>,
     deltas: Vec<MempoolBlockDelta>,
     status: MempoolSyncStatus,
+    minimum_fee_rate: Option<f64>,
     sequence: u64,
     updated_at: u64,
 }
@@ -1278,6 +1279,10 @@ pub fn current_mempool_compact_snapshot() -> MempoolCompactSnapshot {
     compact_snapshot_from_state(&state, false)
 }
 
+pub fn current_mempool_minimum_fee_rate() -> Option<f64> {
+    mempool_state().read().ok()?.minimum_fee_rate
+}
+
 pub fn current_mempool_compact_snapshot_with_deltas() -> MempoolCompactSnapshot {
     let Ok(state) = mempool_state().read() else {
         return MempoolCompactSnapshot::default();
@@ -1798,6 +1803,7 @@ pub fn reset_mempool_store() -> Result<()> {
         state.txs.clear();
         state.templates.clear();
         state.deltas.clear();
+        state.minimum_fee_rate = None;
         state.sequence = state.sequence.saturating_add(1);
         state.status = MempoolSyncStatus {
             phase: MempoolSyncPhase::Starting,
@@ -2708,6 +2714,14 @@ fn recalculate_memory_templates() {
 
 async fn refresh_memory_mempool(rpc: &CoreClient, network: Network) -> Result<()> {
     mark_raw_refresh_start();
+    if let Ok(info) = rpc.get_mempool_info() {
+        let minimum_fee_rate = info.mempool_min_fee.to_sat() as f64 / 1_000.0;
+        if minimum_fee_rate.is_finite() && minimum_fee_rate >= 0.0 {
+            if let Ok(mut state) = mempool_state().write() {
+                state.minimum_fee_rate = Some(minimum_fee_rate);
+            }
+        }
+    }
     let verbose: HashMap<String, VerboseMempoolEntry> = match rpc
         .call("getrawmempool", &[json!(true)])
         .context("bitcoind getrawmempool verbose failed")

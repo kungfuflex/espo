@@ -53,6 +53,7 @@ pub trait ElectrumLike: Send + Sync {
     fn backend(&self) -> ElectrumLikeBackend;
     fn batch_transaction_get_raw(&self, txids: &[Txid]) -> Result<Vec<Vec<u8>>>;
     fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>>;
+    fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid>;
     fn tip_height(&self) -> Result<u32>;
     fn transaction_get_outspends(&self, txid: &Txid) -> Result<Vec<Option<Txid>>>;
     fn batch_transaction_get_outspends(&self, txids: &[Txid]) -> Result<Vec<Vec<Option<Txid>>>>;
@@ -97,6 +98,12 @@ impl ElectrumLike for ElectrumRpcClient {
 
     fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>> {
         self.client.transaction_get_raw(txid).context("electrum transaction_get_raw")
+    }
+
+    fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid> {
+        self.client
+            .transaction_broadcast_raw(raw_tx)
+            .context("electrum transaction_broadcast_raw")
     }
 
     fn tip_height(&self) -> Result<u32> {
@@ -231,6 +238,24 @@ impl EsploraElectrumLike {
 
         let bytes = resp.bytes().await.context("esplora response body read failed")?;
         Ok((idx, bytes.to_vec()))
+    }
+
+    async fn broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid> {
+        let url = format!("{}/tx", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain")
+            .body(hex::encode(raw_tx))
+            .send()
+            .await
+            .with_context(|| format!("esplora POST {url} failed"))?;
+        let status = resp.status();
+        let body = resp.text().await.context("esplora broadcast response body read failed")?;
+        if !status.is_success() {
+            bail!("esplora transaction broadcast returned {status}: {}", body.trim());
+        }
+        Txid::from_str(body.trim()).context("invalid txid in esplora broadcast response")
     }
 
     fn block_on_result<F, T>(&self, fut: F) -> Result<T>
@@ -384,6 +409,10 @@ impl ElectrumLike for EsploraElectrumLike {
             let (_, raw) = self.fetch_one_indexed(0, txid).await?;
             Ok(raw)
         })
+    }
+
+    fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid> {
+        self.block_on_result(self.broadcast_raw(raw_tx))
     }
 
     fn tip_height(&self) -> Result<u32> {

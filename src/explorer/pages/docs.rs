@@ -501,6 +501,24 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     json!({ "height": 946000 }),
                 ),
                 rpc_doc(
+                    "broadcast_transaction",
+                    "Broadcasts a raw Bitcoin transaction through the configured electrs or Esplora backend, with Bitcoin Core as a fallback.",
+                    json!({ "raw_tx": "0200000001..." }),
+                    json!({ "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90" }),
+                ),
+                rpc_doc(
+                    "fee_estimates",
+                    "Returns precise sat/vB fee recommendations derived from Espo's projected mempool blocks. The fields match mempool.space's precise fee response shape.",
+                    json!({}),
+                    json!({
+                        "fastestFee": 1.017,
+                        "halfHourFee": 0.722,
+                        "hourFee": 0.448,
+                        "economyFee": 0.2,
+                        "minimumFee": 0.1
+                    }),
+                ),
+                rpc_doc(
                     "get_method_line_chart",
                     "Samples a numeric value from another RPC method across indexed heights and returns chart-ready points.",
                     json!({
