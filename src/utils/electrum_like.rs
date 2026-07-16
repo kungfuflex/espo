@@ -3,7 +3,7 @@ use bitcoin::{Address, Txid};
 use electrum_client::{Client as ElectrumClient, ElectrumApi, Param};
 use futures::{StreamExt, stream};
 use reqwest::Client as HttpClient;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
 use std::str::FromStr;
@@ -24,6 +24,22 @@ pub struct AddressStats {
     pub confirmed_balance: Option<u64>,
     pub total_received: Option<u64>,
     pub confirmed_utxos: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AddressSummary {
+    pub address: String,
+    pub chain_stats: AddressTxStats,
+    pub mempool_stats: AddressTxStats,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AddressTxStats {
+    pub funded_txo_count: u64,
+    pub funded_txo_sum: u64,
+    pub spent_txo_count: u64,
+    pub spent_txo_sum: u64,
+    pub tx_count: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +74,7 @@ pub trait ElectrumLike: Send + Sync {
     fn transaction_get_outspends(&self, txid: &Txid) -> Result<Vec<Option<Txid>>>;
     fn batch_transaction_get_outspends(&self, txids: &[Txid]) -> Result<Vec<Vec<Option<Txid>>>>;
     fn transaction_get_height(&self, txid: &Txid) -> Result<Option<u64>>;
+    fn address_summary(&self, address: &Address) -> Result<AddressSummary>;
     fn address_stats(&self, address: &Address) -> Result<AddressStats>;
     fn address_history_page(
         &self,
@@ -148,6 +165,12 @@ impl ElectrumLike for ElectrumRpcClient {
             .context("electrum transaction.get (verbose) for height")?;
 
         Ok(extract_height(&resp))
+    }
+
+    fn address_summary(&self, _address: &Address) -> Result<AddressSummary> {
+        Err(anyhow::anyhow!(
+            "exact address summaries require an electrs/esplora HTTP backend; electrum RPC is not supported"
+        ))
     }
 
     fn address_stats(&self, address: &Address) -> Result<AddressStats> {
@@ -274,7 +297,7 @@ impl EsploraElectrumLike {
         }
     }
 
-    async fn fetch_address_summary(&self, address: &str) -> Result<EsploraAddressSummary> {
+    async fn fetch_address_summary(&self, address: &str) -> Result<AddressSummary> {
         let url = format!("{}/address/{}", self.base_url, address);
         let resp = self
             .http
@@ -286,7 +309,7 @@ impl EsploraElectrumLike {
             .with_context(|| format!("esplora GET {url} returned error status"))?;
 
         let body_str = resp.text().await.context("esplora address body read failed")?;
-        let summary: EsploraAddressSummary =
+        let summary: AddressSummary =
             serde_json::from_str(&body_str).context("esplora address json decode failed")?;
         Ok(summary)
     }
@@ -467,6 +490,10 @@ impl ElectrumLike for EsploraElectrumLike {
                 body.get("status").and_then(|s| s.get("block_height")).and_then(|h| h.as_u64());
             Ok(height)
         })
+    }
+
+    fn address_summary(&self, address: &Address) -> Result<AddressSummary> {
+        self.block_on_result(self.fetch_address_summary(&address.to_string()))
     }
 
     fn address_stats(&self, address: &Address) -> Result<AddressStats> {
@@ -651,18 +678,6 @@ fn extract_height(resp: &serde_json::Value) -> Option<u64> {
 }
 
 #[derive(Deserialize)]
-struct EsploraAddressSummary {
-    chain_stats: EsploraAddressChainStats,
-}
-
-#[derive(Deserialize)]
-struct EsploraAddressChainStats {
-    funded_txo_sum: u64,
-    spent_txo_sum: u64,
-    tx_count: u64,
-}
-
-#[derive(Deserialize)]
 struct EsploraUtxo {
     txid: String,
     vout: u32,
@@ -708,4 +723,35 @@ fn extract_outspends(v: &serde_json::Value) -> Vec<Option<Txid>> {
         out.push(if spent { spender } else { None });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn address_summary_preserves_esplora_response_shape() {
+        let expected = json!({
+            "address": "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv",
+            "chain_stats": {
+                "funded_txo_count": 11,
+                "funded_txo_sum": 15_007_688_098u64,
+                "spent_txo_count": 5,
+                "spent_txo_sum": 15_007_599_040u64,
+                "tx_count": 13
+            },
+            "mempool_stats": {
+                "funded_txo_count": 0,
+                "funded_txo_sum": 0,
+                "spent_txo_count": 0,
+                "spent_txo_sum": 0,
+                "tx_count": 0
+            }
+        });
+
+        let summary: AddressSummary = serde_json::from_value(expected.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(summary).unwrap(), expected);
+    }
 }

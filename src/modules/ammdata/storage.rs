@@ -22,19 +22,29 @@ use crate::modules::ammdata::utils::pathfinder::{
     plan_swap_exact_tokens_for_tokens_implicit, plan_swap_tokens_for_exact_tokens,
 };
 use crate::modules::ammdata::utils::token_volume::read_token_volume_v1;
-use crate::modules::essentials::storage::EssentialsProvider;
+use crate::modules::essentials::storage::{
+    EssentialsProvider, GetCreationRecordsByIdParams,
+    GetIndexHeightParams as EssentialsGetIndexHeightParams,
+};
+use crate::modules::essentials::utils::balances::get_balance_for_address;
+use crate::modules::essentials::utils::names::display_alkane_name;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
+use alloy_primitives::U256;
 use anyhow::{Result, anyhow};
-use bitcoin::BlockHash;
+use bitcoin::{Address, BlockHash};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{Value, json, map::Map};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const PRICE_COMPARISON_HOURS: usize = 24;
+const MAX_PRICE_ASSETS: usize = 1_000;
 
 fn dedupe_batch_ops(
     puts: Vec<(Vec<u8>, Vec<u8>)>,
@@ -1726,6 +1736,35 @@ fn read_token_activity(
     Ok(GetTokenActivityPageResult { entries: out, total })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PriceAsset {
+    Btc,
+    Alkane(SchemaAlkaneId),
+}
+
+impl PriceAsset {
+    fn label(self) -> String {
+        match self {
+            Self::Btc => "btc".to_string(),
+            Self::Alkane(id) => id_str(&id),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AssetPriceSnapshot {
+    now: Option<u128>,
+    ago: Option<u128>,
+    now_ts: u64,
+    ago_ts: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AssetMetadata {
+    name: String,
+    symbol: String,
+}
+
 #[derive(Clone)]
 pub struct AmmDataProvider {
     mdb: Arc<Mdb>,
@@ -3330,6 +3369,223 @@ impl AmmDataProvider {
             }
         }
         Ok(GetCanonicalPoolPricesResult { frbtc_price, busd_price })
+    }
+
+    fn hourly_asset_price_snapshot(
+        &self,
+        asset: PriceAsset,
+        now: u64,
+    ) -> Result<AssetPriceSnapshot> {
+        let hourly = match asset {
+            PriceAsset::Btc => read_btc_usd_line_v1(self, Timeframe::H1, now)?,
+            PriceAsset::Alkane(token) => {
+                read_token_usd_candles_v1(self, token, Timeframe::H1, now)?
+            }
+        };
+        let mut price_now = hourly.candles_newest_first.first().map(|candle| candle.close);
+        if let PriceAsset::Alkane(token) = asset {
+            price_now = read_token_usd_candles_v1(self, token, Timeframe::M10, now)
+                .ok()
+                .and_then(|slice| slice.candles_newest_first.first().map(|candle| candle.close))
+                .or(price_now);
+        }
+        let price_ago = hourly
+            .candles_newest_first
+            .get(PRICE_COMPARISON_HOURS)
+            .map(|candle| candle.close);
+        let ago_secs = (PRICE_COMPARISON_HOURS as u64) * Timeframe::H1.duration_secs();
+
+        Ok(AssetPriceSnapshot {
+            now: price_now,
+            ago: price_ago,
+            now_ts: hourly.newest_ts,
+            ago_ts: hourly.newest_ts.saturating_sub(ago_secs),
+        })
+    }
+
+    fn asset_price_snapshots(
+        &self,
+        assets: &[PriceAsset],
+        now: u64,
+    ) -> Result<HashMap<PriceAsset, AssetPriceSnapshot>> {
+        let mut snapshots = HashMap::with_capacity(assets.len());
+        for asset in assets {
+            snapshots.insert(*asset, self.hourly_asset_price_snapshot(*asset, now)?);
+        }
+        Ok(snapshots)
+    }
+
+    fn asset_metadata(&self, assets: &[PriceAsset]) -> Result<HashMap<PriceAsset, AssetMetadata>> {
+        let alkane_ids = assets
+            .iter()
+            .filter_map(|asset| match asset {
+                PriceAsset::Btc => None,
+                PriceAsset::Alkane(id) => Some(*id),
+            })
+            .collect::<Vec<_>>();
+        let records = self
+            .essentials
+            .get_creation_records_by_id(GetCreationRecordsByIdParams {
+                blockhash: StateAt::Latest,
+                alkanes: alkane_ids.clone(),
+            })?
+            .records;
+        let mut metadata = HashMap::with_capacity(assets.len());
+        for (id, record) in alkane_ids.into_iter().zip(records) {
+            let label = id_str(&id);
+            let name = record
+                .as_ref()
+                .and_then(|record| display_alkane_name(&record.names))
+                .unwrap_or_else(|| label.clone());
+            let symbol = record
+                .as_ref()
+                .and_then(|record| record.symbols.iter().find(|value| !value.trim().is_empty()))
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(|| label.clone());
+            metadata.insert(PriceAsset::Alkane(id), AssetMetadata { name, symbol });
+        }
+        if assets.contains(&PriceAsset::Btc) {
+            metadata.insert(PriceAsset::Btc, bitcoin_asset_metadata());
+        }
+        Ok(metadata)
+    }
+
+    pub fn rpc_get_alkanes_price_data(
+        &self,
+        params: RpcGetAlkanesPriceDataParams,
+    ) -> Result<RpcGetAlkanesPriceDataResult> {
+        let assets = match parse_price_assets(params.assets) {
+            Ok(assets) => assets,
+            Err(error) => {
+                return Ok(RpcGetAlkanesPriceDataResult {
+                    value: json!({ "ok": false, "error": error }),
+                });
+            }
+        };
+        let now = params.now.unwrap_or_else(now_ts);
+        let snapshots = self.asset_price_snapshots(&assets, now)?;
+        let metadata = self.asset_metadata(&assets)?;
+        let mut prices = Map::with_capacity(assets.len());
+        for asset in assets {
+            if let Some(snapshot) = snapshots.get(&asset) {
+                let mut row = asset_price_json(*snapshot);
+                add_asset_metadata(&mut row, metadata.get(&asset), &asset.label());
+                prices.insert(asset.label(), row);
+            }
+        }
+
+        Ok(RpcGetAlkanesPriceDataResult {
+            value: json!({
+                "ok": true,
+                "timeframe": "1h",
+                "comparison_hours": PRICE_COMPARISON_HOURS,
+                "assets": Value::Object(prices),
+            }),
+        })
+    }
+
+    pub fn rpc_get_portfolio_stats(
+        &self,
+        params: RpcGetPortfolioStatsParams,
+    ) -> Result<RpcGetPortfolioStatsResult> {
+        let Some(address_raw) = params.address.as_deref().map(str::trim).filter(|v| !v.is_empty())
+        else {
+            return Ok(RpcGetPortfolioStatsResult {
+                value: json!({ "ok": false, "error": "missing_or_invalid_address" }),
+            });
+        };
+        let address = match Address::from_str(address_raw)
+            .and_then(|address| address.require_network(get_network()))
+        {
+            Ok(address) => address.to_string(),
+            Err(_) => {
+                return Ok(RpcGetPortfolioStatsResult {
+                    value: json!({ "ok": false, "error": "invalid_address_format" }),
+                });
+            }
+        };
+        let Some(height) = self
+            .essentials
+            .get_index_height(EssentialsGetIndexHeightParams { blockhash: StateAt::Latest })?
+            .height
+        else {
+            return Ok(RpcGetPortfolioStatsResult {
+                value: json!({ "ok": false, "error": "indexed_height_unavailable" }),
+            });
+        };
+        let balances =
+            get_balance_for_address(StateAt::Latest, self.essentials.as_ref(), &address)?;
+        let mut ids = balances.keys().copied().collect::<Vec<_>>();
+        ids.sort_by_key(|id| (id.block, id.tx));
+        if ids.len() > MAX_PRICE_ASSETS {
+            return Ok(RpcGetPortfolioStatsResult {
+                value: json!({
+                    "ok": false,
+                    "error": "too_many_assets",
+                    "max_assets": MAX_PRICE_ASSETS,
+                }),
+            });
+        }
+
+        let assets = ids.iter().copied().map(PriceAsset::Alkane).collect::<Vec<_>>();
+        let snapshots = self.asset_price_snapshots(&assets, now_ts())?;
+        let metadata = self.asset_metadata(&assets)?;
+        let mut rows = Map::with_capacity(ids.len());
+        let mut total_now = U256::ZERO;
+        let mut total_ago = U256::ZERO;
+        let mut unpriced_assets = Vec::new();
+
+        for id in ids {
+            let asset = PriceAsset::Alkane(id);
+            let label = asset.label();
+            let balance = balances.get(&id).copied().unwrap_or(0);
+            let snapshot = snapshots.get(&asset).copied().unwrap_or(AssetPriceSnapshot {
+                now: None,
+                ago: None,
+                now_ts: 0,
+                ago_ts: 0,
+            });
+            let value_now = portfolio_asset_value(balance, snapshot.now);
+            let value_ago = portfolio_asset_value(balance, snapshot.ago);
+            if let Some(value) = value_now {
+                total_now = total_now.saturating_add(value);
+            }
+            if let Some(value) = value_ago {
+                total_ago = total_ago.saturating_add(value);
+            }
+            if value_now.is_none() || value_ago.is_none() {
+                unpriced_assets.push(label.clone());
+            }
+
+            let mut row = asset_price_json(snapshot);
+            add_asset_metadata(&mut row, metadata.get(&asset), &label);
+            if let Some(object) = row.as_object_mut() {
+                object.insert("balance".to_string(), json!(balance.to_string()));
+                object.insert("balance_at_height".to_string(), json!(balance.to_string()));
+                object.insert("value_now_usd".to_string(), scaled_u256_json(value_now));
+                object.insert("value_24h_ago_usd".to_string(), scaled_u256_json(value_ago));
+                object.insert(
+                    "value_change_24h_usd".to_string(),
+                    signed_scaled_u256_json(value_now, value_ago),
+                );
+            }
+            rows.insert(label, row);
+        }
+
+        Ok(RpcGetPortfolioStatsResult {
+            value: json!({
+                "ok": true,
+                "address": address,
+                "height": height,
+                "complete": unpriced_assets.is_empty(),
+                "unpriced_assets": unpriced_assets,
+                "total_value_usd": format_scaled_u256(total_now),
+                "total_value_24h_ago_usd": format_scaled_u256(total_ago),
+                "change_24h_usd": format_signed_scaled_u256(total_now, total_ago),
+                "change_24h": percentage_change_u256(total_ago, total_now),
+                "assets": Value::Object(rows),
+            }),
+        })
     }
 
     pub fn rpc_get_candles(&self, params: RpcGetCandlesParams) -> Result<RpcGetCandlesResult> {
@@ -5253,6 +5509,23 @@ pub struct RpcGetCandlesResult {
     pub value: Value,
 }
 
+pub struct RpcGetAlkanesPriceDataParams {
+    pub assets: Option<Vec<String>>,
+    pub now: Option<u64>,
+}
+
+pub struct RpcGetAlkanesPriceDataResult {
+    pub value: Value,
+}
+
+pub struct RpcGetPortfolioStatsParams {
+    pub address: Option<String>,
+}
+
+pub struct RpcGetPortfolioStatsResult {
+    pub value: Value,
+}
+
 pub struct RpcGetTokenVolumeParams {
     pub token: Option<String>,
     pub timeframe: Option<String>,
@@ -5555,6 +5828,149 @@ pub fn decode_reserves_snapshot(
 
 fn now_ts() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn parse_price_assets(
+    raw_assets: Option<Vec<String>>,
+) -> std::result::Result<Vec<PriceAsset>, &'static str> {
+    let Some(raw_assets) = raw_assets.filter(|assets| !assets.is_empty()) else {
+        return Err("missing_or_invalid_assets");
+    };
+    if raw_assets.len() > MAX_PRICE_ASSETS {
+        return Err("too_many_assets");
+    }
+
+    let mut assets = Vec::with_capacity(raw_assets.len());
+    let mut seen = HashSet::with_capacity(raw_assets.len());
+    for raw in raw_assets {
+        let raw = raw.trim();
+        let asset = if raw.eq_ignore_ascii_case("btc") {
+            PriceAsset::Btc
+        } else {
+            PriceAsset::Alkane(parse_id_from_str(raw).ok_or("missing_or_invalid_assets")?)
+        };
+        if seen.insert(asset) {
+            assets.push(asset);
+        }
+    }
+    if assets.is_empty() { Err("missing_or_invalid_assets") } else { Ok(assets) }
+}
+
+fn format_scaled_u256(value: U256) -> String {
+    let scale = U256::from(PRICE_SCALE);
+    let whole = value / scale;
+    let remainder = (value % scale).to::<u128>();
+    if remainder == 0 {
+        return whole.to_string();
+    }
+    let fractional = format!("{remainder:016}").trim_end_matches('0').to_string();
+    format!("{whole}.{fractional}")
+}
+
+fn format_signed_scaled_u256(now: U256, ago: U256) -> String {
+    if now >= ago {
+        format_scaled_u256(now - ago)
+    } else {
+        format!("-{}", format_scaled_u256(ago - now))
+    }
+}
+
+fn scaled_u128_json(value: Option<u128>) -> Value {
+    value
+        .map(|value| Value::String(format_scaled_u256(U256::from(value))))
+        .unwrap_or(Value::Null)
+}
+
+fn scaled_u256_json(value: Option<U256>) -> Value {
+    value
+        .map(|value| Value::String(format_scaled_u256(value)))
+        .unwrap_or(Value::Null)
+}
+
+fn signed_scaled_u128_json(now: Option<u128>, ago: Option<u128>) -> Value {
+    match (now, ago) {
+        (Some(now), Some(ago)) => {
+            Value::String(format_signed_scaled_u256(U256::from(now), U256::from(ago)))
+        }
+        _ => Value::Null,
+    }
+}
+
+fn signed_scaled_u256_json(now: Option<U256>, ago: Option<U256>) -> Value {
+    match (now, ago) {
+        (Some(now), Some(ago)) => Value::String(format_signed_scaled_u256(now, ago)),
+        _ => Value::Null,
+    }
+}
+
+fn percentage_change_u256(ago: U256, now: U256) -> Option<String> {
+    if ago.is_zero() {
+        return now.is_zero().then(|| "0.0000".to_string());
+    }
+    let (negative, difference) = if now >= ago { (false, now - ago) } else { (true, ago - now) };
+    let scaled = difference.saturating_mul(U256::from(1_000_000u64)) / ago;
+    let whole = scaled / U256::from(10_000u64);
+    let fractional = (scaled % U256::from(10_000u64)).to::<u64>();
+    let sign = if negative { "-" } else { "" };
+    Some(format!("{sign}{whole}.{fractional:04}"))
+}
+
+fn percentage_change_json(ago: Option<u128>, now: Option<u128>) -> Value {
+    match (ago, now) {
+        (Some(ago), Some(now)) => {
+            json!(percentage_change_u256(U256::from(ago), U256::from(now)))
+        }
+        _ => Value::Null,
+    }
+}
+
+fn asset_price_json(snapshot: AssetPriceSnapshot) -> Value {
+    json!({
+        "price_now_usd": scaled_u128_json(snapshot.now),
+        "price_24h_ago_usd": scaled_u128_json(snapshot.ago),
+        "change_24h": percentage_change_json(snapshot.ago, snapshot.now),
+        "change_24h_usd": signed_scaled_u128_json(snapshot.now, snapshot.ago),
+        "price_now_ts": snapshot.now.map(|_| snapshot.now_ts),
+        "price_24h_ago_ts": snapshot.ago.map(|_| snapshot.ago_ts),
+    })
+}
+
+fn bitcoin_asset_metadata() -> AssetMetadata {
+    bitcoin_asset_metadata_for_network(get_network())
+}
+
+fn bitcoin_asset_metadata_for_network(network: bitcoin::Network) -> AssetMetadata {
+    let (name, symbol) = match network {
+        bitcoin::Network::Bitcoin => ("Bitcoin", "BTC"),
+        bitcoin::Network::Regtest => ("Regtest Bitcoin", "rBTC"),
+        bitcoin::Network::Signet => ("Signet Bitcoin", "sBTC"),
+        bitcoin::Network::Testnet | bitcoin::Network::Testnet4 => ("Testnet Bitcoin", "tBTC"),
+    };
+    AssetMetadata { name: name.to_string(), symbol: symbol.to_string() }
+}
+
+fn add_asset_metadata(row: &mut Value, metadata: Option<&AssetMetadata>, fallback: &str) {
+    let Some(object) = row.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "name".to_string(),
+        Value::String(metadata.map(|value| value.name.as_str()).unwrap_or(fallback).to_string()),
+    );
+    object.insert(
+        "symbol".to_string(),
+        Value::String(metadata.map(|value| value.symbol.as_str()).unwrap_or(fallback).to_string()),
+    );
+}
+
+fn portfolio_asset_value(balance: u128, price: Option<u128>) -> Option<U256> {
+    if balance == 0 {
+        return Some(U256::ZERO);
+    }
+    price.map(|price| {
+        U256::from(balance).saturating_mul(U256::from(price))
+            / U256::from(crate::modules::ammdata::consts::AMOUNT_SCALE)
+    })
 }
 
 fn parse_id_from_str(s: &str) -> Option<SchemaAlkaneId> {
@@ -6230,4 +6646,90 @@ fn parse_u128_arg(v: Option<&Value>) -> Option<u128> {
 
 fn id_str(id: &SchemaAlkaneId) -> String {
     format!("{}:{}", id.block, id.tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn price_assets_accept_btc_alkanes_and_remove_duplicates() {
+        let assets = parse_price_assets(Some(vec![
+            "BTC".to_string(),
+            "2:0".to_string(),
+            "btc".to_string(),
+            "2:68479".to_string(),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            assets,
+            vec![
+                PriceAsset::Btc,
+                PriceAsset::Alkane(SchemaAlkaneId { block: 2, tx: 0 }),
+                PriceAsset::Alkane(SchemaAlkaneId { block: 2, tx: 68479 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn price_assets_reject_invalid_entries() {
+        assert_eq!(parse_price_assets(None), Err("missing_or_invalid_assets"));
+        assert_eq!(
+            parse_price_assets(Some(vec!["not-an-asset".to_string()])),
+            Err("missing_or_invalid_assets")
+        );
+    }
+
+    #[test]
+    fn usd_formatting_and_changes_are_exact() {
+        assert_eq!(format_scaled_u256(U256::from(65000u64) * U256::from(PRICE_SCALE)), "65000");
+        assert_eq!(format_scaled_u256(U256::from(PRICE_SCALE / 20)), "0.05");
+        assert_eq!(
+            percentage_change_u256(U256::from(64_000u64), U256::from(65_000u64)),
+            Some("1.5625".to_string())
+        );
+        assert_eq!(
+            percentage_change_u256(U256::from(100u64), U256::from(75u64)),
+            Some("-25.0000".to_string())
+        );
+    }
+
+    #[test]
+    fn portfolio_value_uses_raw_eight_decimal_balance() {
+        let balance = 200u128 * crate::modules::ammdata::consts::AMOUNT_SCALE;
+        let price = PRICE_SCALE * 3 / 4;
+        let value = portfolio_asset_value(balance, Some(price)).unwrap();
+
+        assert_eq!(format_scaled_u256(value), "150");
+        assert_eq!(portfolio_asset_value(0, None), Some(U256::ZERO));
+        assert_eq!(portfolio_asset_value(1, None), None);
+    }
+
+    #[test]
+    fn portfolio_usd_change_uses_the_selected_balance_for_both_prices() {
+        let balance = crate::modules::ammdata::consts::AMOUNT_SCALE;
+        let current = portfolio_asset_value(balance, Some(100 * PRICE_SCALE)).unwrap();
+        let previous = portfolio_asset_value(balance, Some(50 * PRICE_SCALE)).unwrap();
+
+        assert_eq!(format_scaled_u256(current), "100");
+        assert_eq!(format_signed_scaled_u256(current, previous), "50");
+        assert_eq!(percentage_change_u256(previous, current), Some("100.0000".to_string()));
+    }
+
+    #[test]
+    fn bitcoin_metadata_is_network_specific() {
+        let cases = [
+            (bitcoin::Network::Bitcoin, "Bitcoin", "BTC"),
+            (bitcoin::Network::Regtest, "Regtest Bitcoin", "rBTC"),
+            (bitcoin::Network::Signet, "Signet Bitcoin", "sBTC"),
+            (bitcoin::Network::Testnet, "Testnet Bitcoin", "tBTC"),
+            (bitcoin::Network::Testnet4, "Testnet Bitcoin", "tBTC"),
+        ];
+        for (network, name, symbol) in cases {
+            let metadata = bitcoin_asset_metadata_for_network(network);
+            assert_eq!(metadata.name, name);
+            assert_eq!(metadata.symbol, symbol);
+        }
+    }
 }

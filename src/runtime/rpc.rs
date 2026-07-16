@@ -1,5 +1,7 @@
 use crate::{
-    config::{get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_next_height},
+    config::{
+        get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_next_height, get_network,
+    },
     modules::defs::RpcRegistry,
     runtime::{
         mempool::{
@@ -16,12 +18,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use bitcoin::{Transaction, consensus::deserialize};
+use bitcoin::{Address, Transaction, consensus::deserialize};
 use bitcoincore_rpc::RpcApi;
 use futures::FutureExt;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tarpc::context;
 use tokio::net::TcpListener;
 
@@ -59,6 +61,7 @@ const ROOT_METHOD_GET_ESPO_HEIGHT: &str = "get_espo_height";
 const ROOT_METHOD_GET_METHOD_LINE_CHART: &str = "get_method_line_chart";
 const ROOT_METHOD_BROADCAST_TRANSACTION: &str = "broadcast_transaction";
 const ROOT_METHOD_FEE_ESTIMATES: &str = "fee_estimates";
+const ROOT_METHOD_GET_ADDRESS: &str = "get_address";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +102,7 @@ fn is_builtin_root_method(method: &str) -> bool {
             | ROOT_METHOD_GET_METHOD_LINE_CHART
             | ROOT_METHOD_BROADCAST_TRANSACTION
             | ROOT_METHOD_FEE_ESTIMATES
+            | ROOT_METHOD_GET_ADDRESS
     )
 }
 
@@ -260,6 +264,60 @@ async fn broadcast_transaction_response(id: Value, params: Value) -> JsonRpcResp
             Some(json!({ "detail": detail })),
         ),
         Err(error) => internal_error(id, &format!("transaction broadcast task failed: {error}")),
+    }
+}
+
+fn parse_address_params(params: Value) -> Result<String, String> {
+    let address = match params {
+        Value::Object(params) => params
+            .get("address")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "params.address must be a string".to_string())?,
+        Value::Array(params) if params.len() == 1 => params[0]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "params[0] must be an address string".to_string())?,
+        Value::Array(_) => {
+            return Err("params must contain exactly one address string".to_string());
+        }
+        _ => return Err("params must be an object or a one-item array".to_string()),
+    };
+    let address = address.trim();
+    if address.is_empty() {
+        return Err("address must not be empty".to_string());
+    }
+    Ok(address.to_string())
+}
+
+async fn get_address_response(id: Value, params: Value) -> JsonRpcResponse {
+    let address_raw = match parse_address_params(params) {
+        Ok(address) => address,
+        Err(detail) => return invalid_params(id, &detail),
+    };
+    let address = match Address::from_str(&address_raw)
+        .and_then(|address| address.require_network(get_network()))
+    {
+        Ok(address) => address,
+        Err(error) => return invalid_params(id, &format!("invalid address: {error}")),
+    };
+    let electrum = get_electrum_like();
+    let result = tokio::task::spawn_blocking(move || electrum.address_summary(&address)).await;
+
+    match result {
+        Ok(Ok(summary)) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(json!(summary)),
+            error: None,
+            id,
+        },
+        Ok(Err(error)) => err_response(
+            id,
+            -32000,
+            "Address lookup failed",
+            Some(json!({ "detail": format!("{error:#}") })),
+        ),
+        Err(error) => internal_error(id, &format!("address lookup task failed: {error}")),
     }
 }
 
@@ -677,6 +735,9 @@ async fn handle_single_request(
     if method == ROOT_METHOD_FEE_ESTIMATES {
         return Some(fee_estimates_response(id));
     }
+    if method == ROOT_METHOD_GET_ADDRESS {
+        return Some(get_address_response(id, params).await);
+    }
 
     // Check method existence to produce -32601 at the protocol layer
     let method_exists = {
@@ -861,5 +922,19 @@ mod tests {
         assert!(parse_raw_transaction_params(json!({ "raw_tx": "not-hex" })).is_err());
         assert!(parse_raw_transaction_params(json!([])).is_err());
         assert!(parse_raw_transaction_params(Value::Null).is_err());
+    }
+
+    #[test]
+    fn address_params_accept_object_and_positional_forms() {
+        let address = "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv";
+        assert_eq!(parse_address_params(json!({ "address": address })).unwrap(), address);
+        assert_eq!(parse_address_params(json!([address])).unwrap(), address);
+    }
+
+    #[test]
+    fn address_params_reject_invalid_payloads() {
+        assert!(parse_address_params(json!({ "address": "" })).is_err());
+        assert!(parse_address_params(json!([])).is_err());
+        assert!(parse_address_params(Value::Null).is_err());
     }
 }

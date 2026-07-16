@@ -1,9 +1,10 @@
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
-    RpcGetBestMevSwapParams, RpcGetBtcUsdPriceParams, RpcGetCandlesParams,
-    RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams, RpcGetPoolsParams,
-    RpcGetTokenActivityParams, RpcGetTokenTotalVolumeParams, RpcGetTokenVolumeParams,
-    RpcGetTotalVolumeAmmParams, RpcPingParams,
+    AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAlkanesPriceDataParams,
+    RpcGetAmmFactoriesParams, RpcGetBestMevSwapParams, RpcGetBtcUsdPriceParams,
+    RpcGetCandlesParams, RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams,
+    RpcGetPoolsParams, RpcGetPortfolioStatsParams, RpcGetTokenActivityParams,
+    RpcGetTokenTotalVolumeParams, RpcGetTokenVolumeParams, RpcGetTotalVolumeAmmParams,
+    RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -51,6 +52,86 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                     view.rpc_get_candles(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_price_data = reg.clone();
+    let mdb_price_data = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_price_data
+            .register("get_alkanes_price_data", move |_cx, payload| {
+                let mdb = Arc::clone(&mdb_price_data);
+                async move {
+                    let assets = payload.get("assets").and_then(|value| {
+                        value.as_array().and_then(|items| {
+                            items
+                                .iter()
+                                .map(|item| item.as_str().map(str::to_string))
+                                .collect::<Option<Vec<_>>>()
+                        })
+                    });
+                    let params = RpcGetAlkanesPriceDataParams {
+                        assets,
+                        now: payload.get("now").and_then(|value| value.as_u64()),
+                    };
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|value| value.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(view) => view,
+                        Err(error) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": error.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_alkanes_price_data(params)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                }
+            })
+            .await;
+    });
+
+    let reg_portfolio = reg.clone();
+    let mdb_portfolio = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_portfolio
+            .register("get_portfolio_stats", move |_cx, payload| {
+                let mdb = Arc::clone(&mdb_portfolio);
+                async move {
+                    let params = RpcGetPortfolioStatsParams {
+                        address: payload
+                            .get("address")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                    };
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|value| value.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(view) => view,
+                        Err(error) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": error.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_portfolio_stats(params)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|error| {
+                            json!({
+                                "ok": false,
+                                "error": "internal_error",
+                                "detail": error.to_string()
+                            })
+                        })
                 }
             })
             .await;

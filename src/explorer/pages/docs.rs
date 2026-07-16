@@ -519,6 +519,28 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     }),
                 ),
                 rpc_doc(
+                    "get_address",
+                    "Returns the configured electrs/Esplora address summary without changing its field names or response shape. This method requires electrs_esplora_url; native Electrum RPC does not expose the exact aggregate statistics.",
+                    json!({ "address": "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv" }),
+                    json!({
+                        "address": "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv",
+                        "chain_stats": {
+                            "funded_txo_count": 11,
+                            "funded_txo_sum": 15007688098u64,
+                            "spent_txo_count": 5,
+                            "spent_txo_sum": 15007599040u64,
+                            "tx_count": 13
+                        },
+                        "mempool_stats": {
+                            "funded_txo_count": 0,
+                            "funded_txo_sum": 0,
+                            "spent_txo_count": 0,
+                            "spent_txo_sum": 0,
+                            "tx_count": 0
+                        }
+                    }),
+                ),
+                rpc_doc(
                     "get_method_line_chart",
                     "Samples a numeric value from another RPC method across indexed heights and returns chart-ready points.",
                     json!({
@@ -911,6 +933,69 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     "Returns OHLCV candles for a pool or token pair over a supported timeframe.",
                     json!({ "pool": "2:53014", "timeframe": "1h", "limit": 10, "page": 1, "side": "base" }),
                     json!({ "ok": true, "candles": [{ "ts": 1710000000, "open": "1", "high": "2", "low": "1", "close": "2", "volume": "100" }] }),
+                ),
+                rpc_doc(
+                    "ammdata.get_alkanes_price_data",
+                    "Returns current and 24-hour USD pricing for BTC and requested Alkanes. Current token prices use the same latest 10-minute spot close shown by the newest hourly get_candles candle; comparison prices use hourly candle index 24. change_24h is the percentage change and change_24h_usd is the absolute price change.",
+                    json!({ "assets": ["btc", "2:0", "2:68479"] }),
+                    json!({
+                        "ok": true,
+                        "timeframe": "1h",
+                        "comparison_hours": 24,
+                        "assets": {
+                            "btc": {
+                                "name": "Bitcoin",
+                                "symbol": "BTC",
+                                "price_now_usd": "65000",
+                                "price_24h_ago_usd": "64000",
+                                "change_24h": "1.5625",
+                                "change_24h_usd": "1000",
+                                "price_now_ts": 1779307200,
+                                "price_24h_ago_ts": 1779220800
+                            },
+                            "2:0": {
+                                "name": "DIESEL",
+                                "symbol": "diesel",
+                                "price_now_usd": "0.75",
+                                "price_24h_ago_usd": "0.7",
+                                "change_24h": "7.1428",
+                                "change_24h_usd": "0.05",
+                                "price_now_ts": 1779307200,
+                                "price_24h_ago_ts": 1779220800
+                            }
+                        }
+                    }),
+                ),
+                rpc_doc(
+                    "ammdata.get_portfolio_stats",
+                    "Values an address's Alkane balances at latest or an optional indexed height. The same selected-height balances are valued at current and 24-hour-old prices, so changes represent price movement without treating purchases, sales, or transfers as gains. change_24h is the percentage change and change_24h_usd is the corresponding portfolio USD value change. complete is false when any balance lacks a required price.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "height": 946000 }),
+                    json!({
+                        "ok": true,
+                        "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8",
+                        "height": 946000,
+                        "complete": true,
+                        "unpriced_assets": [],
+                        "total_value_usd": "150",
+                        "total_value_24h_ago_usd": "140",
+                        "change_24h": "7.1428",
+                        "change_24h_usd": "10",
+                        "assets": {
+                            "2:0": {
+                                "name": "DIESEL",
+                                "symbol": "diesel",
+                                "balance": "20000000000",
+                                "balance_at_height": "20000000000",
+                                "price_now_usd": "0.75",
+                                "price_24h_ago_usd": "0.7",
+                                "change_24h": "7.1428",
+                                "change_24h_usd": "0.05",
+                                "value_now_usd": "150",
+                                "value_24h_ago_usd": "140",
+                                "value_change_24h_usd": "10"
+                            }
+                        }
+                    }),
                 ),
                 rpc_doc(
                     "ammdata.get_token_volume",
