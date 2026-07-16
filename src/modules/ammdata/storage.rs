@@ -4,7 +4,7 @@ use super::schemas::{
     SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
 };
 use crate::config::get_network;
-use crate::modules::ammdata::config::AmmDataConfig;
+use crate::modules::ammdata::config::{AmmDataConfig, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID, MAINNET_FIRE_USD_CHART_START_TS,
     PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block, canonical_quotes_at_height,
@@ -3375,20 +3375,47 @@ impl AmmDataProvider {
         &self,
         asset: PriceAsset,
         now: u64,
+        derived_quotes: &[DerivedQuoteConfig],
     ) -> Result<AssetPriceSnapshot> {
-        let hourly = match asset {
-            PriceAsset::Btc => read_btc_usd_line_v1(self, Timeframe::H1, now)?,
+        let (hourly, spot) = match asset {
+            PriceAsset::Btc => (read_btc_usd_line_v1(self, Timeframe::H1, now)?, None),
             PriceAsset::Alkane(token) => {
-                read_token_usd_candles_v1(self, token, Timeframe::H1, now)?
+                let mut merged = None;
+                for quote in derived_quotes {
+                    let hourly = read_token_derived_usd_candles_v1(
+                        self,
+                        token,
+                        quote.alkane,
+                        Timeframe::H1,
+                        now,
+                    )?;
+                    if hourly.candles_newest_first.is_empty() {
+                        continue;
+                    }
+                    let spot = read_token_derived_usd_candles_v1(
+                        self,
+                        token,
+                        quote.alkane,
+                        Timeframe::M10,
+                        now,
+                    )?;
+                    merged = Some((hourly, Some(spot)));
+                    break;
+                }
+                match merged {
+                    Some(slices) => slices,
+                    None => (
+                        read_token_usd_candles_v1(self, token, Timeframe::H1, now)?,
+                        Some(read_token_usd_candles_v1(self, token, Timeframe::M10, now)?),
+                    ),
+                }
             }
         };
-        let mut price_now = hourly.candles_newest_first.first().map(|candle| candle.close);
-        if let PriceAsset::Alkane(token) = asset {
-            price_now = read_token_usd_candles_v1(self, token, Timeframe::M10, now)
-                .ok()
-                .and_then(|slice| slice.candles_newest_first.first().map(|candle| candle.close))
-                .or(price_now);
-        }
+        let price_now = spot
+            .as_ref()
+            .and_then(|slice| slice.candles_newest_first.first())
+            .or_else(|| hourly.candles_newest_first.first())
+            .map(|candle| candle.close);
         let price_ago = hourly
             .candles_newest_first
             .get(PRICE_COMPARISON_HOURS)
@@ -3408,9 +3435,16 @@ impl AmmDataProvider {
         assets: &[PriceAsset],
         now: u64,
     ) -> Result<HashMap<PriceAsset, AssetPriceSnapshot>> {
+        let config = AmmDataConfig::load_from_global_config()?;
+        let derived_quotes = config
+            .derived_liquidity
+            .as_ref()
+            .map(|config| config.derived_quotes.as_slice())
+            .unwrap_or_default();
         let mut snapshots = HashMap::with_capacity(assets.len());
         for asset in assets {
-            snapshots.insert(*asset, self.hourly_asset_price_snapshot(*asset, now)?);
+            snapshots
+                .insert(*asset, self.hourly_asset_price_snapshot(*asset, now, derived_quotes)?);
         }
         Ok(snapshots)
     }
@@ -3450,14 +3484,14 @@ impl AmmDataProvider {
         Ok(metadata)
     }
 
-    pub fn rpc_get_alkanes_price_data(
+    pub fn rpc_get_alkanes_quote(
         &self,
-        params: RpcGetAlkanesPriceDataParams,
-    ) -> Result<RpcGetAlkanesPriceDataResult> {
+        params: RpcGetAlkanesQuoteParams,
+    ) -> Result<RpcGetAlkanesQuoteResult> {
         let assets = match parse_price_assets(params.assets) {
             Ok(assets) => assets,
             Err(error) => {
-                return Ok(RpcGetAlkanesPriceDataResult {
+                return Ok(RpcGetAlkanesQuoteResult {
                     value: json!({ "ok": false, "error": error }),
                 });
             }
@@ -3474,7 +3508,7 @@ impl AmmDataProvider {
             }
         }
 
-        Ok(RpcGetAlkanesPriceDataResult {
+        Ok(RpcGetAlkanesQuoteResult {
             value: json!({
                 "ok": true,
                 "timeframe": "1h",
@@ -3482,6 +3516,33 @@ impl AmmDataProvider {
                 "assets": Value::Object(prices),
             }),
         })
+    }
+
+    pub fn rpc_get_alkane_quote(
+        &self,
+        params: RpcGetAlkaneQuoteParams,
+    ) -> Result<RpcGetAlkaneQuoteResult> {
+        let assets = match parse_price_assets(params.asset.map(|asset| vec![asset])) {
+            Ok(assets) => assets,
+            Err(error) => {
+                return Ok(RpcGetAlkaneQuoteResult {
+                    value: json!({ "ok": false, "error": error }),
+                });
+            }
+        };
+        let asset = assets[0];
+        let now = params.now.unwrap_or_else(now_ts);
+        let snapshots = self.asset_price_snapshots(&[asset], now)?;
+        let metadata = self.asset_metadata(&[asset])?;
+        let mut quote = asset_price_json(snapshots[&asset]);
+        add_asset_metadata(&mut quote, metadata.get(&asset), &asset.label());
+        let mut result = quote.as_object().cloned().unwrap_or_default();
+        result.insert("ok".to_string(), json!(true));
+        result.insert("asset".to_string(), json!(asset.label()));
+        result.insert("timeframe".to_string(), json!("1h"));
+        result.insert("comparison_hours".to_string(), json!(PRICE_COMPARISON_HOURS));
+
+        Ok(RpcGetAlkaneQuoteResult { value: Value::Object(result) })
     }
 
     pub fn rpc_get_portfolio_stats(
@@ -3561,7 +3622,6 @@ impl AmmDataProvider {
             add_asset_metadata(&mut row, metadata.get(&asset), &label);
             if let Some(object) = row.as_object_mut() {
                 object.insert("balance".to_string(), json!(balance.to_string()));
-                object.insert("balance_at_height".to_string(), json!(balance.to_string()));
                 object.insert("value_now_usd".to_string(), scaled_u256_json(value_now));
                 object.insert("value_24h_ago_usd".to_string(), scaled_u256_json(value_ago));
                 object.insert(
@@ -5509,12 +5569,21 @@ pub struct RpcGetCandlesResult {
     pub value: Value,
 }
 
-pub struct RpcGetAlkanesPriceDataParams {
+pub struct RpcGetAlkanesQuoteParams {
     pub assets: Option<Vec<String>>,
     pub now: Option<u64>,
 }
 
-pub struct RpcGetAlkanesPriceDataResult {
+pub struct RpcGetAlkanesQuoteResult {
+    pub value: Value,
+}
+
+pub struct RpcGetAlkaneQuoteParams {
+    pub asset: Option<String>,
+    pub now: Option<u64>,
+}
+
+pub struct RpcGetAlkaneQuoteResult {
     pub value: Value,
 }
 
@@ -5925,11 +5994,13 @@ fn percentage_change_json(ago: Option<u128>, now: Option<u128>) -> Value {
 }
 
 fn asset_price_json(snapshot: AssetPriceSnapshot) -> Value {
+    let price_now = snapshot.now.unwrap_or(0);
+    let price_ago = snapshot.ago.unwrap_or(0);
     json!({
-        "price_now_usd": scaled_u128_json(snapshot.now),
-        "price_24h_ago_usd": scaled_u128_json(snapshot.ago),
-        "change_24h": percentage_change_json(snapshot.ago, snapshot.now),
-        "change_24h_usd": signed_scaled_u128_json(snapshot.now, snapshot.ago),
+        "price_now_usd": scaled_u128_json(Some(price_now)),
+        "price_24h_ago_usd": scaled_u128_json(Some(price_ago)),
+        "change_24h": percentage_change_json(Some(price_ago), Some(price_now)),
+        "change_24h_usd": signed_scaled_u128_json(Some(price_now), Some(price_ago)),
         "price_now_ts": snapshot.now.map(|_| snapshot.now_ts),
         "price_24h_ago_ts": snapshot.ago.map(|_| snapshot.ago_ts),
     })
@@ -6693,6 +6764,19 @@ mod tests {
             percentage_change_u256(U256::from(100u64), U256::from(75u64)),
             Some("-25.0000".to_string())
         );
+    }
+
+    #[test]
+    fn missing_quote_serializes_as_zero_prices() {
+        let quote =
+            asset_price_json(AssetPriceSnapshot { now: None, ago: None, now_ts: 0, ago_ts: 0 });
+
+        assert_eq!(quote["price_now_usd"], json!("0"));
+        assert_eq!(quote["price_24h_ago_usd"], json!("0"));
+        assert_eq!(quote["change_24h"], json!("0.0000"));
+        assert_eq!(quote["change_24h_usd"], json!("0"));
+        assert_eq!(quote["price_now_ts"], Value::Null);
+        assert_eq!(quote["price_24h_ago_ts"], Value::Null);
     }
 
     #[test]

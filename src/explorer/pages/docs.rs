@@ -935,8 +935,8 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     json!({ "ok": true, "candles": [{ "ts": 1710000000, "open": "1", "high": "2", "low": "1", "close": "2", "volume": "100" }] }),
                 ),
                 rpc_doc(
-                    "ammdata.get_alkanes_price_data",
-                    "Returns current and 24-hour USD pricing for BTC and requested Alkanes. Current token prices use the same latest 10-minute spot close shown by the newest hourly get_candles candle; comparison prices use hourly candle index 24. change_24h is the percentage change and change_24h_usd is the absolute price change.",
+                    "ammdata.get_alkanes_quote",
+                    "Returns current and 24-hour USD quotes for BTC and requested Alkanes. Alkane quotes prefer the configured merged <token>-derived_<quote>-usd chart, fall back to the direct <token>-usd chart, and return zero prices when neither chart exists. Current prices use the latest 10-minute close and comparison prices use hourly candle index 24. change_24h is the percentage change and change_24h_usd is the absolute price change.",
                     json!({ "assets": ["btc", "2:0", "2:68479"] }),
                     json!({
                         "ok": true,
@@ -962,8 +962,37 @@ fn docs_modules() -> Vec<ModuleDoc> {
                                 "change_24h_usd": "0.05",
                                 "price_now_ts": 1779307200,
                                 "price_24h_ago_ts": 1779220800
+                            },
+                            "2:68479": {
+                                "name": "TORTILLA",
+                                "symbol": "TORTILLA",
+                                "price_now_usd": "0",
+                                "price_24h_ago_usd": "0",
+                                "change_24h": "0.0000",
+                                "change_24h_usd": "0",
+                                "price_now_ts": null,
+                                "price_24h_ago_ts": null
                             }
                         }
+                    }),
+                ),
+                rpc_doc(
+                    "ammdata.get_alkane_quote",
+                    "Returns one BTC or Alkane quote using the same merged-derived, direct-USD, then zero fallback order as ammdata.get_alkanes_quote. The asset field also accepts an Alkane ID under the alkane alias.",
+                    json!({ "asset": "2:0" }),
+                    json!({
+                        "ok": true,
+                        "asset": "2:0",
+                        "timeframe": "1h",
+                        "comparison_hours": 24,
+                        "name": "DIESEL",
+                        "symbol": "diesel",
+                        "price_now_usd": "0.75",
+                        "price_24h_ago_usd": "0.7",
+                        "change_24h": "7.1428",
+                        "change_24h_usd": "0.05",
+                        "price_now_ts": 1779307200,
+                        "price_24h_ago_ts": 1779220800
                     }),
                 ),
                 rpc_doc(
@@ -985,7 +1014,6 @@ fn docs_modules() -> Vec<ModuleDoc> {
                                 "name": "DIESEL",
                                 "symbol": "diesel",
                                 "balance": "20000000000",
-                                "balance_at_height": "20000000000",
                                 "price_now_usd": "0.75",
                                 "price_24h_ago_usd": "0.7",
                                 "change_24h": "7.1428",

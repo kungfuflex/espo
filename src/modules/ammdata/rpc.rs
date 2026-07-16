@@ -1,10 +1,10 @@
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAlkanesPriceDataParams,
-    RpcGetAmmFactoriesParams, RpcGetBestMevSwapParams, RpcGetBtcUsdPriceParams,
-    RpcGetCandlesParams, RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams,
-    RpcGetPoolsParams, RpcGetPortfolioStatsParams, RpcGetTokenActivityParams,
-    RpcGetTokenTotalVolumeParams, RpcGetTokenVolumeParams, RpcGetTotalVolumeAmmParams,
-    RpcPingParams,
+    AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAlkaneQuoteParams,
+    RpcGetAlkanesQuoteParams, RpcGetAmmFactoriesParams, RpcGetBestMevSwapParams,
+    RpcGetBtcUsdPriceParams, RpcGetCandlesParams, RpcGetChartChangeBlockParams,
+    RpcGetChartChangesBlockParams, RpcGetPoolsParams, RpcGetPortfolioStatsParams,
+    RpcGetTokenActivityParams, RpcGetTokenTotalVolumeParams, RpcGetTokenVolumeParams,
+    RpcGetTotalVolumeAmmParams, RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -57,12 +57,12 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
             .await;
     });
 
-    let reg_price_data = reg.clone();
-    let mdb_price_data = Arc::clone(&mdb_ptr);
+    let reg_alkanes_quote = reg.clone();
+    let mdb_alkanes_quote = Arc::clone(&mdb_ptr);
     tokio::spawn(async move {
-        reg_price_data
-            .register("get_alkanes_price_data", move |_cx, payload| {
-                let mdb = Arc::clone(&mdb_price_data);
+        reg_alkanes_quote
+            .register("get_alkanes_quote", move |_cx, payload| {
+                let mdb = Arc::clone(&mdb_alkanes_quote);
                 async move {
                     let assets = payload.get("assets").and_then(|value| {
                         value.as_array().and_then(|items| {
@@ -72,7 +72,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                                 .collect::<Option<Vec<_>>>()
                         })
                     });
-                    let params = RpcGetAlkanesPriceDataParams {
+                    let params = RpcGetAlkanesQuoteParams {
                         assets,
                         now: payload.get("now").and_then(|value| value.as_u64()),
                     };
@@ -89,7 +89,43 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                             });
                         }
                     };
-                    view.rpc_get_alkanes_price_data(params)
+                    view.rpc_get_alkanes_quote(params)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                }
+            })
+            .await;
+    });
+
+    let reg_alkane_quote = reg.clone();
+    let mdb_alkane_quote = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_alkane_quote
+            .register("get_alkane_quote", move |_cx, payload| {
+                let mdb = Arc::clone(&mdb_alkane_quote);
+                async move {
+                    let params = RpcGetAlkaneQuoteParams {
+                        asset: payload
+                            .get("asset")
+                            .or_else(|| payload.get("alkane"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        now: payload.get("now").and_then(|value| value.as_u64()),
+                    };
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|value| value.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(view) => view,
+                        Err(error) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": error.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_alkane_quote(params)
                         .map(|response| response.value)
                         .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
                 }
