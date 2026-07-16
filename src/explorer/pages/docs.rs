@@ -936,7 +936,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "ammdata.get_alkanes_quote",
-                    "Returns current and 24-hour USD quotes for BTC and requested Alkanes. Alkane quotes prefer the configured merged <token>-derived_<quote>-usd chart, fall back to the direct <token>-usd chart, and return zero prices when neither chart exists. Current prices use the latest 10-minute close and comparison prices use hourly candle index 24. change_24h is the percentage change and change_24h_usd is the absolute price change.",
+                    "Returns current and 24-hour USD quotes for BTC and requested Alkanes. frBTC (32:0) is pegged directly to Espo's indexed BTC/USD history, so its prices and changes match BTC exactly. Other Alkane quotes prefer the configured merged <token>-derived_<quote>-usd chart, fall back to the direct <token>-usd chart, and return zero prices when neither chart exists. Current prices use the latest 10-minute close and comparison prices use hourly candle index 24. change_24h is the percentage change and change_24h_usd is the absolute price change.",
                     json!({ "assets": ["btc", "2:0", "2:68479"] }),
                     json!({
                         "ok": true,
@@ -978,7 +978,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "ammdata.get_alkane_quote",
-                    "Returns one BTC or Alkane quote using the same merged-derived, direct-USD, then zero fallback order as ammdata.get_alkanes_quote. The asset field also accepts an Alkane ID under the alkane alias.",
+                    "Returns one BTC or Alkane quote using the same BTC-pegged frBTC, merged-derived, direct-USD, then zero fallback order as ammdata.get_alkanes_quote. The asset field also accepts an Alkane ID under the alkane alias.",
                     json!({ "asset": "2:0" }),
                     json!({
                         "ok": true,
@@ -997,7 +997,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "ammdata.get_portfolio_stats",
-                    "Values an address's Alkane balances at latest or an optional indexed height. The same selected-height balances are valued at current and 24-hour-old prices, so changes represent price movement without treating purchases, sales, or transfers as gains. change_24h is the percentage change and change_24h_usd is the corresponding portfolio USD value change. complete is false when any balance lacks a required price.",
+                    "Values an address's confirmed BTC and Alkane balances at latest or an optional indexed height. Historical BTC balances are reconstructed from address transaction history, while BTC prices come from Espo's indexed BTC/USD candles. frBTC (32:0) uses that same BTC price history. The same selected-height balances are valued at current and 24-hour-old prices, so changes represent price movement without treating purchases, sales, or transfers as gains. change_24h is the percentage change and change_24h_usd is the corresponding portfolio USD value change. complete is false when any balance lacks a required price.",
                     json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "height": 946000 }),
                     json!({
                         "ok": true,
@@ -1005,11 +1005,23 @@ fn docs_modules() -> Vec<ModuleDoc> {
                         "height": 946000,
                         "complete": true,
                         "unpriced_assets": [],
-                        "total_value_usd": "150",
-                        "total_value_24h_ago_usd": "140",
-                        "change_24h": "7.1428",
-                        "change_24h_usd": "10",
+                        "total_value_usd": "65150",
+                        "total_value_24h_ago_usd": "64140",
+                        "change_24h": "1.5746",
+                        "change_24h_usd": "1010",
                         "assets": {
+                            "btc": {
+                                "name": "Bitcoin",
+                                "symbol": "BTC",
+                                "balance": "100000000",
+                                "price_now_usd": "65000",
+                                "price_24h_ago_usd": "64000",
+                                "change_24h": "1.5625",
+                                "change_24h_usd": "1000",
+                                "value_now_usd": "65000",
+                                "value_24h_ago_usd": "64000",
+                                "value_change_24h_usd": "1000"
+                            },
                             "2:0": {
                                 "name": "DIESEL",
                                 "symbol": "diesel",

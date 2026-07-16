@@ -3,7 +3,7 @@ use super::schemas::{
     SchemaPoolCreationInfoV1, SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2,
     SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
 };
-use crate::config::get_network;
+use crate::config::{get_electrum_like, get_espo_indexed_height, get_network};
 use crate::modules::ammdata::config::{AmmDataConfig, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID, MAINNET_FIRE_USD_CHART_START_TS,
@@ -35,7 +35,7 @@ use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use alloy_primitives::U256;
 use anyhow::{Result, anyhow};
-use bitcoin::{Address, BlockHash};
+use bitcoin::{Address, BlockHash, Transaction, consensus::deserialize};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{Value, json, map::Map};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -45,6 +45,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const PRICE_COMPARISON_HOURS: usize = 24;
 const MAX_PRICE_ASSETS: usize = 1_000;
+const FRBTC_ASSET: SchemaAlkaneId = SchemaAlkaneId { block: 32, tx: 0 };
 
 fn dedupe_batch_ops(
     puts: Vec<(Vec<u8>, Vec<u8>)>,
@@ -3377,37 +3378,41 @@ impl AmmDataProvider {
         now: u64,
         derived_quotes: &[DerivedQuoteConfig],
     ) -> Result<AssetPriceSnapshot> {
-        let (hourly, spot) = match asset {
-            PriceAsset::Btc => (read_btc_usd_line_v1(self, Timeframe::H1, now)?, None),
-            PriceAsset::Alkane(token) => {
-                let mut merged = None;
-                for quote in derived_quotes {
-                    let hourly = read_token_derived_usd_candles_v1(
-                        self,
-                        token,
-                        quote.alkane,
-                        Timeframe::H1,
-                        now,
-                    )?;
-                    if hourly.candles_newest_first.is_empty() {
-                        continue;
+        let (hourly, spot) = if asset_uses_btc_price(asset) {
+            (read_btc_usd_line_v1(self, Timeframe::H1, now)?, None)
+        } else {
+            match asset {
+                PriceAsset::Btc => unreachable!("BTC assets use the BTC price branch"),
+                PriceAsset::Alkane(token) => {
+                    let mut merged = None;
+                    for quote in derived_quotes {
+                        let hourly = read_token_derived_usd_candles_v1(
+                            self,
+                            token,
+                            quote.alkane,
+                            Timeframe::H1,
+                            now,
+                        )?;
+                        if hourly.candles_newest_first.is_empty() {
+                            continue;
+                        }
+                        let spot = read_token_derived_usd_candles_v1(
+                            self,
+                            token,
+                            quote.alkane,
+                            Timeframe::M10,
+                            now,
+                        )?;
+                        merged = Some((hourly, Some(spot)));
+                        break;
                     }
-                    let spot = read_token_derived_usd_candles_v1(
-                        self,
-                        token,
-                        quote.alkane,
-                        Timeframe::M10,
-                        now,
-                    )?;
-                    merged = Some((hourly, Some(spot)));
-                    break;
-                }
-                match merged {
-                    Some(slices) => slices,
-                    None => (
-                        read_token_usd_candles_v1(self, token, Timeframe::H1, now)?,
-                        Some(read_token_usd_candles_v1(self, token, Timeframe::M10, now)?),
-                    ),
+                    match merged {
+                        Some(slices) => slices,
+                        None => (
+                            read_token_usd_candles_v1(self, token, Timeframe::H1, now)?,
+                            Some(read_token_usd_candles_v1(self, token, Timeframe::M10, now)?),
+                        ),
+                    }
                 }
             }
         };
@@ -3484,6 +3489,62 @@ impl AmmDataProvider {
         Ok(metadata)
     }
 
+    fn bitcoin_balance_at_height(&self, address: &Address, height: u32) -> Result<u128> {
+        let electrum = get_electrum_like();
+        if get_espo_indexed_height() == Some(height)
+            && let Ok(stats) = electrum.address_stats(address)
+            && let Some(balance) = stats.confirmed_balance
+        {
+            return Ok(u128::from(balance));
+        }
+
+        let first_page = electrum.address_history_page(address, 0, 1)?;
+        let fetch_limit = first_page
+            .total
+            .unwrap_or(first_page.entries.len())
+            .saturating_add(1_024)
+            .max(1);
+        let history = electrum.address_history_page(address, 0, fetch_limit)?;
+        let mut entries = history
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                entry.height.is_some_and(|entry_height| entry_height <= u64::from(height))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.txid);
+        entries.dedup_by_key(|entry| entry.txid);
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let txids = entries.iter().map(|entry| entry.txid).collect::<Vec<_>>();
+        let raw_transactions = electrum.batch_transaction_get_raw(&txids)?;
+        let target_script = address.script_pubkey();
+        let mut owned_outputs = HashMap::new();
+        let mut spent_outputs = HashSet::new();
+        for (txid, raw) in txids.into_iter().zip(raw_transactions) {
+            if raw.is_empty() {
+                return Err(anyhow!("empty raw transaction returned for {txid}"));
+            }
+            let transaction: Transaction = deserialize(&raw)
+                .map_err(|error| anyhow!("failed to decode address transaction {txid}: {error}"))?;
+            for (vout, output) in transaction.output.iter().enumerate() {
+                if output.script_pubkey == target_script {
+                    owned_outputs.insert((txid, vout as u32), u128::from(output.value.to_sat()));
+                }
+            }
+            for input in &transaction.input {
+                spent_outputs.insert((input.previous_output.txid, input.previous_output.vout));
+            }
+        }
+
+        Ok(owned_outputs
+            .into_iter()
+            .filter(|(outpoint, _)| !spent_outputs.contains(outpoint))
+            .fold(0u128, |total, (_, value)| total.saturating_add(value)))
+    }
+
     pub fn rpc_get_alkanes_quote(
         &self,
         params: RpcGetAlkanesQuoteParams,
@@ -3558,13 +3619,14 @@ impl AmmDataProvider {
         let address = match Address::from_str(address_raw)
             .and_then(|address| address.require_network(get_network()))
         {
-            Ok(address) => address.to_string(),
+            Ok(address) => address,
             Err(_) => {
                 return Ok(RpcGetPortfolioStatsResult {
                     value: json!({ "ok": false, "error": "invalid_address_format" }),
                 });
             }
         };
+        let address_string = address.to_string();
         let Some(height) = self
             .essentials
             .get_index_height(EssentialsGetIndexHeightParams { blockhash: StateAt::Latest })?
@@ -3574,11 +3636,12 @@ impl AmmDataProvider {
                 value: json!({ "ok": false, "error": "indexed_height_unavailable" }),
             });
         };
-        let balances =
-            get_balance_for_address(StateAt::Latest, self.essentials.as_ref(), &address)?;
-        let mut ids = balances.keys().copied().collect::<Vec<_>>();
+        let alkane_balances =
+            get_balance_for_address(StateAt::Latest, self.essentials.as_ref(), &address_string)?;
+        let bitcoin_balance = self.bitcoin_balance_at_height(&address, height)?;
+        let mut ids = alkane_balances.keys().copied().collect::<Vec<_>>();
         ids.sort_by_key(|id| (id.block, id.tx));
-        if ids.len() > MAX_PRICE_ASSETS {
+        if ids.len().saturating_add(1) > MAX_PRICE_ASSETS {
             return Ok(RpcGetPortfolioStatsResult {
                 value: json!({
                     "ok": false,
@@ -3588,18 +3651,24 @@ impl AmmDataProvider {
             });
         }
 
-        let assets = ids.iter().copied().map(PriceAsset::Alkane).collect::<Vec<_>>();
+        let mut balances = HashMap::with_capacity(ids.len().saturating_add(1));
+        balances.insert(PriceAsset::Btc, bitcoin_balance);
+        for (id, balance) in alkane_balances {
+            balances.insert(PriceAsset::Alkane(id), balance);
+        }
+        let mut assets = Vec::with_capacity(ids.len().saturating_add(1));
+        assets.push(PriceAsset::Btc);
+        assets.extend(ids.into_iter().map(PriceAsset::Alkane));
         let snapshots = self.asset_price_snapshots(&assets, now_ts())?;
         let metadata = self.asset_metadata(&assets)?;
-        let mut rows = Map::with_capacity(ids.len());
+        let mut rows = Map::with_capacity(assets.len());
         let mut total_now = U256::ZERO;
         let mut total_ago = U256::ZERO;
         let mut unpriced_assets = Vec::new();
 
-        for id in ids {
-            let asset = PriceAsset::Alkane(id);
+        for asset in assets {
             let label = asset.label();
-            let balance = balances.get(&id).copied().unwrap_or(0);
+            let balance = balances.get(&asset).copied().unwrap_or(0);
             let snapshot = snapshots.get(&asset).copied().unwrap_or(AssetPriceSnapshot {
                 now: None,
                 ago: None,
@@ -3635,7 +3704,7 @@ impl AmmDataProvider {
         Ok(RpcGetPortfolioStatsResult {
             value: json!({
                 "ok": true,
-                "address": address,
+                "address": address_string,
                 "height": height,
                 "complete": unpriced_assets.is_empty(),
                 "unpriced_assets": unpriced_assets,
@@ -5925,6 +5994,10 @@ fn parse_price_assets(
     if assets.is_empty() { Err("missing_or_invalid_assets") } else { Ok(assets) }
 }
 
+fn asset_uses_btc_price(asset: PriceAsset) -> bool {
+    matches!(asset, PriceAsset::Btc | PriceAsset::Alkane(FRBTC_ASSET))
+}
+
 fn format_scaled_u256(value: U256) -> String {
     let scale = U256::from(PRICE_SCALE);
     let whole = value / scale;
@@ -6750,6 +6823,13 @@ mod tests {
             parse_price_assets(Some(vec!["not-an-asset".to_string()])),
             Err("missing_or_invalid_assets")
         );
+    }
+
+    #[test]
+    fn frbtc_uses_the_btc_price_series() {
+        assert!(asset_uses_btc_price(PriceAsset::Btc));
+        assert!(asset_uses_btc_price(PriceAsset::Alkane(FRBTC_ASSET)));
+        assert!(!asset_uses_btc_price(PriceAsset::Alkane(SchemaAlkaneId { block: 2, tx: 0 })));
     }
 
     #[test]
