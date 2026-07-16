@@ -614,9 +614,27 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_block_summary",
-                    "Returns the indexed Alkane summary for a block height.",
+                    "Returns the indexed summary, canonical block hash, serialized header, and exact Unix block time for a block height.",
                     json!({ "height": 946000 }),
-                    json!({ "ok": true, "height": 946000, "tx_count": 2864, "trace_count": 38, "interaction_count": 60, "pool": { "name": "AntPool", "slug": "antpool" } }),
+                    json!({ "ok": true, "height": 946000, "found": true, "blockhash": "0000000000000000000000000000000000000000000000000000000000000000", "header_hex": "00000020...", "block_time": 1779308930, "tx_count": 2864, "trace_count": 38, "interaction_count": 60, "pool": { "name": "AntPool", "slug": "antpool" } }),
+                ),
+                rpc_doc(
+                    "essentials.get_block_time",
+                    "Returns the exact Unix timestamp from the canonical indexed block header at one height.",
+                    json!({ "height": 946000 }),
+                    json!({ "ok": true, "height": 946000, "found": true, "block_time": 1779308930 }),
+                ),
+                rpc_doc(
+                    "essentials.get_block_times",
+                    "Returns exact Unix timestamps for up to 1,000 canonical indexed block heights in request order.",
+                    json!({ "heights": [945999, 946000] }),
+                    json!({
+                        "ok": true,
+                        "times": [
+                            { "height": 945999, "found": true, "block_time": 1779308321 },
+                            { "height": 946000, "found": true, "block_time": 1779308930 }
+                        ]
+                    }),
                 ),
                 rpc_doc(
                     "essentials.get_holders",
@@ -833,9 +851,9 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_address_transactions",
-                    "Returns Bitcoin transactions for an address and can be narrowed to Alkane transactions. When `filter` is provided with `only_alkane_txs`, it scans Alkane transactions until the requested page is filled and returns `total: null`.",
+                    "Returns Bitcoin transactions for an address with exact indexed block heights, Unix block times, and confirmations, and can be narrowed to Alkane transactions. When `filter` is provided with `only_alkane_txs`, it scans Alkane transactions until the requested page is filled and returns `total: null`.",
                     json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "only_alkane_txs": true, "filter": "2:0" }),
-                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "total": null, "transactions": [{ "txid": "e212e704173d61d19a280de3af2f6a5166ecf95e9a2a98f74ceeeb3de323ea1c", "blockHeight": 939827, "confirmed": true }] }),
+                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "total": null, "transactions": [{ "txid": "e212e704173d61d19a280de3af2f6a5166ecf95e9a2a98f74ceeeb3de323ea1c", "blockHeight": 939827, "blockTime": 1779308930, "confirmations": 6174, "confirmed": true }] }),
                 ),
                 rpc_doc(
                     "essentials.get_alkane_latest_traces",

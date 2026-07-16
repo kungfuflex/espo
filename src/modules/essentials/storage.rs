@@ -24,7 +24,9 @@ use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use alkanes_support::proto::alkanes::AlkanesTrace;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, AddressType, BlockHash, Network, ScriptBuf, Transaction, Txid};
+use bitcoin::{
+    Address, AddressType, BlockHash, Network, ScriptBuf, Transaction, Txid, block::Header,
+};
 use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Artifact, Runestone};
@@ -68,6 +70,7 @@ const TX_POINTER_FILTER_WORDS: usize = 1 << 23;
 const TX_POINTER_FILTER_BITS: u64 = (TX_POINTER_FILTER_WORDS as u64) * 64;
 const TX_POINTER_FILTER_MASK: u64 = TX_POINTER_FILTER_BITS - 1;
 const TX_POINTER_FILTER_HASHES: u64 = 4;
+const MAX_BLOCK_TIMES_BATCH: usize = 1_000;
 
 struct TxPointerFilter {
     bits: Vec<u64>,
@@ -3642,7 +3645,11 @@ impl EssentialsProvider {
                 value: json!({"ok": false, "error": "missing_or_invalid_height"}),
             });
         };
-        let height = height as u32;
+        let Ok(height) = u32::try_from(height) else {
+            return Ok(RpcGetBlockSummaryResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_height"}),
+            });
+        };
         let summary = self
             .get_block_summary(GetBlockSummaryParams { blockhash: StateAt::Latest, height })
             .ok()
@@ -3658,9 +3665,11 @@ impl EssentialsProvider {
             fee_median,
             fee_range,
             pool,
+            block_time,
             found,
         ) = if let Some(summary) = summary {
             let blockhash = summary.block_hash().map(|h| h.to_string());
+            let block_time = summary.block_time();
             let pool = summary.pool.map(|pool| {
                 json!({
                     "id": pool.id,
@@ -3682,10 +3691,11 @@ impl EssentialsProvider {
                 summary.fee_median,
                 summary.fee_range,
                 pool,
+                block_time,
                 true,
             )
         } else {
-            (0, 0, 0, None, None, 0.0, 0.0, Vec::new(), None, false)
+            (0, 0, 0, None, None, 0.0, 0.0, Vec::new(), None, None, false)
         };
 
         Ok(RpcGetBlockSummaryResult {
@@ -3702,6 +3712,84 @@ impl EssentialsProvider {
                 "fee_median": fee_median,
                 "fee_range": fee_range,
                 "pool": pool,
+                "block_time": block_time,
+            }),
+        })
+    }
+
+    pub fn rpc_get_block_time(
+        &self,
+        params: RpcGetBlockTimeParams,
+    ) -> Result<RpcGetBlockTimeResult> {
+        let Some(height) = params.height.and_then(|height| u32::try_from(height).ok()) else {
+            return Ok(RpcGetBlockTimeResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_height"}),
+            });
+        };
+        let summary = self.get_block_summaries_by_heights(&[height])?.into_iter().next().flatten();
+        let found = summary.is_some();
+        let block_time = summary.as_ref().and_then(BlockSummary::block_time);
+
+        Ok(RpcGetBlockTimeResult {
+            value: json!({
+                "ok": true,
+                "height": height,
+                "found": found,
+                "block_time": block_time,
+            }),
+        })
+    }
+
+    pub fn rpc_get_block_times(
+        &self,
+        params: RpcGetBlockTimesParams,
+    ) -> Result<RpcGetBlockTimesResult> {
+        let Some(raw_heights) = params.heights else {
+            return Ok(RpcGetBlockTimesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_heights"}),
+            });
+        };
+        if raw_heights.len() > MAX_BLOCK_TIMES_BATCH {
+            return Ok(RpcGetBlockTimesResult {
+                value: json!({
+                    "ok": false,
+                    "error": "too_many_heights",
+                    "max_heights": MAX_BLOCK_TIMES_BATCH,
+                }),
+            });
+        }
+        let heights = match raw_heights
+            .iter()
+            .copied()
+            .map(u32::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(heights) => heights,
+            Err(_) => {
+                return Ok(RpcGetBlockTimesResult {
+                    value: json!({"ok": false, "error": "missing_or_invalid_heights"}),
+                });
+            }
+        };
+        let summaries = self.get_block_summaries_by_heights(&heights)?;
+        let times = heights
+            .into_iter()
+            .zip(summaries)
+            .map(|(height, summary)| {
+                let found = summary.is_some();
+                let block_time = summary.as_ref().and_then(BlockSummary::block_time);
+                json!({
+                    "height": height,
+                    "found": found,
+                    "block_time": block_time,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(RpcGetBlockTimesResult {
+            value: json!({
+                "ok": true,
+                "times": times,
             }),
         })
     }
@@ -5648,9 +5736,10 @@ impl EssentialsProvider {
                 txid: entry.txid,
                 tx: entry.tx.clone(),
                 traces: entry.traces.clone(),
+                block_height: None,
+                block_time: None,
                 confirmations: None,
                 is_mempool: true,
-                summary: None,
             });
         }
 
@@ -5756,9 +5845,10 @@ impl EssentialsProvider {
                                     txid,
                                     tx,
                                     traces: (!traces.is_empty()).then_some(traces),
+                                    block_height: Some(summary.height as u64),
+                                    block_time: None,
                                     confirmations,
                                     is_mempool: false,
-                                    summary: Some(summary),
                                 });
                             }
                         }
@@ -5769,7 +5859,7 @@ impl EssentialsProvider {
                 let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
 
                 if confirmed_slice_end > confirmed_slice_start {
-                    let mut txids: Vec<Txid> = Vec::new();
+                    let mut tx_rows: Vec<(Txid, u32)> = Vec::new();
                     let range_start = confirmed_total.saturating_sub(confirmed_slice_end) as u64;
                     let range_end = confirmed_total.saturating_sub(confirmed_slice_start) as u64;
                     let ids = get_address_index_list_range(
@@ -5785,10 +5875,11 @@ impl EssentialsProvider {
                         let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
                             continue;
                         };
-                        txids.push(Txid::from_byte_array(blob.txid));
+                        tx_rows.push((Txid::from_byte_array(blob.txid), blob.height));
                     }
 
-                    if !txids.is_empty() {
+                    if !tx_rows.is_empty() {
+                        let txids = tx_rows.iter().map(|(txid, _)| *txid).collect::<Vec<_>>();
                         let raw_txs =
                             electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
 
@@ -5808,16 +5899,12 @@ impl EssentialsProvider {
                                 }
                             };
                             let summary = load_tx_summary_v2(self, txid);
-                            let confirmations =
-                                summary.as_ref().and_then(|s| {
-                                    let h = s.height as u64;
-                                    if h == 0 {
-                                        return None;
-                                    }
-                                    chain_tip.and_then(|tip| {
-                                        if tip >= h { Some(tip - h + 1) } else { None }
-                                    })
-                                });
+                            let block_height = tx_rows.get(idx).map(|(_, height)| *height as u64);
+                            let confirmations = block_height.and_then(|height| {
+                                chain_tip.and_then(|tip| {
+                                    if tip >= height { Some(tip - height + 1) } else { None }
+                                })
+                            });
                             let traces = summary
                                 .as_ref()
                                 .map(|s| traces_from_summary(txid, s))
@@ -5826,9 +5913,10 @@ impl EssentialsProvider {
                                 txid: *txid,
                                 tx,
                                 traces,
+                                block_height,
+                                block_time: None,
                                 confirmations,
                                 is_mempool: false,
-                                summary,
                             });
                         }
                     }
@@ -5884,9 +5972,10 @@ impl EssentialsProvider {
                                     txid: *txid,
                                     tx,
                                     traces,
+                                    block_height: entries_for_page[idx].height,
+                                    block_time: None,
                                     confirmations,
                                     is_mempool: false,
-                                    summary,
                                 });
                             }
                         }
@@ -5896,6 +5985,40 @@ impl EssentialsProvider {
                     eprintln!(
                         "[rpc_get_address_transactions] failed to fetch history for {}: {e}",
                         address
+                    );
+                }
+            }
+        }
+
+        let mut block_heights = tx_renders
+            .iter()
+            .filter_map(|render| render.block_height)
+            .filter_map(|height| u32::try_from(height).ok())
+            .collect::<Vec<_>>();
+        block_heights.sort_unstable();
+        block_heights.dedup();
+        if !block_heights.is_empty() {
+            match self.get_block_summaries_by_heights(&block_heights) {
+                Ok(summaries) => {
+                    let block_times = block_heights
+                        .into_iter()
+                        .zip(summaries)
+                        .filter_map(|(height, summary)| {
+                            summary.and_then(|summary| {
+                                summary.block_time().map(|block_time| (height, block_time))
+                            })
+                        })
+                        .collect::<HashMap<_, _>>();
+                    for render in &mut tx_renders {
+                        render.block_time = render
+                            .block_height
+                            .and_then(|height| u32::try_from(height).ok())
+                            .and_then(|height| block_times.get(&height).copied());
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[rpc_get_address_transactions] failed to load block times: {error:#}"
                     );
                 }
             }
@@ -6372,6 +6495,22 @@ pub struct RpcGetBlockSummaryParams {
 }
 
 pub struct RpcGetBlockSummaryResult {
+    pub value: Value,
+}
+
+pub struct RpcGetBlockTimeParams {
+    pub height: Option<u64>,
+}
+
+pub struct RpcGetBlockTimeResult {
+    pub value: Value,
+}
+
+pub struct RpcGetBlockTimesParams {
+    pub heights: Option<Vec<u64>>,
+}
+
+pub struct RpcGetBlockTimesResult {
     pub value: Value,
 }
 
@@ -6861,6 +7000,10 @@ impl BlockSummary {
             return None;
         }
         Some(BlockHash::from_byte_array(self.blockhash))
+    }
+
+    pub fn block_time(&self) -> Option<u64> {
+        deserialize::<Header>(&self.header).ok().map(|header| header.time as u64)
     }
 }
 
@@ -8318,9 +8461,10 @@ struct AddressTxRender {
     txid: Txid,
     tx: Transaction,
     traces: Option<Vec<EspoTrace>>,
+    block_height: Option<u64>,
+    block_time: Option<u64>,
     confirmations: Option<u64>,
     is_mempool: bool,
-    summary: Option<AlkaneTxSummary>,
 }
 
 fn enriched_transaction_json(
@@ -8381,9 +8525,9 @@ fn enriched_transaction_json(
 
     let mut out = Map::new();
     out.insert("txid".to_string(), json!(render.txid.to_string()));
-    out.insert("blockHeight".to_string(), json!(render.summary.as_ref().map(|s| s.height as u64)));
+    out.insert("blockHeight".to_string(), json!(render.block_height));
     out.insert("confirmations".to_string(), json!(render.confirmations));
-    out.insert("blockTime".to_string(), Value::Null);
+    out.insert("blockTime".to_string(), json!(render.block_time));
     out.insert("confirmed".to_string(), json!(!render.is_mempool));
     out.insert("fee".to_string(), fee.map(|value| json!(value)).unwrap_or(Value::Null));
     out.insert("weight".to_string(), json!(tx.weight().to_wu()));
@@ -8682,7 +8826,10 @@ mod tests {
     use crate::core::blockfetcher::BlockFetchMode;
     use crate::runtime::tree_db::{get_global_tree_db, init_global_tree_db};
     use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
-    use bitcoin::{Address, BlockHash, Network};
+    use bitcoin::{
+        Address, BlockHash, Network, Transaction, absolute::LockTime,
+        blockdata::constants::genesis_block, transaction::Version,
+    };
     use rocksdb::{DB, Options};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -8716,6 +8863,76 @@ mod tests {
             fee_range: Vec::new(),
             pool: None,
         }
+    }
+
+    #[test]
+    fn block_summary_time_decodes_indexed_header() {
+        let block = genesis_block(Network::Bitcoin);
+        let mut summary = make_block_summary(0, block.block_hash(), 1);
+        summary.header = serialize(&block.header);
+
+        assert_eq!(summary.block_time(), Some(block.header.time as u64));
+
+        summary.header.clear();
+        assert_eq!(summary.block_time(), None);
+    }
+
+    #[test]
+    fn enriched_transaction_json_uses_exact_block_height_and_time() {
+        let render = AddressTxRender {
+            txid: Txid::from_byte_array([1; 32]),
+            tx: Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: Vec::new(),
+                output: Vec::new(),
+            },
+            traces: None,
+            block_height: Some(123),
+            block_time: Some(1_700_000_000),
+            confirmations: Some(4),
+            is_mempool: false,
+        };
+
+        let value = enriched_transaction_json(&render, &HashMap::new(), Network::Bitcoin);
+
+        assert_eq!(value.get("blockHeight"), Some(&json!(123)));
+        assert_eq!(value.get("blockTime"), Some(&json!(1_700_000_000u64)));
+        assert_eq!(value.get("confirmations"), Some(&json!(4)));
+    }
+
+    #[test]
+    fn block_times_rpc_preserves_requested_heights() {
+        let provider = new_provider_with_tempdb();
+
+        let response = provider
+            .rpc_get_block_times(RpcGetBlockTimesParams { heights: Some(vec![12, 4, 12]) })
+            .expect("block times response")
+            .value;
+        let heights = response["times"]
+            .as_array()
+            .expect("times array")
+            .iter()
+            .filter_map(|entry| entry["height"].as_u64())
+            .collect::<Vec<_>>();
+
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(heights, vec![12, 4, 12]);
+    }
+
+    #[test]
+    fn block_times_rpc_enforces_batch_limit() {
+        let provider = new_provider_with_tempdb();
+        let response = provider
+            .rpc_get_block_times(RpcGetBlockTimesParams {
+                heights: Some(vec![0; MAX_BLOCK_TIMES_BATCH + 1]),
+            })
+            .expect("block times response")
+            .value;
+
+        assert_eq!(response["ok"], json!(false));
+        assert_eq!(response["error"], json!("too_many_heights"));
+        assert_eq!(response["max_heights"], json!(MAX_BLOCK_TIMES_BATCH));
     }
 
     fn write_creation_rows(
