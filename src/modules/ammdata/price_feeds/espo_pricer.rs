@@ -1,7 +1,9 @@
 use super::defs::PriceFeed;
+use crate::config::get_network;
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::PRICE_SCALE_DECIMALS;
 use anyhow::{Context, Result, anyhow};
+use bitcoin::Network;
 use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -76,13 +78,18 @@ impl EspoPricerPriceFeed {
     }
 
     fn price_at_bitcoin_height(&self, height: u64) -> Result<u128> {
-        let response: BtcPriceAtHeightResponse = self
-            .rpc_call(METHOD_GET_BTC_PRICE_AT_HEIGHT, json!({ "height": height }))
-            .with_context(|| {
-                format!("failed to get BTC/USD price from espo pricer at height {height}")
+        let network = get_network();
+        let params = btc_price_params(network, height);
+        let response: BtcPriceAtHeightResponse =
+            self.rpc_call(METHOD_GET_BTC_PRICE_AT_HEIGHT, params).with_context(|| {
+                if network == Network::Bitcoin {
+                    format!("failed to get BTC/USD price from espo pricer at height {height}")
+                } else {
+                    format!("failed to get latest BTC/USD price from espo pricer for {network}")
+                }
             })?;
         parse_price_scaled_decimal(&response.price_scaled)
-            .with_context(|| format!("invalid espo pricer price_scaled at height {height}"))
+            .with_context(|| format!("invalid espo pricer price_scaled for {network}"))
     }
 }
 
@@ -90,6 +97,10 @@ impl PriceFeed for EspoPricerPriceFeed {
     fn get_bitcoin_price_usd_at_block_height(&self, height: u64) -> Result<u128> {
         self.price_at_bitcoin_height(height)
     }
+}
+
+fn btc_price_params(network: Network, height: u64) -> serde_json::Value {
+    if network == Network::Bitcoin { json!({ "height": height }) } else { json!({}) }
 }
 
 fn parse_price_scaled_decimal(raw: &str) -> Result<u128> {
@@ -130,7 +141,9 @@ fn parse_price_scaled_decimal(raw: &str) -> Result<u128> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_price_scaled_decimal;
+    use super::{btc_price_params, parse_price_scaled_decimal};
+    use bitcoin::Network;
+    use serde_json::json;
 
     #[test]
     fn parses_espo_pricer_decimal_to_ammdata_scale() {
@@ -139,5 +152,13 @@ mod tests {
             610_435_600_000_000_000_000
         );
         assert_eq!(parse_price_scaled_decimal("1").unwrap(), 10_000_000_000_000_000);
+    }
+
+    #[test]
+    fn only_mainnet_sends_a_pricer_height() {
+        assert_eq!(btc_price_params(Network::Bitcoin, 900_000), json!({ "height": 900_000 }));
+        for network in [Network::Regtest, Network::Signet, Network::Testnet, Network::Testnet4] {
+            assert_eq!(btc_price_params(network, 900_000), json!({}));
+        }
     }
 }
