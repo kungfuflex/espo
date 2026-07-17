@@ -397,6 +397,7 @@ fn aggregate_full_candle_from_m10(
 pub fn derive_token_data(
     block_ts: u64,
     height: u32,
+    is_latest: bool,
     provider: &AmmDataProvider,
     essentials: &EssentialsProvider,
     canonical_quote_units: &HashMap<SchemaAlkaneId, CanonicalQuoteUnit>,
@@ -423,7 +424,7 @@ pub fn derive_token_data(
     let mut close_sample_cache: HashMap<(Vec<u8>, u64), u128> = HashMap::new();
 
     // ---------- btc/usd price ----------
-    if state.has_trades {
+    if should_index_btc_usd(state.has_trades, is_latest) {
         let mut price: Option<u128> = None;
         match EspoPricerPriceFeed::from_global_config() {
             Ok(feed) => match feed.get_bitcoin_price_usd_at_block_height(height as u64) {
@@ -2639,4 +2640,21 @@ pub fn derive_token_data(
     }
 
     Ok(())
+}
+
+fn should_index_btc_usd(has_trades: bool, is_latest: bool) -> bool {
+    has_trades || is_latest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_index_btc_usd;
+
+    #[test]
+    fn btc_usd_is_indexed_for_trades_or_the_current_tip() {
+        assert!(should_index_btc_usd(true, false));
+        assert!(should_index_btc_usd(false, true));
+        assert!(should_index_btc_usd(true, true));
+        assert!(!should_index_btc_usd(false, false));
+    }
 }

@@ -827,6 +827,7 @@ impl EspoModule for AmmData {
         crate::modules::ammdata::utils::index_tokens::derive_token_data(
             block_ts,
             height,
+            block.is_latest,
             provider,
             essentials,
             &canonical_quote_units,
