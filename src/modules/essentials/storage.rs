@@ -3048,10 +3048,13 @@ impl EssentialsProvider {
     ) -> Result<GetCirculatingSupplyResult> {
         crate::debug_timer_log!("get_circulating_supply");
         let table = self.table();
+        // Historical callers pin this provider to the requested block hash. The latest-supply key
+        // at that tree root is the supply at the requested height, including blocks where supply
+        // did not change and no per-height event row was written.
         let supply = self
             .get_raw_value(GetRawValueParams {
-                blockhash: StateAt::Latest,
-                key: table.circulating_supply_key(&params.alkane, params.height),
+                blockhash: params.blockhash,
+                key: table.circulating_supply_latest_key(&params.alkane),
             })
             .ok()
             .and_then(|resp| resp.value)
@@ -9520,6 +9523,33 @@ mod tests {
         let encoded = encode_alkane_info(&info).expect("encode");
         let decoded = decode_alkane_info(&encoded).expect("decode");
         assert_eq!(info, decoded);
+    }
+
+    #[test]
+    fn circulating_supply_read_does_not_require_an_exact_height_row() {
+        let provider = new_provider_with_tempdb();
+        let alkane = SchemaAlkaneId { block: 2, tx: 77623 };
+        let supply = 5_227_124_025_507u128;
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![(
+                    provider.table().circulating_supply_latest_key(&alkane),
+                    encode_u128_value(supply).expect("encode supply"),
+                )],
+                deletes: Vec::new(),
+            })
+            .expect("write latest supply");
+
+        let result = provider
+            .get_circulating_supply(GetCirculatingSupplyParams {
+                blockhash: StateAt::Latest,
+                alkane,
+                height: 957_625,
+            })
+            .expect("read supply");
+
+        assert_eq!(result.supply, supply);
     }
 
     #[test]
