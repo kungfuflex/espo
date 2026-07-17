@@ -57,7 +57,14 @@ pub async fn faucet_page() -> Html<String> {
       }}
       const status = data.result;
       faucetEnabled = status.enabled === true;
-      amountInput.value = number(status.amount);
+      const minAmount = Number(status.min_amount);
+      const maxAmount = Number(status.max_amount ?? status.amount);
+      if (!Number.isFinite(minAmount) || minAmount < 0 || !Number.isFinite(maxAmount) || maxAmount < minAmount) {{
+        throw new Error('Faucet amount limits are unavailable');
+      }}
+      amountInput.min = String(minAmount);
+      amountInput.max = String(maxAmount);
+      amountInput.value = String(minAmount);
       const totalAvailable = Number(status.total_available);
       available.hidden = !Number.isFinite(totalAvailable);
       availableAmount.textContent = number(totalAvailable);
@@ -76,13 +83,14 @@ pub async fn faucet_page() -> Html<String> {
     event.preventDefault();
     if (!faucetEnabled || !form.reportValidity()) return;
 
+    const requestedAmount = Number(amountInput.value);
     submitButton.disabled = true;
     setMessage('Sending funds...');
     try {{
       const response = await fetch(sendUrl, {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json', Accept: 'application/json' }},
-        body: JSON.stringify({{ address: addressInput.value.trim() }})
+        body: JSON.stringify({{ address: addressInput.value.trim(), amount: requestedAmount }})
       }});
       const data = await response.json();
       if (!response.ok || data.error || !data.result) {{
@@ -149,9 +157,11 @@ pub async fn faucet_page() -> Html<String> {
                         input
                             id="faucet-amount"
                             class="faucet-input faucet-amount-input"
-                            type="text"
-                            readonly
-                            aria-readonly="true"
+                            type="number"
+                            name="amount"
+                            step="0.00000001"
+                            inputmode="decimal"
+                            required
                             data-faucet-amount="";
                         span class="faucet-currency" aria-hidden="true" { (icon_testnet()) }
                     }

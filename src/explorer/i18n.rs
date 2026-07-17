@@ -128,6 +128,7 @@ const EN_TO_ZH: &[(&str, &str)] = &[
     (" per day", " 每日"),
     ("Loading faucet status...", "正在加载水龙头状态..."),
     ("Faucet status is unavailable", "水龙头状态不可用"),
+    ("Faucet amount limits are unavailable", "水龙头金额限制不可用"),
     ("Faucet disabled", "水龙头已禁用"),
     ("Sending funds...", "正在发送资金..."),
     ("Faucet request failed", "水龙头请求失败"),

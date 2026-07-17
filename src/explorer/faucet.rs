@@ -18,6 +18,7 @@ const FORWARDED_IP_HEADERS: [&str; 3] = ["cf-connecting-ip", "x-forwarded-for", 
 #[derive(Debug, Deserialize)]
 pub struct FaucetSendRequest {
     address: String,
+    amount: Option<f64>,
 }
 
 pub(crate) fn faucet_enabled() -> bool {
@@ -48,6 +49,14 @@ fn valid_regtest_address(raw: &str) -> bool {
         .ok()
         .and_then(|address| address.require_network(Network::Regtest).ok())
         .is_some()
+}
+
+fn faucet_send_params(address: &str, amount: Option<f64>) -> Result<Value, &'static str> {
+    match amount {
+        Some(amount) if !amount.is_finite() || amount < 0.0 => Err("invalid_amount"),
+        Some(amount) => Ok(json!([address, amount])),
+        None => Ok(json!([address])),
+    }
 }
 
 async fn call_faucet(
@@ -113,8 +122,12 @@ pub async fn faucet_send(
     if !valid_regtest_address(address) {
         return error_response(StatusCode::BAD_REQUEST, -32602, "Invalid regtest address");
     }
+    let params = match faucet_send_params(address, payload.amount) {
+        Ok(params) => params,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, -32602, "Invalid faucet amount"),
+    };
 
-    match call_faucet("faucet_send", Some(json!([address])), &headers, Some(peer)).await {
+    match call_faucet("faucet_send", Some(params), &headers, Some(peer)).await {
         Ok((status, body)) => (status, Json(body)).into_response(),
         Err("not_configured") => {
             error_response(StatusCode::NOT_FOUND, -32004, "Faucet is not available")
@@ -127,7 +140,7 @@ pub async fn faucet_send(
 
 #[cfg(test)]
 mod tests {
-    use super::valid_regtest_address;
+    use super::{faucet_send_params, valid_regtest_address};
     use bitcoin::{Address, Network, ScriptBuf};
 
     #[test]
@@ -142,5 +155,18 @@ mod tests {
     fn rejects_non_regtest_and_malformed_addresses() {
         assert!(!valid_regtest_address("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"));
         assert!(!valid_regtest_address("not-an-address"));
+    }
+
+    #[test]
+    fn faucet_send_amount_is_forwarded_when_provided() {
+        assert_eq!(
+            faucet_send_params("bcrt1qexample", Some(0.25)).unwrap(),
+            serde_json::json!(["bcrt1qexample", 0.25])
+        );
+        assert_eq!(
+            faucet_send_params("bcrt1qexample", None).unwrap(),
+            serde_json::json!(["bcrt1qexample"])
+        );
+        assert!(faucet_send_params("bcrt1qexample", Some(-0.1)).is_err());
     }
 }

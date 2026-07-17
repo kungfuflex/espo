@@ -1273,7 +1273,6 @@ a:hover {
 }
 .faucet-amount-input {
   padding-right: 52px;
-  color: var(--muted);
 }
 .faucet-currency {
   position: absolute;

@@ -2022,7 +2022,7 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
         http_doc(
             "GET",
             "/api/faucet/status",
-            "Returns the B8 faucet's spendable balance, availability, payout amount, rolling 24-hour usage, and configured caps when the regtest faucet is enabled.",
+            "Returns the B8 faucet's spendable balance, availability, minimum and maximum request amounts, rolling 24-hour usage, and configured caps when the regtest faucet is enabled.",
             json!({}),
             json!({
                 "id": 1,
@@ -2031,6 +2031,8 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
                     "amount": 1.0,
                     "claims_last_24h": 2,
                     "enabled": true,
+                    "min_amount": 0.1,
+                    "max_amount": 1.0,
                     "total_available": 149.5,
                     "max_per_address_per_day": 10.0,
                     "max_per_day": 500.0,
@@ -2042,13 +2044,13 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
         http_doc(
             "POST",
             "/api/faucet/send",
-            "Requests the configured B8 faucet payout for one regtest address. Available only on regtest when b8_faucet_url is configured.",
-            json!({ "address": "bcrt1q..." }),
+            "Requests an amount within the configured B8 faucet minimum and maximum for one regtest address. Omitting amount retains B8's maximum-payout behavior. Available only on regtest when b8_faucet_url is configured.",
+            json!({ "address": "bcrt1q...", "amount": 0.25 }),
             json!({
                 "id": 1,
                 "jsonrpc": "2.0",
                 "result": {
-                    "amount": 1.0,
+                    "amount": 0.25,
                     "txid": "7be14a09c9..."
                 }
             }),
