@@ -97,7 +97,10 @@ fn block_carousel_inner(
   let leftRetryTimer = null;
   let rightRetryTimer = null;
   let confirmAnimationUntil = 0;
-  let queuedMempoolBlocks = null;
+  let queuedMempoolSnapshot = null;
+  let lastMempoolSequence = null;
+  let lastMempoolUpdatedAt = null;
+  let lastMempoolSnapshotKey = null;
   let leftDepleted = false;
   let rightDepleted = false;
   let initialCentered = false;
@@ -112,6 +115,11 @@ fn block_carousel_inner(
   let followLatest = selectedMempoolIndex !== null || current === espoTip;
   let suppressFollowScrollUntil = 0;
   let edgeLoadingArmed = false;
+  let eventsSocket = null;
+  let eventsReconnectTimer = null;
+  let eventsStableTimer = null;
+  let eventsReconnectAttempts = 0;
+  let eventsDisposed = false;
 
   let isDragging = false;
   let dragStartX = 0;
@@ -288,7 +296,7 @@ fn block_carousel_inner(
 
   function renderSkeleton(side, index) {{
     return `
-      <div class="bc-slide bc-skeleton" data-bc-skeleton="${{side}}-${{index}}">
+      <div class="bc-slide bc-skeleton" data-bc-skeleton="${{side}}-${{index}}" data-bc-key="skeleton:${{side}}:${{index}}">
         <div class="bc-top" aria-hidden="true"></div>
         <div class="bc-card bc-card-skeleton" aria-hidden="true"></div>
         <div class="bc-pool-slot" aria-hidden="true"></div>
@@ -422,6 +430,54 @@ fn block_carousel_inner(
     return MEMPOOL_BLOCKS_ENABLED && (isFollowingLatest() || maxH >= espoTip);
   }}
 
+  function stableAnimatedNodeKey(node) {{
+    if (
+      node.matches('.bc-mempool-slide[data-bc-key], .bc-skeleton[data-bc-key], [data-bc-boundary][data-bc-key]')
+    ) {{
+      return node.dataset.bcKey || null;
+    }}
+    return null;
+  }}
+
+  function replaceTrackPreservingAnimations(markup) {{
+    const template = document.createElement('template');
+    template.innerHTML = markup;
+    const desiredNodes = Array.from(template.content.children);
+    const existing = new Map();
+    Array.from(track.children).forEach((node) => {{
+      const key = stableAnimatedNodeKey(node);
+      if (key) existing.set(key, node);
+    }});
+
+    const preserved = new Set();
+    for (let index = 0; index < desiredNodes.length; index += 1) {{
+      const desired = desiredNodes[index];
+      const key = stableAnimatedNodeKey(desired);
+      const current = key ? existing.get(key) : null;
+      if (!current) continue;
+      if (current.matches('.bc-mempool-slide')) {{
+        const mempoolIndex = Number(desired.dataset.mempoolIndex);
+        const block = mempoolBlocks.find((item) => Number(item.index) === mempoolIndex);
+        if (block) updateMempoolSlide(current, block);
+      }}
+      desiredNodes[index] = current;
+      preserved.add(current);
+    }}
+
+    Array.from(track.children).forEach((node) => {{
+      if (!preserved.has(node)) node.remove();
+    }});
+
+    let cursor = track.firstElementChild;
+    desiredNodes.forEach((node) => {{
+      if (node === cursor) {{
+        cursor = cursor.nextElementSibling;
+        return;
+      }}
+      track.insertBefore(node, cursor);
+    }});
+  }}
+
   function render() {{
     blocks.sort((a, b) => b.height - a.height);
     const renderedMempoolBlocks = [...mempoolBlocks]
@@ -434,7 +490,7 @@ fn block_carousel_inner(
     }}
     for (const block of blocks) html.push(renderBlock(block));
     for (let i = 0; i < pendingRight + bufferRight; i++) html.push(renderSkeleton('right', i));
-    track.innerHTML = html.join('');
+    replaceTrackPreservingAnimations(html.join(''));
     refreshRelativeTimes();
   }}
 
@@ -946,13 +1002,66 @@ fn block_carousel_inner(
     }}
   }}
 
-  function applyMempoolSnapshot(snapshot, force = false) {{
+  function mempoolSnapshotKey(snapshot) {{
+    const sequence = Number(snapshot.sequence);
+    return JSON.stringify([
+      Number.isFinite(sequence) ? sequence : null,
+      snapshot.blocks.map(mempoolBlockRenderKey)
+    ]);
+  }}
+
+  function mempoolSnapshotIsStale(snapshot) {{
+    const sequence = Number(snapshot.sequence);
+    const updatedAt = Number(snapshot.updated_at);
+    if (!Number.isFinite(sequence) || lastMempoolSequence === null) return false;
+    if (sequence !== lastMempoolSequence) return sequence < lastMempoolSequence;
+    return Number.isFinite(updatedAt)
+      && lastMempoolUpdatedAt !== null
+      && updatedAt < lastMempoolUpdatedAt;
+  }}
+
+  function compareMempoolSnapshots(left, right) {{
+    const leftSequence = Number(left.sequence);
+    const rightSequence = Number(right.sequence);
+    if (Number.isFinite(leftSequence) && Number.isFinite(rightSequence)) {{
+      if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+      const leftUpdatedAt = Number(left.updated_at);
+      const rightUpdatedAt = Number(right.updated_at);
+      if (Number.isFinite(leftUpdatedAt) && Number.isFinite(rightUpdatedAt)) {{
+        return leftUpdatedAt - rightUpdatedAt;
+      }}
+    }}
+    return 0;
+  }}
+
+  function applyMempoolSnapshot(snapshot, force = false, allowSequenceReset = false) {{
     if (!MEMPOOL_BLOCKS_ENABLED) return;
     if (!snapshot || !Array.isArray(snapshot.blocks)) return;
+    const sequence = Number(snapshot.sequence);
+    if (
+      allowSequenceReset &&
+      Number.isFinite(sequence) &&
+      lastMempoolSequence !== null &&
+      sequence < lastMempoolSequence
+    ) {{
+      lastMempoolSequence = null;
+      lastMempoolUpdatedAt = null;
+      lastMempoolSnapshotKey = null;
+      queuedMempoolSnapshot = null;
+    }}
+    if (mempoolSnapshotIsStale(snapshot)) return;
     if (!force && performance.now() < confirmAnimationUntil) {{
-      queuedMempoolBlocks = snapshot.blocks;
+      if (!queuedMempoolSnapshot || compareMempoolSnapshots(snapshot, queuedMempoolSnapshot) >= 0) {{
+        queuedMempoolSnapshot = snapshot;
+      }}
       return;
     }}
+    const snapshotKey = mempoolSnapshotKey(snapshot);
+    if (snapshotKey === lastMempoolSnapshotKey) return;
+    const updatedAt = Number(snapshot.updated_at);
+    if (Number.isFinite(sequence)) lastMempoolSequence = sequence;
+    if (Number.isFinite(updatedAt)) lastMempoolUpdatedAt = updatedAt;
+    lastMempoolSnapshotKey = snapshotKey;
     mempoolBlocks = snapshot.blocks;
     if (initialCentered) renderMempoolUpdate();
     else render();
@@ -960,10 +1069,10 @@ fn block_carousel_inner(
 
   function flushQueuedMempoolBlocks() {{
     if (!MEMPOOL_BLOCKS_ENABLED) return;
-    if (queuedMempoolBlocks) {{
-      const next = queuedMempoolBlocks;
-      queuedMempoolBlocks = null;
-      applyMempoolSnapshot({{ blocks: next }}, true);
+    if (queuedMempoolSnapshot) {{
+      const next = queuedMempoolSnapshot;
+      queuedMempoolSnapshot = null;
+      applyMempoolSnapshot(next, true);
       return;
     }}
     fetchMempoolBlocks();
@@ -1051,64 +1160,121 @@ fn block_carousel_inner(
     }}
   }}
 
+  function applyEventTip(nextTip, shouldAnimate, forceRefresh = false) {{
+    if (!Number.isFinite(nextTip) || nextTip <= espoTip) return;
+    const previousTip = espoTip;
+    const wasFollowingLatest = isFollowingLatest();
+    const shouldInsertNewTip =
+      wasFollowingLatest &&
+      (forceRefresh ||
+        selectedMempoolIndex !== null ||
+        selectedConfirmedHeight === previousTip ||
+        selectedHeight === previousTip);
+    espoTip = nextTip;
+    root.dataset.espoTip = String(espoTip);
+    if (wasFollowingLatest && selectedConfirmedHeight === previousTip) {{
+      selectedConfirmedHeight = nextTip;
+      root.dataset.current = String(nextTip);
+    }}
+    leftDepleted = maxH >= espoTip;
+    if (!shouldInsertNewTip) {{
+      updateResetButton();
+      queueEdgeCheck();
+      return;
+    }}
+    scheduleLatestTipRefresh(previousTip, shouldAnimate);
+  }}
+
+  function disposeEvents() {{
+    eventsDisposed = true;
+    if (eventsReconnectTimer) {{
+      window.clearTimeout(eventsReconnectTimer);
+      eventsReconnectTimer = null;
+    }}
+    if (eventsStableTimer) {{
+      window.clearTimeout(eventsStableTimer);
+      eventsStableTimer = null;
+    }}
+    const socket = eventsSocket;
+    eventsSocket = null;
+    if (socket && socket.readyState < WebSocket.CLOSING) {{
+      try {{ socket.close(1000, 'carousel replaced'); }} catch (_) {{}}
+    }}
+  }}
+
+  const eventsControllerKey = '__espoBlockCarouselEvents';
+  const previousEventsController = window[eventsControllerKey];
+  if (previousEventsController && typeof previousEventsController.dispose === 'function') {{
+    previousEventsController.dispose();
+  }}
+  const eventsController = {{ dispose: disposeEvents }};
+  window[eventsControllerKey] = eventsController;
+
+  function scheduleEventsReconnect() {{
+    if (eventsDisposed || eventsReconnectTimer || !root.isConnected) return;
+    const delay = Math.min(15_000, 1_000 * (2 ** Math.min(eventsReconnectAttempts, 4)));
+    eventsReconnectAttempts += 1;
+    eventsReconnectTimer = window.setTimeout(() => {{
+      eventsReconnectTimer = null;
+      connectEvents();
+    }}, delay);
+  }}
+
   function connectEvents() {{
-    if (!eventsEnabled || !window.WebSocket) return;
+    if (
+      !eventsEnabled ||
+      !window.WebSocket ||
+      eventsDisposed ||
+      !root.isConnected ||
+      eventsSocket
+    ) return;
     const wsPath = eventsPath.startsWith('/') ? `${{basePrefix}}${{eventsPath}}` : `${{basePrefix}}/${{eventsPath}}`;
     let socket;
     try {{
       socket = new WebSocket(`${{wsProtocol}}//${{window.location.host}}${{wsPath}}`);
     }} catch (_) {{
+      scheduleEventsReconnect();
       return;
     }}
+    eventsSocket = socket;
     socket.addEventListener('open', () => {{
-      if (MEMPOOL_BLOCKS_ENABLED) {{
-        try {{
-          socket.send(JSON.stringify({{ action: 'want', data: ['mempool-blocks'] }}));
-          socket.send(JSON.stringify({{ 'refresh-mempool-blocks': true }}));
-        }} catch (_) {{}}
-        fetchMempoolBlocks();
-      }}
+      if (eventsSocket !== socket || eventsDisposed) return;
+      if (eventsStableTimer) window.clearTimeout(eventsStableTimer);
+      eventsStableTimer = window.setTimeout(() => {{
+        eventsStableTimer = null;
+        if (eventsSocket === socket) eventsReconnectAttempts = 0;
+      }}, 10_000);
     }});
     socket.addEventListener('message', (event) => {{
+      if (eventsSocket !== socket || eventsDisposed || !root.isConnected) return;
       let payload;
       try {{
         payload = JSON.parse(event.data);
       }} catch (_) {{
         return;
       }}
-      if (MEMPOOL_BLOCKS_ENABLED && payload.type === 'hello' && payload.data && payload.data.mempool) {{
-        applyMempoolSnapshot(payload.data.mempool);
+      if (payload.type === 'hello' && payload.data) {{
+        applyEventTip(Number(payload.data.espo_tip), false, true);
+        if (MEMPOOL_BLOCKS_ENABLED && payload.data.mempool) {{
+          applyMempoolSnapshot(payload.data.mempool, false, true);
+        }}
       }}
       if (MEMPOOL_BLOCKS_ENABLED && payload.type === 'mempool-blocks' && payload.data) {{
         applyMempoolSnapshot(payload.data);
       }}
       if (payload.type === 'block') {{
-        const nextTip = Number(payload.data && payload.data.height);
-        const previousTip = espoTip;
-        if (Number.isFinite(nextTip) && nextTip > espoTip) {{
-          const wasFollowingLatest = isFollowingLatest();
-          const shouldInsertNewTip =
-            wasFollowingLatest &&
-            (selectedMempoolIndex !== null ||
-              selectedConfirmedHeight === previousTip ||
-              selectedHeight === previousTip);
-          espoTip = nextTip;
-          root.dataset.espoTip = String(espoTip);
-          if (wasFollowingLatest && selectedConfirmedHeight === previousTip) {{
-            selectedConfirmedHeight = nextTip;
-            root.dataset.current = String(nextTip);
-          }}
-          leftDepleted = maxH >= espoTip;
-          if (!shouldInsertNewTip) {{
-            updateResetButton();
-            queueEdgeCheck();
-            return;
-          }}
-          scheduleLatestTipRefresh(previousTip, true);
-        }}
+        applyEventTip(Number(payload.data && payload.data.height), true);
       }}
     }});
-    socket.addEventListener('close', () => window.setTimeout(connectEvents, 2500));
+    socket.addEventListener('close', () => {{
+      if (eventsSocket !== socket) return;
+      eventsSocket = null;
+      if (eventsStableTimer) {{
+        window.clearTimeout(eventsStableTimer);
+        eventsStableTimer = null;
+      }}
+      scheduleEventsReconnect();
+    }});
   }}
 
   async function fetchLeft() {{
@@ -1302,6 +1468,17 @@ fn block_carousel_inner(
 
   render();
   if (MEMPOOL_BLOCKS_ENABLED) fetchMempoolBlocks();
+  window.addEventListener('online', () => {{
+    if (eventsDisposed || eventsSocket) return;
+    if (eventsReconnectTimer) {{
+      window.clearTimeout(eventsReconnectTimer);
+      eventsReconnectTimer = null;
+    }}
+    connectEvents();
+  }});
+  window.addEventListener('pagehide', () => {{
+    if (window[eventsControllerKey] === eventsController) disposeEvents();
+  }}, {{ once: true }});
   connectEvents();
   fetchInitial();
 }})();

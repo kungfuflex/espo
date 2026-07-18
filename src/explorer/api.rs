@@ -66,7 +66,7 @@ use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
-use tokio::time::{Duration, interval};
+use tokio::time::{Duration, Instant as TokioInstant, interval_at};
 
 #[derive(Deserialize)]
 pub struct CarouselQuery {
@@ -181,7 +181,8 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
     }
 
     let mut events = subscribe_mempool_events();
-    let mut heartbeat = interval(Duration::from_secs(25));
+    let heartbeat_period = Duration::from_secs(25);
+    let mut heartbeat = interval_at(TokioInstant::now() + heartbeat_period, heartbeat_period);
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -246,8 +247,8 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                 }
             }
             _ = heartbeat.tick() => {
-                let payload = json!({"type": "ping", "ts": now_ts()}).to_string();
-                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                let payload = now_ts().to_be_bytes().to_vec();
+                if socket.send(WsMessage::Ping(payload.into())).await.is_err() {
                     break;
                 }
             }
