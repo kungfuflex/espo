@@ -5779,6 +5779,7 @@ impl EssentialsProvider {
             .max(1)
             .min(MAX_PAGE_LIMIT as u64) as usize;
         let only_alkane_txs = params.only_alkane_txs.unwrap_or(true);
+        let include_mempool = params.include_mempool.unwrap_or(false);
         let alkane_filter = if let Some(raw_filter) =
             params.filter.as_deref().map(str::trim).filter(|s| !s.is_empty())
         {
@@ -5818,45 +5819,83 @@ impl EssentialsProvider {
                 }
             };
 
-        let mut pending_entries = pending_for_address(&address);
-        pending_entries.sort_by(|a, b| b.txid.cmp(&a.txid));
-        let pending_filtered: Vec<MempoolEntry> = pending_entries
-            .into_iter()
-            .filter(|entry| {
-                !only_alkane_txs || entry.traces.as_ref().map_or(false, |t| !t.is_empty())
-            })
-            .filter(|entry| {
-                alkane_filter.as_ref().map_or(true, |filter| {
-                    entry.traces.as_ref().map_or(false, |traces| {
-                        espo_traces_first_invoke_matches_filter(traces, filter)
-                    })
-                })
-            })
-            .collect();
-        let pending_total = pending_filtered.len();
-        let pending_slice_start = off.min(pending_total);
-        let pending_slice_end = (off + limit).min(pending_total);
-        let pending_set: HashSet<Txid> = pending_filtered.iter().map(|entry| entry.txid).collect();
-        let mut filtered_has_more = alkane_filter.is_some() && pending_slice_end < pending_total;
-
-        let mut tx_renders: Vec<AddressTxRender> = Vec::new();
-        for entry in pending_filtered
-            .iter()
-            .skip(pending_slice_start)
-            .take(pending_slice_end.saturating_sub(pending_slice_start))
-        {
-            tx_renders.push(AddressTxRender {
-                txid: entry.txid,
-                tx: entry.tx.clone(),
-                traces: entry.traces.clone(),
-                block_height: None,
-                block_time: None,
-                confirmations: None,
-                is_mempool: true,
+        if include_mempool && electrum_like.backend() != ElectrumLikeBackend::EsploraHttp {
+            return Ok(RpcGetAddressTransactionsResult {
+                value: json!({
+                    "ok": false,
+                    "error": "unsupported_backend",
+                    "detail": "include_mempool requires electrs_esplora_url; electrum_rpc_url is not supported"
+                }),
             });
         }
 
-        let remaining_slots = limit.saturating_sub(tx_renders.len());
+        let mempool_txids = if include_mempool {
+            match electrum_like.address_mempool_txids(&address_obj) {
+                Ok(txids) => txids,
+                Err(error) => {
+                    return Ok(RpcGetAddressTransactionsResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "electrs_mempool_fetch_failed",
+                            "detail": error.to_string()
+                        }),
+                    });
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let raw_mempool_txs = if mempool_txids.is_empty() {
+            Vec::new()
+        } else {
+            electrum_like.batch_transaction_get_raw(&mempool_txids).unwrap_or_default()
+        };
+        let mut pending_renders = Vec::new();
+        for (index, txid) in mempool_txids.into_iter().enumerate() {
+            let indexed_entry = pending_by_txid(&txid);
+            let tx = raw_mempool_txs
+                .get(index)
+                .filter(|raw| !raw.is_empty())
+                .and_then(|raw| deserialize::<Transaction>(raw).ok())
+                .or_else(|| indexed_entry.as_ref().map(|entry| entry.tx.clone()));
+            let Some(tx) = tx else {
+                eprintln!(
+                    "[rpc_get_address_transactions] failed to load electrs mempool tx {}",
+                    txid
+                );
+                continue;
+            };
+            let traces = indexed_entry.and_then(|entry| entry.traces);
+            if only_alkane_txs {
+                if let Some(filter) = alkane_filter.as_ref() {
+                    if !traces.as_ref().is_some_and(|traces| {
+                        espo_traces_first_invoke_matches_filter(traces, filter)
+                    }) {
+                        continue;
+                    }
+                } else if traces.as_ref().is_none_or(|traces| traces.is_empty())
+                    && runestone_data(&tx).1.is_empty()
+                {
+                    continue;
+                }
+            }
+            pending_renders.push(AddressTxRender {
+                txid,
+                tx,
+                traces,
+                block_height: None,
+                block_time: None,
+                confirmations: Some(0),
+                is_mempool: true,
+            });
+        }
+        let pending_total = pending_renders.len();
+        let pending_set = pending_renders.iter().map(|render| render.txid).collect::<HashSet<_>>();
+        let mut tx_renders = if page == 1 { pending_renders } else { Vec::new() };
+        let mut filtered_has_more = false;
+
+        // Pending transactions are prepended to page one and never consume confirmed-page slots.
+        let remaining_slots = limit;
         let chain_tip = get_bitcoind_rpc_client()
             .get_blockchain_info()
             .ok()
@@ -5875,7 +5914,7 @@ impl EssentialsProvider {
         let mut confirmed_total = if alkane_filter.is_some() { 0 } else { confirmed_index_total };
 
         if only_alkane_txs {
-            let confirmed_offset = off.saturating_sub(pending_total);
+            let confirmed_offset = off;
             if let Some(filter) = alkane_filter.as_ref() {
                 let target_matches =
                     confirmed_offset.saturating_add(remaining_slots).saturating_add(1);
@@ -6036,7 +6075,7 @@ impl EssentialsProvider {
                 }
             }
         } else {
-            let confirmed_offset = off.saturating_sub(pending_total);
+            let confirmed_offset = off;
             let fetch_limit = remaining_slots.max(1);
             match electrum_like.address_history_page(&address_obj, confirmed_offset, fetch_limit) {
                 Ok(hist_page) => {
@@ -6103,6 +6142,9 @@ impl EssentialsProvider {
             }
         }
 
+        let mut seen_txids = HashSet::new();
+        tx_renders.retain(|render| seen_txids.insert(render.txid));
+
         let mut block_heights = tx_renders
             .iter()
             .filter_map(|render| render.block_height)
@@ -6136,7 +6178,8 @@ impl EssentialsProvider {
                 }
             }
         }
-        let tx_total = pending_total + confirmed_total;
+        let tx_total = pending_total.saturating_add(confirmed_total);
+        let confirmed_render_count = tx_renders.iter().filter(|render| !render.is_mempool).count();
         let mut prev_txids: Vec<Txid> = Vec::new();
         for render in &tx_renders {
             for vin in &render.tx.input {
@@ -6176,11 +6219,12 @@ impl EssentialsProvider {
                 "address": address,
                 "page": page,
                 "limit": limit,
+                "include_mempool": include_mempool,
                 "total": if alkane_filter.is_some() { Value::Null } else { json!(tx_total) },
                 "has_more": if alkane_filter.is_some() {
                     filtered_has_more
                 } else {
-                    (off + tx_renders.len()) < tx_total
+                    off.saturating_add(confirmed_render_count) < confirmed_total
                 },
                 "transactions": transactions,
             }),
@@ -6859,6 +6903,7 @@ pub struct RpcGetAddressTransactionsParams {
     pub page: Option<u64>,
     pub limit: Option<u64>,
     pub only_alkane_txs: Option<bool>,
+    pub include_mempool: Option<bool>,
     pub filter: Option<String>,
 }
 
@@ -9021,6 +9066,31 @@ mod tests {
         assert_eq!(value.get("blockHeight"), Some(&json!(123)));
         assert_eq!(value.get("blockTime"), Some(&json!(1_700_000_000u64)));
         assert_eq!(value.get("confirmations"), Some(&json!(4)));
+    }
+
+    #[test]
+    fn enriched_transaction_json_marks_mempool_transactions_unconfirmed() {
+        let render = AddressTxRender {
+            txid: Txid::from_byte_array([2; 32]),
+            tx: Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: Vec::new(),
+                output: Vec::new(),
+            },
+            traces: None,
+            block_height: None,
+            block_time: None,
+            confirmations: Some(0),
+            is_mempool: true,
+        };
+
+        let value = enriched_transaction_json(&render, &HashMap::new(), Network::Bitcoin);
+
+        assert_eq!(value["confirmed"], json!(false));
+        assert_eq!(value["blockHeight"], Value::Null);
+        assert_eq!(value["blockTime"], Value::Null);
+        assert_eq!(value["confirmations"], json!(0));
     }
 
     #[test]

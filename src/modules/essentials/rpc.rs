@@ -1154,6 +1154,9 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             only_alkane_txs: payload
                                 .get("only_alkane_txs")
                                 .and_then(|v| v.as_bool()),
+                            include_mempool: payload
+                                .get("include_mempool")
+                                .and_then(|v| v.as_bool()),
                             filter: payload
                                 .get("filter")
                                 .and_then(|v| v.as_str())

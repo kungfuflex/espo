@@ -466,6 +466,18 @@ fn method_notes(method: &MethodDoc) -> Vec<String> {
             &mut notes,
             "When `filter` is provided, `total` is `null` because the filtered total is not known without scanning the complete address history. Use `has_more` for pagination.",
         );
+        push_note(
+            &mut notes,
+            "`include_mempool` defaults to false. When true, all matching transactions currently returned by electrs `/address/:address/txs/mempool` are prepended to page 1 and do not consume confirmed pagination slots.",
+        );
+        push_note(
+            &mut notes,
+            "Mempool inclusion requires `electrs_esplora_url`. Requests with `include_mempool: true` return `unsupported_backend` when Espo is configured to use Electrum RPC instead.",
+        );
+        push_note(
+            &mut notes,
+            "Pending transactions have `confirmed: false`, `blockHeight: null`, `blockTime: null`, and `confirmations: 0`. Espo queries electrs on every included request, so dropped or RBF-replaced transactions disappear on the next poll.",
+        );
     }
     if combined.contains("include_outpoints") {
         push_note(
@@ -890,9 +902,33 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_address_transactions",
-                    "Returns Bitcoin transactions for an address with exact indexed block heights, Unix block times, and confirmations, and can be narrowed to Alkane transactions. When `filter` is provided with `only_alkane_txs`, it scans Alkane transactions until the requested page is filled and returns `total: null`.",
-                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "only_alkane_txs": true, "filter": "2:0" }),
-                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "total": null, "transactions": [{ "txid": "e212e704173d61d19a280de3af2f6a5166ecf95e9a2a98f74ceeeb3de323ea1c", "blockHeight": 939827, "blockTime": 1779308930, "confirmations": 6174, "confirmed": true }] }),
+                    "Returns Bitcoin transactions for an address with exact indexed block heights, Unix block times, and confirmations, and can be narrowed to Alkane transactions. Pending transactions can be included from electrs REST on page 1 only. When `filter` is provided with `only_alkane_txs`, it scans Alkane transactions until the requested confirmed page is filled and returns `total: null`.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "only_alkane_txs": true, "filter": "2:0", "include_mempool": true }),
+                    json!({
+                        "ok": true,
+                        "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8",
+                        "page": 1,
+                        "limit": 1,
+                        "include_mempool": true,
+                        "total": null,
+                        "has_more": true,
+                        "transactions": [
+                            {
+                                "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90",
+                                "blockHeight": null,
+                                "blockTime": null,
+                                "confirmations": 0,
+                                "confirmed": false
+                            },
+                            {
+                                "txid": "e212e704173d61d19a280de3af2f6a5166ecf95e9a2a98f74ceeeb3de323ea1c",
+                                "blockHeight": 939827,
+                                "blockTime": 1779308930,
+                                "confirmations": 6174,
+                                "confirmed": true
+                            }
+                        ]
+                    }),
                 ),
                 rpc_doc(
                     "essentials.get_alkane_latest_traces",
