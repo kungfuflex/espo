@@ -335,6 +335,22 @@ fn block_carousel_inner(
   function renderMempoolBlock(block) {{
     const href = `${{basePrefix}}/mempool-block/${{block.index + 1}}`;
     const isCurrent = Number(block.index) === selectedMempoolIndex;
+    const renderKey = escapeHtml(mempoolBlockRenderKey(block));
+    return `
+      <div class="bc-slide bc-mempool-slide" data-mempool-index="${{block.index}}" data-bc-key="mempool:${{block.index}}" data-bc-render-key="${{renderKey}}">
+        <div class="bc-top"></div>
+        <a class="bc-card bc-mempool-card${{isCurrent ? ' current' : ''}}" href="${{href}}" draggable="false">
+          <div class="bc-face">
+            ${{renderMempoolFace(block)}}
+          </div>
+          ${{isCurrent ? renderCurrentIndicator() : ''}}
+        </a>
+        <div class="bc-pool-slot"></div>
+      </div>
+    `;
+  }}
+
+  function renderMempoolFace(block) {{
     const etaSeconds = (Number(block.index) + 1) * MEMPOOL_BLOCK_INTERVAL_SECS;
     const useMinutes = etaSeconds % 60 === 0;
     const etaAmount = useMinutes ? etaSeconds / 60 : etaSeconds;
@@ -342,20 +358,56 @@ fn block_carousel_inner(
       ? `约 ${{etaAmount}} ${{useMinutes ? '分钟' : '秒'}}后`
       : `in ~${{etaAmount}} ${{useMinutes ? (etaAmount === 1 ? 'minute' : 'minutes') : (etaAmount === 1 ? 'second' : 'seconds')}}`;
     return `
-      <div class="bc-slide bc-mempool-slide" data-mempool-index="${{block.index}}" data-bc-key="mempool:${{block.index}}">
-        <div class="bc-top"></div>
-        <a class="bc-card bc-mempool-card${{isCurrent ? ' current' : ''}}" href="${{href}}" draggable="false">
-          <div class="bc-face">
-            ${{renderFeeStats(block)}}
-            <div class="bc-traces">${{formatTraces(block.trace_count || 0)}}</div>
-            <div class="bc-tx-count">${{formatTxCount(block.tx_count || 0)}}</div>
-            <div class="bc-time">${{etaLabel}}</div>
-          </div>
-          ${{isCurrent ? '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>' : ''}}
-        </a>
-        <div class="bc-pool-slot"></div>
-      </div>
+      ${{renderFeeStats(block)}}
+      <div class="bc-traces">${{formatTraces(block.trace_count || 0)}}</div>
+      <div class="bc-tx-count">${{formatTxCount(block.tx_count || 0)}}</div>
+      <div class="bc-time">${{etaLabel}}</div>
     `;
+  }}
+
+  function mempoolBlockRenderKey(block) {{
+    const feeRange = Array.isArray(block.fee_range)
+      ? block.fee_range
+      : (Array.isArray(block.feeRange) ? block.feeRange : []);
+    return JSON.stringify([
+      Number(block.index),
+      block.median_fee_rate ?? null,
+      block.min_fee_rate ?? null,
+      block.max_fee_rate ?? null,
+      feeRange,
+      Number(block.trace_count || 0),
+      Number(block.tx_count || 0)
+    ]);
+  }}
+
+  function renderCurrentIndicator() {{
+    return '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>';
+  }}
+
+  function elementFromMarkup(markup) {{
+    const template = document.createElement('template');
+    template.innerHTML = markup.trim();
+    return template.content.firstElementChild;
+  }}
+
+  function updateMempoolSlide(slide, block) {{
+    const index = Number(block.index);
+    const isCurrent = index === selectedMempoolIndex;
+    slide.dataset.mempoolIndex = String(block.index);
+    slide.dataset.bcKey = `mempool:${{block.index}}`;
+    const card = slide.querySelector('.bc-mempool-card');
+    if (!card) return;
+    card.setAttribute('href', `${{basePrefix}}/mempool-block/${{index + 1}}`);
+    card.classList.toggle('current', isCurrent);
+    const face = card.querySelector('.bc-face');
+    const renderKey = mempoolBlockRenderKey(block);
+    if (face && slide.dataset.bcRenderKey !== renderKey) {{
+      face.innerHTML = renderMempoolFace(block);
+      slide.dataset.bcRenderKey = renderKey;
+    }}
+    const indicator = card.querySelector('.bc-indicator');
+    if (isCurrent && !indicator) card.insertAdjacentHTML('beforeend', renderCurrentIndicator());
+    if (!isCurrent && indicator) indicator.remove();
   }}
 
   function renderBoundary() {{
@@ -440,10 +492,48 @@ fn block_carousel_inner(
     }}, TIP_ANIMATION_MS + 80);
   }}
 
-  function renderPreservingAnchor(anchorSelector) {{
+  function reconcileMempoolSlides(anchorSelector) {{
     const anchor = track.querySelector(anchorSelector);
     const beforeLeft = anchor ? anchor.getBoundingClientRect().left : null;
-    render();
+    const renderedMempoolBlocks = [...mempoolBlocks]
+      .sort((a, b) => Number(b.index) - Number(a.index));
+    const existingSlides = new Map();
+    track.querySelectorAll('.bc-mempool-slide[data-mempool-index]').forEach((slide) => {{
+      existingSlides.set(String(slide.dataset.mempoolIndex), slide);
+    }});
+    let boundary = track.querySelector('[data-bc-boundary]');
+
+    if (!shouldRenderMempoolSide() || !renderedMempoolBlocks.length) {{
+      existingSlides.forEach((slide) => slide.remove());
+      if (boundary) boundary.remove();
+    }} else {{
+      if (!boundary) {{
+        boundary = elementFromMarkup(renderBoundary());
+        const firstConfirmed = track.querySelector('[data-height]');
+        if (firstConfirmed) track.insertBefore(boundary, firstConfirmed);
+        else track.appendChild(boundary);
+      }}
+      const desiredSlides = [];
+      renderedMempoolBlocks.forEach((block) => {{
+        const key = String(block.index);
+        let slide = existingSlides.get(key);
+        if (slide) {{
+          updateMempoolSlide(slide, block);
+          existingSlides.delete(key);
+        }} else {{
+          slide = elementFromMarkup(renderMempoolBlock(block));
+        }}
+        if (slide) desiredSlides.push(slide);
+      }});
+      existingSlides.forEach((slide) => slide.remove());
+      let nextNode = boundary;
+      for (let index = desiredSlides.length - 1; index >= 0; index -= 1) {{
+        const slide = desiredSlides[index];
+        if (slide.nextElementSibling !== nextNode) track.insertBefore(slide, nextNode);
+        nextNode = slide;
+      }}
+    }}
+
     if (beforeLeft === null) return;
     const nextAnchor = track.querySelector(anchorSelector);
     if (!nextAnchor) return;
@@ -455,7 +545,7 @@ fn block_carousel_inner(
   }}
 
   function renderMempoolUpdate() {{
-    renderPreservingAnchor(`[data-height="${{selectedHeight}}"]`);
+    reconcileMempoolSlides(`[data-height="${{selectedHeight}}"]`);
     updateResetButton();
     queueEdgeCheck();
   }}
