@@ -20,7 +20,7 @@ use crate::modules::essentials::storage::{
     HoldersCountEntry, load_creation_record,
 };
 use crate::modules::essentials::utils::inspections::AlkaneCreationRecord;
-use crate::modules::essentials::utils::names::display_alkane_name;
+use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
 
 #[derive(Deserialize)]
 pub struct PageQuery {
@@ -142,7 +142,9 @@ pub async fn alkanes_page(
 
     let build_row = |rec: &AlkaneCreationRecord, holders: u64| {
         let id = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
-        let name = display_alkane_name(&rec.names).unwrap_or_else(|| "Unnamed".to_string());
+        let name = display_alkane_name_and_symbol(&rec.names, &rec.symbols)
+            .0
+            .unwrap_or_else(|| "Unnamed".to_string());
         let icon_url = alkane_icon_url(&rec.alkane, &state.essentials_mdb);
         let fallback = if name == "Unnamed" {
             '?'

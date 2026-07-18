@@ -12,7 +12,7 @@ use crate::modules::essentials::storage::{
     RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams,
     RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams, RpcGetOrbitalVolumesParams,
     RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams, RpcGetTransferVolumeParams,
-    RpcPingParams,
+    RpcPingParams, RpcSearchAlkaneParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
@@ -141,6 +141,34 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
                         view.rpc_get_all_alkanes(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_search = reg.clone();
+        let mdb_search = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_search
+                .register("search_alkane", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_search);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcSearchAlkaneParams {
+                            prefix: payload
+                                .get("prefix")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_search_alkane(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }

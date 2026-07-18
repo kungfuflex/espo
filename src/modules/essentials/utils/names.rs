@@ -41,6 +41,25 @@ pub fn display_alkane_name(names: &[String]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+pub fn display_alkane_name_and_symbol(
+    names: &[String],
+    symbols: &[String],
+) -> (Option<String>, Option<String>) {
+    let name = display_alkane_name(names);
+    let symbol = symbols
+        .iter()
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+        .map(str::to_string);
+
+    match (name, symbol) {
+        (Some(name), Some(symbol)) => (Some(name), Some(symbol)),
+        (Some(name), None) => (Some(name.clone()), Some(name.to_uppercase())),
+        (None, Some(symbol)) => (Some(symbol.clone()), Some(symbol)),
+        (None, None) => (None, None),
+    }
+}
+
 fn parse_short_id(id: &EspoSandshrewLikeTraceShortId) -> Option<SchemaAlkaneId> {
     fn parse_u32_or_hex(s: &str) -> Option<u32> {
         if let Some(hex) = s.strip_prefix("0x") {
@@ -332,5 +351,18 @@ mod tests {
         ]);
 
         assert_eq!(name_from_creation_trace(&block, &alkane).as_deref(), Some("FIRE / frBTC LP"));
+    }
+
+    #[test]
+    fn display_metadata_falls_back_between_name_and_symbol() {
+        assert_eq!(
+            display_alkane_name_and_symbol(&["Diesel".to_string()], &[]),
+            (Some("Diesel".to_string()), Some("DIESEL".to_string()))
+        );
+        assert_eq!(
+            display_alkane_name_and_symbol(&[], &["dUSD".to_string()]),
+            (Some("dUSD".to_string()), Some("dUSD".to_string()))
+        );
+        assert_eq!(display_alkane_name_and_symbol(&[], &[]), (None, None));
     }
 }

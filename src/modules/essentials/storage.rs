@@ -13,7 +13,9 @@ use crate::modules::essentials::utils::balances::{
     get_transfer_volume_for_alkane,
 };
 use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
-use crate::modules::essentials::utils::names::display_alkane_name;
+use crate::modules::essentials::utils::names::{
+    display_alkane_name_and_symbol, normalize_alkane_name,
+};
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RuneBalance, RunesProvider};
 use crate::runtime::mdb::{Mdb, MdbBatch};
@@ -3496,8 +3498,7 @@ impl EssentialsProvider {
                 .map(|hc| hc.count)
                 .unwrap_or(0);
             let inspection_json = rec.inspection.as_ref().map(inspection_to_json);
-            let name = display_alkane_name(&rec.names);
-            let symbol = rec.symbols.first().cloned();
+            let (name, symbol) = display_alkane_name_and_symbol(&rec.names, &rec.symbols);
             items.push(json!({
                 "alkane": format!("{}:{}", rec.alkane.block, rec.alkane.tx),
                 "creation_txid": hex::encode(rec.txid),
@@ -3519,6 +3520,116 @@ impl EssentialsProvider {
                 "page": page,
                 "limit": limit,
                 "total": total,
+                "items": items,
+            }),
+        })
+    }
+
+    pub fn rpc_search_alkane(
+        &self,
+        params: RpcSearchAlkaneParams,
+    ) -> Result<RpcSearchAlkaneResult> {
+        let Some(prefix) = params.prefix.as_deref().and_then(normalize_alkane_name) else {
+            return Ok(RpcSearchAlkaneResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_prefix"
+                }),
+            });
+        };
+        let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
+        let candidate_limit = limit.saturating_mul(4).min(400) as u64;
+
+        let name_ids = self
+            .get_alkane_ids_by_name_prefix_page(GetAlkaneIdsByNamePrefixPageParams {
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+                offset: 0,
+                limit: candidate_limit,
+            })?
+            .ids;
+        let symbol_ids = self
+            .get_alkane_ids_by_symbol_prefix_page(GetAlkaneIdsBySymbolPrefixPageParams {
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+                offset: 0,
+                limit: candidate_limit,
+            })?
+            .ids;
+
+        let mut seen = HashSet::new();
+        let ids = name_ids
+            .into_iter()
+            .chain(symbol_ids)
+            .filter(|id| seen.insert(*id))
+            .collect::<Vec<_>>();
+        let records = self
+            .get_creation_records_by_id(GetCreationRecordsByIdParams {
+                blockhash: StateAt::Latest,
+                alkanes: ids.clone(),
+            })?
+            .records;
+        let holder_counts = self
+            .get_holders_counts_by_id(GetHoldersCountsByIdParams {
+                blockhash: StateAt::Latest,
+                alkanes: ids.clone(),
+            })?
+            .counts;
+
+        let mut matches = ids
+            .into_iter()
+            .zip(records)
+            .zip(holder_counts)
+            .filter_map(|((alkane, record), holder_count)| {
+                let record = record?;
+                let (name, symbol) = display_alkane_name_and_symbol(&record.names, &record.symbols);
+                let exact = name
+                    .as_deref()
+                    .and_then(normalize_alkane_name)
+                    .is_some_and(|value| value == prefix)
+                    || symbol
+                        .as_deref()
+                        .and_then(normalize_alkane_name)
+                        .is_some_and(|value| value == prefix);
+                Some((
+                    !exact,
+                    std::cmp::Reverse(holder_count),
+                    name.clone().unwrap_or_default().to_ascii_lowercase(),
+                    alkane,
+                    name,
+                    symbol,
+                    record.creation_height,
+                ))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.3.block.cmp(&right.3.block))
+                .then_with(|| left.3.tx.cmp(&right.3.tx))
+        });
+        matches.truncate(limit);
+
+        let items = matches
+            .into_iter()
+            .map(|(_, holder_count, _, alkane, name, symbol, creation_height)| {
+                json!({
+                    "alkane": format!("{}:{}", alkane.block, alkane.tx),
+                    "name": name,
+                    "symbol": symbol,
+                    "holder_count": holder_count.0,
+                    "creation_height": creation_height,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(RpcSearchAlkaneResult {
+            value: json!({
+                "ok": true,
+                "prefix": prefix,
+                "limit": limit,
                 "items": items,
             }),
         })
@@ -3581,8 +3692,7 @@ impl EssentialsProvider {
                 .unwrap_or(0)
             });
         let inspection_json = record.inspection.as_ref().map(inspection_to_json);
-        let name = display_alkane_name(&record.names);
-        let symbol = record.symbols.first().cloned();
+        let (name, symbol) = display_alkane_name_and_symbol(&record.names, &record.symbols);
 
         Ok(RpcGetAlkaneInfoResult {
             value: json!({
@@ -6477,6 +6587,15 @@ pub struct RpcGetAllAlkanesResult {
     pub value: Value,
 }
 
+pub struct RpcSearchAlkaneParams {
+    pub prefix: Option<String>,
+    pub limit: Option<u64>,
+}
+
+pub struct RpcSearchAlkaneResult {
+    pub value: Value,
+}
+
 pub struct RpcGetAlkaneInfoParams {
     pub alkane: Option<String>,
 }
@@ -8936,6 +9055,45 @@ mod tests {
         assert_eq!(response["ok"], json!(false));
         assert_eq!(response["error"], json!("too_many_heights"));
         assert_eq!(response["max_heights"], json!(MAX_BLOCK_TIMES_BATCH));
+    }
+
+    #[test]
+    fn search_alkane_matches_prefix_and_falls_back_symbol_to_uppercase_name() {
+        let provider = new_provider_with_tempdb();
+        let table = provider.table();
+        let mut exact = make_creation_record(1);
+        exact.names = vec!["Diesel".to_string()];
+        exact.symbols.clear();
+        let mut prefixed = make_creation_record(2);
+        prefixed.names = vec!["Diesel Fuel".to_string()];
+        prefixed.symbols = vec!["DSL-F".to_string()];
+        write_creation_rows(&provider, &[(0, exact.clone()), (1, prefixed.clone())], 2);
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (table.alkane_name_index_key("diesel", &exact.alkane), Vec::new()),
+                    (table.alkane_name_index_key("diesel fuel", &prefixed.alkane), Vec::new()),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write name index");
+
+        let response = provider
+            .rpc_search_alkane(RpcSearchAlkaneParams {
+                prefix: Some("DIE".to_string()),
+                limit: Some(10),
+            })
+            .expect("search response")
+            .value;
+        let items = response["items"].as_array().expect("items");
+
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["prefix"], json!("die"));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["alkane"], json!("1:1"));
+        assert_eq!(items[0]["name"], json!("Diesel"));
+        assert_eq!(items[0]["symbol"], json!("DIESEL"));
     }
 
     fn write_creation_rows(

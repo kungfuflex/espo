@@ -618,13 +618,30 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_all_alkanes",
-                    "Lists Alkane creation records with basic metadata.",
+                    "Lists Alkane creation records with basic metadata. When only a name or symbol is indexed, the missing scalar field falls back to the available value; name-to-symbol fallbacks are uppercased. The raw names and symbols arrays remain unchanged.",
                     json!({ "page": 1, "limit": 1 }),
-                    json!({ "ok": true, "page": 1, "limit": 1, "total": 77735, "items": [{ "alkane": "2:77579", "name": "Beep Boop Orbited #1376", "holder_count": 1 }] }),
+                    json!({ "ok": true, "page": 1, "limit": 1, "total": 77735, "items": [{ "alkane": "2:77579", "name": "Beep Boop Orbited #1376", "symbol": "BEEP BOOP ORBITED #1376", "holder_count": 1 }] }),
+                ),
+                rpc_doc(
+                    "essentials.search_alkane",
+                    "Searches indexed Alkane names and symbols by a case-insensitive prefix. Exact matches rank first, followed by holder count. limit defaults to 20 and is capped at 100. A missing symbol falls back to the uppercased name, and a missing name falls back to the symbol.",
+                    json!({ "prefix": "die", "limit": 10 }),
+                    json!({
+                        "ok": true,
+                        "prefix": "die",
+                        "limit": 10,
+                        "items": [{
+                            "alkane": "2:0",
+                            "name": "DIESEL",
+                            "symbol": "diesel",
+                            "holder_count": 6409,
+                            "creation_height": 880000
+                        }]
+                    }),
                 ),
                 rpc_doc(
                     "essentials.get_alkane_info",
-                    "Returns the creation metadata, names, icon, and indexed details for one Alkane.",
+                    "Returns the creation metadata, names, icon, and indexed details for one Alkane. A missing scalar symbol falls back to the uppercased name, and a missing scalar name falls back to the symbol.",
                     json!({ "alkane": "2:0" }),
                     json!({ "ok": true, "alkane": "2:0", "name": "DIESEL", "symbol": "diesel", "holder_count": 6409, "creation_height": 880000 }),
                 ),
@@ -935,6 +952,30 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     json!({ "ok": true, "candles": [{ "ts": 1710000000, "open": "1", "high": "2", "low": "1", "close": "2", "volume": "100" }] }),
                 ),
                 rpc_doc(
+                    "ammdata.get_btc_usd_candles",
+                    "Returns Espo's native indexed BTC/USD history without deriving it through an Alkane market. Supported timeframes are 10m, 1h, 4h, 1d, 1w, and 1M. Candles are newest first and prices are fixed-point integers scaled by 10^16; divide open, high, low, and close by price_scale to obtain USD. Missing buckets are forward-filled from the last indexed price, and volume is always zero because this is a price index rather than an AMM market.",
+                    json!({ "timeframe": "1h", "limit": 2, "page": 1 }),
+                    json!({
+                        "ok": true,
+                        "pair": "btc-usd",
+                        "timeframe": "1h",
+                        "page": 1,
+                        "limit": 2,
+                        "total": 1000,
+                        "has_more": true,
+                        "price_scale": "10000000000000000",
+                        "price_decimals": 16,
+                        "candles": [{
+                            "ts": 1779307200,
+                            "open": "650000000000000000000",
+                            "high": "650000000000000000000",
+                            "low": "650000000000000000000",
+                            "close": "650000000000000000000",
+                            "volume": "0"
+                        }]
+                    }),
+                ),
+                rpc_doc(
                     "ammdata.get_alkanes_quote",
                     "Returns current and 24-hour USD quotes for BTC and requested Alkanes. frBTC (32:0) is pegged directly to Espo's indexed BTC/USD history, so its prices and changes match BTC exactly. Other Alkane quotes prefer the configured merged <token>-derived_<quote>-usd chart, fall back to the direct <token>-usd chart, and return zero prices when neither chart exists. Current prices use the latest 10-minute close and comparison prices use hourly candle index 24. change_24h is the percentage change and change_24h_usd is the absolute price change.",
                     json!({ "assets": ["btc", "2:0", "2:68479"] }),
@@ -997,7 +1038,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "ammdata.get_portfolio_stats",
-                    "Values an address's confirmed BTC and Alkane balances at latest or an optional indexed height. Historical BTC balances are reconstructed from address transaction history, while BTC prices come from Espo's indexed BTC/USD candles. frBTC (32:0) uses that same BTC price history. The same selected-height balances are valued at current and 24-hour-old prices, so changes represent price movement without treating purchases, sales, or transfers as gains. change_24h is the percentage change and change_24h_usd is the corresponding portfolio USD value change. complete is false when any balance lacks a required price.",
+                    "Values an address's confirmed BTC and Alkane balances at latest or an optional indexed height. Historical BTC balances are reconstructed from address transaction history, while BTC prices come from Espo's indexed BTC/USD candles. frBTC (32:0) uses that same BTC price history. The same selected-height balances are valued at current and 24-hour-old prices, so changes represent price movement without treating purchases, sales, or transfers as gains. change_24h is the percentage change and change_24h_usd is the corresponding portfolio USD value change. Alkane names and symbols fall back to each other when one is missing, with name-to-symbol fallbacks uppercased. complete is false when any balance lacks a required price.",
                     json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "height": 946000 }),
                     json!({
                         "ok": true,
@@ -1186,9 +1227,9 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "ammdata.get_btc_usd_price",
-                    "Returns the BTC/USD price at latest or at a requested height.",
+                    "Returns the BTC/USD price at latest or at a requested height. price is a fixed-point integer scaled by 10^16.",
                     json!({ "height": 946000 }),
-                    json!({ "ok": true, "height": 946000, "price_usd": "65000" }),
+                    json!({ "ok": true, "height": 946000, "price": "650000000000000000000", "source": "ammdata_index" }),
                 ),
                 rpc_doc(
                     "ammdata.get_total_volume_amm",

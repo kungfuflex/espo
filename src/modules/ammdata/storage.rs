@@ -27,7 +27,7 @@ use crate::modules::essentials::storage::{
     GetIndexHeightParams as EssentialsGetIndexHeightParams,
 };
 use crate::modules::essentials::utils::balances::get_balance_for_address;
-use crate::modules::essentials::utils::names::display_alkane_name;
+use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
@@ -3472,15 +3472,12 @@ impl AmmDataProvider {
         let mut metadata = HashMap::with_capacity(assets.len());
         for (id, record) in alkane_ids.into_iter().zip(records) {
             let label = id_str(&id);
-            let name = record
+            let (name, symbol) = record
                 .as_ref()
-                .and_then(|record| display_alkane_name(&record.names))
-                .unwrap_or_else(|| label.clone());
-            let symbol = record
-                .as_ref()
-                .and_then(|record| record.symbols.iter().find(|value| !value.trim().is_empty()))
-                .map(|value| value.trim().to_string())
-                .unwrap_or_else(|| label.clone());
+                .map(|record| display_alkane_name_and_symbol(&record.names, &record.symbols))
+                .unwrap_or_default();
+            let name = name.unwrap_or_else(|| label.clone());
+            let symbol = symbol.unwrap_or_else(|| label.clone());
             metadata.insert(PriceAsset::Alkane(id), AssetMetadata { name, symbol });
         }
         if assets.contains(&PriceAsset::Btc) {
@@ -4041,6 +4038,31 @@ impl AmmDataProvider {
                 value: json!({ "ok": false, "error": format!("read_failed: {e}") }),
             }),
         }
+    }
+
+    pub fn rpc_get_btc_usd_candles(
+        &self,
+        params: RpcGetBtcUsdCandlesParams,
+    ) -> Result<RpcGetBtcUsdCandlesResult> {
+        let tf = params.timeframe.as_deref().and_then(parse_timeframe).unwrap_or(Timeframe::H1);
+        let legacy_size = params.size.map(|value| value as usize);
+        let limit = params
+            .limit
+            .map(|value| value as usize)
+            .or(legacy_size)
+            .unwrap_or(120)
+            .clamp(1, 1_000);
+        let page = params.page.map(|value| value as usize).unwrap_or(1).max(1);
+        let now = params.now.unwrap_or_else(now_ts);
+
+        let value = match read_btc_usd_line_v1(self, tf, now) {
+            Ok(slice) => btc_usd_candles_json(&slice, tf, limit, page),
+            Err(error) => json!({
+                "ok": false,
+                "error": format!("read_failed: {error}")
+            }),
+        };
+        Ok(RpcGetBtcUsdCandlesResult { value })
     }
 
     pub fn rpc_get_chart_change_block(
@@ -5638,6 +5660,18 @@ pub struct RpcGetCandlesResult {
     pub value: Value,
 }
 
+pub struct RpcGetBtcUsdCandlesParams {
+    pub timeframe: Option<String>,
+    pub limit: Option<u64>,
+    pub size: Option<u64>,
+    pub page: Option<u64>,
+    pub now: Option<u64>,
+}
+
+pub struct RpcGetBtcUsdCandlesResult {
+    pub value: Value,
+}
+
 pub struct RpcGetAlkanesQuoteParams {
     pub assets: Option<Vec<String>>,
     pub now: Option<u64>,
@@ -6663,6 +6697,47 @@ fn read_btc_usd_line_v1(
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }
 
+fn btc_usd_candles_json(slice: &CandleSlice, tf: Timeframe, limit: usize, page: usize) -> Value {
+    let total = slice.candles_newest_first.len();
+    let offset = limit.saturating_mul(page.saturating_sub(1));
+    let end = offset.saturating_add(limit).min(total);
+    let candles = if offset >= total {
+        Vec::new()
+    } else {
+        slice.candles_newest_first[offset..end]
+            .iter()
+            .enumerate()
+            .map(|(index, candle)| {
+                let global_index = offset.saturating_add(index);
+                let ts = slice
+                    .newest_ts
+                    .saturating_sub((global_index as u64).saturating_mul(tf.duration_secs()));
+                json!({
+                    "ts": ts,
+                    "open": candle.open.to_string(),
+                    "high": candle.high.to_string(),
+                    "low": candle.low.to_string(),
+                    "close": candle.close.to_string(),
+                    "volume": candle.volume.to_string(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    json!({
+        "ok": true,
+        "pair": "btc-usd",
+        "timeframe": tf.code(),
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "has_more": end < total,
+        "price_scale": PRICE_SCALE.to_string(),
+        "price_decimals": 16,
+        "candles": candles,
+    })
+}
+
 fn parse_timeframe(s: &str) -> Option<Timeframe> {
     match s {
         "10m" | "m10" => Some(Timeframe::M10),
@@ -6895,5 +6970,43 @@ mod tests {
             assert_eq!(metadata.name, name);
             assert_eq!(metadata.symbol, symbol);
         }
+    }
+
+    #[test]
+    fn btc_usd_candle_response_uses_native_scale_and_pagination() {
+        let slice = CandleSlice {
+            newest_ts: 7_200,
+            candles_newest_first: vec![
+                SchemaCandleV1 {
+                    open: 65_000 * PRICE_SCALE,
+                    high: 65_000 * PRICE_SCALE,
+                    low: 65_000 * PRICE_SCALE,
+                    close: 65_000 * PRICE_SCALE,
+                    volume: 0,
+                },
+                SchemaCandleV1 {
+                    open: 64_000 * PRICE_SCALE,
+                    high: 64_000 * PRICE_SCALE,
+                    low: 64_000 * PRICE_SCALE,
+                    close: 64_000 * PRICE_SCALE,
+                    volume: 0,
+                },
+                SchemaCandleV1 {
+                    open: 63_000 * PRICE_SCALE,
+                    high: 63_000 * PRICE_SCALE,
+                    low: 63_000 * PRICE_SCALE,
+                    close: 63_000 * PRICE_SCALE,
+                    volume: 0,
+                },
+            ],
+        };
+
+        let response = btc_usd_candles_json(&slice, Timeframe::H1, 2, 2);
+
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["price_scale"], json!(PRICE_SCALE.to_string()));
+        assert_eq!(response["has_more"], json!(false));
+        assert_eq!(response["candles"][0]["ts"], json!(0));
+        assert_eq!(response["candles"][0]["close"], json!((63_000 * PRICE_SCALE).to_string()));
     }
 }
