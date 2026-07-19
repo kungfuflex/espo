@@ -14,6 +14,7 @@ const MAINNET_ALKANE_NAME_OVERRIDES: &[(&str, &str, &str)] =
     &[("2:0", "DIESEL", "DIESEL"), ("32:0", "frBTC", "FRBTC"), ("2:68479", "TORTILLA", "TORTILLA")];
 const MAINNET_ICON_OVERRIDES: &[(&str, &str)] = &[
     ("2:68479", "https://cdn.idclub.io/alkanes/2-62083.webp"),
+    ("2:77269", "https://i.ibb.co/RTZw3zyh/tortilla-Lp-2.png"),
     ("2:77623", "https://i.ibb.co/nN1LKyZb/fire.png"),
     ("32:0", FRBTC_ICON_URL),
 ];
