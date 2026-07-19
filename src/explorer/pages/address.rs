@@ -1764,6 +1764,9 @@ fn address_event_listener_script_with_events(
     if (payload.type === 'address-tx') {{
       return data.address === address || addressMapContains(data.addresses) || trackedTxids.has(data.txid);
     }}
+    if (payload.type === 'address-status') {{
+      return data.address === address;
+    }}
     if (payload.type === 'tx') {{
       return (
         trackedTxids.has(data.txid) ||

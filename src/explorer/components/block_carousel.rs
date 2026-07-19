@@ -20,6 +20,9 @@ fn block_carousel_inner(
     selected_mempool_index: Option<usize>,
     espo_tip: u64,
 ) -> Markup {
+    let selected_confirmed_js = current_height
+        .map(|height| height.to_string())
+        .unwrap_or_else(|| "null".to_string());
     let current_height = current_height.unwrap_or(espo_tip);
     let base_path_js = format!("{:?}", explorer_path("/"));
     let pool_icons_js = bundled_pool_icon_svgs_json();
@@ -63,7 +66,7 @@ fn block_carousel_inner(
   const resetButton = root.querySelector('[data-bc-reset]');
   const current = Number(root.dataset.current);
   let selectedMempoolIndex = {selected_mempool_js};
-  let selectedConfirmedHeight = selectedMempoolIndex === null ? current : null;
+  let selectedConfirmedHeight = selectedMempoolIndex === null ? {selected_confirmed_js} : null;
   let espoTip = Number(root.dataset.espoTip);
   if (!scroller || !track || !Number.isFinite(current) || !Number.isFinite(espoTip)) return;
 
@@ -1218,6 +1221,17 @@ fn block_carousel_inner(
         }} catch (_) {{}}
       }}
     }},
+    selectMempoolBlock(index) {{
+      if (index === null || index === undefined || index === '') return;
+      const targetIndex = Number(index);
+      if (!Number.isInteger(targetIndex) || targetIndex < 0 || eventsDisposed) return;
+      if (selectedMempoolIndex === targetIndex && selectedConfirmedHeight === null) return;
+      selectedMempoolIndex = targetIndex;
+      selectedConfirmedHeight = null;
+      followLatest = true;
+      renderMempoolUpdate();
+      requestAnimationFrame(() => centerMempool(targetIndex, true));
+    }},
     selectConfirmedBlock(height) {{
       const targetHeight = Number(height);
       if (!Number.isFinite(targetHeight) || targetHeight < 0 || eventsDisposed) return;
@@ -1279,6 +1293,9 @@ fn block_carousel_inner(
         eventsStableTimer = null;
         if (eventsSocket === socket) eventsReconnectAttempts = 0;
       }}, 10_000);
+      const wantedEvents = ['block'];
+      if (MEMPOOL_BLOCKS_ENABLED) wantedEvents.push('mempool-blocks');
+      try {{ socket.send(JSON.stringify({{ action: 'want', data: wantedEvents }})); }} catch (_) {{}}
       trackedEventTxids.forEach((txid) => {{
         try {{ socket.send(JSON.stringify({{ action: 'want', data: ['tx'], txid }})); }} catch (_) {{}}
       }});
@@ -1525,6 +1542,7 @@ fn block_carousel_inner(
 }})();
 "#,
         base_path_js = base_path_js,
+        selected_confirmed_js = selected_confirmed_js,
         pool_icons_js = pool_icons_js,
         ws_path_js = ws_path_js,
         mempool_block_interval_secs = mempool_block_interval_secs,

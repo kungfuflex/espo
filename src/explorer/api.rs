@@ -169,13 +169,14 @@ pub async fn explorer_events_ws(ws: WebSocketUpgrade) -> Response {
 }
 
 fn explorer_tx_status_payload(txid: &Txid) -> String {
-    let data = if pending_by_txid(txid).is_some() {
+    let data = if let Some(entry) = pending_by_txid(txid) {
         json!({
             "txid": txid.to_string(),
             "status": "mempool",
             "height": null,
             "timestamp": null,
             "confirmations": 0,
+            "mempool_block": entry.position.as_ref().map(|position| position.block),
         })
     } else if let Ok(Some(height)) = get_electrum_like().transaction_get_height(txid) {
         let timestamp =
@@ -200,12 +201,106 @@ fn explorer_tx_status_payload(txid: &Txid) -> String {
     json!({ "type": "tx-status", "data": data }).to_string()
 }
 
+#[derive(Default)]
+struct ExplorerEventSubscriptions {
+    blocks: bool,
+    mempool_blocks: bool,
+    txids: HashSet<String>,
+    addresses: HashSet<String>,
+}
+
+fn filtered_explorer_event(
+    payload: &Value,
+    subscriptions: &ExplorerEventSubscriptions,
+) -> Option<Value> {
+    let event_type = payload.get("type").and_then(Value::as_str)?;
+    let data = payload.get("data").and_then(Value::as_object);
+
+    match event_type {
+        "mempool-blocks" => subscriptions.mempool_blocks.then(|| payload.clone()),
+        "block" => {
+            if !subscriptions.blocks {
+                return None;
+            }
+            let matching_txids: Vec<String> = data
+                .and_then(|data| data.get("txids"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|txid| subscriptions.txids.contains(*txid))
+                .map(str::to_string)
+                .collect();
+            let mut filtered = payload.clone();
+            filtered["data"]["txids"] = json!(matching_txids);
+            Some(filtered)
+        }
+        "tx" => {
+            if subscriptions.txids.is_empty() {
+                return None;
+            }
+            let single_matches = data
+                .and_then(|data| data.get("txid"))
+                .and_then(Value::as_str)
+                .map(|txid| subscriptions.txids.contains(txid))
+                .unwrap_or(false);
+            let matching_txids: Vec<String> = data
+                .and_then(|data| data.get("txids"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|txid| subscriptions.txids.contains(*txid))
+                .map(str::to_string)
+                .collect();
+            if !single_matches && matching_txids.is_empty() {
+                return None;
+            }
+            let mut filtered = payload.clone();
+            if data.and_then(|data| data.get("txids")).is_some() {
+                filtered["data"]["txids"] = json!(matching_txids);
+            }
+            Some(filtered)
+        }
+        "address-tx" => {
+            if subscriptions.addresses.is_empty() {
+                return None;
+            }
+            let single_matches = data
+                .and_then(|data| data.get("address"))
+                .and_then(Value::as_str)
+                .map(|address| subscriptions.addresses.contains(address))
+                .unwrap_or(false);
+            let matching_addresses = data
+                .and_then(|data| data.get("addresses"))
+                .and_then(Value::as_object)
+                .map(|addresses| {
+                    addresses
+                        .iter()
+                        .filter(|(address, _)| subscriptions.addresses.contains(*address))
+                        .map(|(address, txids)| (address.clone(), txids.clone()))
+                        .collect::<serde_json::Map<String, Value>>()
+                })
+                .unwrap_or_default();
+            if !single_matches && matching_addresses.is_empty() {
+                return None;
+            }
+            let mut filtered = payload.clone();
+            if data.and_then(|data| data.get("addresses")).is_some() {
+                filtered["data"]["addresses"] = Value::Object(matching_addresses);
+            }
+            Some(filtered)
+        }
+        _ => None,
+    }
+}
+
 async fn handle_explorer_events_socket(mut socket: WebSocket) {
     let mut tracked_mempool_block: Option<usize> = None;
+    let mut subscriptions = ExplorerEventSubscriptions::default();
     let initial = json!({
         "type": "hello",
         "data": {
-            "mempool": explorer_mempool_snapshot(),
             "espo_tip": get_espo_next_height().saturating_sub(1),
         }
     });
@@ -222,23 +317,26 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                 match event {
                     Ok(payload) => {
                         let parsed_payload = serde_json::from_str::<Value>(&payload).ok();
-                        let client_payload = if parsed_payload
+                        if let Some(filtered) = parsed_payload
                             .as_ref()
-                            .and_then(|value| value.get("type"))
-                            .and_then(|value| value.as_str())
-                            == Some("mempool-blocks")
+                            .and_then(|payload| filtered_explorer_event(payload, &subscriptions))
                         {
-                            json!({
-                                "type": "mempool-blocks",
-                                "data": explorer_mempool_snapshot(),
-                            })
-                            .to_string()
-                        } else {
-                            strip_mempool_deltas_for_client(parsed_payload.as_ref())
-                                .unwrap_or(payload)
-                        };
-                        if socket.send(WsMessage::Text(client_payload.into())).await.is_err() {
-                            break;
+                            let client_payload = if filtered
+                                .get("type")
+                                .and_then(Value::as_str)
+                                == Some("mempool-blocks")
+                            {
+                                json!({
+                                    "type": "mempool-blocks",
+                                    "data": explorer_mempool_snapshot(),
+                                })
+                                .to_string()
+                            } else {
+                                filtered.to_string()
+                            };
+                            if socket.send(WsMessage::Text(client_payload.into())).await.is_err() {
+                                break;
+                            }
                         }
                         if let Some(index) = tracked_mempool_block {
                             if let Some(parsed) = parsed_payload.clone() {
@@ -271,8 +369,75 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let payload = json!({"type": "mempool-blocks", "data": explorer_mempool_snapshot()}).to_string();
-                        if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                        let mut disconnected = false;
+                        if subscriptions.blocks {
+                            let payload = json!({
+                                "type": "hello",
+                                "data": {
+                                    "espo_tip": get_espo_next_height().saturating_sub(1),
+                                }
+                            })
+                            .to_string();
+                            disconnected = socket
+                                .send(WsMessage::Text(payload.into()))
+                                .await
+                                .is_err();
+                        }
+                        if !disconnected && subscriptions.mempool_blocks {
+                            let payload = json!({
+                                "type": "mempool-blocks",
+                                "data": explorer_mempool_snapshot(),
+                            })
+                            .to_string();
+                            disconnected = socket
+                                .send(WsMessage::Text(payload.into()))
+                                .await
+                                .is_err();
+                        }
+                        if !disconnected {
+                            for txid in &subscriptions.txids {
+                                let Ok(txid) = Txid::from_str(txid) else {
+                                    continue;
+                                };
+                                let payload = explorer_tx_status_payload(&txid);
+                                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !disconnected {
+                            for address in &subscriptions.addresses {
+                                let payload = json!({
+                                    "type": "address-status",
+                                    "data": { "address": address },
+                                })
+                                .to_string();
+                                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !disconnected
+                            && let Some(index) = tracked_mempool_block
+                        {
+                            let snapshot = explorer_mempool_snapshot();
+                            let payload = json!({
+                                "type": "projected-block-transactions",
+                                "data": {
+                                    "index": index,
+                                    "sequence": snapshot.sequence,
+                                    "full": get_mempool_block_transaction_ids(index),
+                                }
+                            })
+                            .to_string();
+                            disconnected = socket
+                                .send(WsMessage::Text(payload.into()))
+                                .await
+                                .is_err();
+                        }
+                        if disconnected {
                             break;
                         }
                     }
@@ -290,20 +455,37 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                     Some(Ok(WsMessage::Close(_))) | None => break,
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
-                            let wants_mempool_blocks = parsed
+                            let is_want = parsed
                                 .get("action")
                                 .and_then(|value| value.as_str())
-                                == Some("want")
-                                && parsed
+                                == Some("want");
+                            let wants = |event_type: &str| {
+                                is_want
+                                    && parsed
                                     .get("data")
                                     .and_then(|value| value.as_array())
                                     .map(|items| {
-                                        items.iter().any(|item| {
-                                            item.as_str() == Some("mempool-blocks")
-                                        })
+                                        items.iter().any(|item| item.as_str() == Some(event_type))
                                     })
-                                    .unwrap_or(false);
-                            if wants_mempool_blocks
+                                    .unwrap_or(false)
+                            };
+                            if wants("block") {
+                                subscriptions.blocks = true;
+                                let payload = json!({
+                                    "type": "hello",
+                                    "data": {
+                                        "espo_tip": get_espo_next_height().saturating_sub(1),
+                                    }
+                                })
+                                .to_string();
+                                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            if wants("mempool-blocks") {
+                                subscriptions.mempool_blocks = true;
+                            }
+                            if wants("mempool-blocks")
                                 || parsed.get("refresh-mempool-blocks").is_some()
                                 || parsed.get("refresh_mempool_blocks").is_some()
                             {
@@ -316,27 +498,26 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                                     break;
                                 }
                             }
-                            let wants_tx = parsed
-                                .get("action")
-                                .and_then(|value| value.as_str())
-                                == Some("want")
-                                && parsed
-                                    .get("data")
-                                    .and_then(|value| value.as_array())
-                                    .map(|items| {
-                                        items.iter().any(|item| item.as_str() == Some("tx"))
-                                    })
-                                    .unwrap_or(false);
-                            if wants_tx
+                            if wants("tx")
                                 && let Some(txid) = parsed
                                     .get("txid")
                                     .and_then(|value| value.as_str())
                                     .and_then(|value| Txid::from_str(value).ok())
                             {
+                                subscriptions.txids.insert(txid.to_string());
                                 let payload = explorer_tx_status_payload(&txid);
                                 if socket.send(WsMessage::Text(payload.into())).await.is_err() {
                                     break;
                                 }
+                            }
+                            if wants("address")
+                                && let Some(address) = parsed
+                                    .get("address")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|address| !address.is_empty())
+                            {
+                                subscriptions.addresses.insert(address.to_string());
                             }
                             let requested = parsed
                                 .get("track-mempool-block")
@@ -382,18 +563,6 @@ fn now_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn strip_mempool_deltas_for_client(payload: Option<&Value>) -> Option<String> {
-    let payload = payload?;
-    if payload.get("type").and_then(|v| v.as_str()) != Some("mempool-blocks") {
-        return None;
-    }
-    let mut stripped = payload.clone();
-    if let Some(data) = stripped.get_mut("data") {
-        data["deltas"] = json!([]);
-    }
-    serde_json::to_string(&stripped).ok()
 }
 
 #[derive(Deserialize)]
@@ -2594,5 +2763,73 @@ fn parse_u64_any(s: &str) -> Option<u64> {
         u64::from_str_radix(h, 16).ok()
     } else {
         t.parse().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ExplorerEventSubscriptions, filtered_explorer_event};
+
+    fn subscriptions() -> ExplorerEventSubscriptions {
+        ExplorerEventSubscriptions {
+            blocks: true,
+            mempool_blocks: true,
+            txids: ["tracked".to_string()].into_iter().collect(),
+            addresses: ["bc1ptracked".to_string()].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn websocket_drops_untracked_transaction_events() {
+        let subscriptions = subscriptions();
+        let event = json!({
+            "type": "tx",
+            "data": {
+                "event": "updated",
+                "status": "mempool",
+                "txid": "unrelated",
+                "addresses": ["bc1punrelated"],
+            }
+        });
+
+        assert!(filtered_explorer_event(&event, &subscriptions).is_none());
+    }
+
+    #[test]
+    fn websocket_narrows_confirmed_transaction_and_block_batches() {
+        let subscriptions = subscriptions();
+        for event_type in ["tx", "block"] {
+            let event = json!({
+                "type": event_type,
+                "data": {
+                    "status": "confirmed",
+                    "height": 100,
+                    "txids": ["unrelated", "tracked"],
+                }
+            });
+            let filtered = filtered_explorer_event(&event, &subscriptions).unwrap();
+
+            assert_eq!(filtered["data"]["txids"], json!(["tracked"]));
+        }
+    }
+
+    #[test]
+    fn websocket_narrows_confirmed_address_maps() {
+        let subscriptions = subscriptions();
+        let event = json!({
+            "type": "address-tx",
+            "data": {
+                "status": "confirmed",
+                "addresses": {
+                    "bc1punrelated": ["unrelated"],
+                    "bc1ptracked": ["tracked"],
+                },
+            }
+        });
+        let filtered = filtered_explorer_event(&event, &subscriptions).unwrap();
+
+        assert_eq!(filtered["data"]["addresses"], json!({ "bc1ptracked": ["tracked"] }));
     }
 }

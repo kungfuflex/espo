@@ -81,8 +81,10 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
   const blockPrefix = {block_prefix_js};
   const events = window.__espoBlockCarouselEvents;
   let liveRefreshInFlight = false;
+  let liveRefreshQueued = false;
   let confirmedHeight = null;
   let latestTip = null;
+  let indexedContentLoaded = document.querySelector('[data-tx-live-content]')?.dataset.txState === 'confirmed';
 
   const initHeaderInteractions = () => {{
     document.querySelectorAll('[data-copy-btn]').forEach((btn) => {{
@@ -159,7 +161,10 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
   const isWaiting = () => Boolean(document.querySelector('[data-tx-waiting="1"]'));
 
   const refreshLiveContent = async () => {{
-    if (liveRefreshInFlight) return;
+    if (liveRefreshInFlight) {{
+      liveRefreshQueued = true;
+      return;
+    }}
     liveRefreshInFlight = true;
     try {{
       const response = await fetch(window.location.href, {{
@@ -174,10 +179,15 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
       if (!next || !current) return;
       next.querySelectorAll('script').forEach((script) => script.remove());
       current.replaceWith(next);
+      indexedContentLoaded = next.dataset.txState === 'confirmed';
       initHeaderInteractions();
     }} catch (_) {{
     }} finally {{
       liveRefreshInFlight = false;
+      if (liveRefreshQueued) {{
+        liveRefreshQueued = false;
+        refreshLiveContent();
+      }}
     }}
   }};
 
@@ -220,8 +230,9 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
       return;
     }}
 
-    confirmedHeight = height;
     const live = document.querySelector('[data-tx-live-content]');
+    const needsIndexedRefresh = !indexedContentLoaded;
+    confirmedHeight = height;
     if (live) live.dataset.txState = 'confirmed';
 
     const timestamp = Number(timestampValue);
@@ -253,6 +264,7 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
     }});
     updateConfirmationCount(latestTip ?? height, Number(confirmationsValue));
     initHeaderInteractions();
+    if (needsIndexedRefresh) refreshLiveContent();
   }};
 
   const handleEvent = (payload) => {{
@@ -276,8 +288,11 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
     if (payload.type === 'tx-status' && data.txid === txid) {{
       if (data.status === 'confirmed') {{
         markConfirmed(data.height, data.timestamp, Number(data.confirmations));
-      }} else if (data.status === 'mempool' && isWaiting()) {{
-        refreshLiveContent();
+      }} else if (data.status === 'mempool') {{
+        if (events && typeof events.selectMempoolBlock === 'function') {{
+          events.selectMempoolBlock(data.mempool_block);
+        }}
+        if (isWaiting()) refreshLiveContent();
       }}
       return;
     }}
@@ -286,8 +301,11 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
     if (!matches) return;
     if (data.status === 'confirmed' || data.event === 'confirmed') {{
       markConfirmed(data.height, data.timestamp, 1);
-    }} else if (isWaiting()) {{
-      refreshLiveContent();
+    }} else {{
+      if (events && typeof events.selectMempoolBlock === 'function') {{
+        events.selectMempoolBlock(data.mempool_block);
+      }}
+      if (isWaiting()) refreshLiveContent();
     }}
   }};
 
@@ -830,6 +848,9 @@ mod tests {
         assert!(script.contains("events.subscribe(handleEvent)"));
         assert!(script.contains("events.trackTransaction(txid)"));
         assert!(script.contains("events.selectConfirmedBlock(height)"));
+        assert!(script.contains("const needsIndexedRefresh = !indexedContentLoaded"));
+        assert!(script.contains("if (needsIndexedRefresh) refreshLiveContent()"));
+        assert!(script.contains("liveRefreshQueued"));
         assert!(!script.contains("new WebSocket"));
         assert!(!script.contains("setInterval"));
         assert!(!script.contains("main.app"));

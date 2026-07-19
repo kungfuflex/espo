@@ -2215,7 +2215,7 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
         ),
         ws_doc(
             "/api/events/ws",
-            "Streams explorer mempool and chain events when websocket support is enabled. Send a want request to receive the current status of a transaction; subsequent mempool and confirmation changes arrive on the same connection.",
+            "Streams explorer events when websocket support is enabled. Clients receive only the categories and identifiers requested with `action: want`: `block`, `mempool-blocks`, a specific `txid`, or a specific `address`. Transaction and address batches are narrowed server-side to the tracked values. A transaction request returns its current status immediately and then streams only that transaction's mempool and confirmation changes on the same connection.",
             json!({ "action": "want", "data": ["tx"], "txid": "4d3f...9a10" }),
             json!({ "type": "tx-status", "data": { "txid": "4d3f...9a10", "status": "confirmed", "height": 958411, "timestamp": 1784382000, "confirmations": 2 } }),
         ),
