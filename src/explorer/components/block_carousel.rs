@@ -62,7 +62,7 @@ fn block_carousel_inner(
   const track = root.querySelector('[data-bc-track]');
   const resetButton = root.querySelector('[data-bc-reset]');
   const current = Number(root.dataset.current);
-  const selectedMempoolIndex = {selected_mempool_js};
+  let selectedMempoolIndex = {selected_mempool_js};
   let selectedConfirmedHeight = selectedMempoolIndex === null ? current : null;
   let espoTip = Number(root.dataset.espoTip);
   if (!scroller || !track || !Number.isFinite(current) || !Number.isFinite(espoTip)) return;
@@ -1227,6 +1227,30 @@ fn block_carousel_inner(
           eventsSocket.send(JSON.stringify({{ action: 'want', data: ['tx'], txid: normalized }}));
         }} catch (_) {{}}
       }}
+    }},
+    selectConfirmedBlock(height) {{
+      const targetHeight = Number(height);
+      if (!Number.isFinite(targetHeight) || targetHeight < 0 || eventsDisposed) return;
+      selectedMempoolIndex = null;
+      selectedConfirmedHeight = targetHeight;
+      selectedHeight = targetHeight;
+      root.dataset.current = String(targetHeight);
+      followLatest = targetHeight === espoTip;
+
+      if (!seen.has(targetHeight)) {{
+        if (targetHeight !== espoTip) {{
+          fetchWindow(targetHeight).then((batch) => {{
+            if (!batch || eventsDisposed) return;
+            applyBlocks(batch);
+            render();
+            requestAnimationFrame(() => centerHeight(targetHeight, true));
+          }});
+        }}
+        return;
+      }}
+
+      render();
+      requestAnimationFrame(() => centerHeight(targetHeight, true));
     }}
   }};
   window[eventsControllerKey] = eventsController;

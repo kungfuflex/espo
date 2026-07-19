@@ -212,6 +212,9 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
   const markConfirmed = (heightValue, timestampValue, confirmationsValue = null) => {{
     const height = Number(heightValue);
     if (!Number.isFinite(height)) return;
+    if (events && typeof events.selectConfirmedBlock === 'function') {{
+      events.selectConfirmedBlock(height);
+    }}
     if (isWaiting()) {{
       refreshLiveContent();
       return;
@@ -826,6 +829,7 @@ mod tests {
         assert!(script.contains("window.__espoBlockCarouselEvents"));
         assert!(script.contains("events.subscribe(handleEvent)"));
         assert!(script.contains("events.trackTransaction(txid)"));
+        assert!(script.contains("events.selectConfirmedBlock(height)"));
         assert!(!script.contains("new WebSocket"));
         assert!(!script.contains("setInterval"));
         assert!(!script.contains("main.app"));
