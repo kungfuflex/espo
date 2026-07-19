@@ -1162,24 +1162,14 @@ fn block_carousel_inner(
     }}
   }}
 
-  function applyEventTip(nextTip, shouldAnimate, forceRefresh = false) {{
+  function applyEventTip(nextTip, shouldAnimate) {{
     if (!Number.isFinite(nextTip) || nextTip <= espoTip) return;
     const previousTip = espoTip;
     const wasFollowingLatest = isFollowingLatest();
-    const shouldInsertNewTip =
-      wasFollowingLatest &&
-      (forceRefresh ||
-        selectedMempoolIndex !== null ||
-        selectedConfirmedHeight === previousTip ||
-        selectedHeight === previousTip);
     espoTip = nextTip;
     root.dataset.espoTip = String(espoTip);
-    if (wasFollowingLatest && selectedConfirmedHeight === previousTip) {{
-      selectedConfirmedHeight = nextTip;
-      root.dataset.current = String(nextTip);
-    }}
     leftDepleted = maxH >= espoTip;
-    if (!shouldInsertNewTip) {{
+    if (!wasFollowingLatest) {{
       updateResetButton();
       queueEdgeCheck();
       return;
@@ -1302,7 +1292,7 @@ fn block_carousel_inner(
         return;
       }}
       if (payload.type === 'hello' && payload.data) {{
-        applyEventTip(Number(payload.data.espo_tip), false, true);
+        applyEventTip(Number(payload.data.espo_tip), false);
         if (MEMPOOL_BLOCKS_ENABLED && payload.data.mempool) {{
           applyMempoolSnapshot(payload.data.mempool, false, true);
         }}
