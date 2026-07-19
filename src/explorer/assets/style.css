@@ -1282,6 +1282,25 @@ a:hover {
   min-width: 0;
   text-align: left;
 }
+.faucet-asset-dropdown .dropdown-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  line-height: 20px;
+}
+.faucet-asset-dropdown .dropdown-icon,
+.faucet-asset-dropdown .dropdown-caret,
+.faucet-asset-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+.faucet-asset-icon {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+}
 .faucet-asset-dropdown .dropdown-panel {
   width: 100%;
   min-width: 0;
