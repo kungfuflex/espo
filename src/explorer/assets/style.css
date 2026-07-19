@@ -1268,8 +1268,34 @@ a:hover {
 .faucet-input:focus {
   border-color: var(--link-dark);
 }
-.faucet-select {
-  cursor: pointer;
+.faucet-asset-dropdown {
+  display: flex;
+  width: 100%;
+}
+.faucet-asset-dropdown .dropdown-trigger {
+  width: 100%;
+  min-height: 44px;
+  justify-content: flex-start;
+}
+.faucet-asset-dropdown .dropdown-trigger > .dropdown-label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+}
+.faucet-asset-dropdown .dropdown-panel {
+  width: 100%;
+  min-width: 0;
+  background: var(--panel);
+}
+.faucet-asset-dropdown .dropdown-item[hidden] {
+  display: none;
+}
+.faucet-asset-dropdown[data-disabled="1"] {
+  opacity: 0.55;
+}
+.faucet-asset-dropdown .dropdown-icon .network-svg {
+  width: 20px;
+  height: 20px;
 }
 .faucet-amount-control {
   position: relative;
