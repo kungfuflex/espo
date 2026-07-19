@@ -1010,8 +1010,14 @@ async fn run_indexer_loop(
                             next_height
                         ),
                     }
-                    publish_new_block_event(next_height, &block_txids);
-                    publish_confirmed_tx_events(next_height, &block_txids, &block_address_txs);
+                    let block_timestamp = espo_block.block_header.time;
+                    publish_new_block_event(next_height, block_timestamp, &block_txids);
+                    publish_confirmed_tx_events(
+                        next_height,
+                        block_timestamp,
+                        &block_txids,
+                        &block_address_txs,
+                    );
                     drop(db_write_guard);
 
                     if let Some(backup) = cfg.debug_backup.as_ref() {

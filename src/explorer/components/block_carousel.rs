@@ -120,6 +120,8 @@ fn block_carousel_inner(
   let eventsStableTimer = null;
   let eventsReconnectAttempts = 0;
   let eventsDisposed = false;
+  const eventSubscribers = new Set();
+  const trackedEventTxids = new Set();
 
   let isDragging = false;
   let dragStartX = 0;
@@ -1187,6 +1189,8 @@ fn block_carousel_inner(
 
   function disposeEvents() {{
     eventsDisposed = true;
+    eventSubscribers.clear();
+    trackedEventTxids.clear();
     if (eventsReconnectTimer) {{
       window.clearTimeout(eventsReconnectTimer);
       eventsReconnectTimer = null;
@@ -1207,7 +1211,24 @@ fn block_carousel_inner(
   if (previousEventsController && typeof previousEventsController.dispose === 'function') {{
     previousEventsController.dispose();
   }}
-  const eventsController = {{ dispose: disposeEvents }};
+  const eventsController = {{
+    dispose: disposeEvents,
+    subscribe(listener) {{
+      if (typeof listener !== 'function' || eventsDisposed) return () => {{}};
+      eventSubscribers.add(listener);
+      return () => eventSubscribers.delete(listener);
+    }},
+    trackTransaction(txid) {{
+      const normalized = String(txid || '').trim();
+      if (!normalized || eventsDisposed) return;
+      trackedEventTxids.add(normalized);
+      if (eventsSocket && eventsSocket.readyState === WebSocket.OPEN) {{
+        try {{
+          eventsSocket.send(JSON.stringify({{ action: 'want', data: ['tx'], txid: normalized }}));
+        }} catch (_) {{}}
+      }}
+    }}
+  }};
   window[eventsControllerKey] = eventsController;
 
   function scheduleEventsReconnect() {{
@@ -1244,6 +1265,9 @@ fn block_carousel_inner(
         eventsStableTimer = null;
         if (eventsSocket === socket) eventsReconnectAttempts = 0;
       }}, 10_000);
+      trackedEventTxids.forEach((txid) => {{
+        try {{ socket.send(JSON.stringify({{ action: 'want', data: ['tx'], txid }})); }} catch (_) {{}}
+      }});
     }});
     socket.addEventListener('message', (event) => {{
       if (eventsSocket !== socket || eventsDisposed || !root.isConnected) return;
@@ -1265,6 +1289,9 @@ fn block_carousel_inner(
       if (payload.type === 'block') {{
         applyEventTip(Number(payload.data && payload.data.height), true);
       }}
+      eventSubscribers.forEach((listener) => {{
+        try {{ listener(payload); }} catch (_) {{}}
+      }});
     }});
     socket.addEventListener('close', () => {{
       if (eventsSocket !== socket) return;

@@ -2215,9 +2215,9 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
         ),
         ws_doc(
             "/api/events/ws",
-            "Streams explorer mempool and chain events when websocket support is enabled.",
-            json!({ "type": "subscribe", "channels": ["mempool"] }),
-            json!({ "type": "mempool", "blocks": [{ "index": 0, "tx_count": 3879, "trace_count": 2119, "vsize": 998957 }] }),
+            "Streams explorer mempool and chain events when websocket support is enabled. Send a want request to receive the current status of a transaction; subsequent mempool and confirmation changes arrive on the same connection.",
+            json!({ "action": "want", "data": ["tx"], "txid": "4d3f...9a10" }),
+            json!({ "type": "tx-status", "data": { "txid": "4d3f...9a10", "status": "confirmed", "height": 958411, "timestamp": 1784382000, "confirmations": 2 } }),
         ),
     ]
 }

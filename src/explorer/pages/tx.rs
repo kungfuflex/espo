@@ -15,7 +15,7 @@ use crate::alkanes::trace::{
     traces_for_block_as_prost,
 };
 use crate::config::{
-    get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_next_height, get_metashrew,
+    get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_metashrew,
 };
 use crate::explorer::api::cached_bitcoin_chain_tip_height;
 use crate::explorer::components::block_carousel::{block_carousel, block_carousel_with_mempool};
@@ -65,30 +65,24 @@ fn mempool_tx_url(network: Network, txid: &Txid) -> Option<String> {
 }
 
 fn tx_event_listener_script(txid: &Txid) -> Markup {
-    let base_path_js =
-        serde_json::to_string(&explorer_path("/")).unwrap_or_else(|_| "\"/\"".into());
+    tx_event_listener_script_with_block_prefix(txid, &explorer_path("/block/"))
+}
+
+fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -> Markup {
     let txid_js = serde_json::to_string(&txid.to_string()).unwrap_or_else(|_| "\"\"".into());
-    let mempool_cfg = &get_config().mempool;
-    let ws_path = mempool_cfg.websocket_path.as_deref().unwrap_or("/api/events/ws").to_string();
-    let ws_path_js =
-        serde_json::to_string(&ws_path).unwrap_or_else(|_| "\"/api/events/ws\"".into());
-    let ws_enabled_js = mempool_cfg.websocket_enabled;
+    let block_prefix_js =
+        serde_json::to_string(block_prefix).unwrap_or_else(|_| "\"/block/\"".into());
 
     PreEscaped(format!(
         r#"
 <script data-tx-event-listener="">
 (() => {{
   const txid = {txid_js};
-  const basePath = {base_path_js};
-  const eventsPath = {ws_path_js};
-  const eventsEnabled = {ws_enabled_js};
-  let refreshTimer = null;
-  let refreshInFlight = false;
-  let retryTimer = null;
-  let pollTimer = null;
-
-  const normalizedBase = basePath.endsWith('/') ? basePath.slice(0, -1) : basePath;
-  const wsPath = eventsPath.startsWith('/') ? `${{normalizedBase}}${{eventsPath}}` : `${{normalizedBase}}/${{eventsPath}}`;
+  const blockPrefix = {block_prefix_js};
+  const events = window.__espoBlockCarouselEvents;
+  let liveRefreshInFlight = false;
+  let confirmedHeight = null;
+  let latestTip = null;
 
   const initHeaderInteractions = () => {{
     document.querySelectorAll('[data-copy-btn]').forEach((btn) => {{
@@ -160,124 +154,152 @@ fn tx_event_listener_script(txid: &Txid) -> Markup {
     }});
   }};
 
-  const executeMainScripts = (main) => {{
-    main.querySelectorAll('script').forEach((oldScript) => {{
-      if (oldScript.hasAttribute('data-tx-event-listener')) return;
-      const script = document.createElement('script');
-      for (const attr of oldScript.attributes) {{
-        script.setAttribute(attr.name, attr.value);
-      }}
-      script.textContent = oldScript.textContent;
-      oldScript.replaceWith(script);
-    }});
-  }};
+  const arrayIncludesTxid = (value) => Array.isArray(value) && value.includes(txid);
 
-  const syncHead = (doc) => {{
-    if (doc.title) document.title = doc.title;
-    ['description'].forEach((name) => {{
-      const next = doc.head.querySelector(`meta[name="${{name}}"]`);
-      const current = document.head.querySelector(`meta[name="${{name}}"]`);
-      if (next && current) current.setAttribute('content', next.getAttribute('content') || '');
-    }});
-    ['canonical', 'alternate'].forEach((rel) => {{
-      const current = Array.from(document.head.querySelectorAll(`link[rel="${{rel}}"]`));
-      const next = Array.from(doc.head.querySelectorAll(`link[rel="${{rel}}"]`));
-      current.forEach((node, idx) => {{
-        if (next[idx]) node.setAttribute('href', next[idx].getAttribute('href') || '');
-      }});
-    }});
-  }};
+  const isWaiting = () => Boolean(document.querySelector('[data-tx-waiting="1"]'));
 
-  const refreshDom = async () => {{
-    if (refreshInFlight) return;
-    refreshInFlight = true;
+  const refreshLiveContent = async () => {{
+    if (liveRefreshInFlight) return;
+    liveRefreshInFlight = true;
     try {{
-      const res = await fetch(window.location.href, {{
+      const response = await fetch(window.location.href, {{
         cache: 'no-store',
-        headers: {{ 'Accept': 'text/html' }}
+        headers: {{ Accept: 'text/html' }}
       }});
-      if (!res.ok) return;
-      const text = await res.text();
+      if (!response.ok) return;
+      const text = await response.text();
       const doc = new DOMParser().parseFromString(text, 'text/html');
-      const nextMain = doc.querySelector('main.app');
-      const currentMain = document.querySelector('main.app');
-      if (!nextMain || !currentMain) return;
-      syncHead(doc);
-      currentMain.replaceWith(nextMain);
-      executeMainScripts(nextMain);
+      const next = doc.querySelector('[data-tx-live-content]');
+      const current = document.querySelector('[data-tx-live-content]');
+      if (!next || !current) return;
+      next.querySelectorAll('script').forEach((script) => script.remove());
+      current.replaceWith(next);
       initHeaderInteractions();
     }} catch (_) {{
     }} finally {{
-      refreshInFlight = false;
+      liveRefreshInFlight = false;
     }}
   }};
 
-  const scheduleRefresh = () => {{
-    if (refreshTimer) return;
-    refreshTimer = window.setTimeout(() => {{
-      refreshTimer = null;
-      refreshDom();
-    }}, 350);
+  const summaryItem = (label) => Array.from(
+    document.querySelectorAll('[data-tx-live-content] .summary-item')
+  ).find((item) => {{
+    const labelNode = item.querySelector('.summary-label');
+    return labelNode && labelNode.textContent.trim() === label;
+  }});
+
+  const replaceSummaryValue = (label, value) => {{
+    const item = summaryItem(label);
+    if (!item) return;
+    const labelNode = item.querySelector('.summary-label');
+    Array.from(item.children).forEach((child) => {{
+      if (child !== labelNode) child.remove();
+    }});
+    item.append(value);
   }};
 
-  const arrayIncludesTxid = (value) => Array.isArray(value) && value.includes(txid);
-
-  const matchesTx = (payload) => {{
-    if (!payload || typeof payload !== 'object') return false;
-    const data = payload.data || {{}};
-    if (payload.type === 'tx') {{
-      return data.txid === txid || arrayIncludesTxid(data.txids);
-    }}
-    if (payload.type === 'block') {{
-      return arrayIncludesTxid(data.txids);
-    }}
-    return false;
+  const updateConfirmationCount = (tipHeight, explicitCount = null) => {{
+    if (!Number.isFinite(confirmedHeight)) return;
+    const count = Number.isFinite(explicitCount)
+      ? Math.max(1, explicitCount)
+      : Math.max(1, Number(tipHeight) - confirmedHeight + 1);
+    const pill = document.querySelector('[data-tx-live-content] .tx-conf-pill');
+    if (!pill) return;
+    pill.classList.remove('pending', 'neutral');
+    pill.textContent = `${{new Intl.NumberFormat().format(count)}} ${{count === 1 ? 'confirmation' : 'confirmations'}}`;
   }};
 
-  const connect = () => {{
-    if (!eventsEnabled || !window.WebSocket) return;
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let socket;
-    try {{
-      socket = new WebSocket(`${{protocol}}//${{window.location.host}}${{wsPath}}`);
-    }} catch (_) {{
+  const markConfirmed = (heightValue, timestampValue, confirmationsValue = null) => {{
+    const height = Number(heightValue);
+    if (!Number.isFinite(height)) return;
+    if (isWaiting()) {{
+      refreshLiveContent();
       return;
     }}
-    socket.addEventListener('open', () => {{
-      try {{
-        socket.send(JSON.stringify({{ action: 'want', data: ['tx'], txid }}));
-      }} catch (_) {{}}
+
+    confirmedHeight = height;
+    const live = document.querySelector('[data-tx-live-content]');
+    if (live) live.dataset.txState = 'confirmed';
+
+    const timestamp = Number(timestampValue);
+    if (Number.isFinite(timestamp) && timestamp > 0) {{
+      const timestampGroup = document.createElement('div');
+      timestampGroup.className = 'summary-inline';
+      timestampGroup.dataset.tsGroup = '';
+      const timestampNode = document.createElement('span');
+      timestampNode.className = 'summary-value';
+      timestampNode.dataset.headerTs = String(timestamp);
+      timestampNode.textContent = String(timestamp);
+      const relativeNode = document.createElement('span');
+      relativeNode.className = 'summary-sub';
+      relativeNode.setAttribute('data-header-ts-rel', '');
+      timestampGroup.append(timestampNode, relativeNode);
+      replaceSummaryValue('Timestamp', timestampGroup);
+    }}
+
+    const blockLink = document.createElement('a');
+    blockLink.className = 'summary-value link';
+    blockLink.href = `${{blockPrefix}}${{height}}`;
+    blockLink.textContent = new Intl.NumberFormat().format(height);
+    replaceSummaryValue('Block', blockLink);
+
+    document.querySelectorAll('[data-tx-live-content] .tx-pill-status').forEach((pill) => {{
+      const row = pill.closest('.tx-pill-row');
+      pill.remove();
+      if (row && !row.children.length) row.remove();
     }});
-    socket.addEventListener('message', (event) => {{
-      let payload;
-      try {{
-        payload = JSON.parse(event.data);
-      }} catch (_) {{
-        return;
-      }}
-      if (matchesTx(payload)) scheduleRefresh();
-    }});
-    socket.addEventListener('close', () => {{
-      if (refreshTimer || retryTimer) return;
-      retryTimer = window.setTimeout(() => {{
-        retryTimer = null;
-        connect();
-      }}, 2500);
-    }});
+    updateConfirmationCount(latestTip ?? height, Number(confirmationsValue));
+    initHeaderInteractions();
   }};
 
-  connect();
+  const handleEvent = (payload) => {{
+    if (!payload || typeof payload !== 'object') return;
+    const data = payload.data || {{}};
+    if (payload.type === 'hello') {{
+      const tip = Number(data.espo_tip);
+      if (Number.isFinite(tip)) latestTip = tip;
+      return;
+    }}
+    if (payload.type === 'block') {{
+      const height = Number(data.height);
+      if (Number.isFinite(height)) latestTip = height;
+      if (arrayIncludesTxid(data.txids)) {{
+        markConfirmed(height, data.timestamp, 1);
+      }} else if (confirmedHeight !== null) {{
+        updateConfirmationCount(height);
+      }}
+      return;
+    }}
+    if (payload.type === 'tx-status' && data.txid === txid) {{
+      if (data.status === 'confirmed') {{
+        markConfirmed(data.height, data.timestamp, Number(data.confirmations));
+      }} else if (data.status === 'mempool' && isWaiting()) {{
+        refreshLiveContent();
+      }}
+      return;
+    }}
+    if (payload.type !== 'tx') return;
+    const matches = data.txid === txid || arrayIncludesTxid(data.txids);
+    if (!matches) return;
+    if (data.status === 'confirmed' || data.event === 'confirmed') {{
+      markConfirmed(data.height, data.timestamp, 1);
+    }} else if (isWaiting()) {{
+      refreshLiveContent();
+    }}
+  }};
 
-  if (document.querySelector('[data-tx-waiting="1"]')) {{
-    pollTimer = window.setInterval(async () => {{
-      if (refreshTimer || refreshInFlight) return;
-      await refreshDom();
-      if (!document.querySelector('[data-tx-waiting="1"]')) window.clearInterval(pollTimer);
-    }}, 5000);
-  }}
+  document.querySelectorAll('[data-copy-btn]').forEach((btn) => {{
+    btn.dataset.copyBound = '1';
+  }});
+  if (!events || typeof events.subscribe !== 'function') return;
+  const unsubscribe = events.subscribe(handleEvent);
+  if (typeof events.trackTransaction === 'function') events.trackTransaction(txid);
+  window.addEventListener('pagehide', unsubscribe, {{ once: true }});
 }})();
 </script>
-"#
+"#,
+        txid_js = txid_js,
+        block_prefix_js = block_prefix_js,
     ))
 }
 
@@ -311,15 +333,17 @@ fn render_waiting_tx_page(state: &ExplorerState, txid: &Txid, canonical_path: &s
             div class="block-hero full-bleed" {
                 (block_carousel(None, espo_tip))
             }
-            (header_markup)
-            div class="card tx-wait-card" data-tx-waiting="1" {
-                div class="tx-wait-copy" {
-                    h2 class="h2" { "Transaction not found" }
-                    p class="muted" { "Waiting for this transaction to reach the mempool." }
+            div data-tx-live-content="" data-tx-state="waiting" {
+                (header_markup)
+                div class="card tx-wait-card" data-tx-waiting="1" {
+                    div class="tx-wait-copy" {
+                        h2 class="h2" { "Transaction not found" }
+                        p class="muted" { "Waiting for this transaction to reach the mempool." }
+                    }
+                    div class="tx-wait-spinner" aria-hidden="true" {}
                 }
-                div class="tx-wait-spinner" aria-hidden="true" {}
+                (header_scripts())
             }
-            (header_scripts())
             (tx_event_listener_script(txid))
         },
     )
@@ -703,18 +727,20 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
                     (block_carousel(tx_height, espo_tip))
                 }
             }
-            (header_markup)
-            @if let Some(url) = mempool_url {
-                div class="tx-mempool-row" {
-                    a class="tx-mempool-link" href=(url) target="_blank" rel="noopener noreferrer" {
-                        "view on mempool.space"
-                        (icon_arrow_up_right())
+            div data-tx-live-content="" data-tx-state=(if tx_height.is_some() { "confirmed" } else { "mempool" }) {
+                (header_markup)
+                @if let Some(url) = mempool_url {
+                    div class="tx-mempool-row" {
+                        a class="tx-mempool-link" href=(url) target="_blank" rel="noopener noreferrer" {
+                            "view on mempool.space"
+                            (icon_arrow_up_right())
+                        }
                     }
                 }
+                h2 class="h2" { "Inputs & Outputs" }
+                (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, render_fee_rate, projected_balances, projected_rune_io, false, defer_alkane_trace_status))
+                (header_scripts())
             }
-            h2 class="h2" { "Inputs & Outputs" }
-            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, render_fee_rate, projected_balances, projected_rune_io, false, defer_alkane_trace_status))
-            (header_scripts())
             (tx_event_listener_script(&txid))
         },
     )
@@ -780,4 +806,28 @@ fn fetch_traces_for_tx_noheight(txid: &Txid, tx: &Transaction) -> anyhow::Result
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use bitcoin::Txid;
+
+    use super::tx_event_listener_script_with_block_prefix;
+
+    #[test]
+    fn pending_transaction_listener_uses_shared_events_without_polling_or_page_replacement() {
+        let txid =
+            Txid::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
+        let script = tx_event_listener_script_with_block_prefix(&txid, "/block/").into_string();
+
+        assert!(script.contains("window.__espoBlockCarouselEvents"));
+        assert!(script.contains("events.subscribe(handleEvent)"));
+        assert!(script.contains("events.trackTransaction(txid)"));
+        assert!(!script.contains("new WebSocket"));
+        assert!(!script.contains("setInterval"));
+        assert!(!script.contains("main.app"));
+    }
 }

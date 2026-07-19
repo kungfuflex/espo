@@ -9,8 +9,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::{
-    get_bitcoind_rpc_client, get_config, get_espo_db, get_espo_next_height, get_metashrew_rpc_url,
-    get_network,
+    get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_db, get_espo_next_height,
+    get_metashrew_rpc_url, get_network,
 };
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
@@ -34,7 +34,8 @@ use crate::modules::runes::storage::{RuneEntry, RunesProvider, SchemaRuneId};
 use crate::modules::tokendata::storage::TokenDataProvider;
 use crate::runtime::mdb::Mdb;
 use crate::runtime::mempool::{
-    current_mempool_compact_snapshot, get_mempool_block_transaction_ids, subscribe_mempool_events,
+    current_mempool_compact_snapshot, get_mempool_block_transaction_ids, pending_by_txid,
+    subscribe_mempool_events,
 };
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
@@ -51,7 +52,7 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use bitcoin::transaction::Version;
-use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
+use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid};
 use bitcoincore_rpc::RpcApi;
 use bitcoincore_rpc::bitcoin::Network;
 use borsh::BorshDeserialize;
@@ -167,6 +168,38 @@ pub async fn explorer_events_ws(ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(handle_explorer_events_socket)
 }
 
+fn explorer_tx_status_payload(txid: &Txid) -> String {
+    let data = if pending_by_txid(txid).is_some() {
+        json!({
+            "txid": txid.to_string(),
+            "status": "mempool",
+            "height": null,
+            "timestamp": null,
+            "confirmations": 0,
+        })
+    } else if let Ok(Some(height)) = get_electrum_like().transaction_get_height(txid) {
+        let timestamp =
+            get_cached_block_summary(height as u32).and_then(|summary| summary.block_time());
+        let tip = get_espo_next_height().saturating_sub(1) as u64;
+        json!({
+            "txid": txid.to_string(),
+            "status": "confirmed",
+            "height": height,
+            "timestamp": timestamp,
+            "confirmations": tip.saturating_sub(height).saturating_add(1),
+        })
+    } else {
+        json!({
+            "txid": txid.to_string(),
+            "status": "not_found",
+            "height": null,
+            "timestamp": null,
+            "confirmations": 0,
+        })
+    };
+    json!({ "type": "tx-status", "data": data }).to_string()
+}
+
 async fn handle_explorer_events_socket(mut socket: WebSocket) {
     let mut tracked_mempool_block: Option<usize> = None;
     let initial = json!({
@@ -279,6 +312,28 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                                     "data": explorer_mempool_snapshot(),
                                 })
                                 .to_string();
+                                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let wants_tx = parsed
+                                .get("action")
+                                .and_then(|value| value.as_str())
+                                == Some("want")
+                                && parsed
+                                    .get("data")
+                                    .and_then(|value| value.as_array())
+                                    .map(|items| {
+                                        items.iter().any(|item| item.as_str() == Some("tx"))
+                                    })
+                                    .unwrap_or(false);
+                            if wants_tx
+                                && let Some(txid) = parsed
+                                    .get("txid")
+                                    .and_then(|value| value.as_str())
+                                    .and_then(|value| Txid::from_str(value).ok())
+                            {
+                                let payload = explorer_tx_status_payload(&txid);
                                 if socket.send(WsMessage::Text(payload.into())).await.is_err() {
                                     break;
                                 }

@@ -406,6 +406,7 @@ fn publish_mempool_entry_event(entry: &MempoolTransactionStruct, event: &str) {
 
 pub fn publish_confirmed_tx_events(
     height: u32,
+    timestamp: u32,
     txids: &[Txid],
     address_txs: &HashMap<String, Vec<Txid>>,
 ) {
@@ -415,6 +416,7 @@ pub fn publish_confirmed_tx_events(
             "event": "confirmed",
             "status": "confirmed",
             "height": height,
+            "timestamp": timestamp,
             "txids": txids.iter().map(ToString::to_string).collect::<Vec<_>>(),
         }
     }));
@@ -432,6 +434,7 @@ pub fn publish_confirmed_tx_events(
                 "event": "confirmed",
                 "status": "confirmed",
                 "height": height,
+                "timestamp": timestamp,
                 "addresses": addresses,
             }
         }));
@@ -1560,11 +1563,12 @@ pub fn get_mempool_block_spenders(index: usize) -> Option<HashMap<(Txid, u32), T
     Some(out)
 }
 
-pub fn publish_new_block_event(height: u32, txids: &[Txid]) {
+pub fn publish_new_block_event(height: u32, timestamp: u32, txids: &[Txid]) {
     publish_mempool_event(&json!({
         "type": "block",
         "data": {
             "height": height,
+            "timestamp": timestamp,
             "txids": txids.iter().map(ToString::to_string).collect::<Vec<_>>(),
         }
     }));
