@@ -1268,6 +1268,9 @@ a:hover {
 .faucet-input:focus {
   border-color: var(--link-dark);
 }
+.faucet-select {
+  cursor: pointer;
+}
 .faucet-amount-control {
   position: relative;
 }
@@ -1283,10 +1286,21 @@ a:hover {
   align-items: center;
   pointer-events: none;
 }
+.faucet-asset-icon > [data-faucet-icon] {
+  display: inline-flex;
+  align-items: center;
+}
+.faucet-asset-icon > [data-faucet-icon][hidden] {
+  display: none;
+}
 .faucet-currency .network-svg,
-.faucet-limit-icon .network-svg {
+.faucet-limit-icon .network-svg,
+.faucet-diesel-icon {
   width: 20px;
   height: 20px;
+}
+.faucet-diesel-icon .alk-icon-letter {
+  font-size: 10px;
 }
 .faucet-limit {
   display: flex;

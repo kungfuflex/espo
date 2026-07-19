@@ -19,6 +19,7 @@ const FORWARDED_IP_HEADERS: [&str; 3] = ["cf-connecting-ip", "x-forwarded-for", 
 pub struct FaucetSendRequest {
     address: String,
     amount: Option<f64>,
+    asset: Option<String>,
 }
 
 pub(crate) fn faucet_enabled() -> bool {
@@ -51,11 +52,29 @@ fn valid_regtest_address(raw: &str) -> bool {
         .is_some()
 }
 
-fn faucet_send_params(address: &str, amount: Option<f64>) -> Result<Value, &'static str> {
-    match amount {
-        Some(amount) if !amount.is_finite() || amount < 0.0 => Err("invalid_amount"),
-        Some(amount) => Ok(json!([address, amount])),
-        None => Ok(json!([address])),
+fn faucet_asset(raw: Option<&str>) -> Result<Option<&'static str>, &'static str> {
+    match raw.map(str::trim).filter(|asset| !asset.is_empty()) {
+        None => Ok(None),
+        Some(asset) if asset.eq_ignore_ascii_case("rbtc") => Ok(Some("rbtc")),
+        Some(asset) if asset.eq_ignore_ascii_case("diesel") => Ok(Some("diesel")),
+        Some(_) => Err("invalid_asset"),
+    }
+}
+
+fn faucet_send_params(
+    address: &str,
+    amount: Option<f64>,
+    asset: Option<&str>,
+) -> Result<Value, &'static str> {
+    let asset = faucet_asset(asset)?;
+    if amount.is_some_and(|amount| !amount.is_finite() || amount < 0.0) {
+        return Err("invalid_amount");
+    }
+    match (amount, asset) {
+        (Some(amount), Some(asset)) => Ok(json!([address, amount, asset])),
+        (Some(amount), None) => Ok(json!([address, amount])),
+        (None, Some(asset)) => Ok(json!([address, null, asset])),
+        (None, None) => Ok(json!([address])),
     }
 }
 
@@ -122,8 +141,11 @@ pub async fn faucet_send(
     if !valid_regtest_address(address) {
         return error_response(StatusCode::BAD_REQUEST, -32602, "Invalid regtest address");
     }
-    let params = match faucet_send_params(address, payload.amount) {
+    let params = match faucet_send_params(address, payload.amount, payload.asset.as_deref()) {
         Ok(params) => params,
+        Err("invalid_asset") => {
+            return error_response(StatusCode::BAD_REQUEST, -32602, "Invalid faucet asset");
+        }
         Err(_) => return error_response(StatusCode::BAD_REQUEST, -32602, "Invalid faucet amount"),
     };
 
@@ -160,13 +182,22 @@ mod tests {
     #[test]
     fn faucet_send_amount_is_forwarded_when_provided() {
         assert_eq!(
-            faucet_send_params("bcrt1qexample", Some(0.25)).unwrap(),
+            faucet_send_params("bcrt1qexample", Some(0.25), None).unwrap(),
             serde_json::json!(["bcrt1qexample", 0.25])
         );
         assert_eq!(
-            faucet_send_params("bcrt1qexample", None).unwrap(),
+            faucet_send_params("bcrt1qexample", None, None).unwrap(),
             serde_json::json!(["bcrt1qexample"])
         );
-        assert!(faucet_send_params("bcrt1qexample", Some(-0.1)).is_err());
+        assert_eq!(
+            faucet_send_params("bcrt1qexample", Some(3.0), Some("diesel")).unwrap(),
+            serde_json::json!(["bcrt1qexample", 3.0, "diesel"])
+        );
+        assert_eq!(
+            faucet_send_params("bcrt1qexample", None, Some("diesel")).unwrap(),
+            serde_json::json!(["bcrt1qexample", null, "diesel"])
+        );
+        assert!(faucet_send_params("bcrt1qexample", Some(-0.1), None).is_err());
+        assert!(faucet_send_params("bcrt1qexample", Some(1.0), Some("unknown")).is_err());
     }
 }

@@ -2099,35 +2099,53 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
         http_doc(
             "GET",
             "/api/faucet/status",
-            "Returns the B8 faucet's spendable balance, availability, minimum and maximum request amounts, rolling 24-hour usage, and configured caps when the regtest faucet is enabled.",
+            "Returns B8's separate rBTC and DIESEL faucet settings, spendable balances, minimum and maximum request amounts, rolling 24-hour usage, and configured caps when the regtest faucet is enabled. The top-level fields mirror rBTC for compatibility.",
             json!({}),
             json!({
                 "id": 1,
                 "jsonrpc": "2.0",
                 "result": {
                     "amount": 1.0,
-                    "claims_last_24h": 2,
                     "enabled": true,
-                    "min_amount": 0.1,
                     "max_amount": 1.0,
-                    "total_available": 149.5,
-                    "max_per_address_per_day": 10.0,
-                    "max_per_day": 500.0,
-                    "max_per_ip_per_day": 10.0,
-                    "sent_last_24h": 2.0
+                    "rbtc": {
+                        "amount": 1.0,
+                        "claims_last_24h": 2,
+                        "enabled": true,
+                        "min_amount": 0.1,
+                        "max_amount": 1.0,
+                        "total_available": 149.5,
+                        "max_per_address_per_day": 10.0,
+                        "max_per_day": 500.0,
+                        "max_per_ip_per_day": 10.0,
+                        "sent_last_24h": 2.0
+                    },
+                    "diesel": {
+                        "amount": 10.0,
+                        "claims_last_24h": 3,
+                        "enabled": true,
+                        "min_amount": 1.0,
+                        "max_amount": 10.0,
+                        "total_available": 3200.0,
+                        "max_per_address_per_day": 100.0,
+                        "max_per_day": 5000.0,
+                        "max_per_ip_per_day": 100.0,
+                        "sent_last_24h": 8.0
+                    }
                 }
             }),
         ),
         http_doc(
             "POST",
             "/api/faucet/send",
-            "Requests an amount within the configured B8 faucet minimum and maximum for one regtest address. Omitting amount retains B8's maximum-payout behavior. Available only on regtest when b8_faucet_url is configured.",
-            json!({ "address": "bcrt1q...", "amount": 0.25 }),
+            "Requests rBTC or DIESEL within that asset's configured B8 faucet minimum and maximum for one regtest address. asset defaults to rbtc when omitted. Omitting amount retains B8's maximum-payout behavior. Available only on regtest when b8_faucet_url is configured.",
+            json!({ "address": "bcrt1q...", "amount": 3.0, "asset": "diesel" }),
             json!({
                 "id": 1,
                 "jsonrpc": "2.0",
                 "result": {
-                    "amount": 0.25,
+                    "amount": 3.0,
+                    "asset": "diesel",
                     "txid": "7be14a09c9..."
                 }
             }),
