@@ -1,15 +1,28 @@
-use super::{MempoolContractRule, add_to_sheet, cellpack_from_protostone};
-use crate::config::get_network;
+use super::{MempoolContractRule, add_to_sheet, cellpack_from_protostone, remove_from_sheet};
+use crate::config::get_espo_db;
 use crate::modules::ammdata::consts::FRBTC_ALKANE_ID;
+use crate::modules::essentials::storage::EssentialsProvider;
 use crate::modules::essentials::utils::balances::{ContractProjection, ContractProjectionContext};
-use crate::modules::subfrost::consts::get_subfrost_wrap_address;
-use bitcoin::Address;
-use std::str::FromStr;
+use crate::modules::subfrost::signer::get_signer_script;
+use crate::runtime::mdb::Mdb;
+use bitcoin::{ScriptBuf, TxOut};
+use std::sync::Arc;
 
 const FRBTC_WRAP_OPCODE: u128 = 77;
 const FRBTC_UNWRAP_OPCODE: u128 = 78;
 
-pub(crate) struct FrBtcProjectionRule;
+pub(crate) struct FrBtcProjectionRule {
+    signer_script: Option<ScriptBuf>,
+}
+
+impl FrBtcProjectionRule {
+    pub(crate) fn new() -> Self {
+        let mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        let essentials_provider = EssentialsProvider::new(mdb);
+        let signer_script = get_signer_script(&essentials_provider).ok().flatten();
+        Self { signer_script }
+    }
+}
 
 impl MempoolContractRule for FrBtcProjectionRule {
     fn project(&mut self, ctx: &ContractProjectionContext<'_>) -> Option<ContractProjection> {
@@ -19,18 +32,26 @@ impl MempoolContractRule for FrBtcProjectionRule {
         {
             return None;
         }
+        let signer_script = self.signer_script.as_ref()?;
 
         match cellpack.inputs.first().copied()? {
             FRBTC_WRAP_OPCODE => {
-                let sats = wrap_btc_sats(ctx, &cellpack.inputs)?;
+                let sats = signer_output_sats(&ctx.tx.output, signer_script)?;
                 let minted = wrap_mint_amount(sats);
                 let mut output = ctx.incoming.clone();
                 add_to_sheet(&mut output, FRBTC_ALKANE_ID, minted);
                 Some(ContractProjection { output })
             }
             FRBTC_UNWRAP_OPCODE => {
+                let signer_vout = usize::try_from(*cellpack.inputs.get(1)?).ok()?;
+                let amount = *cellpack.inputs.get(2)?;
+                if amount == 0 || !signer_vout_matches(&ctx.tx.output, signer_vout, signer_script) {
+                    return None;
+                }
                 let mut output = ctx.incoming.clone();
-                output.remove(&FRBTC_ALKANE_ID);
+                if remove_from_sheet(&mut output, FRBTC_ALKANE_ID, amount) != amount {
+                    return None;
+                }
                 Some(ContractProjection { output })
             }
             _ => None,
@@ -38,59 +59,57 @@ impl MempoolContractRule for FrBtcProjectionRule {
     }
 }
 
-fn wrap_btc_sats(ctx: &ContractProjectionContext<'_>, inputs: &[u128]) -> Option<u128> {
-    if subfrost_wrap_address_is_configured() {
-        return subfrost_output_sats(ctx);
-    }
-
-    let candidates = [inputs.get(1).copied(), ctx.protostone.from.map(u128::from), Some(0)];
-
-    for candidate in candidates.into_iter().flatten() {
-        let Ok(vout) = usize::try_from(candidate) else {
-            continue;
-        };
-        let Some(output) = ctx.tx.output.get(vout) else {
-            continue;
-        };
-        if output.script_pubkey.is_op_return() {
-            continue;
-        }
-        let sats = u128::from(output.value.to_sat());
-        if sats > 0 {
-            return Some(sats);
-        }
-    }
-
-    None
-}
-
 fn wrap_mint_amount(sats: u128) -> u128 {
     sats
 }
 
-fn subfrost_output_sats(ctx: &ContractProjectionContext<'_>) -> Option<u128> {
-    let network = get_network();
-    let address = get_subfrost_wrap_address(network);
-    let script_pubkey =
-        Address::from_str(address).ok()?.require_network(network).ok()?.script_pubkey();
-    ctx.tx
-        .output
+fn signer_output_sats(outputs: &[TxOut], signer_script: &ScriptBuf) -> Option<u128> {
+    let sats = outputs
         .iter()
-        .find(|output| output.script_pubkey == script_pubkey)
-        .map(|output| u128::from(output.value.to_sat()))
-        .filter(|sats| *sats > 0)
+        .filter(|output| output.script_pubkey == *signer_script)
+        .fold(0u128, |total, output| total.saturating_add(u128::from(output.value.to_sat())));
+    (sats > 0).then_some(sats)
 }
 
-fn subfrost_wrap_address_is_configured() -> bool {
-    !get_subfrost_wrap_address(get_network()).is_empty()
+fn signer_vout_matches(outputs: &[TxOut], vout: usize, signer_script: &ScriptBuf) -> bool {
+    outputs.get(vout).is_some_and(|output| output.script_pubkey == *signer_script)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::Amount;
+
+    fn signer_script() -> ScriptBuf {
+        ScriptBuf::from_bytes(
+            hex::decode("51201d4830313fb48f68b43b07391fe1232f8488621b2cbc5fb4b26d8935e4bf1cb4")
+                .unwrap(),
+        )
+    }
 
     #[test]
     fn wrap_mint_amount_matches_signer_output_sats() {
         assert_eq!(wrap_mint_amount(100_000_000), 100_000_000);
+    }
+
+    #[test]
+    fn wrap_uses_signer_outputs_instead_of_vout_zero() {
+        let signer = signer_script();
+        let outputs = vec![
+            TxOut { value: Amount::from_sat(10), script_pubkey: ScriptBuf::new() },
+            TxOut { value: Amount::from_sat(50), script_pubkey: signer.clone() },
+        ];
+        assert_eq!(signer_output_sats(&outputs, &signer), Some(50));
+    }
+
+    #[test]
+    fn unwrap_requires_the_requested_signer_vout() {
+        let signer = signer_script();
+        let outputs = vec![
+            TxOut { value: Amount::from_sat(50), script_pubkey: ScriptBuf::new() },
+            TxOut { value: Amount::from_sat(330), script_pubkey: signer.clone() },
+        ];
+        assert!(!signer_vout_matches(&outputs, 0, &signer));
+        assert!(signer_vout_matches(&outputs, 1, &signer));
     }
 }

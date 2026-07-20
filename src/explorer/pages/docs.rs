@@ -1638,8 +1638,14 @@ fn docs_modules() -> Vec<ModuleDoc> {
         ModuleDoc {
             slug: "subfrost-rpc",
             title: "Subfrost JSON-RPC",
-            intro: "frBTC wrap and unwrap event and request history methods.",
+            intro: "Current frBTC signer and wrap and unwrap event and request history methods.",
             methods: vec![
+                rpc_doc(
+                    "subfrost.get_signer",
+                    "Returns the current Subfrost signer address from the indexed /signer scriptPubKey on frBTC contract 32:0.",
+                    json!({}),
+                    json!({ "ok": true, "alkane": "32:0", "storage_key": "/signer", "script_pubkey": "0x51201d4830313fb48f68b43b07391fe1232f8488621b2cbc5fb4b26d8935e4bf1cb4", "address": "bcrt1pr4yrqvflkj8k3dpmquu3lcfr97zgscsm9j79ld9jdkynte9lrj6qlcsdcx" }),
+                ),
                 rpc_doc(
                     "subfrost.get_wrap_events_by_address",
                     "Returns frBTC wrap events for an address.",

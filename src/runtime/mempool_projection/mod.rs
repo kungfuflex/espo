@@ -22,7 +22,7 @@ impl MempoolProjectionRegistry {
     pub(crate) fn from_latest_indices() -> Self {
         Self {
             rules: vec![
-                Box::new(frbtc::FrBtcProjectionRule),
+                Box::new(frbtc::FrBtcProjectionRule::new()),
                 Box::new(amm::AmmProjectionRule::new()),
                 Box::new(fire::FireProjectionRule::new()),
             ],
