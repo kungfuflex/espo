@@ -430,10 +430,15 @@ impl AmmProjectionRule {
         incoming: &ProjectionSheet,
         implicit: bool,
     ) -> Option<ContractProjection> {
-        let (path, cursor) = parse_path(inputs)?;
+        let (mut path, cursor) = parse_path(inputs, if implicit { 1 } else { 2 })?;
+        let amount_in = if implicit {
+            let (input_id, available) = single_incoming_asset(incoming)?;
+            path.insert(0, input_id);
+            available
+        } else {
+            inputs.get(cursor).copied().unwrap_or_default()
+        };
         let available = incoming.get(path.first()?).copied().unwrap_or_default();
-        let amount_in =
-            if implicit { available } else { inputs.get(cursor).copied().unwrap_or_default() };
         if amount_in == 0 || available < amount_in {
             return None;
         }
@@ -461,7 +466,7 @@ impl AmmProjectionRule {
         inputs: &[u128],
         incoming: &ProjectionSheet,
     ) -> Option<ContractProjection> {
-        let (path, cursor) = parse_path(inputs)?;
+        let (path, cursor) = parse_path(inputs, 2)?;
         let desired_out = inputs.get(cursor).copied().unwrap_or_default();
         let amount_in_max = inputs.get(cursor + 1).copied().unwrap_or_default();
         if desired_out == 0 {
@@ -526,9 +531,9 @@ fn pools_by_pair(
     out
 }
 
-fn parse_path(inputs: &[u128]) -> Option<(Vec<SchemaAlkaneId>, usize)> {
+fn parse_path(inputs: &[u128], minimum_len: usize) -> Option<(Vec<SchemaAlkaneId>, usize)> {
     let len = usize::try_from(*inputs.get(1)?).ok()?;
-    if len < 2 {
+    if len < minimum_len {
         return None;
     }
     let mut path = Vec::with_capacity(len);
@@ -539,6 +544,15 @@ fn parse_path(inputs: &[u128]) -> Option<(Vec<SchemaAlkaneId>, usize)> {
         cursor += 2;
     }
     Some((path, cursor))
+}
+
+fn single_incoming_asset(incoming: &ProjectionSheet) -> Option<(SchemaAlkaneId, u128)> {
+    let mut assets = incoming.iter().filter(|(_, amount)| **amount > 0);
+    let (id, amount) = assets.next()?;
+    if assets.next().is_some() {
+        return None;
+    }
+    Some((*id, *amount))
 }
 
 fn parse_alkane_at(inputs: &[u128], offset: usize) -> Option<SchemaAlkaneId> {
@@ -741,9 +755,71 @@ mod tests {
     fn parse_factory_path_returns_cursor_after_path() {
         let id0 = SchemaAlkaneId { block: 2, tx: 0 };
         let id1 = SchemaAlkaneId { block: 32, tx: 0 };
-        let (path, cursor) = parse_path(&[13, 2, 2, 0, 32, 0, 1000, 1, 100]).unwrap();
+        let (path, cursor) = parse_path(&[13, 2, 2, 0, 32, 0, 1000, 1, 100], 2).unwrap();
         assert_eq!(path, vec![id0, id1]);
         assert_eq!(cursor, 6);
+    }
+
+    #[test]
+    fn implicit_exact_in_prepends_the_single_incoming_asset() {
+        let token_in = SchemaAlkaneId { block: 2, tx: 0 };
+        let token_out = SchemaAlkaneId { block: 32, tx: 0 };
+        let pool = SchemaAlkaneId { block: 2, tx: 123 };
+        let reserves = HashMap::from([(
+            pool,
+            SchemaPoolSnapshot {
+                base_reserve: 10_000,
+                quote_reserve: 10_000,
+                base_id: token_in,
+                quote_id: token_out,
+            },
+        )]);
+        let mut rule = AmmProjectionRule {
+            factory_id: Some(SchemaAlkaneId { block: 4, tx: 65_522 }),
+            pools_by_pair: pools_by_pair(&reserves),
+            reserves,
+            lp_supplies: HashMap::new(),
+        };
+        let incoming = ProjectionSheet::from([(token_in, 1_000)]);
+
+        // Opcode 29 encodes only the destination path; the contract prepends token_in.
+        let projected = rule
+            .project_factory_exact_in(&[29, 1, 32, 0, 800, u128::MAX], &incoming, true)
+            .unwrap();
+
+        assert_eq!(projected.output, ProjectionSheet::from([(token_out, 900)]));
+        let updated = rule.reserves.get(&pool).unwrap();
+        assert_eq!(updated.base_reserve, 11_000);
+        assert_eq!(updated.quote_reserve, 9_100);
+    }
+
+    #[test]
+    fn implicit_exact_in_rejects_multiple_incoming_assets() {
+        let token_in = SchemaAlkaneId { block: 2, tx: 0 };
+        let token_out = SchemaAlkaneId { block: 32, tx: 0 };
+        let pool = SchemaAlkaneId { block: 2, tx: 123 };
+        let reserves = HashMap::from([(
+            pool,
+            SchemaPoolSnapshot {
+                base_reserve: 10_000,
+                quote_reserve: 10_000,
+                base_id: token_in,
+                quote_id: token_out,
+            },
+        )]);
+        let mut rule = AmmProjectionRule {
+            factory_id: None,
+            pools_by_pair: pools_by_pair(&reserves),
+            reserves,
+            lp_supplies: HashMap::new(),
+        };
+        let incoming =
+            ProjectionSheet::from([(token_in, 1_000), (SchemaAlkaneId { block: 2, tx: 1 }, 1)]);
+
+        assert!(
+            rule.project_factory_exact_in(&[29, 1, 32, 0, 800, u128::MAX], &incoming, true)
+                .is_none()
+        );
     }
 
     #[test]
