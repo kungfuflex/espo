@@ -1010,34 +1010,37 @@ async fn run_indexer_loop(
                             next_height
                         ),
                     }
+                    let indexed_height = next_height;
                     let block_timestamp = espo_block.block_header.time;
-                    publish_new_block_event(next_height, block_timestamp, &block_txids);
-                    publish_confirmed_tx_events(
-                        next_height,
-                        block_timestamp,
-                        &block_txids,
-                        &block_address_txs,
-                    );
                     drop(db_write_guard);
-
-                    if let Some(backup) = cfg.debug_backup.as_ref() {
-                        if debug_backup_remaining.remove(&next_height) {
-                            eprintln!(
-                                "[debug_backup] reached block {}, copying db dir '{}' to '{}/bkp-{}'",
-                                next_height, cfg.db_path, backup.dir, next_height
-                            );
-                            match run_debug_backup(&cfg.db_path, backup, next_height) {
-                                Ok(_) => eprintln!("[debug_backup] backup complete"),
-                                Err(e) => eprintln!("[debug_backup] backup failed: {e}"),
-                            }
-                        }
-                    }
 
                     eta.finish_block();
                     next_height = next_height.saturating_add(1);
                     if let Some(h) = ESPO_HEIGHT.get() {
                         h.store(next_height, std::sync::atomic::Ordering::Relaxed);
                     }
+
+                    publish_new_block_event(indexed_height, block_timestamp, &block_txids);
+                    publish_confirmed_tx_events(
+                        indexed_height,
+                        block_timestamp,
+                        &block_txids,
+                        &block_address_txs,
+                    );
+
+                    if let Some(backup) = cfg.debug_backup.as_ref() {
+                        if debug_backup_remaining.remove(&indexed_height) {
+                            eprintln!(
+                                "[debug_backup] reached block {}, copying db dir '{}' to '{}/bkp-{}'",
+                                indexed_height, cfg.db_path, backup.dir, indexed_height
+                            );
+                            match run_debug_backup(&cfg.db_path, backup, indexed_height) {
+                                Ok(_) => eprintln!("[debug_backup] backup complete"),
+                                Err(e) => eprintln!("[debug_backup] backup failed: {e}"),
+                            }
+                        }
+                    }
+
                     if cfg.indexer_block_delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(cfg.indexer_block_delay_ms)).await;
                     }

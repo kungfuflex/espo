@@ -57,6 +57,10 @@ impl MempoolContractRule for FrBtcProjectionRule {
             _ => None,
         }
     }
+
+    fn prefer_input_projection(&self) -> bool {
+        true
+    }
 }
 
 fn wrap_mint_amount(sats: u128) -> u128 {

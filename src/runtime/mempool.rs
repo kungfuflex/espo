@@ -1485,6 +1485,9 @@ pub fn get_mempool_index_transactions_ordered_by_block_and_fee() -> Vec<MempoolB
     out
 }
 
+/// Returns protostone transactions in canonical mempool order from block zero
+/// through the last target. The prefix is required to carry projected vouts and
+/// contract state across projected block boundaries.
 pub fn get_mempool_block_transactions_for_targets(
     index: usize,
     targets: &HashSet<Txid>,
@@ -1496,35 +1499,29 @@ pub fn get_mempool_block_transactions_for_targets(
     let Ok(state) = mempool_state().read() else {
         return None;
     };
-    let template = state.templates.iter().find(|template| template.index == index)?;
-    let ordered: Vec<Txid> = template
-        .transaction_ids
-        .iter()
-        .filter_map(|txid_str| Txid::from_str(txid_str).ok())
-        .collect();
-    let in_block: HashSet<Txid> = ordered.iter().copied().collect();
-    let mut needed: HashSet<Txid> =
-        targets.iter().copied().filter(|txid| in_block.contains(txid)).collect();
-    let mut stack: Vec<Txid> = needed.iter().copied().collect();
-
-    while let Some(txid) = stack.pop() {
-        let Some(entry) = state.txs.get(&txid) else {
-            continue;
-        };
-        for prev in &entry.spent_outpoints {
-            let parent = prev.txid;
-            if in_block.contains(&parent) && needed.insert(parent) {
-                stack.push(parent);
-            }
-        }
+    let ordered = mempool_projection_prefix(&state.templates, index, targets)?;
+    let mut package_rates = HashMap::new();
+    for template in state.templates.iter().filter(|template| template.index <= index) {
+        let block_ordered: Vec<Txid> = template
+            .transaction_ids
+            .iter()
+            .filter_map(|txid_str| Txid::from_str(txid_str).ok())
+            .collect();
+        package_rates.extend(package_effective_rates_for_block(
+            &block_ordered,
+            &state.txs,
+            &HashMap::new(),
+        ));
     }
 
     Some(
         ordered
             .iter()
-            .filter(|txid| needed.contains(*txid))
             .filter_map(|txid| {
                 let entry = state.txs.get(txid)?;
+                if entry.protostones.is_empty() && !targets.contains(txid) {
+                    return None;
+                }
                 let tx = entry.tx.clone()?;
                 Some(MempoolBlockTx {
                     txid: *txid,
@@ -1536,7 +1533,7 @@ pub fn get_mempool_block_transactions_for_targets(
                     first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
-                    fee_rate: entry.fee_rate,
+                    fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
                     position: entry.position.clone(),
                     readiness: derive_readiness(entry),
                     defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
@@ -1544,6 +1541,22 @@ pub fn get_mempool_block_transactions_for_targets(
             })
             .collect(),
     )
+}
+
+fn mempool_projection_prefix(
+    templates: &[MempoolBlockTemplate],
+    max_index: usize,
+    targets: &HashSet<Txid>,
+) -> Option<Vec<Txid>> {
+    templates.iter().find(|template| template.index == max_index)?;
+    let ordered: Vec<Txid> = templates
+        .iter()
+        .filter(|template| template.index <= max_index)
+        .flat_map(|template| template.transaction_ids.iter())
+        .filter_map(|txid| Txid::from_str(txid).ok())
+        .collect();
+    let last_target = ordered.iter().rposition(|txid| targets.contains(txid))?;
+    Some(ordered.into_iter().take(last_target.saturating_add(1)).collect())
 }
 
 pub fn get_mempool_block_spenders(index: usize) -> Option<HashMap<(Txid, u32), Txid>> {
@@ -3380,6 +3393,28 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks.iter().map(Vec::len).sum::<usize>(), 3);
         assert!(blocks.iter().all(|block| !block.is_empty()));
+    }
+
+    #[test]
+    fn mempool_projection_prefix_keeps_prior_blocks_and_stops_at_last_target() {
+        let txids: Vec<Txid> = (1..=5).map(|seed| Txid::from_byte_array([seed; 32])).collect();
+        let templates = vec![
+            MempoolBlockTemplate {
+                index: 0,
+                transaction_ids: txids[..2].iter().map(ToString::to_string).collect(),
+                ..Default::default()
+            },
+            MempoolBlockTemplate {
+                index: 1,
+                transaction_ids: txids[2..].iter().map(ToString::to_string).collect(),
+                ..Default::default()
+            },
+        ];
+        let targets = HashSet::from([txids[3]]);
+
+        let prefix = mempool_projection_prefix(&templates, 1, &targets).expect("prefix");
+
+        assert_eq!(prefix, txids[..4]);
     }
 
     #[test]

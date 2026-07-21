@@ -82,6 +82,10 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
   const events = window.__espoBlockCarouselEvents;
   let liveRefreshInFlight = false;
   let liveRefreshQueued = false;
+  let liveRefreshRetryTimer = null;
+  let liveRefreshTargetHeight = null;
+  let liveRefreshAttempt = 0;
+  let listenerDisposed = false;
   let confirmedHeight = null;
   let latestTip = null;
   let indexedContentLoaded = document.querySelector('[data-tx-live-content]')?.dataset.txState === 'confirmed';
@@ -160,33 +164,79 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
 
   const isWaiting = () => Boolean(document.querySelector('[data-tx-waiting="1"]'));
 
-  const refreshLiveContent = async () => {{
+  const clearLiveRefreshRetry = () => {{
+    if (liveRefreshRetryTimer) window.clearTimeout(liveRefreshRetryTimer);
+    liveRefreshRetryTimer = null;
+    liveRefreshTargetHeight = null;
+    liveRefreshAttempt = 0;
+  }};
+
+  const scheduleLiveRefreshRetry = () => {{
+    if (
+      listenerDisposed ||
+      indexedContentLoaded ||
+      liveRefreshRetryTimer ||
+      !Number.isFinite(liveRefreshTargetHeight)
+    ) return;
+    const delay = Math.min(5_000, 250 * (2 ** Math.min(liveRefreshAttempt, 5)));
+    liveRefreshAttempt += 1;
+    liveRefreshRetryTimer = window.setTimeout(() => {{
+      liveRefreshRetryTimer = null;
+      refreshLiveContent(liveRefreshTargetHeight);
+    }}, delay);
+  }};
+
+  const refreshLiveContent = async (expectedConfirmedHeight = null) => {{
+    const hasExpectedHeight = expectedConfirmedHeight !== null
+      && expectedConfirmedHeight !== undefined
+      && expectedConfirmedHeight !== '';
+    const expectedHeight = hasExpectedHeight ? Number(expectedConfirmedHeight) : Number.NaN;
+    if (Number.isFinite(expectedHeight) && expectedHeight >= 0) {{
+      if (liveRefreshTargetHeight !== expectedHeight) liveRefreshAttempt = 0;
+      liveRefreshTargetHeight = expectedHeight;
+    }}
+    if (listenerDisposed) return;
     if (liveRefreshInFlight) {{
       liveRefreshQueued = true;
       return;
     }}
     liveRefreshInFlight = true;
+    let needsRetry = false;
     try {{
       const response = await fetch(window.location.href, {{
         cache: 'no-store',
         headers: {{ Accept: 'text/html' }}
       }});
-      if (!response.ok) return;
+      if (!response.ok) {{
+        needsRetry = Number.isFinite(liveRefreshTargetHeight);
+        return;
+      }}
       const text = await response.text();
       const doc = new DOMParser().parseFromString(text, 'text/html');
       const next = doc.querySelector('[data-tx-live-content]');
       const current = document.querySelector('[data-tx-live-content]');
-      if (!next || !current) return;
+      if (!next || !current) {{
+        needsRetry = Number.isFinite(liveRefreshTargetHeight);
+        return;
+      }}
+      if (Number.isFinite(liveRefreshTargetHeight) && next.dataset.txState !== 'confirmed') {{
+        needsRetry = true;
+        return;
+      }}
       next.querySelectorAll('script').forEach((script) => script.remove());
       current.replaceWith(next);
       indexedContentLoaded = next.dataset.txState === 'confirmed';
+      if (indexedContentLoaded) clearLiveRefreshRetry();
       initHeaderInteractions();
     }} catch (_) {{
+      needsRetry = Number.isFinite(liveRefreshTargetHeight);
     }} finally {{
       liveRefreshInFlight = false;
       if (liveRefreshQueued) {{
         liveRefreshQueued = false;
-        refreshLiveContent();
+        if (!indexedContentLoaded) refreshLiveContent(liveRefreshTargetHeight);
+      }} else if (needsRetry) {{
+        scheduleLiveRefreshRetry();
       }}
     }}
   }};
@@ -222,17 +272,19 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
   const markConfirmed = (heightValue, timestampValue, confirmationsValue = null) => {{
     const height = Number(heightValue);
     if (!Number.isFinite(height)) return;
+    if (liveRefreshTargetHeight !== height) liveRefreshAttempt = 0;
+    liveRefreshTargetHeight = height;
+    confirmedHeight = height;
     if (events && typeof events.selectConfirmedBlock === 'function') {{
       events.selectConfirmedBlock(height);
     }}
     if (isWaiting()) {{
-      refreshLiveContent();
+      refreshLiveContent(height);
       return;
     }}
 
     const live = document.querySelector('[data-tx-live-content]');
     const needsIndexedRefresh = !indexedContentLoaded;
-    confirmedHeight = height;
     if (live) live.dataset.txState = 'confirmed';
 
     const timestamp = Number(timestampValue);
@@ -264,7 +316,7 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
     }});
     updateConfirmationCount(latestTip ?? height, Number(confirmationsValue));
     initHeaderInteractions();
-    if (needsIndexedRefresh) refreshLiveContent();
+    if (needsIndexedRefresh) refreshLiveContent(height);
   }};
 
   const handleEvent = (payload) => {{
@@ -315,7 +367,11 @@ fn tx_event_listener_script_with_block_prefix(txid: &Txid, block_prefix: &str) -
   if (!events || typeof events.subscribe !== 'function') return;
   const unsubscribe = events.subscribe(handleEvent);
   if (typeof events.trackTransaction === 'function') events.trackTransaction(txid);
-  window.addEventListener('pagehide', unsubscribe, {{ once: true }});
+  window.addEventListener('pagehide', () => {{
+    listenerDisposed = true;
+    if (liveRefreshRetryTimer) window.clearTimeout(liveRefreshRetryTimer);
+    unsubscribe();
+  }}, {{ once: true }});
 }})();
 </script>
 "#,
@@ -849,7 +905,11 @@ mod tests {
         assert!(script.contains("events.trackTransaction(txid)"));
         assert!(script.contains("events.selectConfirmedBlock(height)"));
         assert!(script.contains("const needsIndexedRefresh = !indexedContentLoaded"));
-        assert!(script.contains("if (needsIndexedRefresh) refreshLiveContent()"));
+        assert!(script.contains("if (needsIndexedRefresh) refreshLiveContent(height)"));
+        assert!(script.contains("expectedConfirmedHeight !== null"));
+        assert!(script.contains("next.dataset.txState !== 'confirmed'"));
+        assert!(script.contains("scheduleLiveRefreshRetry()"));
+        assert!(script.contains("current.replaceWith(next)"));
         assert!(script.contains("liveRefreshQueued"));
         assert!(!script.contains("new WebSocket"));
         assert!(!script.contains("setInterval"));

@@ -97,6 +97,10 @@ impl MempoolContractRule for AmmProjectionRule {
 
         None
     }
+
+    fn prefer_input_projection(&self) -> bool {
+        true
+    }
 }
 
 impl AmmProjectionRule {

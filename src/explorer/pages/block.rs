@@ -298,6 +298,7 @@ pub(crate) fn mempool_block_projected_balances(
     let mut contract_projector = MempoolProjectionRegistry::from_latest_indices();
 
     for item in ordered_txs {
+        contract_projector.begin_transaction();
         let mut input_totals: BTreeMap<crate::schemas::SchemaAlkaneId, u128> = BTreeMap::new();
         for vin in &item.tx.input {
             if vin.previous_output.is_null() {
@@ -322,7 +323,7 @@ pub(crate) fn mempool_block_projected_balances(
             input_balances,
             Some(&mut contract_projector),
         );
-        if projected.is_empty() {
+        if projected.is_empty() && !contract_projector.did_apply() {
             continue;
         }
         let projected = sanitize_diesel_ug_projection(item, projected);
