@@ -1949,8 +1949,8 @@ pub async fn alkane_page(
                                         span class="alkane-inspect-name" { (inspect_name.clone()) }
                                         span class="alkane-inspect-id mono" { (inspect_id_label.clone()) }
                                     }
-                                    div class="alkane-inspect-block-control" {
-                                        span class="alkane-inspect-block-label" { "View as block:" }
+                                    div class="alkane-inspect-block-control order-control" {
+                                        span class="alkane-inspect-block-label muted" { "View as block:" }
                                         div class="hero-search-input alkane-inspect-block-input-wrap" {
                                             input class="hero-search-field alkane-inspect-block-input mono" type="text" value="latest" placeholder="latest" data-sim-block-input="" aria-label="View as block" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
                                         }
@@ -1976,7 +1976,7 @@ pub async fn alkane_page(
                                             }
                                         }
                                         button class="holders-export-button alkabi-export-button" type="submit" data-alkabi-export-submit="" {
-                                            span data-alkabi-export-label="" { "Export" }
+                                            span data-alkabi-export-label="" { "Download" }
                                             span class="alkabi-export-spinner" aria-hidden="true" {}
                                         }
                                         span class="alkabi-export-status muted" role="status" aria-live="polite" data-alkabi-export-status="" {}

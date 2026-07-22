@@ -625,7 +625,7 @@ a:hover {
   margin-top: 10px;
 }
 .alkabi-export-button {
-  min-width: 68px;
+  min-width: 94px;
 }
 .alkabi-export-spinner {
   display: none;
@@ -3079,11 +3079,6 @@ a:hover {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-}
-.alkane-inspect-block-label {
-  color: var(--muted2);
-  font-size: 14px;
-  font-weight: 600;
 }
 .alkane-inspect-block-input-wrap {
   width: min(220px, 100%);
