@@ -38,6 +38,8 @@ impl TestConfigBuilder {
             rollback: None,
             view_only: true, // Default to view-only for tests
             db_path: espo_path,
+            db_cache: false,
+            alkabi_verify_trials: 128,
             sdb_poll_ms: 100, // Fast polling for tests
             indexer_block_delay_ms: 0,
             port: 0, // Let OS assign port

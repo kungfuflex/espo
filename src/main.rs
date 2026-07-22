@@ -352,9 +352,9 @@ fn copy_debug_backup_tree(src_root: &Path, dest_root: &Path) -> std::io::Result<
         if file_type.is_dir() {
             if entry.file_name() == "espo" {
                 checkpoint_espo_db(&dest_path)?;
-            } else if entry.file_name() == "tmp" {
-                // Secondary RocksDB state is derived from the primary metashrew DB.
-                // Recreate the directory structure instead of copying a live secondary.
+            } else if entry.file_name() == "tmp" || entry.file_name() == "cache" {
+                // Secondary and cache state is derived. Recreate the directory
+                // structure instead of copying a live RocksDB.
                 std::fs::create_dir_all(&dest_path)?;
             } else {
                 copy_dir_recursive(&src_path, &dest_path)?;

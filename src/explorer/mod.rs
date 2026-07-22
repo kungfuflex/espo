@@ -12,8 +12,8 @@ use std::net::SocketAddr;
 
 use api::{
     address_chart, alkane_abi_export, alkane_balance_chart, alkane_chart, alkane_holders_export,
-    carousel_blocks, explorer_events_ws, mempool_blocks, minting_price_chart, rune_holders_export,
-    search_guess, simulate_contract,
+    alkane_wasm_export, carousel_blocks, explorer_events_ws, mempool_blocks, minting_price_chart,
+    rune_holders_export, search_guess, simulate_contract,
 };
 use axum::Router;
 use axum::extract::Request;
@@ -72,6 +72,7 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/api/search/guess", get(search_guess))
         .route("/api/alkane/simulate", post(simulate_contract))
         .route("/api/alkane/abi/export", get(alkane_abi_export))
+        .route("/api/alkane/wasm/export", get(alkane_wasm_export))
         .route("/api/alkane/holders/export", get(alkane_holders_export))
         .route("/api/alkane/chart", get(alkane_chart))
         .route("/api/alkane/balance-chart", get(alkane_balance_chart))

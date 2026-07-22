@@ -26,6 +26,8 @@ fn init_test_config_from_run_sh() {
         rollback: None,
         view_only: true,
         db_path: "./db".to_string(),
+        db_cache: false,
+        alkabi_verify_trials: 128,
         sdb_poll_ms: 5000,
         indexer_block_delay_ms: 0,
         port: 5778,

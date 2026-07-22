@@ -1026,6 +1026,7 @@ pub async fn alkane_page(
     };
     let holder_export_action = explorer_path("/api/alkane/holders/export");
     let abi_export_action = explorer_path("/api/alkane/abi/export");
+    let wasm_export_action = explorer_path("/api/alkane/wasm/export");
 
     let (activity_total, activity_entries, activity_label) = if tab == AlkaneTab::Volume {
         match volume_kind {
@@ -1981,6 +1982,11 @@ pub async fn alkane_page(
                                         }
                                         span class="alkabi-export-status muted" role="status" aria-live="polite" data-alkabi-export-status="" {}
                                     }
+                                    form class="alkane-wasm-export-form" action=(wasm_export_action) method="get" target="alkane-wasm-download-frame" data-download-form="" {
+                                        input type="hidden" name="alkane" value=(alk_str.clone());
+                                        button class="holders-export-button" type="submit" { "Download WASM" }
+                                    }
+                                    iframe class="holders-export-frame" name="alkane-wasm-download-frame" title="Contract WASM download" aria-hidden="true" {}
                                     @if view_methods.is_empty() && write_methods.is_empty() {
                                         p class="muted" { "No contract methods found." }
                                     } @else {

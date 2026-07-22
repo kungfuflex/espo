@@ -624,6 +624,9 @@ a:hover {
 .alkabi-export-form {
   margin-top: 10px;
 }
+.alkane-wasm-export-form {
+  margin: 10px 0 0;
+}
 .alkabi-export-button {
   min-width: 94px;
 }

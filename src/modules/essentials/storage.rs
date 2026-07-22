@@ -9293,6 +9293,8 @@ mod tests {
             rollback: None,
             view_only: true,
             db_path: db_dir.path().to_string_lossy().to_string(),
+            db_cache: false,
+            alkabi_verify_trials: 128,
             sdb_poll_ms: 100,
             indexer_block_delay_ms: 0,
             port: 0,

@@ -27,7 +27,9 @@ use crate::modules::essentials::storage::{
     GetListEntriesDescParams, HolderEntry, HolderId, HoldersCountEntry, get_cached_block_summary,
     load_creation_record,
 };
-use crate::modules::essentials::utils::alkabi::extract_contract_alkabi;
+use crate::modules::essentials::utils::alkabi::{
+    AlkabiFormat, extract_contract_alkabi, load_contract_wasm,
+};
 use crate::modules::essentials::utils::balances::get_holders_for_alkane;
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::modules::runes::main::{runes_enabled_from_global_config, runes_genesis_block};
@@ -613,6 +615,11 @@ pub struct AlkaneHoldersExportQuery {
 pub struct AlkaneAbiExportQuery {
     pub alkane: Option<String>,
     pub format: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AlkaneWasmExportQuery {
+    pub alkane: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1250,19 +1257,21 @@ pub async fn alkane_abi_export(Query(q): Query<AlkaneAbiExportQuery>) -> Respons
     let Some(alkane) = parse_alkane_id(raw_alkane) else {
         return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
     };
-    let format = match q.format.as_deref().map(|value| value.trim().to_ascii_lowercase()) {
-        Some(format) if format == "json" || format == "ts" => format,
-        Some(_) => return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_format"),
-        None => "json".to_string(),
+    let format = match q.format.as_deref() {
+        Some(raw) => match AlkabiFormat::parse(Some(raw)) {
+            Some(format) => format,
+            None => return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_format"),
+        },
+        None => AlkabiFormat::Json,
     };
 
-    let extraction_format = format.clone();
+    let extraction_format = format;
     let generated = tokio::task::spawn_blocking(move || {
         let essentials_mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
         let essentials_provider = EssentialsProvider::new(essentials_mdb);
         let abi = extract_contract_alkabi(&essentials_provider, &alkane)?;
-        let filename = alkabi_download_filename(&abi.contract, &extraction_format);
-        let body = if extraction_format == "ts" { abi.to_ts() } else { abi.to_json_pretty() };
+        let filename = alkabi_download_filename(&abi.contract, extraction_format.as_str());
+        let body = extraction_format.download_body(&abi).to_string();
         anyhow::Ok((filename, body))
     })
     .await;
@@ -1284,12 +1293,48 @@ pub async fn alkane_abi_export(Query(q): Query<AlkaneAbiExportQuery>) -> Respons
             return text_response(StatusCode::INTERNAL_SERVER_ERROR, "alkabi_export_failed");
         }
     };
-    let content_type = if format == "ts" {
-        "text/typescript; charset=utf-8"
-    } else {
-        "application/json; charset=utf-8"
+    let content_type = match format {
+        AlkabiFormat::Json => "application/json; charset=utf-8",
+        AlkabiFormat::TypeScript => "text/typescript; charset=utf-8",
     };
     download_response(content_type, &filename, body)
+}
+
+pub async fn alkane_wasm_export(Query(q): Query<AlkaneWasmExportQuery>) -> Response {
+    let Some(raw_alkane) = q.alkane.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
+    };
+    let Some(alkane) = parse_alkane_id(raw_alkane) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
+    };
+
+    let generated = tokio::task::spawn_blocking(move || {
+        let essentials_mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        let essentials_provider = EssentialsProvider::new(essentials_mdb);
+        load_contract_wasm(&essentials_provider, &alkane)
+    })
+    .await;
+
+    let wasm = match generated {
+        Ok(Ok(wasm)) => wasm,
+        Ok(Err(error)) => {
+            eprintln!(
+                "[explorer] WASM export failed for {}:{}: {error:#}",
+                alkane.block, alkane.tx
+            );
+            return text_response(StatusCode::UNPROCESSABLE_ENTITY, "wasm_export_failed");
+        }
+        Err(error) => {
+            eprintln!(
+                "[explorer] WASM export task failed for {}:{}: {error}",
+                alkane.block, alkane.tx
+            );
+            return text_response(StatusCode::INTERNAL_SERVER_ERROR, "wasm_export_failed");
+        }
+    };
+
+    let filename = format!("alkane-{}-{}.wasm", alkane.block, alkane.tx);
+    download_bytes_response("application/wasm", &filename, wasm)
 }
 
 pub async fn rune_holders_export(Query(q): Query<RuneHoldersExportQuery>) -> Response {
@@ -2711,6 +2756,10 @@ fn csv_escape_cell(raw: &str) -> String {
 }
 
 fn download_response(content_type: &'static str, filename: &str, body: String) -> Response {
+    download_bytes_response(content_type, filename, body.into_bytes())
+}
+
+fn download_bytes_response(content_type: &'static str, filename: &str, body: Vec<u8>) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)

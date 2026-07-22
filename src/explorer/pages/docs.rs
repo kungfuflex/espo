@@ -488,6 +488,14 @@ fn method_notes(method: &MethodDoc) -> Vec<String> {
             &mut notes,
             "Proxy contracts resolve their indexed implementation recursively, and factory clones use their indexed factory WASM before Alkabi extraction.",
         );
+        push_note(
+            &mut notes,
+            "Espo uses the top-level `alkabi_verify_trials` config value, which defaults to 128 and must be greater than zero. Reducible view methods include a verified `plan`; unsupported views omit it so consumers can fall back to simulation.",
+        );
+        push_note(
+            &mut notes,
+            "When top-level config `db_cache` is true, analyzed exports are persisted by network, resolved immutable WASM source, and verification trial count in `${db_path}/cache`. Concurrent misses for the same source and trial count share one job and wait for its cached result.",
+        );
     }
     if combined.contains("include_outpoints") {
         push_note(
@@ -669,7 +677,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_alkabi",
-                    "Extracts a contract's Alkabi ABI from its indexed WASM. Set format to json to return the ABI as a JSON object, or ts to return a generated TypeScript module string. Proxy implementations and factory clones resolve through the same indexed metadata used by the explorer's contract inspector. An optional height selects the indexed proxy and factory metadata at that height.",
+                    "Extracts a contract's Alkabi ABI from its indexed WASM and synthesizes verified static plans for reducible view methods. Set format to json to return the ABI as a JSON object, or ts to return a generated TypeScript module string. Proxy implementations and factory clones resolve through the same indexed metadata used by the explorer's contract inspector. An optional height selects the indexed proxy and factory metadata at that height.",
                     json!({ "alkane": "2:0", "format": "json" }),
                     json!({
                         "ok": true,
@@ -2213,6 +2221,13 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
             "Exports holders for an Alkane as a downloadable response.",
             json!({}),
             json!({ "content_type": "text/csv" }),
+        ),
+        http_doc(
+            "GET",
+            "/api/alkane/wasm/export?alkane=2%3A0",
+            "Downloads the resolved contract WASM. Proxy implementations and factory clones use the same indexed source resolution as Alkabi exports.",
+            json!({}),
+            json!({ "content_type": "application/wasm", "filename": "alkane-2-0.wasm" }),
         ),
         http_doc(
             "GET",
