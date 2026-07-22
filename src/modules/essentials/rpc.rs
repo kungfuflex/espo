@@ -2,7 +2,7 @@ use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::storage::{
     EssentialsProvider, RpcGetAddressActivityParams, RpcGetAddressBalancesParams,
     RpcGetAddressCumulativeAlkanesParams, RpcGetAddressOutpointsParams,
-    RpcGetAddressSpendableOutpointsParams, RpcGetAddressTransactionsParams,
+    RpcGetAddressSpendableOutpointsParams, RpcGetAddressTransactionsParams, RpcGetAlkabiParams,
     RpcGetAlkaneAddressTxsParams, RpcGetAlkaneBalanceMetashrewParams,
     RpcGetAlkaneBalanceTxsByTokenParams, RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams,
     RpcGetAlkaneBlockTxsParams, RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams,
@@ -198,6 +198,40 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                         view.rpc_get_alkane_info(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_alkabi = reg.clone();
+        let mdb_alkabi = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_alkabi
+                .register("get_alkabi", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_alkabi);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(view) => view,
+                            Err(error) => return error,
+                        };
+                        let params = RpcGetAlkabiParams {
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string),
+                            format: payload
+                                .get("format")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string),
+                        };
+                        tokio::task::spawn_blocking(move || view.rpc_get_alkabi(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;

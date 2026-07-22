@@ -479,6 +479,16 @@ fn method_notes(method: &MethodDoc) -> Vec<String> {
             "Pending transactions have `confirmed: false`, `blockHeight: null`, `blockTime: null`, and `confirmations: 0`. Espo queries electrs on every included request, so dropped or RBF-replaced transactions disappear on the next poll.",
         );
     }
+    if method.title == "essentials.get_alkabi" {
+        push_note(
+            &mut notes,
+            "With `format: \"json\"`, `abi` is a JSON object. With `format: \"ts\"`, `abi` is a string containing a complete generated TypeScript module.",
+        );
+        push_note(
+            &mut notes,
+            "Proxy contracts resolve their indexed implementation recursively, and factory clones use their indexed factory WASM before Alkabi extraction.",
+        );
+    }
     if combined.contains("include_outpoints") {
         push_note(
             &mut notes,
@@ -656,6 +666,26 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     "Returns the creation metadata, names, icon, and indexed details for one Alkane. A missing scalar symbol falls back to the uppercased name, and a missing scalar name falls back to the symbol.",
                     json!({ "alkane": "2:0" }),
                     json!({ "ok": true, "alkane": "2:0", "name": "DIESEL", "symbol": "diesel", "holder_count": 6409, "creation_height": 880000 }),
+                ),
+                rpc_doc(
+                    "essentials.get_alkabi",
+                    "Extracts a contract's Alkabi ABI from its indexed WASM. Set format to json to return the ABI as a JSON object, or ts to return a generated TypeScript module string. Proxy implementations and factory clones resolve through the same indexed metadata used by the explorer's contract inspector. An optional height selects the indexed proxy and factory metadata at that height.",
+                    json!({ "alkane": "2:0", "format": "json" }),
+                    json!({
+                        "ok": true,
+                        "alkane": "2:0",
+                        "format": "json",
+                        "abi": {
+                            "alkabi": 1,
+                            "contract": "GenesisAlkane",
+                            "types": {},
+                            "methods": [{
+                                "name": "mint",
+                                "opcode": 77,
+                                "kind": "execute"
+                            }]
+                        }
+                    }),
                 ),
                 rpc_doc(
                     "essentials.get_factory_children",

@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::config::{
     get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_db, get_espo_next_height,
-    get_metashrew, get_metashrew_rpc_url, get_network,
+    get_metashrew_rpc_url, get_network,
 };
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
@@ -27,8 +27,8 @@ use crate::modules::essentials::storage::{
     GetListEntriesDescParams, HolderEntry, HolderId, HoldersCountEntry, get_cached_block_summary,
     load_creation_record,
 };
+use crate::modules::essentials::utils::alkabi::extract_contract_alkabi;
 use crate::modules::essentials::utils::balances::get_holders_for_alkane;
-use crate::modules::essentials::utils::inspections::resolve_contract_wasm_source;
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::modules::runes::main::{runes_enabled_from_global_config, runes_genesis_block};
 use crate::modules::runes::storage::{RuneEntry, RunesProvider, SchemaRuneId};
@@ -1260,11 +1260,7 @@ pub async fn alkane_abi_export(Query(q): Query<AlkaneAbiExportQuery>) -> Respons
     let generated = tokio::task::spawn_blocking(move || {
         let essentials_mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
         let essentials_provider = EssentialsProvider::new(essentials_mdb);
-        let source = resolve_contract_wasm_source(&alkane, &essentials_provider).unwrap_or(alkane);
-        let (wasm, _) = get_metashrew()
-            .get_alkane_wasm_bytes_prefer_first_version(&source)?
-            .context("contract wasm not found")?;
-        let abi: alkabi::AlkabiAbi = alkabi::extract::extract_abi(&wasm)?;
+        let abi = extract_contract_alkabi(&essentials_provider, &alkane)?;
         let filename = alkabi_download_filename(&abi.contract, &extraction_format);
         let body = if extraction_format == "ts" { abi.to_ts() } else { abi.to_json_pretty() };
         anyhow::Ok((filename, body))

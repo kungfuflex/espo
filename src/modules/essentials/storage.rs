@@ -3712,6 +3712,75 @@ impl EssentialsProvider {
         })
     }
 
+    pub fn rpc_get_alkabi(&self, params: RpcGetAlkabiParams) -> Result<RpcGetAlkabiResult> {
+        let Some(raw_alkane) = params.alkane.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return Ok(RpcGetAlkabiResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_alkane",
+                    "hint": "provide alkane as \"<block>:<tx>\" (hex ok)"
+                }),
+            });
+        };
+        let Some(alkane) = crate::utils::parse_alkane_id(raw_alkane) else {
+            return Ok(RpcGetAlkabiResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_alkane",
+                    "hint": "provide alkane as \"<block>:<tx>\" (hex ok)"
+                }),
+            });
+        };
+        let Some(format) = crate::modules::essentials::utils::alkabi::AlkabiFormat::parse(
+            params.format.as_deref(),
+        ) else {
+            return Ok(RpcGetAlkabiResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_format",
+                    "hint": "provide format as \"json\" or \"ts\""
+                }),
+            });
+        };
+
+        let abi =
+            match crate::modules::essentials::utils::alkabi::extract_contract_alkabi(self, &alkane)
+            {
+                Ok(abi) => abi,
+                Err(error) => {
+                    return Ok(RpcGetAlkabiResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "alkabi_generation_failed",
+                            "detail": error.to_string()
+                        }),
+                    });
+                }
+            };
+        let rendered = match format.render(&abi) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(RpcGetAlkabiResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "alkabi_generation_failed",
+                        "detail": error.to_string()
+                    }),
+                });
+            }
+        };
+
+        Ok(RpcGetAlkabiResult {
+            value: json!({
+                "ok": true,
+                "alkane": alkane.to_string(),
+                "format": format.as_str(),
+                "abi": rendered
+            }),
+        })
+    }
+
     pub fn rpc_get_factory_children(
         &self,
         params: RpcGetFactoryChildrenParams,
@@ -6645,6 +6714,15 @@ pub struct RpcGetAlkaneInfoParams {
 }
 
 pub struct RpcGetAlkaneInfoResult {
+    pub value: Value,
+}
+
+pub struct RpcGetAlkabiParams {
+    pub alkane: Option<String>,
+    pub format: Option<String>,
+}
+
+pub struct RpcGetAlkabiResult {
     pub value: Value,
 }
 
