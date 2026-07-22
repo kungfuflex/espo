@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::config::{
     get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_db, get_espo_next_height,
-    get_metashrew_rpc_url, get_network,
+    get_metashrew, get_metashrew_rpc_url, get_network,
 };
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
@@ -28,6 +28,7 @@ use crate::modules::essentials::storage::{
     load_creation_record,
 };
 use crate::modules::essentials::utils::balances::get_holders_for_alkane;
+use crate::modules::essentials::utils::inspections::resolve_contract_wasm_source;
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::modules::runes::main::{runes_enabled_from_global_config, runes_genesis_block};
 use crate::modules::runes::storage::{RuneEntry, RunesProvider, SchemaRuneId};
@@ -604,6 +605,12 @@ pub struct AlkaneChartQuery {
 
 #[derive(Deserialize)]
 pub struct AlkaneHoldersExportQuery {
+    pub alkane: Option<String>,
+    pub format: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AlkaneAbiExportQuery {
     pub alkane: Option<String>,
     pub format: Option<String>,
 }
@@ -1233,6 +1240,59 @@ pub async fn alkane_holders_export(Query(q): Query<AlkaneHoldersExportQuery>) ->
     };
     let content_type =
         if format == "csv" { "text/csv; charset=utf-8" } else { "application/json; charset=utf-8" };
+    download_response(content_type, &filename, body)
+}
+
+pub async fn alkane_abi_export(Query(q): Query<AlkaneAbiExportQuery>) -> Response {
+    let Some(raw_alkane) = q.alkane.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
+    };
+    let Some(alkane) = parse_alkane_id(raw_alkane) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
+    };
+    let format = match q.format.as_deref().map(|value| value.trim().to_ascii_lowercase()) {
+        Some(format) if format == "json" || format == "ts" => format,
+        Some(_) => return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_format"),
+        None => "json".to_string(),
+    };
+
+    let extraction_format = format.clone();
+    let generated = tokio::task::spawn_blocking(move || {
+        let essentials_mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        let essentials_provider = EssentialsProvider::new(essentials_mdb);
+        let source = resolve_contract_wasm_source(&alkane, &essentials_provider).unwrap_or(alkane);
+        let (wasm, _) = get_metashrew()
+            .get_alkane_wasm_bytes_prefer_first_version(&source)?
+            .context("contract wasm not found")?;
+        let abi: alkabi::AlkabiAbi = alkabi::extract::extract_abi(&wasm)?;
+        let filename = alkabi_download_filename(&abi.contract, &extraction_format);
+        let body = if extraction_format == "ts" { abi.to_ts() } else { abi.to_json_pretty() };
+        anyhow::Ok((filename, body))
+    })
+    .await;
+
+    let (filename, body) = match generated {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            eprintln!(
+                "[explorer] Alkabi export failed for {}:{}: {error:#}",
+                alkane.block, alkane.tx
+            );
+            return text_response(StatusCode::UNPROCESSABLE_ENTITY, "alkabi_export_failed");
+        }
+        Err(error) => {
+            eprintln!(
+                "[explorer] Alkabi export task failed for {}:{}: {error}",
+                alkane.block, alkane.tx
+            );
+            return text_response(StatusCode::INTERNAL_SERVER_ERROR, "alkabi_export_failed");
+        }
+    };
+    let content_type = if format == "ts" {
+        "text/typescript; charset=utf-8"
+    } else {
+        "application/json; charset=utf-8"
+    };
     download_response(content_type, &filename, body)
 }
 
@@ -2663,6 +2723,26 @@ fn download_response(content_type: &'static str, filename: &str, body: String) -
         .unwrap_or_else(|_| text_response(StatusCode::INTERNAL_SERVER_ERROR, "response_failed"))
 }
 
+fn alkabi_download_filename(contract_name: &str, extension: &str) -> String {
+    let name = contract_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let name = name.trim_matches('.');
+    let name = if name.chars().any(|character| character.is_ascii_alphanumeric()) {
+        name
+    } else {
+        "alkane"
+    };
+    format!("{name}.{extension}")
+}
+
 fn text_response(status: StatusCode, body: &'static str) -> Response {
     (status, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
 }
@@ -2770,7 +2850,7 @@ fn parse_u64_any(s: &str) -> Option<u64> {
 mod tests {
     use serde_json::json;
 
-    use super::{ExplorerEventSubscriptions, filtered_explorer_event};
+    use super::{ExplorerEventSubscriptions, alkabi_download_filename, filtered_explorer_event};
 
     fn subscriptions() -> ExplorerEventSubscriptions {
         ExplorerEventSubscriptions {
@@ -2779,6 +2859,24 @@ mod tests {
             txids: ["tracked".to_string()].into_iter().collect(),
             addresses: ["bc1ptracked".to_string()].into_iter().collect(),
         }
+    }
+
+    #[test]
+    fn alkabi_filename_uses_the_contract_name_and_requested_extension() {
+        assert_eq!(alkabi_download_filename("AMMPool", "ts"), "AMMPool.ts");
+        assert_eq!(alkabi_download_filename("My Contract", "json"), "My_Contract.json");
+        assert_eq!(alkabi_download_filename("../", "json"), "alkane.json");
+    }
+
+    #[test]
+    fn alkabi_extracts_the_bundled_factory_wasm() {
+        let abi = alkabi::extract::extract_abi(include_bytes!("../../test_data/factory.wasm"))
+            .expect("extract bundled factory ABI");
+
+        assert!(!abi.contract.trim().is_empty());
+        assert!(!abi.methods.is_empty());
+        assert!(abi.to_json_pretty().contains("\"contract\""));
+        assert!(abi.to_ts().contains("export default"));
     }
 
     #[test]

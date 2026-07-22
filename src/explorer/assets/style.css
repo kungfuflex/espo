@@ -617,6 +617,43 @@ a:hover {
   color: #fff;
   text-decoration: none !important;
 }
+.holders-export-button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+.alkabi-export-form {
+  margin-top: 10px;
+}
+.alkabi-export-button {
+  min-width: 68px;
+}
+.alkabi-export-spinner {
+  display: none;
+  width: 15px;
+  height: 15px;
+  border: 2px solid rgba(255, 255, 255, 0.45);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: alkabi-export-spin 700ms linear infinite;
+}
+.alkabi-export-button[data-loading="1"] [data-alkabi-export-label] {
+  display: none;
+}
+.alkabi-export-button[data-loading="1"] .alkabi-export-spinner {
+  display: block;
+}
+.alkabi-export-status {
+  flex-basis: 100%;
+  font-size: 13px;
+}
+.alkabi-export-status:empty {
+  display: none;
+}
+@keyframes alkabi-export-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 .tx-page-id {
   display: block;
   max-width: 100%;
