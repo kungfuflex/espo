@@ -2,7 +2,6 @@ pub mod dbpaths;
 pub mod jemalloc_prof;
 pub mod mdb;
 pub mod mempool;
-#[cfg(feature = "p2p-mempool")]
 pub mod mempool_p2p;
 pub mod mempool_projection;
 pub mod pointers;

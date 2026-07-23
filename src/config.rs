@@ -704,6 +704,13 @@ pub struct CliArgs {
     /// config-file `trace_format`.
     #[arg(long, value_enum)]
     pub format: Option<TraceFormat>,
+
+    /// Drive the mempool incrementally over bitcoind's P2P protocol
+    /// (mempool/inv/getdata/tx via qubitcoin-net) instead of RPC
+    /// getrawmempool polling. Opt-in; overrides the config-file
+    /// `mempool.source` (equivalent to setting it to "p2p").
+    #[arg(long, default_value_t = false)]
+    pub mempool_p2p: bool,
 }
 
 fn load_config_file(path: &str) -> Result<ConfigFile> {
@@ -986,6 +993,9 @@ pub fn init_config() -> Result<()> {
     }
     if let Some(fmt) = cli.format {
         cfg.trace_format = fmt;
+    }
+    if cli.mempool_p2p {
+        cfg.mempool.source = "p2p".to_string();
     }
     init_config_from(cfg)
 }

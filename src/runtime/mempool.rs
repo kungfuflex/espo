@@ -2234,7 +2234,6 @@ fn build_memory_metadata_entry(
 
 /// Returns true if the in-memory mempool already holds `txid` (used by the
 /// P2P driver to skip re-processing an already-known transaction).
-#[cfg_attr(not(feature = "p2p-mempool"), allow(dead_code))]
 pub(crate) fn memory_contains_txid(txid: &Txid) -> bool {
     mempool_state()
         .read()
@@ -3420,7 +3419,6 @@ fn ingest_zmq_sequence(url: String) {
 
 /// Resolve the bitcoind P2P peer socket address: an explicit `mempool.p2p_peer`
 /// ("host:port") when set, otherwise the bitcoind RPC host + `bitcoind_p2p_port`.
-#[cfg(feature = "p2p-mempool")]
 fn resolve_p2p_peer(cfg: &crate::config::MempoolConfig) -> Result<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
     let target = if let Some(peer) =
@@ -3447,10 +3445,10 @@ fn resolve_p2p_peer(cfg: &crate::config::MempoolConfig) -> Result<std::net::Sock
     Ok(addr)
 }
 
-/// Spawn the P2P mempool driver when `mempool.source == "p2p"` AND the binary
-/// was built with `--features p2p-mempool`. Returns true when the incremental
-/// driver is active (callers slow the RPC reconcile in that case).
-#[cfg(feature = "p2p-mempool")]
+/// Spawn the P2P mempool driver when `mempool.source == "p2p"` (opt in at
+/// runtime via `--mempool-p2p`). The driver is always compiled in native
+/// builds. Returns true when the incremental driver is active (callers slow
+/// the RPC reconcile in that case).
 fn spawn_p2p_driver_if_enabled(cfg: &crate::config::MempoolConfig, network: Network) -> bool {
     if !cfg.source.eq_ignore_ascii_case("p2p") {
         return false;
@@ -3480,17 +3478,6 @@ fn spawn_p2p_driver_if_enabled(cfg: &crate::config::MempoolConfig, network: Netw
             false
         }
     }
-}
-
-/// Feature-off shim: warn if p2p was requested, then use the RPC path.
-#[cfg(not(feature = "p2p-mempool"))]
-fn spawn_p2p_driver_if_enabled(cfg: &crate::config::MempoolConfig, _network: Network) -> bool {
-    if cfg.source.eq_ignore_ascii_case("p2p") {
-        eprintln!(
-            "[mempool] p2p mempool requested but binary built without --features p2p-mempool; falling back to rpc"
-        );
-    }
-    false
 }
 
 pub async fn run_mempool_service(network: Network) -> Result<()> {

@@ -1,4 +1,5 @@
-//! Opt-in P2P mempool driver (feature = "p2p-mempool").
+//! P2P mempool driver — always compiled (native); opt in at runtime with
+//! `--mempool-p2p` (or `mempool.source = "p2p"`).
 //!
 //! Speaks bitcoind's P2P protocol via the `qubitcoin-net` crate and maintains
 //! espo's in-memory mempool incrementally from `inv`/`tx` messages, instead of
