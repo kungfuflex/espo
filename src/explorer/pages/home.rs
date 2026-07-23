@@ -25,7 +25,7 @@ use crate::modules::essentials::storage::{
     AlkaneTxSummary, EssentialsProvider, EssentialsTable, GetHoldersOrderedPageParams,
     HoldersCountEntry, load_creation_record, load_tx_summary_v2,
 };
-use crate::modules::essentials::utils::names::display_alkane_name;
+use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::RunesProvider;
 use crate::schemas::EspoOutpoint;
@@ -70,7 +70,9 @@ fn load_top_alkanes_by_holders(
             .unwrap_or(0);
 
         let id = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
-        let name = display_alkane_name(&rec.names).unwrap_or_else(|| "Unnamed".to_string());
+        let name = display_alkane_name_and_symbol(&rec.names, &rec.symbols)
+            .0
+            .unwrap_or_else(|| "Unnamed".to_string());
         let icon_url = alkane_icon_url(&rec.alkane, mdb);
         let fallback = if name == "Unnamed" {
             '?'

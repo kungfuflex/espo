@@ -37,6 +37,7 @@ use crate::modules::essentials::storage::{
 use crate::modules::essentials::utils::balances::{
     get_alkane_balances, get_balance_for_address, get_outpoint_balances_with_spent_batch,
 };
+use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
 use crate::modules::oylapi::config::OylApiConfig;
 use crate::modules::oylapi::ordinals::{OrdOutput, fetch_ord_outputs};
 use crate::modules::subfrost::schemas::SchemaWrapEventV1;
@@ -214,12 +215,11 @@ pub async fn get_alkanes_by_address(
 
     for (alkane, balance) in balances {
         let rec = rec_map.get(&alkane);
-        let name = rec.and_then(|r| r.names.first()).cloned().unwrap_or_default();
-        let symbol = rec
-            .and_then(|r| r.symbols.first())
-            .cloned()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
+        let (name, symbol) = rec
+            .map(|record| display_alkane_name_and_symbol(&record.names, &record.symbols))
+            .unwrap_or_default();
+        let name = name.unwrap_or_default();
+        let symbol = symbol.unwrap_or_default().to_uppercase();
 
         let (frbtc_price, busd_price) =
             match canonical_pool_prices(blockhash.clone(), state, &alkane, now_ts) {
@@ -3076,8 +3076,9 @@ pub async fn get_address_utxos(
             })?
             .records;
         for rec in records.into_iter().flatten() {
-            let name = rec.names.first().cloned().unwrap_or_default();
-            let symbol = rec.symbols.first().cloned().unwrap_or_default().to_ascii_uppercase();
+            let (name, symbol) = display_alkane_name_and_symbol(&rec.names, &rec.symbols);
+            let name = name.unwrap_or_default();
+            let symbol = symbol.unwrap_or_default().to_uppercase();
             names.insert(rec.alkane, (name, symbol));
         }
     }
@@ -3950,8 +3951,12 @@ fn get_token_meta(
         .essentials
         .get_creation_record(GetCreationRecordParams { blockhash: blockhash.clone(), alkane: *id })?
         .record;
-    let name = rec.as_ref().and_then(|r| r.names.first().cloned()).unwrap_or_default();
-    let symbol_raw = rec.as_ref().and_then(|r| r.symbols.first().cloned()).unwrap_or_default();
+    let (name, symbol_raw) = rec
+        .as_ref()
+        .map(|record| display_alkane_name_and_symbol(&record.names, &record.symbols))
+        .unwrap_or_default();
+    let name = name.unwrap_or_default();
+    let symbol_raw = symbol_raw.unwrap_or_default();
     let label = if !symbol_raw.is_empty() {
         symbol_raw.clone()
     } else if !name.is_empty() {
@@ -4565,15 +4570,9 @@ fn build_alkane_token(
     let busd_mcap = if has_busd { metrics.marketcap_usd } else { 0 };
 
     let id_str = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
-    let mut name = rec.names.first().cloned().unwrap_or_default();
-    if name.is_empty() {
-        name = id_str.clone();
-    }
-    let mut symbol = rec.symbols.first().cloned().unwrap_or_default();
-    if symbol.is_empty() {
-        symbol = id_str;
-    }
-    let symbol = symbol.to_ascii_uppercase();
+    let (name, symbol) = display_alkane_name_and_symbol(&rec.names, &rec.symbols);
+    let name = name.unwrap_or_else(|| id_str.clone());
+    let symbol = symbol.unwrap_or(id_str).to_uppercase();
     let change_1d_raw =
         if metrics.change_1d.trim().is_empty() { "0" } else { metrics.change_1d.as_str() };
     let change_7d_raw =
@@ -5101,7 +5100,7 @@ fn alkane_label(blockhash: StateAt, state: &OylApiState, id: &SchemaAlkaneId) ->
         })?
         .record;
     Ok(rec
-        .and_then(|r| r.symbols.first().cloned().or_else(|| r.names.first().cloned()))
+        .and_then(|record| display_alkane_name_and_symbol(&record.names, &record.symbols).1)
         .unwrap_or_else(|| format!("{}:{}", id.block, id.tx)))
 }
 

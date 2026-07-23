@@ -1,9 +1,10 @@
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
-    RpcGetBestMevSwapParams, RpcGetBtcUsdPriceParams, RpcGetCandlesParams,
+    AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAlkaneQuoteParams,
+    RpcGetAlkanesQuoteParams, RpcGetAmmFactoriesParams, RpcGetBestMevSwapParams,
+    RpcGetBtcUsdCandlesParams, RpcGetBtcUsdPriceParams, RpcGetCandlesParams,
     RpcGetChartChangeBlockParams, RpcGetChartChangesBlockParams, RpcGetPoolsParams,
-    RpcGetTokenActivityParams, RpcGetTokenTotalVolumeParams, RpcGetTokenVolumeParams,
-    RpcGetTotalVolumeAmmParams, RpcPingParams,
+    RpcGetPortfolioStatsParams, RpcGetTokenActivityParams, RpcGetTokenTotalVolumeParams,
+    RpcGetTokenVolumeParams, RpcGetTotalVolumeAmmParams, RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -51,6 +52,160 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                     view.rpc_get_candles(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_btc_candles = reg.clone();
+    let mdb_ptr_btc_candles = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_btc_candles
+            .register("get_btc_usd_candles", move |_cx, payload| {
+                let mdb = Arc::clone(&mdb_ptr_btc_candles);
+                async move {
+                    let params = RpcGetBtcUsdCandlesParams {
+                        timeframe: payload
+                            .get("timeframe")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        limit: payload.get("limit").and_then(|value| value.as_u64()),
+                        size: payload.get("size").and_then(|value| value.as_u64()),
+                        page: payload.get("page").and_then(|value| value.as_u64()),
+                        now: payload.get("now").and_then(|value| value.as_u64()),
+                    };
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|value| value.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(view) => view,
+                        Err(error) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": error.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_btc_usd_candles(params)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                }
+            })
+            .await;
+    });
+
+    let reg_alkanes_quote = reg.clone();
+    let mdb_alkanes_quote = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_alkanes_quote
+            .register("get_alkanes_quote", move |_cx, payload| {
+                let mdb = Arc::clone(&mdb_alkanes_quote);
+                async move {
+                    let assets = payload.get("assets").and_then(|value| {
+                        value.as_array().and_then(|items| {
+                            items
+                                .iter()
+                                .map(|item| item.as_str().map(str::to_string))
+                                .collect::<Option<Vec<_>>>()
+                        })
+                    });
+                    let params = RpcGetAlkanesQuoteParams {
+                        assets,
+                        now: payload.get("now").and_then(|value| value.as_u64()),
+                    };
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|value| value.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(view) => view,
+                        Err(error) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": error.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_alkanes_quote(params)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                }
+            })
+            .await;
+    });
+
+    let reg_alkane_quote = reg.clone();
+    let mdb_alkane_quote = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_alkane_quote
+            .register("get_alkane_quote", move |_cx, payload| {
+                let mdb = Arc::clone(&mdb_alkane_quote);
+                async move {
+                    let params = RpcGetAlkaneQuoteParams {
+                        asset: payload
+                            .get("asset")
+                            .or_else(|| payload.get("alkane"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        now: payload.get("now").and_then(|value| value.as_u64()),
+                    };
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|value| value.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(view) => view,
+                        Err(error) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": error.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_alkane_quote(params)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                }
+            })
+            .await;
+    });
+
+    let reg_portfolio = reg.clone();
+    let mdb_portfolio = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_portfolio
+            .register("get_portfolio_stats", move |_cx, payload| {
+                let mdb = Arc::clone(&mdb_portfolio);
+                async move {
+                    let params = RpcGetPortfolioStatsParams {
+                        address: payload
+                            .get("address")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                    };
+                    let view = match mdb.with_height(
+                        payload.get("height").and_then(|value| value.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(view) => view,
+                        Err(error) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": error.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_portfolio_stats(params)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|error| {
+                            json!({
+                                "ok": false,
+                                "error": "internal_error",
+                                "detail": error.to_string()
+                            })
+                        })
                 }
             })
             .await;

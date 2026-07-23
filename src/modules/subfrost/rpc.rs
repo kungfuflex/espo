@@ -1,5 +1,7 @@
 use crate::config::get_network;
 use crate::modules::defs::RpcNsRegistrar;
+use crate::modules::essentials::storage::EssentialsProvider;
+use crate::modules::subfrost::signer::{SIGNER_ALKANE_ID, SIGNER_STORAGE_KEY, get_signer};
 use crate::modules::subfrost::storage::{
     GetUnwrapEventsAllParams, GetUnwrapEventsByAddressParams, GetUnwrapRequestsAllParams,
     GetUnwrapRequestsByAddressParams, GetWrapEventsAllParams, GetWrapEventsByAddressParams,
@@ -12,7 +14,36 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 #[allow(dead_code)]
-pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
+pub fn register_rpc(
+    reg: &RpcNsRegistrar,
+    provider: Arc<SubfrostProvider>,
+    essentials_provider: Arc<EssentialsProvider>,
+) {
+    let reg_signer = reg.clone();
+    tokio::spawn(async move {
+        reg_signer
+            .register("get_signer", move |_cx, _payload| {
+                let essentials_provider = Arc::clone(&essentials_provider);
+                async move {
+                    match get_signer(essentials_provider.as_ref(), get_network()) {
+                        Ok(Some(signer)) => json!({
+                            "ok": true,
+                            "alkane": format!("{}:{}", SIGNER_ALKANE_ID.block, SIGNER_ALKANE_ID.tx),
+                            "storage_key": String::from_utf8_lossy(SIGNER_STORAGE_KEY),
+                            "script_pubkey": format!("0x{}", hex::encode(signer.script_pubkey.as_bytes())),
+                            "address": signer.address.to_string(),
+                        }),
+                        Ok(None) => json!({ "ok": false, "error": "signer_not_found" }),
+                        Err(err) => {
+                            eprintln!("[SUBFROST] get_signer failed: {err:#}");
+                            json!({ "ok": false, "error": "invalid_signer" })
+                        }
+                    }
+                }
+            })
+            .await;
+    });
+
     let reg_wrap_addr = reg.clone();
     let provider_wrap_addr = Arc::clone(&provider);
     tokio::spawn(async move {

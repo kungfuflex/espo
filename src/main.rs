@@ -353,9 +353,9 @@ fn copy_debug_backup_tree(src_root: &Path, dest_root: &Path) -> std::io::Result<
         if file_type.is_dir() {
             if entry.file_name() == "espo" {
                 checkpoint_espo_db(&dest_path)?;
-            } else if entry.file_name() == "tmp" {
-                // Secondary RocksDB state is derived from the primary metashrew DB.
-                // Recreate the directory structure instead of copying a live secondary.
+            } else if entry.file_name() == "tmp" || entry.file_name() == "cache" {
+                // Secondary and cache state is derived. Recreate the directory
+                // structure instead of copying a live RocksDB.
                 std::fs::create_dir_all(&dest_path)?;
             } else {
                 copy_dir_recursive(&src_path, &dest_path)?;
@@ -1023,28 +1023,37 @@ async fn run_indexer_loop(
                             next_height
                         ),
                     }
-                    publish_new_block_event(next_height, &block_txids);
-                    publish_confirmed_tx_events(next_height, &block_txids, &block_address_txs);
+                    let indexed_height = next_height;
+                    let block_timestamp = espo_block.block_header.time;
                     drop(db_write_guard);
-
-                    if let Some(backup) = cfg.debug_backup.as_ref() {
-                        if debug_backup_remaining.remove(&next_height) {
-                            eprintln!(
-                                "[debug_backup] reached block {}, copying db dir '{}' to '{}/bkp-{}'",
-                                next_height, cfg.db_path, backup.dir, next_height
-                            );
-                            match run_debug_backup(&cfg.db_path, backup, next_height) {
-                                Ok(_) => eprintln!("[debug_backup] backup complete"),
-                                Err(e) => eprintln!("[debug_backup] backup failed: {e}"),
-                            }
-                        }
-                    }
 
                     eta.finish_block();
                     next_height = next_height.saturating_add(1);
                     if let Some(h) = ESPO_HEIGHT.get() {
                         h.store(next_height, std::sync::atomic::Ordering::Relaxed);
                     }
+
+                    publish_new_block_event(indexed_height, block_timestamp, &block_txids);
+                    publish_confirmed_tx_events(
+                        indexed_height,
+                        block_timestamp,
+                        &block_txids,
+                        &block_address_txs,
+                    );
+
+                    if let Some(backup) = cfg.debug_backup.as_ref() {
+                        if debug_backup_remaining.remove(&indexed_height) {
+                            eprintln!(
+                                "[debug_backup] reached block {}, copying db dir '{}' to '{}/bkp-{}'",
+                                indexed_height, cfg.db_path, backup.dir, indexed_height
+                            );
+                            match run_debug_backup(&cfg.db_path, backup, indexed_height) {
+                                Ok(_) => eprintln!("[debug_backup] backup complete"),
+                                Err(e) => eprintln!("[debug_backup] backup failed: {e}"),
+                            }
+                        }
+                    }
+
                     if cfg.indexer_block_delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(cfg.indexer_block_delay_ms)).await;
                     }

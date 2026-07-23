@@ -1,6 +1,7 @@
-use super::consts::{get_frbtc_alkane, get_subfrost_wrap_address};
+use super::consts::get_frbtc_alkane;
 use super::rpc::register_rpc;
 use super::schemas::{SchemaUnwrapRequestV1, SchemaWrapEventV1};
+use super::signer::get_signer_script;
 use super::storage::{
     BuildEventListAppendsParams, BuildUnwrapRequestAppendsParams,
     BuildUnwrapRequestFulfillmentUpdatesParams, BuildUnwrapTotalPointAppendsParams,
@@ -14,6 +15,7 @@ use crate::alkanes::trace::{
 use crate::config::{debug_enabled, get_electrum_like, get_network};
 use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
+use crate::modules::essentials::storage::EssentialsProvider;
 use crate::modules::essentials::utils::balances::clean_espo_sandshrew_like_trace;
 use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
@@ -21,26 +23,38 @@ use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash as _;
-use bitcoin::{Address, Network, ScriptBuf, Transaction, Txid};
+use bitcoin::{Network, ScriptBuf, Transaction, Txid};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
 pub struct Subfrost {
     provider: Option<Arc<SubfrostProvider>>,
+    essentials_provider: Option<Arc<EssentialsProvider>>,
     index_height: Arc<std::sync::RwLock<Option<u32>>>,
 }
 
 impl Subfrost {
     pub fn new() -> Self {
-        Self { provider: None, index_height: Arc::new(std::sync::RwLock::new(None)) }
+        Self {
+            provider: None,
+            essentials_provider: None,
+            index_height: Arc::new(std::sync::RwLock::new(None)),
+        }
     }
 
     #[inline]
     fn provider(&self) -> &SubfrostProvider {
         self.provider.as_ref().expect("ModuleRegistry must call set_mdb()").as_ref()
+    }
+
+    #[inline]
+    fn essentials_provider(&self) -> &EssentialsProvider {
+        self.essentials_provider
+            .as_ref()
+            .expect("ModuleRegistry must call set_mdb()")
+            .as_ref()
     }
 
     fn load_index_height(&self) -> Result<Option<u32>> {
@@ -80,6 +94,9 @@ impl EspoModule for Subfrost {
     }
 
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
+        self.essentials_provider = Some(Arc::new(EssentialsProvider::new(Arc::new(
+            mdb.clone_with_prefix(b"essentials:"),
+        ))));
         self.provider = Some(Arc::new(SubfrostProvider::new(mdb)));
         match self.load_index_height() {
             Ok(h) => {
@@ -113,7 +130,7 @@ impl EspoModule for Subfrost {
         let block_ts = block.block_header.time as u64;
         let network = get_network();
         let frbtc = get_frbtc_alkane(network);
-        let subfrost_wrap_script = subfrost_wrap_script(network);
+        let subfrost_signer_script = get_signer_script(self.essentials_provider())?;
 
         let mut block_tx_map: HashMap<Txid, &Transaction> = HashMap::new();
         for atx in &block.transactions {
@@ -153,7 +170,7 @@ impl EspoModule for Subfrost {
                 for ev in &cleaned.events {
                     match ev {
                         EspoSandshrewLikeTraceEvent::Invoke(inv) => {
-                            let Some((kind, amount)) = parse_wrap_invoke(inv, frbtc) else {
+                            let Some(parsed) = parse_wrap_invoke(inv, frbtc) else {
                                 stack.push(None);
                                 continue;
                             };
@@ -166,8 +183,9 @@ impl EspoModule for Subfrost {
                                 address_spk.map(|s| s.as_bytes().to_vec()).unwrap_or_default()
                             });
                             stack.push(Some(PendingWrap {
-                                kind,
-                                amount,
+                                kind: parsed.kind,
+                                amount: parsed.amount,
+                                signer_vout: parsed.signer_vout,
                                 address_spk: address_spk_bytes.clone(),
                             }));
                         }
@@ -196,9 +214,10 @@ impl EspoModule for Subfrost {
                                         unwrap_delta_success.saturating_add(amount);
                                 }
                                 if success {
-                                    if let Some(vout) = subfrost_wrap_vout(
+                                    if let Some(vout) = subfrost_unwrap_vout(
                                         &tx.transaction,
-                                        subfrost_wrap_script.as_ref(),
+                                        pending.signer_vout,
+                                        subfrost_signer_script.as_ref(),
                                     ) {
                                         let txid_bytes = txid.to_byte_array();
                                         unwrap_requests_all.push(SchemaUnwrapRequestV1 {
@@ -371,8 +390,10 @@ impl EspoModule for Subfrost {
     }
 
     fn register_rpc(&self, reg: &RpcNsRegistrar) {
-        if let Some(provider) = self.provider.as_ref() {
-            register_rpc(reg, provider.clone());
+        if let (Some(provider), Some(essentials_provider)) =
+            (self.provider.as_ref(), self.essentials_provider.as_ref())
+        {
+            register_rpc(reg, provider.clone(), essentials_provider.clone());
         }
     }
 
@@ -381,7 +402,7 @@ impl EspoModule for Subfrost {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WrapKind {
     Wrap,
     Unwrap,
@@ -391,23 +412,30 @@ enum WrapKind {
 struct PendingWrap {
     kind: WrapKind,
     amount: Option<u128>,
+    signer_vout: Option<u32>,
     address_spk: Vec<u8>,
+}
+
+struct ParsedWrapInvoke {
+    kind: WrapKind,
+    amount: Option<u128>,
+    signer_vout: Option<u32>,
 }
 
 fn parse_wrap_invoke(
     invoke: &EspoSandshrewLikeTraceInvokeData,
     frbtc: SchemaAlkaneId,
-) -> Option<(WrapKind, Option<u128>)> {
+) -> Option<ParsedWrapInvoke> {
     let myself = parse_trace_id(&invoke.context.myself)?;
     if myself != frbtc {
         return None;
     }
     let opcode0 = invoke.context.inputs.get(0).and_then(|s| parse_hex_u64(s));
     let opcode2 = invoke.context.inputs.get(2).and_then(|s| parse_hex_u64(s));
-    let opcode = match opcode0 {
-        Some(0x4d) | Some(0x4e) => opcode0,
-        _ => opcode2,
-    }?;
+    let (opcode_index, opcode) = match opcode0 {
+        Some(opcode @ (0x4d | 0x4e)) => (0, opcode),
+        _ => (2, opcode2?),
+    };
     let kind = match opcode {
         0x4d => WrapKind::Wrap,
         0x4e => WrapKind::Unwrap,
@@ -417,7 +445,15 @@ fn parse_wrap_invoke(
         WrapKind::Wrap => None,
         WrapKind::Unwrap => extract_amount_for_alkane(&invoke.context.incoming_alkanes, frbtc),
     };
-    Some((kind, amount))
+    let signer_vout = match kind {
+        WrapKind::Wrap => None,
+        WrapKind::Unwrap => invoke
+            .context
+            .inputs
+            .get(opcode_index + 1)
+            .and_then(|value| parse_hex_u32(value)),
+    };
+    Some(ParsedWrapInvoke { kind, amount, signer_vout })
 }
 
 fn extract_amount_for_alkane(
@@ -532,25 +568,15 @@ fn spk_from_protostone(tx: &Transaction) -> Option<bitcoin::ScriptBuf> {
     None
 }
 
-fn subfrost_wrap_script(network: Network) -> Option<ScriptBuf> {
-    let address = get_subfrost_wrap_address(network);
-    if address.is_empty() {
-        return None;
-    }
-    Address::from_str(address)
-        .ok()
-        .and_then(|a| a.require_network(network).ok())
-        .map(|a| a.script_pubkey())
-}
-
-fn subfrost_wrap_vout(tx: &Transaction, wrap_script: Option<&ScriptBuf>) -> Option<u32> {
-    let wrap_script = wrap_script?;
-    tx.output
-        .iter()
-        .enumerate()
-        .filter(|(_, output)| output.script_pubkey.as_bytes() == wrap_script.as_bytes())
-        .min_by_key(|(idx, output)| (output.value.to_sat(), *idx as u64))
-        .map(|(idx, _)| idx as u32)
+fn subfrost_unwrap_vout(
+    tx: &Transaction,
+    requested_vout: Option<u32>,
+    signer_script: Option<&ScriptBuf>,
+) -> Option<u32> {
+    let requested_vout = requested_vout?;
+    let signer_script = signer_script?;
+    let output = tx.output.get(usize::try_from(requested_vout).ok()?)?;
+    (output.script_pubkey == *signer_script).then_some(requested_vout)
 }
 
 fn collect_unwrap_request_spends(
@@ -575,4 +601,61 @@ fn collect_unwrap_request_spends(
 
 fn encode_u128_value(value: u128) -> Vec<u8> {
     value.to_be_bytes().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alkanes::trace::{
+        EspoSandshrewLikeTraceInvokeContext, EspoSandshrewLikeTraceShortId,
+    };
+
+    fn unwrap_invoke(inputs: &[&str]) -> EspoSandshrewLikeTraceInvokeData {
+        EspoSandshrewLikeTraceInvokeData {
+            typ: "call".to_string(),
+            context: EspoSandshrewLikeTraceInvokeContext {
+                myself: EspoSandshrewLikeTraceShortId {
+                    block: "0x20".to_string(),
+                    tx: "0x0".to_string(),
+                },
+                caller: EspoSandshrewLikeTraceShortId {
+                    block: "0x0".to_string(),
+                    tx: "0x0".to_string(),
+                },
+                inputs: inputs.iter().map(|value| (*value).to_string()).collect(),
+                incoming_alkanes: vec![EspoSandshrewLikeTraceTransfer {
+                    id: EspoSandshrewLikeTraceShortId {
+                        block: "0x20".to_string(),
+                        tx: "0x0".to_string(),
+                    },
+                    value: "0x186a0".to_string(),
+                }],
+                vout: 4,
+            },
+            fuel: 1,
+        }
+    }
+
+    #[test]
+    fn parses_direct_unwrap_signer_vout() {
+        let parsed = parse_wrap_invoke(
+            &unwrap_invoke(&["0x4e", "0x1", "0x186a0"]),
+            SchemaAlkaneId { block: 32, tx: 0 },
+        )
+        .unwrap();
+        assert_eq!(parsed.kind, WrapKind::Unwrap);
+        assert_eq!(parsed.signer_vout, Some(1));
+        assert_eq!(parsed.amount, Some(100_000));
+    }
+
+    #[test]
+    fn parses_forwarded_unwrap_signer_vout_relative_to_opcode() {
+        let parsed = parse_wrap_invoke(
+            &unwrap_invoke(&["0xd", "0x2", "0x4e", "0x1", "0x186a0"]),
+            SchemaAlkaneId { block: 32, tx: 0 },
+        )
+        .unwrap();
+        assert_eq!(parsed.kind, WrapKind::Unwrap);
+        assert_eq!(parsed.signer_vout, Some(1));
+    }
 }

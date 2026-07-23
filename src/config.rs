@@ -31,6 +31,7 @@ static ELECTRUM_LIKE: OnceLock<Arc<dyn ElectrumLike>> = OnceLock::new();
 static BITCOIND_CLIENT: OnceLock<CoreClient> = OnceLock::new();
 static METASHREW_SDB: OnceLock<std::sync::Arc<SDB>> = OnceLock::new();
 static ESPO_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
+static CACHE_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
 static BLOCK_SOURCE: OnceLock<BlkOrRpcBlockSource> = OnceLock::new();
 
 // NEW: Global bitcoin::Network
@@ -38,6 +39,8 @@ static NETWORK: OnceLock<Network> = OnceLock::new();
 
 const ESPO_ROCKS_BLOCK_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const ESPO_ROCKS_MAX_OPEN_FILES: i32 = 1024;
+const CACHE_ROCKS_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const CACHE_ROCKS_MAX_OPEN_FILES: i32 = 128;
 
 fn configure_espo_rocksdb_options(opts: &mut Options) {
     let cache = Cache::new_lru_cache(ESPO_ROCKS_BLOCK_CACHE_BYTES);
@@ -46,6 +49,15 @@ fn configure_espo_rocksdb_options(opts: &mut Options) {
     table.set_cache_index_and_filter_blocks(true);
     opts.set_block_based_table_factory(&table);
     opts.set_max_open_files(ESPO_ROCKS_MAX_OPEN_FILES);
+}
+
+fn configure_cache_rocksdb_options(opts: &mut Options) {
+    let cache = Cache::new_lru_cache(CACHE_ROCKS_BLOCK_CACHE_BYTES);
+    let mut table = BlockBasedOptions::default();
+    table.set_block_cache(&cache);
+    table.set_cache_index_and_filter_blocks(true);
+    opts.set_block_based_table_factory(&table);
+    opts.set_max_open_files(CACHE_ROCKS_MAX_OPEN_FILES);
 }
 
 fn parse_network(s: &str) -> Result<Network> {
@@ -114,6 +126,10 @@ fn default_bitcoind_blocks_dir() -> String {
 
 fn default_db_path() -> String {
     "./db".to_string()
+}
+
+fn default_alkabi_verify_trials() -> u32 {
+    128
 }
 
 fn default_sdb_poll_ms() -> u16 {
@@ -192,6 +208,10 @@ fn default_mempool_block_weight_units() -> u64 {
     4_000_000
 }
 
+fn default_regtest_block_interval_secs() -> u64 {
+    600
+}
+
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
@@ -232,6 +252,81 @@ impl ExplorerNetworks {
             && self.testnet3.is_none()
             && self.testnet4.is_none()
             && self.regtest.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HostsConfig {
+    #[serde(default)]
+    pub explorer_host: Option<String>,
+    #[serde(default)]
+    pub rpc_host: Option<String>,
+    #[serde(default)]
+    pub oyl_api_host: Option<String>,
+}
+
+impl HostsConfig {
+    fn normalized(self) -> Self {
+        Self {
+            explorer_host: normalize_optional_string(self.explorer_host),
+            rpc_host: normalize_optional_string(self.rpc_host),
+            oyl_api_host: normalize_optional_string(self.oyl_api_host),
+        }
+    }
+}
+
+#[cfg(test)]
+mod hosts_config_tests {
+    use super::{ConfigFile, HostsConfig};
+
+    #[test]
+    fn hosts_object_and_fields_are_optional() {
+        let file: ConfigFile = serde_json::from_value(serde_json::json!({
+            "readonly_metashrew_db_dir": "/tmp/metashrew",
+            "metashrew_rpc_url": "http://127.0.0.1:7145",
+            "bitcoind_rpc_url": "http://127.0.0.1:8332"
+        }))
+        .unwrap();
+        let hosts: HostsConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+
+        assert!(file.hosts.explorer_host.is_none());
+        assert!(file.hosts.rpc_host.is_none());
+        assert!(file.hosts.oyl_api_host.is_none());
+        assert!(!file.db_cache);
+        assert_eq!(file.alkabi_verify_trials, 128);
+        assert!(hosts.explorer_host.is_none());
+        assert!(hosts.rpc_host.is_none());
+        assert!(hosts.oyl_api_host.is_none());
+    }
+
+    #[test]
+    fn persistent_db_cache_is_optional_and_can_be_enabled() {
+        let file: ConfigFile = serde_json::from_value(serde_json::json!({
+            "readonly_metashrew_db_dir": "/tmp/metashrew",
+            "metashrew_rpc_url": "http://127.0.0.1:7145",
+            "bitcoind_rpc_url": "http://127.0.0.1:8332",
+            "db_cache": true,
+            "alkabi_verify_trials": 256
+        }))
+        .unwrap();
+
+        assert!(file.db_cache);
+        assert_eq!(file.alkabi_verify_trials, 256);
+    }
+
+    #[test]
+    fn hosts_are_trimmed_and_blank_values_are_ignored() {
+        let hosts = serde_json::from_value::<HostsConfig>(serde_json::json!({
+            "explorer_host": " https://explorer.example.com ",
+            "rpc_host": "   ",
+            "oyl_api_host": "https://oyl.example.com"
+        }))
+        .unwrap()
+        .normalized();
+
+        assert_eq!(hosts.explorer_host.as_deref(), Some("https://explorer.example.com"));
+        assert!(hosts.rpc_host.is_none());
+        assert_eq!(hosts.oyl_api_host.as_deref(), Some("https://oyl.example.com"));
     }
 }
 
@@ -359,6 +454,8 @@ pub struct MempoolConfig {
     pub template_blocks: usize,
     #[serde(default = "default_mempool_block_weight_units")]
     pub block_weight_units: u64,
+    #[serde(default = "default_regtest_block_interval_secs")]
+    pub regtest_block_interval_secs: u64,
     #[serde(default)]
     pub zmq_rawtx_url: Option<String>,
     #[serde(default)]
@@ -382,6 +479,7 @@ impl Default for MempoolConfig {
             max_txs: default_mempool_max_txs(),
             template_blocks: default_mempool_template_blocks(),
             block_weight_units: default_mempool_block_weight_units(),
+            regtest_block_interval_secs: default_regtest_block_interval_secs(),
             zmq_rawtx_url: None,
             zmq_sequence_url: None,
             websocket_enabled: false,
@@ -441,6 +539,10 @@ pub struct ConfigFile {
     pub bitcoind_rpc_user: String,
     #[serde(default)]
     pub bitcoind_rpc_pass: String,
+    #[serde(default)]
+    pub b8_faucet_url: Option<String>,
+    #[serde(default)]
+    pub hosts: HostsConfig,
     #[serde(default = "default_bitcoind_blocks_dir")]
     pub bitcoind_blocks_dir: String,
     #[serde(default)]
@@ -449,6 +551,10 @@ pub struct ConfigFile {
     pub rollback: Option<u32>,
     #[serde(default = "default_db_path")]
     pub db_path: String,
+    #[serde(default)]
+    pub db_cache: bool,
+    #[serde(default = "default_alkabi_verify_trials")]
+    pub alkabi_verify_trials: u32,
     #[serde(default = "default_sdb_poll_ms")]
     pub sdb_poll_ms: u16,
     #[serde(default)]
@@ -516,11 +622,15 @@ pub struct AppConfig {
     pub bitcoind_rpc_url: String,
     pub bitcoind_rpc_user: String,
     pub bitcoind_rpc_pass: String,
+    pub b8_faucet_url: Option<String>,
+    pub hosts: HostsConfig,
     pub bitcoind_blocks_dir: String,
     pub reset_mempool_on_startup: bool,
     pub rollback: Option<u32>,
     pub view_only: bool,
     pub db_path: String,
+    pub db_cache: bool,
+    pub alkabi_verify_trials: u32,
     pub sdb_poll_ms: u16,
     pub indexer_block_delay_ms: u64,
     pub port: u16,
@@ -603,11 +713,15 @@ impl AppConfig {
             bitcoind_rpc_url: file.bitcoind_rpc_url,
             bitcoind_rpc_user: file.bitcoind_rpc_user,
             bitcoind_rpc_pass: file.bitcoind_rpc_pass,
+            b8_faucet_url: normalize_optional_string(file.b8_faucet_url),
+            hosts: file.hosts.normalized(),
             bitcoind_blocks_dir: file.bitcoind_blocks_dir,
             reset_mempool_on_startup: file.reset_mempool_on_startup,
             rollback: file.rollback,
             view_only,
             db_path: file.db_path,
+            db_cache: file.db_cache,
+            alkabi_verify_trials: file.alkabi_verify_trials,
             sdb_poll_ms: file.sdb_poll_ms,
             indexer_block_delay_ms: file.indexer_block_delay_ms,
             port: file.port,
@@ -685,6 +799,17 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
         anyhow::bail!("Temporary dbs dir is not a directory: {}", tmp.display());
     }
 
+    if cfg.db_cache {
+        let cache = db_root.join("cache");
+        if !cache.exists() {
+            fs::create_dir_all(&cache).map_err(|e| {
+                anyhow::anyhow!("Failed to create cache db dir {}: {e}", cache.display())
+            })?;
+        } else if !cache.is_dir() {
+            anyhow::bail!("Cache db path is not a directory: {}", cache.display());
+        }
+    }
+
     let espo_dir = db_root.join("espo");
     if !espo_dir.exists() {
         fs::create_dir_all(&espo_dir).map_err(|e| {
@@ -712,6 +837,12 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
     }
     if cfg.trace_read_workers == 0 {
         anyhow::bail!("trace_read_workers must be greater than 0");
+    }
+    if cfg.alkabi_verify_trials == 0 {
+        anyhow::bail!("alkabi_verify_trials must be greater than 0");
+    }
+    if cfg.mempool.regtest_block_interval_secs == 0 {
+        anyhow::bail!("mempool.regtest_block_interval_secs must be greater than 0");
     }
 
     cfg.explorer_base_path = normalize_explorer_base_path(&cfg.explorer_base_path)?;
@@ -801,6 +932,18 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
         .set(espo_db.clone())
         .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
 
+    if cfg.db_cache {
+        let mut cache_opts = Options::default();
+        cache_opts.create_if_missing(true);
+        configure_cache_rocksdb_options(&mut cache_opts);
+        let cache_path = Path::new(&cfg.db_path).join("cache");
+        let cache_db = std::sync::Arc::new(DB::open(&cache_opts, &cache_path)?);
+        CACHE_DB
+            .set(cache_db)
+            .map_err(|_| anyhow::anyhow!("Cache DB already initialized"))?;
+        eprintln!("[cache] persistent cache DB enabled at {}", cache_path.display());
+    }
+
     init_global_tree_db(espo_db.clone())?;
 
     // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
@@ -884,6 +1027,11 @@ pub fn get_espo_db_path() -> String {
 /// Cloneable handle to the global ESPO RocksDB
 pub fn get_espo_db() -> std::sync::Arc<DB> {
     std::sync::Arc::clone(ESPO_DB.get().expect("init_config() must be called once at startup"))
+}
+
+/// Optional writable cache database for derived, reproducible results.
+pub fn get_cache_db() -> Option<std::sync::Arc<DB>> {
+    CACHE_DB.get().map(std::sync::Arc::clone)
 }
 
 /// Global accessor for the block source (blk files + RPC fallback)

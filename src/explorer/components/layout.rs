@@ -11,6 +11,7 @@ use crate::explorer::components::footer::footer;
 use crate::explorer::components::svg_assets::{
     dots, icon_btc, icon_language, icon_search, icon_signet, icon_testnet, logo_espo,
 };
+use crate::explorer::faucet::faucet_enabled;
 use crate::explorer::i18n::translate_html;
 use crate::explorer::paths::{current_language, explorer_base_path, explorer_path};
 use crate::modules::runes::main::runes_enabled_from_global_config;
@@ -122,6 +123,7 @@ pub fn layout_with_meta(
     let root_base_path_js = format!("{:?}", explorer_base_path());
     let network_dropdown = network_dropdown();
     let runes_enabled = runes_enabled_from_global_config();
+    let faucet_enabled = faucet_enabled();
     let sync_banner = get_sync_banner().map(|banner| {
         let message = if language.is_chinese() {
             banner.message_zh.as_deref().unwrap_or(&banner.message)
@@ -215,6 +217,9 @@ pub fn layout_with_meta(
                                 @if runes_enabled {
                                     a class="navlink" href=(explorer_path("/runes")) { "Runes" }
                                 }
+                                @if faucet_enabled {
+                                    a class="navlink" href=(explorer_path("/faucet")) { "Faucet" }
+                                }
                                 a class="navlink" href=(explorer_path("/docs")) { "Docs" }
                             }
                             div class="nav-actions" {
@@ -230,6 +235,9 @@ pub fn layout_with_meta(
                                 a class="nav-menu-link" href=(explorer_path("/alkanes")) { "Alkanes" }
                                 @if runes_enabled {
                                     a class="nav-menu-link" href=(explorer_path("/runes")) { "Runes" }
+                                }
+                                @if faucet_enabled {
+                                    a class="nav-menu-link" href=(explorer_path("/faucet")) { "Faucet" }
                                 }
                                 a class="nav-menu-link" href=(explorer_path("/docs")) { "Docs" }
                             }

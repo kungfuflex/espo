@@ -37,6 +37,7 @@ use alloy_primitives::U256;
 use anyhow::Result;
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::consensus::encode::deserialize;
+use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 use bitcoin::hashes::Hash;
 use bitcoin::{Network, OutPoint, Transaction, Txid, opcodes};
 use bitcoincore_rpc::RpcApi;
@@ -53,10 +54,14 @@ const GENESIS_RUNE_ID: SchemaRuneId = SchemaRuneId { block: 1, tx: 0 };
 pub fn runes_genesis_block(network: Network) -> u32 {
     crate::consts::genesis_with_override(match network {
         Network::Bitcoin => MAINNET_RUNES_GENESIS,
-        Network::Testnet => Rune::first_rune_height(Network::Testnet),
-        Network::Regtest | Network::Signet => 0,
         _ => 0,
     })
+}
+
+fn genesis_rune_mint_height_range(genesis_height: u32) -> (Option<u64>, Option<u64>) {
+    let start = u64::from(genesis_height);
+    let end = start + u64::from(SUBSIDY_HALVING_INTERVAL);
+    (Some(start), Some(end))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,10 +141,7 @@ impl EspoModule for Runes {
         let provider = Arc::new(RunesProvider::new(mdb));
         match provider.get_index_height() {
             Ok(mut height) => {
-                if height.is_some()
-                    && provider.get_rune(GENESIS_RUNE_ID).ok().flatten().is_none()
-                    && runes_genesis_block(get_network()) == MAINNET_RUNES_GENESIS
-                {
+                if height.is_some() && provider.get_rune(GENESIS_RUNE_ID).ok().flatten().is_none() {
                     let cleared = provider.clear_namespace().unwrap_or_else(|err| {
                         eprintln!("[RUNES] failed to clear invalid runes namespace: {err:?}");
                         0
@@ -457,8 +459,9 @@ impl<'a> BlockRunesIndexer<'a> {
         external_prev_map: &HashMap<Txid, Transaction>,
     ) -> Result<()> {
         let txid = tx.compute_txid();
-        if self.height == MAINNET_RUNES_GENESIS && tx_index == 0 {
-            self.ensure_genesis_rune(txid)?;
+        let genesis_height = runes_genesis_block(get_network());
+        if self.height == genesis_height && tx_index == 0 {
+            self.ensure_genesis_rune(txid, genesis_height)?;
         }
         let has_runestone = tx_has_runestone_carrier(tx);
         let mut has_rune_input = false;
@@ -1098,14 +1101,14 @@ impl<'a> BlockRunesIndexer<'a> {
         Ok(Some(amount))
     }
 
-    fn ensure_genesis_rune(&mut self, txid: Txid) -> Result<()> {
+    fn ensure_genesis_rune(&mut self, txid: Txid, genesis_height: u32) -> Result<()> {
         if self.load_entry(GENESIS_RUNE_ID)?.is_some() {
             return Ok(());
         }
         let terms = ordinals::Terms {
             amount: Some(1),
             cap: Some(u128::MAX),
-            height: (Some(MAINNET_RUNES_GENESIS as u64), Some(1_050_000)),
+            height: genesis_rune_mint_height_range(genesis_height),
             offset: (None, None),
         };
         let entry = make_entry(
@@ -1675,4 +1678,27 @@ fn tx_has_runestone_carrier(tx: &Transaction) -> bool {
         matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_RETURN))))
             && matches!(instructions.next(), Some(Ok(Instruction::Op(opcodes::all::OP_PUSHNUM_13))))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runes_start_at_zero_outside_mainnet() {
+        assert_eq!(runes_genesis_block(Network::Bitcoin), MAINNET_RUNES_GENESIS);
+
+        for network in [Network::Regtest, Network::Signet, Network::Testnet, Network::Testnet4] {
+            assert_eq!(runes_genesis_block(network), 0);
+        }
+    }
+
+    #[test]
+    fn genesis_rune_mint_window_spans_one_halving_interval() {
+        assert_eq!(
+            genesis_rune_mint_height_range(MAINNET_RUNES_GENESIS),
+            (Some(840_000), Some(1_050_000))
+        );
+        assert_eq!(genesis_rune_mint_height_range(0), (Some(0), Some(210_000)));
+    }
 }

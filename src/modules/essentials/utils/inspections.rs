@@ -2,7 +2,7 @@ use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
     EspoSandshrewLikeTraceStatus, EspoTrace,
 };
-use crate::modules::essentials::storage::EssentialsProvider;
+use crate::modules::essentials::storage::{EssentialsProvider, GetRawValueParams};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_cli_common::alkanes::inspector::types::{AlkaneMetadata, AlkaneMethod};
@@ -16,6 +16,10 @@ use std::collections::HashSet;
 use std::future::Future;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::block_in_place;
+
+const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
+const KV_KEY_BEACON: &[u8] = b"/beacon";
+const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward", 36863)];
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct StoredInspectionMethod {
@@ -144,6 +148,94 @@ pub fn load_inspection(
         })?
         .record;
     Ok(rec.and_then(|r| r.inspection))
+}
+
+fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
+    let Some(meta) = inspection.metadata.as_ref() else { return false };
+    UPGRADEABLE_METHODS.iter().all(|(name, opcode)| {
+        meta.methods
+            .iter()
+            .any(|method| method.name.eq_ignore_ascii_case(name) && method.opcode == *opcode)
+    })
+}
+
+fn kv_row_key(alkane: &SchemaAlkaneId, storage_key: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 4 + 8 + 2 + storage_key.len());
+    key.push(0x01);
+    key.extend_from_slice(&alkane.block.to_be_bytes());
+    key.extend_from_slice(&alkane.tx.to_be_bytes());
+    let len = u16::try_from(storage_key.len()).unwrap_or(u16::MAX);
+    key.extend_from_slice(&len.to_be_bytes());
+    if len as usize != storage_key.len() {
+        key.extend_from_slice(&storage_key[..len as usize]);
+    } else {
+        key.extend_from_slice(storage_key);
+    }
+    key
+}
+
+fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
+    if raw.len() < 32 {
+        return None;
+    }
+    let block = u128::from_le_bytes(raw[0..16].try_into().ok()?);
+    let tx = u128::from_le_bytes(raw[16..32].try_into().ok()?);
+    Some(SchemaAlkaneId { block: u32::try_from(block).ok()?, tx: u64::try_from(tx).ok()? })
+}
+
+fn proxy_target_from_db(
+    alkane: &SchemaAlkaneId,
+    provider: &EssentialsProvider,
+) -> Option<SchemaAlkaneId> {
+    let lookup = |storage_key| {
+        provider
+            .get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: kv_row_key(alkane, storage_key),
+            })
+            .ok()
+            .and_then(|response| response.value)
+            .and_then(|raw| {
+                if raw.len() >= 32 {
+                    decode_kv_implementation(&raw[32..])
+                } else {
+                    decode_kv_implementation(&raw)
+                }
+            })
+    };
+    lookup(KV_KEY_IMPLEMENTATION).or_else(|| lookup(KV_KEY_BEACON))
+}
+
+pub fn resolve_proxy_target_recursive(
+    start: &SchemaAlkaneId,
+    provider: &EssentialsProvider,
+) -> Option<SchemaAlkaneId> {
+    let mut current = *start;
+    let mut seen = HashSet::new();
+    for _ in 0..8 {
+        let inspection = load_inspection(provider, &current).ok().flatten()?;
+        if !is_upgradeable_proxy(&inspection) {
+            return (current != *start).then_some(current);
+        }
+        let next = proxy_target_from_db(&current, provider)?;
+        if !seen.insert(next) {
+            return None;
+        }
+        current = next;
+    }
+    None
+}
+
+pub fn resolve_contract_wasm_source(
+    start: &SchemaAlkaneId,
+    provider: &EssentialsProvider,
+) -> Option<SchemaAlkaneId> {
+    let resolved = resolve_proxy_target_recursive(start, provider).unwrap_or(*start);
+    load_inspection(provider, &resolved)
+        .ok()
+        .flatten()
+        .and_then(|inspection| inspection.factory_alkane)
+        .or(Some(resolved))
 }
 
 fn parse_short_id(id: &EspoSandshrewLikeTraceShortId) -> Option<SchemaAlkaneId> {
@@ -277,6 +369,8 @@ mod tests {
         EspoSandshrewLikeTraceReturnData, EspoSandshrewLikeTraceReturnResponse,
         EspoSandshrewLikeTraceStatus, EspoTrace,
     };
+    use crate::modules::essentials::storage::{SetBatchParams, encode_creation_record};
+    use crate::runtime::mdb::Mdb;
     use crate::schemas::EspoOutpoint;
     use alkanes_support::proto::alkanes::AlkanesTrace;
     use bitcoin::block::Header;
@@ -286,6 +380,7 @@ mod tests {
         Amount, Network, ScriptBuf, Transaction, TxOut, locktime::absolute, transaction,
     };
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn test_tx(value: u64) -> Transaction {
         Transaction {
@@ -339,6 +434,57 @@ mod tests {
         }
     }
 
+    fn inspection_record(
+        alkane: SchemaAlkaneId,
+        methods: Vec<StoredInspectionMethod>,
+        factory_alkane: Option<SchemaAlkaneId>,
+    ) -> AlkaneCreationRecord {
+        AlkaneCreationRecord {
+            alkane,
+            txid: [0; 32],
+            creation_height: 1,
+            creation_timestamp: 1,
+            tx_index_in_block: 0,
+            inspection: Some(StoredInspectionResult {
+                alkane,
+                bytecode_length: 1,
+                metadata: Some(StoredInspectionMetadata {
+                    name: "TestContract".to_string(),
+                    version: "1.0.0".to_string(),
+                    description: None,
+                    methods,
+                }),
+                metadata_error: None,
+                factory_alkane,
+            }),
+            names: Vec::new(),
+            symbols: Vec::new(),
+            cap: 0,
+            mint_amount: 0,
+        }
+    }
+
+    fn write_inspection_records(
+        provider: &EssentialsProvider,
+        records: &[AlkaneCreationRecord],
+        extra_puts: Vec<(Vec<u8>, Vec<u8>)>,
+    ) {
+        let table = provider.table();
+        let mut puts = records
+            .iter()
+            .map(|record| {
+                (
+                    table.alkane_creation_by_id_key(&record.alkane),
+                    encode_creation_record(record).expect("encode creation record"),
+                )
+            })
+            .collect::<Vec<_>>();
+        puts.extend(extra_puts);
+        provider
+            .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+            .expect("write inspection records");
+    }
+
     #[test]
     fn inspection_round_trip() {
         let record = StoredInspectionResult {
@@ -362,6 +508,56 @@ mod tests {
         let bytes = encode_inspection(&record).expect("encode");
         let decoded = decode_inspection(&bytes).expect("decode");
         assert_eq!(record, decoded);
+    }
+
+    #[test]
+    fn resolves_factory_clone_wasm_source_from_indexed_inspection() {
+        let dir = tempfile::tempdir_in(".").expect("tempdir");
+        let provider = EssentialsProvider::new(Arc::new(
+            Mdb::open(dir.path(), b"inspection_factory_test:").expect("open mdb"),
+        ));
+        let clone = SchemaAlkaneId { block: 2, tx: 10 };
+        let factory = SchemaAlkaneId { block: 4, tx: 20 };
+        write_inspection_records(
+            &provider,
+            &[inspection_record(clone, Vec::new(), Some(factory))],
+            Vec::new(),
+        );
+
+        assert_eq!(resolve_contract_wasm_source(&clone, &provider), Some(factory));
+    }
+
+    #[test]
+    fn resolves_proxy_to_factory_clone_wasm_source() {
+        let dir = tempfile::tempdir_in(".").expect("tempdir");
+        let provider = EssentialsProvider::new(Arc::new(
+            Mdb::open(dir.path(), b"inspection_proxy_test:").expect("open mdb"),
+        ));
+        let proxy = SchemaAlkaneId { block: 2, tx: 10 };
+        let implementation = SchemaAlkaneId { block: 4, tx: 20 };
+        let factory = SchemaAlkaneId { block: 8, tx: 30 };
+        let proxy_methods = UPGRADEABLE_METHODS
+            .iter()
+            .map(|(name, opcode)| StoredInspectionMethod {
+                name: (*name).to_string(),
+                opcode: *opcode,
+                params: Vec::new(),
+                returns: String::new(),
+            })
+            .collect();
+        let mut implementation_value = vec![0; 32];
+        implementation_value.extend_from_slice(&(implementation.block as u128).to_le_bytes());
+        implementation_value.extend_from_slice(&(implementation.tx as u128).to_le_bytes());
+        write_inspection_records(
+            &provider,
+            &[
+                inspection_record(proxy, proxy_methods, None),
+                inspection_record(implementation, Vec::new(), Some(factory)),
+            ],
+            vec![(kv_row_key(&proxy, KV_KEY_IMPLEMENTATION), implementation_value)],
+        );
+
+        assert_eq!(resolve_contract_wasm_source(&proxy, &provider), Some(factory));
     }
 
     #[test]

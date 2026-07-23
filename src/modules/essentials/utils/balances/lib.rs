@@ -58,6 +58,7 @@ type AlkaneDeltaMap = HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU12
 type RootDebitCandidateMap = HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, u128>>;
 
 #[allow(dead_code)]
+#[derive(Clone, Copy)]
 pub(crate) struct ContractProjectionContext<'a> {
     pub tx: &'a Transaction,
     pub protostone: &'a Protostone,
@@ -72,6 +73,13 @@ pub(crate) struct ContractProjection {
 
 pub(crate) trait MempoolContractProjector {
     fn project(&mut self, ctx: ContractProjectionContext<'_>) -> Option<ContractProjection>;
+
+    fn project_from_inputs(
+        &mut self,
+        _ctx: ContractProjectionContext<'_>,
+    ) -> Option<ContractProjection> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -362,38 +370,6 @@ fn parse_u128_from_str(input: &str) -> Option<u128> {
     } else {
         input.parse::<u128>().ok()
     }
-}
-
-fn trace_has_root_out_of_fuel_failure(
-    trace: &EspoSandshrewLikeTrace,
-    host_function_values: &EspoHostFunctionValues,
-) -> bool {
-    let cleaned = clean_espo_sandshrew_like_trace(trace, host_function_values);
-    let events = cleaned.as_ref().map(|t| t.events.as_slice()).unwrap_or(&trace.events);
-    let mut depth = 0usize;
-    for ev in events {
-        match ev {
-            EspoSandshrewLikeTraceEvent::Invoke(_) => {
-                depth = depth.saturating_add(1);
-            }
-            EspoSandshrewLikeTraceEvent::Return(ret) => {
-                let is_root = depth == 1;
-                if is_root && ret.status == EspoSandshrewLikeTraceStatus::Failure {
-                    let data = ret.response.data.strip_prefix("0x").unwrap_or(&ret.response.data);
-                    if let Ok(bytes) = hex::decode(data) {
-                        if String::from_utf8_lossy(&bytes)
-                            .contains("all fuel consumed by WebAssembly")
-                        {
-                            return true;
-                        }
-                    }
-                }
-                depth = depth.saturating_sub(1);
-            }
-            EspoSandshrewLikeTraceEvent::Create(_) => {}
-        }
-    }
-    false
 }
 
 pub(crate) fn mint_deltas_from_trace(
@@ -1531,8 +1507,43 @@ fn apply_transfers_multi_attributed(
             status == EspoTraceType::REVERT && net_in.as_ref().map_or(true, |m| m.is_empty());
         let status = if revert_missing_incoming { EspoTraceType::NOTRACE } else { status };
 
+        // AMM and frBTC mempool projections are derived from the actual VIN sheet and
+        // transaction outputs. Prefer them over a successful view trace, which was
+        // evaluated without unconfirmed ancestors and can therefore be stale.
+        let input_projection = if status != EspoTraceType::REVERT {
+            contract_projector.as_deref_mut().and_then(|projector| {
+                let mut incoming = sheet.clone();
+                if i == 0 {
+                    for (rid, amt) in seed_unalloc.clone().drain_all() {
+                        if amt == 0 {
+                            continue;
+                        }
+                        *incoming.entry(rid).or_default() =
+                            incoming.get(&rid).copied().unwrap_or(0).saturating_add(amt);
+                    }
+                }
+                projector.project_from_inputs(ContractProjectionContext {
+                    tx,
+                    protostone: ps,
+                    protostone_index: i,
+                    shadow_vout,
+                    incoming: &incoming,
+                })
+            })
+        } else {
+            None
+        };
+        let used_input_projection = input_projection.is_some();
+        if let Some(projection) = input_projection {
+            if i == 0 {
+                seed_unalloc.drain_all();
+                merge_sourced_sheet(&mut source_sheet, std::mem::take(&mut seed_sources));
+            }
+            sheet = projection.output;
+        }
+
         // On success, consume incoming amounts so only returned/minted balances remain.
-        if status == EspoTraceType::SUCCESS {
+        if !used_input_projection && status == EspoTraceType::SUCCESS {
             if i == 0 {
                 merge_sourced_sheet(&mut source_sheet, std::mem::take(&mut seed_sources));
             }
@@ -1571,7 +1582,7 @@ fn apply_transfers_multi_attributed(
         }
 
         // add net_out to sheet
-        if status == EspoTraceType::SUCCESS {
+        if !used_input_projection && status == EspoTraceType::SUCCESS {
             if let Some(ref net_out_map) = net_out {
                 for (rid, amt) in net_out_map {
                     if *amt == 0 {
@@ -1583,7 +1594,7 @@ fn apply_transfers_multi_attributed(
             }
         }
         // merge VIN balances ONLY into protostone 0’s sheet
-        if i == 0 && status == EspoTraceType::NOTRACE {
+        if !used_input_projection && i == 0 && status == EspoTraceType::NOTRACE {
             for (rid, amt) in seed_unalloc.drain_all() {
                 if amt == 0 {
                     continue;
@@ -1594,7 +1605,7 @@ fn apply_transfers_multi_attributed(
             merge_sourced_sheet(&mut source_sheet, std::mem::take(&mut seed_sources));
         }
 
-        if status == EspoTraceType::NOTRACE {
+        if !used_input_projection && status == EspoTraceType::NOTRACE {
             if let Some(projector) = contract_projector.as_deref_mut() {
                 if let Some(projection) = projector.project(ContractProjectionContext {
                     tx,
@@ -2433,6 +2444,28 @@ mod edict_fork_tests {
     use bitcoin::{Amount, TxOut, locktime::absolute, opcodes, transaction};
     use protorune_support::balance_sheet::ProtoruneRuneId;
 
+    struct InputPreferredSwapProjector {
+        token_in: SchemaAlkaneId,
+        token_out: SchemaAlkaneId,
+        amount_out: u128,
+    }
+
+    impl MempoolContractProjector for InputPreferredSwapProjector {
+        fn project(&mut self, _ctx: ContractProjectionContext<'_>) -> Option<ContractProjection> {
+            None
+        }
+
+        fn project_from_inputs(
+            &mut self,
+            ctx: ContractProjectionContext<'_>,
+        ) -> Option<ContractProjection> {
+            if ctx.incoming.get(&self.token_in).copied().unwrap_or_default() == 0 {
+                return None;
+            }
+            Some(ContractProjection { output: BTreeMap::from([(self.token_out, self.amount_out)]) })
+        }
+    }
+
     fn tx_with_middle_op_return() -> Transaction {
         Transaction {
             version: transaction::Version::TWO,
@@ -2493,6 +2526,106 @@ mod edict_fork_tests {
 
     fn amount_at(map: &HashMap<u32, Vec<BalanceEntry>>, vout: u32) -> u128 {
         map.get(&vout).into_iter().flatten().map(|entry| entry.amount).sum()
+    }
+
+    fn token_amount_at(
+        map: &HashMap<u32, Vec<BalanceEntry>>,
+        vout: u32,
+        token: SchemaAlkaneId,
+    ) -> u128 {
+        map.get(&vout)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.alkane == token)
+            .map(|entry| entry.amount)
+            .sum()
+    }
+
+    #[test]
+    fn input_projection_overrides_stale_success_trace_before_edict_routing() {
+        let token_in = SchemaAlkaneId { block: 32, tx: 0 };
+        let token_out = SchemaAlkaneId { block: 2, tx: 77_269 };
+        let stale_trace_token = SchemaAlkaneId { block: 2, tx: 1 };
+        let tx = tx_with_leading_op_return(3);
+        let shadow_vout = tx.output.len() as u32 + 1;
+        let trace_json = format!(
+            r#"{{
+  "outpoint": "test",
+  "events": [
+    {{
+      "event": "invoke",
+      "data": {{
+        "type": "call",
+        "context": {{
+          "myself": {{"block": "0x4", "tx": "0x1"}},
+          "caller": {{"block": "0x0", "tx": "0x0"}},
+          "inputs": ["0x3"],
+          "incomingAlkanes": [
+            {{"id": {{"block": "0x20", "tx": "0x0"}}, "value": "0x64"}}
+          ],
+          "vout": {shadow_vout}
+        }},
+        "fuel": 1
+      }}
+    }},
+    {{
+      "event": "return",
+      "data": {{
+        "status": "success",
+        "response": {{
+          "alkanes": [
+            {{"id": {{"block": "0x2", "tx": "0x1"}}, "value": "0x1"}}
+          ],
+          "data": "0x",
+          "storage": []
+        }}
+      }}
+    }}
+  ]
+}}"#
+        );
+        let sandshrew_trace: EspoSandshrewLikeTrace =
+            serde_json::from_str(&trace_json).expect("trace json");
+        let trace = EspoTrace {
+            sandshrew_trace,
+            protobuf_trace: Default::default(),
+            storage_changes: Default::default(),
+            outpoint: EspoOutpoint { txid: vec![0; 32], vout: shadow_vout, tx_spent: None },
+        };
+        let protostone = Protostone {
+            burn: None,
+            message: vec![1],
+            edicts: vec![ProtostoneEdict {
+                id: ProtoruneRuneId {
+                    block: u128::from(token_out.block),
+                    tx: u128::from(token_out.tx),
+                },
+                amount: 80,
+                output: 1,
+            }],
+            refund: None,
+            pointer: Some(2),
+            from: None,
+            protocol_tag: 1,
+        };
+        let mut seed = Unallocated::default();
+        seed.add(token_in, 100);
+        let mut projector = InputPreferredSwapProjector { token_in, token_out, amount_out: 90 };
+
+        let allocations = apply_transfers_multi(
+            &tx,
+            &[protostone],
+            &[trace],
+            ALKANES_V217_EDICT_FIX_HEIGHT,
+            seed,
+            Some(&mut projector),
+        )
+        .expect("projected allocations");
+
+        assert_eq!(token_amount_at(&allocations, 1, token_out), 80);
+        assert_eq!(token_amount_at(&allocations, 2, token_out), 10);
+        assert_eq!(token_amount_at(&allocations, 1, stale_trace_token), 0);
+        assert_eq!(token_amount_at(&allocations, 2, stale_trace_token), 0);
     }
 
     #[test]
@@ -3407,7 +3540,6 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         let mut holder_alkanes_changed: HashSet<SchemaAlkaneId> = HashSet::new();
         let mut local_alkane_delta: AlkaneDeltaMap = HashMap::new();
         let mut local_root_debit_candidates: RootDebitCandidateMap = HashMap::new();
-        let mut tx_has_root_out_of_fuel_failure = false;
         let mut tx_mint_deltas: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
 
         let mut add_holder_delta =
@@ -3592,12 +3724,6 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
         let traces_for_tx: Vec<EspoTrace> = atx.traces.clone().unwrap_or_default();
         if !traces_for_tx.is_empty() {
             for t in &traces_for_tx {
-                if trace_has_root_out_of_fuel_failure(
-                    &t.sandshrew_trace,
-                    &block.host_function_values,
-                ) {
-                    tx_has_root_out_of_fuel_failure = true;
-                }
                 let (ok, deltas, root_debits) = accumulate_alkane_balance_deltas(
                     &t.sandshrew_trace,
                     &txid,
@@ -3637,32 +3763,12 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
                 }
             }
         }
-        if tx_has_root_out_of_fuel_failure && !local_root_debit_candidates.is_empty() {
-            let mut empty_owners: Vec<SchemaAlkaneId> = Vec::new();
-            for (owner, per_token_candidates) in &local_root_debit_candidates {
-                let entry = local_alkane_delta.entry(*owner).or_default();
-                for (token, amount) in per_token_candidates {
-                    let slot = entry.entry(*token).or_insert_with(SignedU128::zero);
-                    *slot += SignedU128::positive(*amount);
-                    if slot.is_zero() {
-                        entry.remove(token);
-                    }
-                }
-                if entry.is_empty() {
-                    empty_owners.push(*owner);
-                }
-            }
-            for owner in empty_owners {
-                local_alkane_delta.remove(&owner);
-            }
-            local_root_debit_candidates.clear();
-            if debug {
-                eprintln!(
-                    "[balances] skipped root response debit candidates after root out-of-fuel: txid={}",
-                    txid
-                );
-            }
-        }
+        // NOTE: a protostone that fails with "all fuel consumed by WebAssembly" only
+        // rolls back its own message (protorune checkpoints/rollbacks per protostone
+        // and refunds that protostone's inputs). Successful sibling protostones in the
+        // same transaction keep their commits — including root response debits — so an
+        // out-of-fuel failure in one protostone must NOT cancel debit candidates
+        // accumulated from the other traces of the same tx.
         if !local_root_debit_candidates.is_empty() {
             let mut empty_owners: Vec<SchemaAlkaneId> = Vec::new();
             for (owner, per_token_candidates) in &local_root_debit_candidates {

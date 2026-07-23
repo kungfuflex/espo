@@ -297,6 +297,7 @@ struct InMemoryMempool {
     templates: Vec<MempoolBlockTemplate>,
     deltas: Vec<MempoolBlockDelta>,
     status: MempoolSyncStatus,
+    minimum_fee_rate: Option<f64>,
     sequence: u64,
     updated_at: u64,
 }
@@ -405,6 +406,7 @@ fn publish_mempool_entry_event(entry: &MempoolTransactionStruct, event: &str) {
 
 pub fn publish_confirmed_tx_events(
     height: u32,
+    timestamp: u32,
     txids: &[Txid],
     address_txs: &HashMap<String, Vec<Txid>>,
 ) {
@@ -414,6 +416,7 @@ pub fn publish_confirmed_tx_events(
             "event": "confirmed",
             "status": "confirmed",
             "height": height,
+            "timestamp": timestamp,
             "txids": txids.iter().map(ToString::to_string).collect::<Vec<_>>(),
         }
     }));
@@ -431,6 +434,7 @@ pub fn publish_confirmed_tx_events(
                 "event": "confirmed",
                 "status": "confirmed",
                 "height": height,
+                "timestamp": timestamp,
                 "addresses": addresses,
             }
         }));
@@ -1064,6 +1068,25 @@ fn block_summary(template: &MempoolBlockTemplate) -> MempoolBlockSummary {
     }
 }
 
+fn ensure_regtest_mempool_template(templates: &mut Vec<MempoolBlockTemplate>, network: Network) {
+    if network != Network::Regtest || !templates.is_empty() {
+        return;
+    }
+    templates.push(MempoolBlockTemplate {
+        index: 0,
+        tx_count: 0,
+        trace_count: 0,
+        weight: 0,
+        vsize: 0,
+        total_fees: 0,
+        median_fee_rate: Some(0.0),
+        min_fee_rate: Some(0.0),
+        max_fee_rate: Some(0.0),
+        fee_range: Vec::new(),
+        transaction_ids: Vec::new(),
+    });
+}
+
 fn compact_snapshot_from_state(
     state: &InMemoryMempool,
     include_deltas: bool,
@@ -1257,6 +1280,10 @@ pub fn current_mempool_compact_snapshot() -> MempoolCompactSnapshot {
         return MempoolCompactSnapshot::default();
     };
     compact_snapshot_from_state(&state, false)
+}
+
+pub fn current_mempool_minimum_fee_rate() -> Option<f64> {
+    mempool_state().read().ok()?.minimum_fee_rate
 }
 
 pub fn current_mempool_compact_snapshot_with_deltas() -> MempoolCompactSnapshot {
@@ -1458,6 +1485,9 @@ pub fn get_mempool_index_transactions_ordered_by_block_and_fee() -> Vec<MempoolB
     out
 }
 
+/// Returns protostone transactions in canonical mempool order from block zero
+/// through the last target. The prefix is required to carry projected vouts and
+/// contract state across projected block boundaries.
 pub fn get_mempool_block_transactions_for_targets(
     index: usize,
     targets: &HashSet<Txid>,
@@ -1469,35 +1499,29 @@ pub fn get_mempool_block_transactions_for_targets(
     let Ok(state) = mempool_state().read() else {
         return None;
     };
-    let template = state.templates.iter().find(|template| template.index == index)?;
-    let ordered: Vec<Txid> = template
-        .transaction_ids
-        .iter()
-        .filter_map(|txid_str| Txid::from_str(txid_str).ok())
-        .collect();
-    let in_block: HashSet<Txid> = ordered.iter().copied().collect();
-    let mut needed: HashSet<Txid> =
-        targets.iter().copied().filter(|txid| in_block.contains(txid)).collect();
-    let mut stack: Vec<Txid> = needed.iter().copied().collect();
-
-    while let Some(txid) = stack.pop() {
-        let Some(entry) = state.txs.get(&txid) else {
-            continue;
-        };
-        for prev in &entry.spent_outpoints {
-            let parent = prev.txid;
-            if in_block.contains(&parent) && needed.insert(parent) {
-                stack.push(parent);
-            }
-        }
+    let ordered = mempool_projection_prefix(&state.templates, index, targets)?;
+    let mut package_rates = HashMap::new();
+    for template in state.templates.iter().filter(|template| template.index <= index) {
+        let block_ordered: Vec<Txid> = template
+            .transaction_ids
+            .iter()
+            .filter_map(|txid_str| Txid::from_str(txid_str).ok())
+            .collect();
+        package_rates.extend(package_effective_rates_for_block(
+            &block_ordered,
+            &state.txs,
+            &HashMap::new(),
+        ));
     }
 
     Some(
         ordered
             .iter()
-            .filter(|txid| needed.contains(*txid))
             .filter_map(|txid| {
                 let entry = state.txs.get(txid)?;
+                if entry.protostones.is_empty() && !targets.contains(txid) {
+                    return None;
+                }
                 let tx = entry.tx.clone()?;
                 Some(MempoolBlockTx {
                     txid: *txid,
@@ -1509,7 +1533,7 @@ pub fn get_mempool_block_transactions_for_targets(
                     first_seen: entry.first_seen,
                     fee_sat: entry.fee_sat,
                     vsize: entry.vsize,
-                    fee_rate: entry.fee_rate,
+                    fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
                     position: entry.position.clone(),
                     readiness: derive_readiness(entry),
                     defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
@@ -1517,6 +1541,22 @@ pub fn get_mempool_block_transactions_for_targets(
             })
             .collect(),
     )
+}
+
+fn mempool_projection_prefix(
+    templates: &[MempoolBlockTemplate],
+    max_index: usize,
+    targets: &HashSet<Txid>,
+) -> Option<Vec<Txid>> {
+    templates.iter().find(|template| template.index == max_index)?;
+    let ordered: Vec<Txid> = templates
+        .iter()
+        .filter(|template| template.index <= max_index)
+        .flat_map(|template| template.transaction_ids.iter())
+        .filter_map(|txid| Txid::from_str(txid).ok())
+        .collect();
+    let last_target = ordered.iter().rposition(|txid| targets.contains(txid))?;
+    Some(ordered.into_iter().take(last_target.saturating_add(1)).collect())
 }
 
 pub fn get_mempool_block_spenders(index: usize) -> Option<HashMap<(Txid, u32), Txid>> {
@@ -1536,11 +1576,12 @@ pub fn get_mempool_block_spenders(index: usize) -> Option<HashMap<(Txid, u32), T
     Some(out)
 }
 
-pub fn publish_new_block_event(height: u32, txids: &[Txid]) {
+pub fn publish_new_block_event(height: u32, timestamp: u32, txids: &[Txid]) {
     publish_mempool_event(&json!({
         "type": "block",
         "data": {
             "height": height,
+            "timestamp": timestamp,
             "txids": txids.iter().map(ToString::to_string).collect::<Vec<_>>(),
         }
     }));
@@ -1993,6 +2034,7 @@ pub fn reset_mempool_store() -> Result<()> {
         state.txs.clear();
         state.templates.clear();
         state.deltas.clear();
+        state.minimum_fee_rate = None;
         state.sequence = state.sequence.saturating_add(1);
         state.status = MempoolSyncStatus {
             phase: MempoolSyncPhase::Starting,
@@ -2803,7 +2845,7 @@ fn recalculate_memory_templates() {
             transaction_ids: txids.iter().map(ToString::to_string).collect(),
         });
     }
-
+    ensure_regtest_mempool_template(&mut templates, get_network());
     let Ok(mut state) = mempool_state().write() else { return };
     let previous_templates = state.templates.clone();
     let templates_changed = previous_templates != templates;
@@ -2903,6 +2945,14 @@ fn recalculate_memory_templates() {
 
 async fn refresh_memory_mempool(rpc: &CoreClient, network: Network) -> Result<()> {
     mark_raw_refresh_start();
+    if let Ok(info) = rpc.get_mempool_info() {
+        let minimum_fee_rate = info.mempool_min_fee.to_sat() as f64 / 1_000.0;
+        if minimum_fee_rate.is_finite() && minimum_fee_rate >= 0.0 {
+            if let Ok(mut state) = mempool_state().write() {
+                state.minimum_fee_rate = Some(minimum_fee_rate);
+            }
+        }
+    }
     let verbose: HashMap<String, VerboseMempoolEntry> = match rpc
         .call("getrawmempool", &[json!(true)])
         .context("bitcoind getrawmempool verbose failed")
@@ -3483,6 +3533,102 @@ mod tests {
             from: None,
             protocol_tag: 1,
         }
+    }
+
+    fn mempool_transaction(seed: u8, vsize: u64, fee_sat: u64) -> (Txid, MempoolTransactionStruct) {
+        let txid = Txid::from_byte_array([seed; 32]);
+        (
+            txid,
+            MempoolTransactionStruct {
+                txid,
+                tx: None,
+                protostones: Vec::new(),
+                fixed_trace: None,
+                fixed_trace_context: None,
+                diesel_trace: None,
+                rune_io: None,
+                first_seen: 0,
+                fee_sat,
+                weight: vsize.saturating_mul(4),
+                vsize,
+                fee_rate: fee_sat as f64 / vsize.max(1) as f64,
+                inputs: Vec::new(),
+                spent_outpoints: Vec::new(),
+                addresses: Vec::new(),
+                is_diesel_mint: false,
+                is_ug_mint: false,
+                template_index: None,
+                position: None,
+                readiness: MempoolTxReadiness::MetadataOnly,
+            },
+        )
+    }
+
+    #[test]
+    fn calculate_block_templates_returns_no_blocks_for_empty_mempool() {
+        let txs = HashMap::new();
+
+        let (blocks, rates) = calculate_block_templates(&txs, 8, 1_000_000);
+
+        assert!(blocks.is_empty());
+        assert!(rates.is_empty());
+    }
+
+    #[test]
+    fn regtest_keeps_one_empty_mempool_template() {
+        let mut templates = Vec::new();
+
+        ensure_regtest_mempool_template(&mut templates, Network::Regtest);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].index, 0);
+        assert_eq!(templates[0].tx_count, 0);
+        assert!(templates[0].transaction_ids.is_empty());
+    }
+
+    #[test]
+    fn mainnet_does_not_add_empty_mempool_template() {
+        let mut templates = Vec::new();
+
+        ensure_regtest_mempool_template(&mut templates, Network::Bitcoin);
+
+        assert!(templates.is_empty());
+    }
+
+    #[test]
+    fn calculate_block_templates_returns_only_populated_blocks_needed() {
+        let txs: HashMap<_, _> = [1, 2, 3]
+            .into_iter()
+            .map(|seed| mempool_transaction(seed, 100_000, 100_000))
+            .collect();
+
+        let (blocks, _) = calculate_block_templates(&txs, 8, 1_000_000);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.iter().map(Vec::len).sum::<usize>(), 3);
+        assert!(blocks.iter().all(|block| !block.is_empty()));
+    }
+
+    #[test]
+    fn mempool_projection_prefix_keeps_prior_blocks_and_stops_at_last_target() {
+        let txids: Vec<Txid> = (1..=5).map(|seed| Txid::from_byte_array([seed; 32])).collect();
+        let templates = vec![
+            MempoolBlockTemplate {
+                index: 0,
+                transaction_ids: txids[..2].iter().map(ToString::to_string).collect(),
+                ..Default::default()
+            },
+            MempoolBlockTemplate {
+                index: 1,
+                transaction_ids: txids[2..].iter().map(ToString::to_string).collect(),
+                ..Default::default()
+            },
+        ];
+        let targets = HashSet::from([txids[3]]);
+
+        let prefix = mempool_projection_prefix(&templates, 1, &targets).expect("prefix");
+
+        assert_eq!(prefix, txids[..4]);
     }
 
     #[test]

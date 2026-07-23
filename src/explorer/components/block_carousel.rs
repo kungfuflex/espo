@@ -1,3 +1,4 @@
+use bitcoin::Network;
 use maud::{Markup, PreEscaped, html};
 
 use crate::config::get_config;
@@ -19,6 +20,9 @@ fn block_carousel_inner(
     selected_mempool_index: Option<usize>,
     espo_tip: u64,
 ) -> Markup {
+    let selected_confirmed_js = current_height
+        .map(|height| height.to_string())
+        .unwrap_or_else(|| "null".to_string());
     let current_height = current_height.unwrap_or(espo_tip);
     let base_path_js = format!("{:?}", explorer_path("/"));
     let pool_icons_js = bundled_pool_icon_svgs_json();
@@ -26,7 +30,11 @@ fn block_carousel_inner(
     let ws_path = mempool_cfg.websocket_path.as_deref().unwrap_or("/api/events/ws").to_string();
     let ws_path_js = format!("{:?}", ws_path);
     let ws_enabled_js = mempool_cfg.websocket_enabled;
-    let mempool_slot_count = mempool_cfg.template_blocks.max(1);
+    let mempool_block_interval_secs = if get_config().network == Network::Regtest {
+        mempool_cfg.regtest_block_interval_secs
+    } else {
+        600
+    };
     let selected_mempool_js = selected_mempool_index
         .map(|idx| idx.to_string())
         .unwrap_or_else(|| "null".to_string());
@@ -44,7 +52,7 @@ fn block_carousel_inner(
   const POOL_ICONS = {pool_icons_js};
   const eventsPath = {ws_path_js};
   const eventsEnabled = {ws_enabled_js};
-  const MEMPOOL_SLOT_COUNT = {mempool_slot_count};
+  const MEMPOOL_BLOCK_INTERVAL_SECS = {mempool_block_interval_secs};
   const RUNES_ENABLED = {runes_enabled_js};
   const MEMPOOL_BLOCKS_ENABLED = {mempool_blocks_enabled_js};
   const LIVE_TIP_ANIMATION_ENABLED = MEMPOOL_BLOCKS_ENABLED;
@@ -57,8 +65,8 @@ fn block_carousel_inner(
   const track = root.querySelector('[data-bc-track]');
   const resetButton = root.querySelector('[data-bc-reset]');
   const current = Number(root.dataset.current);
-  const selectedMempoolIndex = {selected_mempool_js};
-  let selectedConfirmedHeight = selectedMempoolIndex === null ? current : null;
+  let selectedMempoolIndex = {selected_mempool_js};
+  let selectedConfirmedHeight = selectedMempoolIndex === null ? {selected_confirmed_js} : null;
   let espoTip = Number(root.dataset.espoTip);
   if (!scroller || !track || !Number.isFinite(current) || !Number.isFinite(espoTip)) return;
 
@@ -67,7 +75,7 @@ fn block_carousel_inner(
   const EDGE_THRESHOLD = 320;
   const LEFT_BUFFER_VIEWPORTS = 2;
   const RIGHT_BUFFER_VIEWPORTS = 2;
-  const WINDOW_VIEWPORTS_LEFT = 1;
+  const WINDOW_VIEWPORTS_LEFT = 2;
   const WINDOW_VIEWPORTS_RIGHT = 2;
   const MIN_VIEWPORT_BLOCKS = 10;
   const MIN_WINDOW_BLOCKS = 36;
@@ -92,7 +100,10 @@ fn block_carousel_inner(
   let leftRetryTimer = null;
   let rightRetryTimer = null;
   let confirmAnimationUntil = 0;
-  let queuedMempoolBlocks = null;
+  let queuedMempoolSnapshot = null;
+  let lastMempoolSequence = null;
+  let lastMempoolUpdatedAt = null;
+  let lastMempoolSnapshotKey = null;
   let leftDepleted = false;
   let rightDepleted = false;
   let initialCentered = false;
@@ -106,6 +117,14 @@ fn block_carousel_inner(
   let lastTipAnimationAt = 0;
   let followLatest = selectedMempoolIndex !== null || current === espoTip;
   let suppressFollowScrollUntil = 0;
+  let edgeLoadingArmed = false;
+  let eventsSocket = null;
+  let eventsReconnectTimer = null;
+  let eventsStableTimer = null;
+  let eventsReconnectAttempts = 0;
+  let eventsDisposed = false;
+  const eventSubscribers = new Set();
+  const trackedEventTxids = new Set();
 
   let isDragging = false;
   let dragStartX = 0;
@@ -282,7 +301,7 @@ fn block_carousel_inner(
 
   function renderSkeleton(side, index) {{
     return `
-      <div class="bc-slide bc-skeleton" data-bc-skeleton="${{side}}-${{index}}">
+      <div class="bc-slide bc-skeleton" data-bc-skeleton="${{side}}-${{index}}" data-bc-key="skeleton:${{side}}:${{index}}">
         <div class="bc-top" aria-hidden="true"></div>
         <div class="bc-card bc-card-skeleton" aria-hidden="true"></div>
         <div class="bc-pool-slot" aria-hidden="true"></div>
@@ -329,33 +348,79 @@ fn block_carousel_inner(
   function renderMempoolBlock(block) {{
     const href = `${{basePrefix}}/mempool-block/${{block.index + 1}}`;
     const isCurrent = Number(block.index) === selectedMempoolIndex;
-    const etaMinutes = (Number(block.index) + 1) * 10;
-    const etaLabel = isChinese ? `约 ${{etaMinutes}} 分钟后` : `in ~${{etaMinutes}} minutes`;
+    const renderKey = escapeHtml(mempoolBlockRenderKey(block));
     return `
-      <div class="bc-slide bc-mempool-slide" data-mempool-index="${{block.index}}" data-bc-key="mempool:${{block.index}}">
+      <div class="bc-slide bc-mempool-slide" data-mempool-index="${{block.index}}" data-bc-key="mempool:${{block.index}}" data-bc-render-key="${{renderKey}}">
         <div class="bc-top"></div>
         <a class="bc-card bc-mempool-card${{isCurrent ? ' current' : ''}}" href="${{href}}" draggable="false">
           <div class="bc-face">
-            ${{renderFeeStats(block)}}
-            <div class="bc-traces">${{formatTraces(block.trace_count || 0)}}</div>
-            <div class="bc-tx-count">${{formatTxCount(block.tx_count || 0)}}</div>
-            <div class="bc-time">${{etaLabel}}</div>
+            ${{renderMempoolFace(block)}}
           </div>
-          ${{isCurrent ? '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>' : ''}}
+          ${{isCurrent ? renderCurrentIndicator() : ''}}
         </a>
         <div class="bc-pool-slot"></div>
       </div>
     `;
   }}
 
-  function renderMempoolSkeleton(index) {{
+  function renderMempoolFace(block) {{
+    const etaSeconds = (Number(block.index) + 1) * MEMPOOL_BLOCK_INTERVAL_SECS;
+    const useMinutes = etaSeconds % 60 === 0;
+    const etaAmount = useMinutes ? etaSeconds / 60 : etaSeconds;
+    const etaLabel = isChinese
+      ? `约 ${{etaAmount}} ${{useMinutes ? '分钟' : '秒'}}后`
+      : `in ~${{etaAmount}} ${{useMinutes ? (etaAmount === 1 ? 'minute' : 'minutes') : (etaAmount === 1 ? 'second' : 'seconds')}}`;
     return `
-      <div class="bc-slide bc-mempool-slide bc-mempool-placeholder" data-mempool-index="${{index}}" data-bc-key="mempool:${{index}}">
-        <div class="bc-top"></div>
-        <div class="bc-card bc-card-skeleton bc-mempool-card" aria-hidden="true"></div>
-        <div class="bc-pool-slot" aria-hidden="true"></div>
-      </div>
+      ${{renderFeeStats(block)}}
+      <div class="bc-traces">${{formatTraces(block.trace_count || 0)}}</div>
+      <div class="bc-tx-count">${{formatTxCount(block.tx_count || 0)}}</div>
+      <div class="bc-time">${{etaLabel}}</div>
     `;
+  }}
+
+  function mempoolBlockRenderKey(block) {{
+    const feeRange = Array.isArray(block.fee_range)
+      ? block.fee_range
+      : (Array.isArray(block.feeRange) ? block.feeRange : []);
+    return JSON.stringify([
+      Number(block.index),
+      block.median_fee_rate ?? null,
+      block.min_fee_rate ?? null,
+      block.max_fee_rate ?? null,
+      feeRange,
+      Number(block.trace_count || 0),
+      Number(block.tx_count || 0)
+    ]);
+  }}
+
+  function renderCurrentIndicator() {{
+    return '<div class="bc-indicator" aria-hidden="true"><svg class="bc-indicator-svg" viewBox="0 0 24 14" focusable="false"><path d="M12 14L0 0h24L12 14z"></path></svg></div>';
+  }}
+
+  function elementFromMarkup(markup) {{
+    const template = document.createElement('template');
+    template.innerHTML = markup.trim();
+    return template.content.firstElementChild;
+  }}
+
+  function updateMempoolSlide(slide, block) {{
+    const index = Number(block.index);
+    const isCurrent = index === selectedMempoolIndex;
+    slide.dataset.mempoolIndex = String(block.index);
+    slide.dataset.bcKey = `mempool:${{block.index}}`;
+    const card = slide.querySelector('.bc-mempool-card');
+    if (!card) return;
+    card.setAttribute('href', `${{basePrefix}}/mempool-block/${{index + 1}}`);
+    card.classList.toggle('current', isCurrent);
+    const face = card.querySelector('.bc-face');
+    const renderKey = mempoolBlockRenderKey(block);
+    if (face && slide.dataset.bcRenderKey !== renderKey) {{
+      face.innerHTML = renderMempoolFace(block);
+      slide.dataset.bcRenderKey = renderKey;
+    }}
+    const indicator = card.querySelector('.bc-indicator');
+    if (isCurrent && !indicator) card.insertAdjacentHTML('beforeend', renderCurrentIndicator());
+    if (!isCurrent && indicator) indicator.remove();
   }}
 
   function renderBoundary() {{
@@ -370,79 +435,68 @@ fn block_carousel_inner(
     return MEMPOOL_BLOCKS_ENABLED && (isFollowingLatest() || maxH >= espoTip);
   }}
 
+  function stableAnimatedNodeKey(node) {{
+    if (
+      node.matches('.bc-mempool-slide[data-bc-key], .bc-skeleton[data-bc-key], [data-bc-boundary][data-bc-key]')
+    ) {{
+      return node.dataset.bcKey || null;
+    }}
+    return null;
+  }}
+
+  function replaceTrackPreservingAnimations(markup) {{
+    const template = document.createElement('template');
+    template.innerHTML = markup;
+    const desiredNodes = Array.from(template.content.children);
+    const existing = new Map();
+    Array.from(track.children).forEach((node) => {{
+      const key = stableAnimatedNodeKey(node);
+      if (key) existing.set(key, node);
+    }});
+
+    const preserved = new Set();
+    for (let index = 0; index < desiredNodes.length; index += 1) {{
+      const desired = desiredNodes[index];
+      const key = stableAnimatedNodeKey(desired);
+      const current = key ? existing.get(key) : null;
+      if (!current) continue;
+      if (current.matches('.bc-mempool-slide')) {{
+        const mempoolIndex = Number(desired.dataset.mempoolIndex);
+        const block = mempoolBlocks.find((item) => Number(item.index) === mempoolIndex);
+        if (block) updateMempoolSlide(current, block);
+      }}
+      desiredNodes[index] = current;
+      preserved.add(current);
+    }}
+
+    Array.from(track.children).forEach((node) => {{
+      if (!preserved.has(node)) node.remove();
+    }});
+
+    let cursor = track.firstElementChild;
+    desiredNodes.forEach((node) => {{
+      if (node === cursor) {{
+        cursor = cursor.nextElementSibling;
+        return;
+      }}
+      track.insertBefore(node, cursor);
+    }});
+  }}
+
   function render() {{
     blocks.sort((a, b) => b.height - a.height);
-    const mempoolByIndex = new Map(mempoolBlocks.map((block) => [Number(block.index), block]));
+    const renderedMempoolBlocks = [...mempoolBlocks]
+      .sort((a, b) => Number(b.index) - Number(a.index));
     const html = [];
     for (let i = 0; i < pendingLeft + bufferLeft; i++) html.push(renderSkeleton('left', i));
-    if (shouldRenderMempoolSide()) {{
-      for (let i = MEMPOOL_SLOT_COUNT - 1; i >= 0; i--) {{
-        const block = mempoolByIndex.get(i);
-        html.push(block ? renderMempoolBlock(block) : renderMempoolSkeleton(i));
-      }}
+    if (shouldRenderMempoolSide() && renderedMempoolBlocks.length) {{
+      for (const block of renderedMempoolBlocks) html.push(renderMempoolBlock(block));
       html.push(renderBoundary());
     }}
     for (const block of blocks) html.push(renderBlock(block));
     for (let i = 0; i < pendingRight + bufferRight; i++) html.push(renderSkeleton('right', i));
-    track.innerHTML = html.join('');
+    replaceTrackPreservingAnimations(html.join(''));
     refreshRelativeTimes();
-  }}
-
-  function htmlToElement(markup) {{
-    const template = document.createElement('template');
-    template.innerHTML = markup.trim();
-    return template.content.firstElementChild;
-  }}
-
-  function syncAttributes(target, source) {{
-    Array.from(target.attributes).forEach((attr) => {{
-      if (!source.hasAttribute(attr.name)) target.removeAttribute(attr.name);
-    }});
-    Array.from(source.attributes).forEach((attr) => {{
-      if (target.getAttribute(attr.name) !== attr.value) {{
-        target.setAttribute(attr.name, attr.value);
-      }}
-    }});
-  }}
-
-  function updateMempoolSlide(existing, next) {{
-    if (!existing || !next) return false;
-    syncAttributes(existing, next);
-    existing.className = next.className;
-
-    const existingTop = existing.querySelector('.bc-top');
-    const nextTop = next.querySelector('.bc-top');
-    if (existingTop && nextTop) existingTop.innerHTML = nextTop.innerHTML;
-
-    const existingPool = existing.querySelector('.bc-pool-slot');
-    const nextPool = next.querySelector('.bc-pool-slot');
-    if (existingPool && nextPool) existingPool.innerHTML = nextPool.innerHTML;
-
-    const existingCard = existing.querySelector('.bc-card');
-    const nextCard = next.querySelector('.bc-card');
-    if (!existingCard || !nextCard || existingCard.tagName !== nextCard.tagName) {{
-      existing.replaceWith(next);
-      return false;
-    }}
-
-    syncAttributes(existingCard, nextCard);
-    existingCard.className = nextCard.className;
-
-    const existingFace = existingCard.querySelector('.bc-face');
-    const nextFace = nextCard.querySelector('.bc-face');
-    if (existingFace && nextFace) {{
-      existingFace.innerHTML = nextFace.innerHTML;
-      refreshRelativeTimes();
-    }} else {{
-      existingCard.innerHTML = nextCard.innerHTML;
-      refreshRelativeTimes();
-      return true;
-    }}
-
-    existingCard.querySelectorAll('.bc-indicator').forEach((indicator) => indicator.remove());
-    const nextIndicator = nextCard.querySelector('.bc-indicator');
-    if (nextIndicator) existingCard.appendChild(nextIndicator.cloneNode(true));
-    return true;
   }}
 
   function captureCarouselPositions() {{
@@ -499,10 +553,48 @@ fn block_carousel_inner(
     }}, TIP_ANIMATION_MS + 80);
   }}
 
-  function renderPreservingAnchor(anchorSelector) {{
+  function reconcileMempoolSlides(anchorSelector) {{
     const anchor = track.querySelector(anchorSelector);
     const beforeLeft = anchor ? anchor.getBoundingClientRect().left : null;
-    render();
+    const renderedMempoolBlocks = [...mempoolBlocks]
+      .sort((a, b) => Number(b.index) - Number(a.index));
+    const existingSlides = new Map();
+    track.querySelectorAll('.bc-mempool-slide[data-mempool-index]').forEach((slide) => {{
+      existingSlides.set(String(slide.dataset.mempoolIndex), slide);
+    }});
+    let boundary = track.querySelector('[data-bc-boundary]');
+
+    if (!shouldRenderMempoolSide() || !renderedMempoolBlocks.length) {{
+      existingSlides.forEach((slide) => slide.remove());
+      if (boundary) boundary.remove();
+    }} else {{
+      if (!boundary) {{
+        boundary = elementFromMarkup(renderBoundary());
+        const firstConfirmed = track.querySelector('[data-height]');
+        if (firstConfirmed) track.insertBefore(boundary, firstConfirmed);
+        else track.appendChild(boundary);
+      }}
+      const desiredSlides = [];
+      renderedMempoolBlocks.forEach((block) => {{
+        const key = String(block.index);
+        let slide = existingSlides.get(key);
+        if (slide) {{
+          updateMempoolSlide(slide, block);
+          existingSlides.delete(key);
+        }} else {{
+          slide = elementFromMarkup(renderMempoolBlock(block));
+        }}
+        if (slide) desiredSlides.push(slide);
+      }});
+      existingSlides.forEach((slide) => slide.remove());
+      let nextNode = boundary;
+      for (let index = desiredSlides.length - 1; index >= 0; index -= 1) {{
+        const slide = desiredSlides[index];
+        if (slide.nextElementSibling !== nextNode) track.insertBefore(slide, nextNode);
+        nextNode = slide;
+      }}
+    }}
+
     if (beforeLeft === null) return;
     const nextAnchor = track.querySelector(anchorSelector);
     if (!nextAnchor) return;
@@ -514,19 +606,7 @@ fn block_carousel_inner(
   }}
 
   function renderMempoolUpdate() {{
-    const mempoolByIndex = new Map(mempoolBlocks.map((block) => [Number(block.index), block]));
-    for (let i = MEMPOOL_SLOT_COUNT - 1; i >= 0; i--) {{
-      const key = `mempool:${{i}}`;
-      const existing = track.querySelector(`[data-bc-key="${{key}}"]`);
-      const block = mempoolByIndex.get(i);
-      const next = htmlToElement(block ? renderMempoolBlock(block) : renderMempoolSkeleton(i));
-      if (!existing) {{
-        const boundary = track.querySelector('[data-bc-boundary]');
-        if (boundary) track.insertBefore(next, boundary);
-        continue;
-      }}
-      updateMempoolSlide(existing, next);
-    }}
+    reconcileMempoolSlides(`[data-height="${{selectedHeight}}"]`);
     updateResetButton();
     queueEdgeCheck();
   }}
@@ -752,6 +832,7 @@ fn block_carousel_inner(
   }}
 
   function markUserNavigated() {{
+    edgeLoadingArmed = true;
     if (performance.now() < suppressFollowScrollUntil) return;
     followLatest = false;
     selectedConfirmedHeight = null;
@@ -926,13 +1007,66 @@ fn block_carousel_inner(
     }}
   }}
 
-  function applyMempoolSnapshot(snapshot, force = false) {{
+  function mempoolSnapshotKey(snapshot) {{
+    const sequence = Number(snapshot.sequence);
+    return JSON.stringify([
+      Number.isFinite(sequence) ? sequence : null,
+      snapshot.blocks.map(mempoolBlockRenderKey)
+    ]);
+  }}
+
+  function mempoolSnapshotIsStale(snapshot) {{
+    const sequence = Number(snapshot.sequence);
+    const updatedAt = Number(snapshot.updated_at);
+    if (!Number.isFinite(sequence) || lastMempoolSequence === null) return false;
+    if (sequence !== lastMempoolSequence) return sequence < lastMempoolSequence;
+    return Number.isFinite(updatedAt)
+      && lastMempoolUpdatedAt !== null
+      && updatedAt < lastMempoolUpdatedAt;
+  }}
+
+  function compareMempoolSnapshots(left, right) {{
+    const leftSequence = Number(left.sequence);
+    const rightSequence = Number(right.sequence);
+    if (Number.isFinite(leftSequence) && Number.isFinite(rightSequence)) {{
+      if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+      const leftUpdatedAt = Number(left.updated_at);
+      const rightUpdatedAt = Number(right.updated_at);
+      if (Number.isFinite(leftUpdatedAt) && Number.isFinite(rightUpdatedAt)) {{
+        return leftUpdatedAt - rightUpdatedAt;
+      }}
+    }}
+    return 0;
+  }}
+
+  function applyMempoolSnapshot(snapshot, force = false, allowSequenceReset = false) {{
     if (!MEMPOOL_BLOCKS_ENABLED) return;
     if (!snapshot || !Array.isArray(snapshot.blocks)) return;
+    const sequence = Number(snapshot.sequence);
+    if (
+      allowSequenceReset &&
+      Number.isFinite(sequence) &&
+      lastMempoolSequence !== null &&
+      sequence < lastMempoolSequence
+    ) {{
+      lastMempoolSequence = null;
+      lastMempoolUpdatedAt = null;
+      lastMempoolSnapshotKey = null;
+      queuedMempoolSnapshot = null;
+    }}
+    if (mempoolSnapshotIsStale(snapshot)) return;
     if (!force && performance.now() < confirmAnimationUntil) {{
-      queuedMempoolBlocks = snapshot.blocks;
+      if (!queuedMempoolSnapshot || compareMempoolSnapshots(snapshot, queuedMempoolSnapshot) >= 0) {{
+        queuedMempoolSnapshot = snapshot;
+      }}
       return;
     }}
+    const snapshotKey = mempoolSnapshotKey(snapshot);
+    if (snapshotKey === lastMempoolSnapshotKey) return;
+    const updatedAt = Number(snapshot.updated_at);
+    if (Number.isFinite(sequence)) lastMempoolSequence = sequence;
+    if (Number.isFinite(updatedAt)) lastMempoolUpdatedAt = updatedAt;
+    lastMempoolSnapshotKey = snapshotKey;
     mempoolBlocks = snapshot.blocks;
     if (initialCentered) renderMempoolUpdate();
     else render();
@@ -940,10 +1074,10 @@ fn block_carousel_inner(
 
   function flushQueuedMempoolBlocks() {{
     if (!MEMPOOL_BLOCKS_ENABLED) return;
-    if (queuedMempoolBlocks) {{
-      const next = queuedMempoolBlocks;
-      queuedMempoolBlocks = null;
-      applyMempoolSnapshot({{ blocks: next }}, true);
+    if (queuedMempoolSnapshot) {{
+      const next = queuedMempoolSnapshot;
+      queuedMempoolSnapshot = null;
+      applyMempoolSnapshot(next, true);
       return;
     }}
     fetchMempoolBlocks();
@@ -1031,64 +1165,174 @@ fn block_carousel_inner(
     }}
   }}
 
+  function applyEventTip(nextTip, shouldAnimate) {{
+    if (!Number.isFinite(nextTip) || nextTip <= espoTip) return;
+    const previousTip = espoTip;
+    const wasFollowingLatest = isFollowingLatest();
+    espoTip = nextTip;
+    root.dataset.espoTip = String(espoTip);
+    leftDepleted = maxH >= espoTip;
+    if (!wasFollowingLatest) {{
+      updateResetButton();
+      queueEdgeCheck();
+      return;
+    }}
+    scheduleLatestTipRefresh(previousTip, shouldAnimate);
+  }}
+
+  function disposeEvents() {{
+    eventsDisposed = true;
+    eventSubscribers.clear();
+    trackedEventTxids.clear();
+    if (eventsReconnectTimer) {{
+      window.clearTimeout(eventsReconnectTimer);
+      eventsReconnectTimer = null;
+    }}
+    if (eventsStableTimer) {{
+      window.clearTimeout(eventsStableTimer);
+      eventsStableTimer = null;
+    }}
+    const socket = eventsSocket;
+    eventsSocket = null;
+    if (socket && socket.readyState < WebSocket.CLOSING) {{
+      try {{ socket.close(1000, 'carousel replaced'); }} catch (_) {{}}
+    }}
+  }}
+
+  const eventsControllerKey = '__espoBlockCarouselEvents';
+  const previousEventsController = window[eventsControllerKey];
+  if (previousEventsController && typeof previousEventsController.dispose === 'function') {{
+    previousEventsController.dispose();
+  }}
+  const eventsController = {{
+    dispose: disposeEvents,
+    subscribe(listener) {{
+      if (typeof listener !== 'function' || eventsDisposed) return () => {{}};
+      eventSubscribers.add(listener);
+      return () => eventSubscribers.delete(listener);
+    }},
+    trackTransaction(txid) {{
+      const normalized = String(txid || '').trim();
+      if (!normalized || eventsDisposed) return;
+      trackedEventTxids.add(normalized);
+      if (eventsSocket && eventsSocket.readyState === WebSocket.OPEN) {{
+        try {{
+          eventsSocket.send(JSON.stringify({{ action: 'want', data: ['tx'], txid: normalized }}));
+        }} catch (_) {{}}
+      }}
+    }},
+    selectMempoolBlock(index) {{
+      if (index === null || index === undefined || index === '') return;
+      const targetIndex = Number(index);
+      if (!Number.isInteger(targetIndex) || targetIndex < 0 || eventsDisposed) return;
+      if (selectedMempoolIndex === targetIndex && selectedConfirmedHeight === null) return;
+      selectedMempoolIndex = targetIndex;
+      selectedConfirmedHeight = null;
+      followLatest = true;
+      renderMempoolUpdate();
+      requestAnimationFrame(() => centerMempool(targetIndex, true));
+    }},
+    selectConfirmedBlock(height) {{
+      const targetHeight = Number(height);
+      if (!Number.isFinite(targetHeight) || targetHeight < 0 || eventsDisposed) return;
+      selectedMempoolIndex = null;
+      selectedConfirmedHeight = targetHeight;
+      selectedHeight = targetHeight;
+      root.dataset.current = String(targetHeight);
+      followLatest = targetHeight === espoTip;
+
+      if (!seen.has(targetHeight)) {{
+        if (targetHeight !== espoTip) {{
+          fetchWindow(targetHeight).then((batch) => {{
+            if (!batch || eventsDisposed) return;
+            applyBlocks(batch);
+            render();
+            requestAnimationFrame(() => centerHeight(targetHeight, true));
+          }});
+        }}
+        return;
+      }}
+
+      render();
+      requestAnimationFrame(() => centerHeight(targetHeight, true));
+    }}
+  }};
+  window[eventsControllerKey] = eventsController;
+
+  function scheduleEventsReconnect() {{
+    if (eventsDisposed || eventsReconnectTimer || !root.isConnected) return;
+    const delay = Math.min(15_000, 1_000 * (2 ** Math.min(eventsReconnectAttempts, 4)));
+    eventsReconnectAttempts += 1;
+    eventsReconnectTimer = window.setTimeout(() => {{
+      eventsReconnectTimer = null;
+      connectEvents();
+    }}, delay);
+  }}
+
   function connectEvents() {{
-    if (!eventsEnabled || !window.WebSocket) return;
+    if (
+      !eventsEnabled ||
+      !window.WebSocket ||
+      eventsDisposed ||
+      !root.isConnected ||
+      eventsSocket
+    ) return;
     const wsPath = eventsPath.startsWith('/') ? `${{basePrefix}}${{eventsPath}}` : `${{basePrefix}}/${{eventsPath}}`;
     let socket;
     try {{
       socket = new WebSocket(`${{wsProtocol}}//${{window.location.host}}${{wsPath}}`);
     }} catch (_) {{
+      scheduleEventsReconnect();
       return;
     }}
+    eventsSocket = socket;
     socket.addEventListener('open', () => {{
-      if (MEMPOOL_BLOCKS_ENABLED) {{
-        try {{
-          socket.send(JSON.stringify({{ action: 'want', data: ['mempool-blocks'] }}));
-          socket.send(JSON.stringify({{ 'refresh-mempool-blocks': true }}));
-        }} catch (_) {{}}
-        fetchMempoolBlocks();
-      }}
+      if (eventsSocket !== socket || eventsDisposed) return;
+      if (eventsStableTimer) window.clearTimeout(eventsStableTimer);
+      eventsStableTimer = window.setTimeout(() => {{
+        eventsStableTimer = null;
+        if (eventsSocket === socket) eventsReconnectAttempts = 0;
+      }}, 10_000);
+      const wantedEvents = ['block'];
+      if (MEMPOOL_BLOCKS_ENABLED) wantedEvents.push('mempool-blocks');
+      try {{ socket.send(JSON.stringify({{ action: 'want', data: wantedEvents }})); }} catch (_) {{}}
+      trackedEventTxids.forEach((txid) => {{
+        try {{ socket.send(JSON.stringify({{ action: 'want', data: ['tx'], txid }})); }} catch (_) {{}}
+      }});
     }});
     socket.addEventListener('message', (event) => {{
+      if (eventsSocket !== socket || eventsDisposed || !root.isConnected) return;
       let payload;
       try {{
         payload = JSON.parse(event.data);
       }} catch (_) {{
         return;
       }}
-      if (MEMPOOL_BLOCKS_ENABLED && payload.type === 'hello' && payload.data && payload.data.mempool) {{
-        applyMempoolSnapshot(payload.data.mempool);
+      if (payload.type === 'hello' && payload.data) {{
+        applyEventTip(Number(payload.data.espo_tip), false);
+        if (MEMPOOL_BLOCKS_ENABLED && payload.data.mempool) {{
+          applyMempoolSnapshot(payload.data.mempool, false, true);
+        }}
       }}
       if (MEMPOOL_BLOCKS_ENABLED && payload.type === 'mempool-blocks' && payload.data) {{
         applyMempoolSnapshot(payload.data);
       }}
       if (payload.type === 'block') {{
-        const nextTip = Number(payload.data && payload.data.height);
-        const previousTip = espoTip;
-        if (Number.isFinite(nextTip) && nextTip > espoTip) {{
-          const wasFollowingLatest = isFollowingLatest();
-          const shouldInsertNewTip =
-            wasFollowingLatest &&
-            (selectedMempoolIndex !== null ||
-              selectedConfirmedHeight === previousTip ||
-              selectedHeight === previousTip);
-          espoTip = nextTip;
-          root.dataset.espoTip = String(espoTip);
-          if (wasFollowingLatest && selectedConfirmedHeight === previousTip) {{
-            selectedConfirmedHeight = nextTip;
-            root.dataset.current = String(nextTip);
-          }}
-          leftDepleted = maxH >= espoTip;
-          if (!shouldInsertNewTip) {{
-            updateResetButton();
-            queueEdgeCheck();
-            return;
-          }}
-          scheduleLatestTipRefresh(previousTip, true);
-        }}
+        applyEventTip(Number(payload.data && payload.data.height), true);
       }}
+      eventSubscribers.forEach((listener) => {{
+        try {{ listener(payload); }} catch (_) {{}}
+      }});
     }});
-    socket.addEventListener('close', () => window.setTimeout(connectEvents, 2500));
+    socket.addEventListener('close', () => {{
+      if (eventsSocket !== socket) return;
+      eventsSocket = null;
+      if (eventsStableTimer) {{
+        window.clearTimeout(eventsStableTimer);
+        eventsStableTimer = null;
+      }}
+      scheduleEventsReconnect();
+    }});
   }}
 
   async function fetchLeft() {{
@@ -1194,6 +1438,7 @@ fn block_carousel_inner(
     updateSelectedHeight();
     if (!programmaticScrollRaf) pruneBlocksAroundViewport();
     updateResetButton();
+    if (!edgeLoadingArmed) return;
     const realRemainingLeft = realLeftEdge() - scroller.scrollLeft;
     const shouldFetchLeft = realRemainingLeft <= Math.max(EDGE_THRESHOLD, scroller.clientWidth * 1.5);
     ensureLeftBufferAhead();
@@ -1281,14 +1526,26 @@ fn block_carousel_inner(
 
   render();
   if (MEMPOOL_BLOCKS_ENABLED) fetchMempoolBlocks();
+  window.addEventListener('online', () => {{
+    if (eventsDisposed || eventsSocket) return;
+    if (eventsReconnectTimer) {{
+      window.clearTimeout(eventsReconnectTimer);
+      eventsReconnectTimer = null;
+    }}
+    connectEvents();
+  }});
+  window.addEventListener('pagehide', () => {{
+    if (window[eventsControllerKey] === eventsController) disposeEvents();
+  }}, {{ once: true }});
   connectEvents();
   fetchInitial();
 }})();
 "#,
         base_path_js = base_path_js,
+        selected_confirmed_js = selected_confirmed_js,
         pool_icons_js = pool_icons_js,
         ws_path_js = ws_path_js,
-        mempool_slot_count = mempool_slot_count,
+        mempool_block_interval_secs = mempool_block_interval_secs,
         selected_mempool_js = selected_mempool_js,
         is_chinese = is_chinese,
         runes_enabled_js = runes_enabled_js,

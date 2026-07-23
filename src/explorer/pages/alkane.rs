@@ -34,14 +34,15 @@ use crate::modules::ammdata::storage::{
     parse_change_basis_points,
 };
 use crate::modules::essentials::storage::{
-    BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
-    spk_to_address_str,
+    BalanceEntry, HolderId, load_creation_record, spk_to_address_str,
 };
 use crate::modules::essentials::utils::balances::{
     get_alkane_balances, get_holders_for_alkane, get_total_received_for_alkane,
     get_transfer_volume_for_alkane,
 };
-use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
+use crate::modules::essentials::utils::inspections::{
+    StoredInspectionMethod, load_inspection, resolve_proxy_target_recursive,
+};
 use crate::modules::pizzafun::storage::{GetSeriesByAlkaneParams, PizzafunProvider};
 use crate::modules::tokendata::schemas::{SchemaTokenActivityV1, TokenActivityKind};
 use crate::modules::tokendata::storage::{
@@ -53,13 +54,10 @@ use crate::schemas::SchemaAlkaneId;
 use alloy_primitives::U256;
 use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Txid};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const ADDR_SUFFIX_LEN: usize = 8;
-const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
-const KV_KEY_BEACON: &[u8] = b"/beacon";
-const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward", 36863)];
 const DIESEL_ALKANE_ID: SchemaAlkaneId = SchemaAlkaneId { block: 2, tx: 0 };
 
 #[derive(Deserialize)]
@@ -1027,6 +1025,8 @@ pub async fn alkane_page(
         }
     };
     let holder_export_action = explorer_path("/api/alkane/holders/export");
+    let abi_export_action = explorer_path("/api/alkane/abi/export");
+    let wasm_export_action = explorer_path("/api/alkane/wasm/export");
 
     let (activity_total, activity_entries, activity_label) = if tab == AlkaneTab::Volume {
         match volume_kind {
@@ -1950,12 +1950,43 @@ pub async fn alkane_page(
                                         span class="alkane-inspect-name" { (inspect_name.clone()) }
                                         span class="alkane-inspect-id mono" { (inspect_id_label.clone()) }
                                     }
-                                    div class="alkane-inspect-block-control" {
-                                        span class="alkane-inspect-block-label" { "View as block:" }
+                                    div class="alkane-inspect-block-control order-control" {
+                                        span class="alkane-inspect-block-label muted" { "View as block:" }
                                         div class="hero-search-input alkane-inspect-block-input-wrap" {
                                             input class="hero-search-field alkane-inspect-block-input mono" type="text" value="latest" placeholder="latest" data-sim-block-input="" aria-label="View as block" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
                                         }
                                     }
+                                    form class="order-control holders-export-form alkabi-export-form" action=(abi_export_action) method="get" data-download-form="" data-alkabi-export-form="" {
+                                        input type="hidden" name="alkane" value=(alk_str.clone());
+                                        input type="hidden" name="format" value="json";
+                                        span class="muted" { "Download Alkabi ABI:" }
+                                        div class="dropdown holders-export-dropdown" data-dropdown="" data-open="" {
+                                            button class="dropdown-trigger" type="button" aria-label="Select Alkabi ABI format" aria-haspopup="true" aria-expanded="false" data-dropdown-toggle="" {
+                                                span class="dropdown-label" data-dropdown-selected-label="" { "JSON" }
+                                                span class="dropdown-caret" { (icon_dropdown_caret()) }
+                                            }
+                                            div class="dropdown-panel" role="menu" aria-hidden="true" {
+                                                button class="dropdown-item selected" type="button" role="menuitem" data-dropdown-value="json" data-dropdown-input="format" data-dropdown-label="JSON" {
+                                                    span class="dropdown-icon dropdown-check-slot" { (icon_dropdown_check()) }
+                                                    span class="dropdown-label" { "JSON" }
+                                                }
+                                                button class="dropdown-item" type="button" role="menuitem" data-dropdown-value="ts" data-dropdown-input="format" data-dropdown-label="TS" {
+                                                    span class="dropdown-icon dropdown-check-slot" { (icon_dropdown_check()) }
+                                                    span class="dropdown-label" { "TS" }
+                                                }
+                                            }
+                                        }
+                                        button class="holders-export-button alkabi-export-button" type="submit" data-alkabi-export-submit="" {
+                                            span data-alkabi-export-label="" { "Download" }
+                                            span class="alkabi-export-spinner" aria-hidden="true" {}
+                                        }
+                                        span class="alkabi-export-status muted" role="status" aria-live="polite" data-alkabi-export-status="" {}
+                                    }
+                                    form class="alkane-wasm-export-form" action=(wasm_export_action) method="get" target="alkane-wasm-download-frame" data-download-form="" {
+                                        input type="hidden" name="alkane" value=(alk_str.clone());
+                                        button class="holders-export-button" type="submit" { "Download WASM" }
+                                    }
+                                    iframe class="holders-export-frame" name="alkane-wasm-download-frame" title="Contract WASM download" aria-hidden="true" {}
                                     @if view_methods.is_empty() && write_methods.is_empty() {
                                         p class="muted" { "No contract methods found." }
                                     } @else {
@@ -2347,89 +2378,6 @@ fn split_methods(
         }
     }
     (view, write)
-}
-
-fn is_upgradeable_proxy(
-    inspection: &crate::modules::essentials::utils::inspections::StoredInspectionResult,
-) -> bool {
-    let Some(meta) = inspection.metadata.as_ref() else { return false };
-    UPGRADEABLE_METHODS.iter().all(|(name, opcode)| {
-        meta.methods
-            .iter()
-            .any(|m| m.name.eq_ignore_ascii_case(name) && m.opcode == *opcode)
-    })
-}
-
-fn kv_row_key(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(1 + 4 + 8 + 2 + skey.len());
-    v.push(0x01);
-    v.extend_from_slice(&alk.block.to_be_bytes());
-    v.extend_from_slice(&alk.tx.to_be_bytes());
-    let len = u16::try_from(skey.len()).unwrap_or(u16::MAX);
-    v.extend_from_slice(&len.to_be_bytes());
-    if len as usize != skey.len() {
-        v.extend_from_slice(&skey[..(len as usize)]);
-    } else {
-        v.extend_from_slice(skey);
-    }
-    v
-}
-
-fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
-    if raw.len() < 32 {
-        return None;
-    }
-    let block_bytes: [u8; 16] = raw[0..16].try_into().ok()?;
-    let tx_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
-    let block = u128::from_le_bytes(block_bytes);
-    let tx = u128::from_le_bytes(tx_bytes);
-    if block > u32::MAX as u128 || tx > u64::MAX as u128 {
-        return None;
-    }
-    Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
-}
-
-fn proxy_target_from_db(
-    alk: &SchemaAlkaneId,
-    provider: &EssentialsProvider,
-) -> Option<SchemaAlkaneId> {
-    let lookup = |key| {
-        provider
-            .get_raw_value(GetRawValueParams {
-                blockhash: StateAt::Latest,
-                key: kv_row_key(alk, key),
-            })
-            .ok()
-            .and_then(|resp| resp.value)
-            .and_then(|raw| {
-                if raw.len() >= 32 {
-                    decode_kv_implementation(&raw[32..])
-                } else {
-                    decode_kv_implementation(&raw)
-                }
-            })
-    };
-    lookup(KV_KEY_IMPLEMENTATION).or_else(|| lookup(KV_KEY_BEACON))
-}
-
-fn resolve_proxy_target_recursive(
-    start: &SchemaAlkaneId,
-    provider: &EssentialsProvider,
-) -> Option<SchemaAlkaneId> {
-    let mut current = *start;
-    let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
-    for _ in 0..8 {
-        let inspection = load_inspection(provider, &current).ok().flatten()?;
-        if !is_upgradeable_proxy(&inspection) {
-            return (current != *start).then_some(current);
-        }
-        let next = proxy_target_from_db(&current, provider)?;
-        if !seen.insert(next) {
-            return None;
-        }
-        current = next;
-    }
-    None
 }
 
 fn alkane_balance_chart_scripts() -> Markup {
@@ -2885,10 +2833,61 @@ fn inspect_scripts() -> Markup {
   if (!alkaneId) return;
   const writeDefault = 'Providing inputs to simulate methods is not currently supported on espo';
   const blockInput = root.querySelector('[data-sim-block-input]');
+  const abiForm = root.querySelector('[data-alkabi-export-form]');
   const currentBlockTag = () => {
     const value = blockInput && typeof blockInput.value === 'string' ? blockInput.value.trim() : '';
     return value || 'latest';
   };
+  const downloadAbi = async (event) => {
+    event.preventDefault();
+    if (!abiForm || abiForm.dataset.loading === '1') return;
+    const button = abiForm.querySelector('[data-alkabi-export-submit]');
+    const status = abiForm.querySelector('[data-alkabi-export-status]');
+    if (!button) return;
+
+    abiForm.dataset.loading = '1';
+    button.disabled = true;
+    button.dataset.loading = '1';
+    button.setAttribute('aria-busy', 'true');
+    if (status) status.textContent = '';
+
+    try {
+      const params = new URLSearchParams(new FormData(abiForm));
+      const response = await fetch(`${abiForm.action}?${params.toString()}`, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json, text/typescript' }
+      });
+      if (!response.ok) {
+        throw new Error((await response.text()) || 'ABI export failed');
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get('Content-Disposition') || '';
+      const filenameMatch = disposition.match(/filename="([^"]+)"/i);
+      const extension = params.get('format') === 'ts' ? 'ts' : 'json';
+      const filename = filenameMatch ? filenameMatch[1] : `alkane.${extension}`;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      link.hidden = true;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (error) {
+      if (status) {
+        status.textContent = error && error.message ? error.message : 'ABI export failed';
+      }
+    } finally {
+      abiForm.dataset.loading = '0';
+      button.disabled = false;
+      button.dataset.loading = '0';
+      button.removeAttribute('aria-busy');
+    }
+  };
+  if (abiForm) {
+    abiForm.addEventListener('submit', downloadAbi);
+  }
   const clearValueNode = (node) => {
     if (!node) return;
     node.removeAttribute('data-cards');

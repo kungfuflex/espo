@@ -9,8 +9,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::{
-    get_bitcoind_rpc_client, get_config, get_espo_db, get_espo_next_height, get_metashrew_rpc_url,
-    get_network,
+    get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_db, get_espo_next_height,
+    get_metashrew_rpc_url, get_network,
 };
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
@@ -27,6 +27,9 @@ use crate::modules::essentials::storage::{
     GetListEntriesDescParams, HolderEntry, HolderId, HoldersCountEntry, get_cached_block_summary,
     load_creation_record,
 };
+use crate::modules::essentials::utils::alkabi::{
+    AlkabiFormat, extract_contract_alkabi, load_contract_wasm,
+};
 use crate::modules::essentials::utils::balances::get_holders_for_alkane;
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::modules::runes::main::{runes_enabled_from_global_config, runes_genesis_block};
@@ -34,7 +37,8 @@ use crate::modules::runes::storage::{RuneEntry, RunesProvider, SchemaRuneId};
 use crate::modules::tokendata::storage::TokenDataProvider;
 use crate::runtime::mdb::Mdb;
 use crate::runtime::mempool::{
-    current_mempool_compact_snapshot, get_mempool_block_transaction_ids, subscribe_mempool_events,
+    current_mempool_compact_snapshot, get_mempool_block_transaction_ids, pending_by_txid,
+    subscribe_mempool_events,
 };
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
@@ -51,7 +55,7 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use bitcoin::transaction::Version;
-use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
+use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid};
 use bitcoincore_rpc::RpcApi;
 use bitcoincore_rpc::bitcoin::Network;
 use borsh::BorshDeserialize;
@@ -66,7 +70,7 @@ use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
-use tokio::time::{Duration, interval};
+use tokio::time::{Duration, Instant as TokioInstant, interval_at};
 
 #[derive(Deserialize)]
 pub struct CarouselQuery {
@@ -167,12 +171,139 @@ pub async fn explorer_events_ws(ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(handle_explorer_events_socket)
 }
 
+fn explorer_tx_status_payload(txid: &Txid) -> String {
+    let data = if let Some(entry) = pending_by_txid(txid) {
+        json!({
+            "txid": txid.to_string(),
+            "status": "mempool",
+            "height": null,
+            "timestamp": null,
+            "confirmations": 0,
+            "mempool_block": entry.position.as_ref().map(|position| position.block),
+        })
+    } else if let Ok(Some(height)) = get_electrum_like().transaction_get_height(txid) {
+        let timestamp =
+            get_cached_block_summary(height as u32).and_then(|summary| summary.block_time());
+        let tip = get_espo_next_height().saturating_sub(1) as u64;
+        json!({
+            "txid": txid.to_string(),
+            "status": "confirmed",
+            "height": height,
+            "timestamp": timestamp,
+            "confirmations": tip.saturating_sub(height).saturating_add(1),
+        })
+    } else {
+        json!({
+            "txid": txid.to_string(),
+            "status": "not_found",
+            "height": null,
+            "timestamp": null,
+            "confirmations": 0,
+        })
+    };
+    json!({ "type": "tx-status", "data": data }).to_string()
+}
+
+#[derive(Default)]
+struct ExplorerEventSubscriptions {
+    blocks: bool,
+    mempool_blocks: bool,
+    txids: HashSet<String>,
+    addresses: HashSet<String>,
+}
+
+fn filtered_explorer_event(
+    payload: &Value,
+    subscriptions: &ExplorerEventSubscriptions,
+) -> Option<Value> {
+    let event_type = payload.get("type").and_then(Value::as_str)?;
+    let data = payload.get("data").and_then(Value::as_object);
+
+    match event_type {
+        "mempool-blocks" => subscriptions.mempool_blocks.then(|| payload.clone()),
+        "block" => {
+            if !subscriptions.blocks {
+                return None;
+            }
+            let matching_txids: Vec<String> = data
+                .and_then(|data| data.get("txids"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|txid| subscriptions.txids.contains(*txid))
+                .map(str::to_string)
+                .collect();
+            let mut filtered = payload.clone();
+            filtered["data"]["txids"] = json!(matching_txids);
+            Some(filtered)
+        }
+        "tx" => {
+            if subscriptions.txids.is_empty() {
+                return None;
+            }
+            let single_matches = data
+                .and_then(|data| data.get("txid"))
+                .and_then(Value::as_str)
+                .map(|txid| subscriptions.txids.contains(txid))
+                .unwrap_or(false);
+            let matching_txids: Vec<String> = data
+                .and_then(|data| data.get("txids"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|txid| subscriptions.txids.contains(*txid))
+                .map(str::to_string)
+                .collect();
+            if !single_matches && matching_txids.is_empty() {
+                return None;
+            }
+            let mut filtered = payload.clone();
+            if data.and_then(|data| data.get("txids")).is_some() {
+                filtered["data"]["txids"] = json!(matching_txids);
+            }
+            Some(filtered)
+        }
+        "address-tx" => {
+            if subscriptions.addresses.is_empty() {
+                return None;
+            }
+            let single_matches = data
+                .and_then(|data| data.get("address"))
+                .and_then(Value::as_str)
+                .map(|address| subscriptions.addresses.contains(address))
+                .unwrap_or(false);
+            let matching_addresses = data
+                .and_then(|data| data.get("addresses"))
+                .and_then(Value::as_object)
+                .map(|addresses| {
+                    addresses
+                        .iter()
+                        .filter(|(address, _)| subscriptions.addresses.contains(*address))
+                        .map(|(address, txids)| (address.clone(), txids.clone()))
+                        .collect::<serde_json::Map<String, Value>>()
+                })
+                .unwrap_or_default();
+            if !single_matches && matching_addresses.is_empty() {
+                return None;
+            }
+            let mut filtered = payload.clone();
+            if data.and_then(|data| data.get("addresses")).is_some() {
+                filtered["data"]["addresses"] = Value::Object(matching_addresses);
+            }
+            Some(filtered)
+        }
+        _ => None,
+    }
+}
+
 async fn handle_explorer_events_socket(mut socket: WebSocket) {
     let mut tracked_mempool_block: Option<usize> = None;
+    let mut subscriptions = ExplorerEventSubscriptions::default();
     let initial = json!({
         "type": "hello",
         "data": {
-            "mempool": explorer_mempool_snapshot(),
             "espo_tip": get_espo_next_height().saturating_sub(1),
         }
     });
@@ -181,30 +312,34 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
     }
 
     let mut events = subscribe_mempool_events();
-    let mut heartbeat = interval(Duration::from_secs(25));
+    let heartbeat_period = Duration::from_secs(25);
+    let mut heartbeat = interval_at(TokioInstant::now() + heartbeat_period, heartbeat_period);
     loop {
         tokio::select! {
             event = events.recv() => {
                 match event {
                     Ok(payload) => {
                         let parsed_payload = serde_json::from_str::<Value>(&payload).ok();
-                        let client_payload = if parsed_payload
+                        if let Some(filtered) = parsed_payload
                             .as_ref()
-                            .and_then(|value| value.get("type"))
-                            .and_then(|value| value.as_str())
-                            == Some("mempool-blocks")
+                            .and_then(|payload| filtered_explorer_event(payload, &subscriptions))
                         {
-                            json!({
-                                "type": "mempool-blocks",
-                                "data": explorer_mempool_snapshot(),
-                            })
-                            .to_string()
-                        } else {
-                            strip_mempool_deltas_for_client(parsed_payload.as_ref())
-                                .unwrap_or(payload)
-                        };
-                        if socket.send(WsMessage::Text(client_payload.into())).await.is_err() {
-                            break;
+                            let client_payload = if filtered
+                                .get("type")
+                                .and_then(Value::as_str)
+                                == Some("mempool-blocks")
+                            {
+                                json!({
+                                    "type": "mempool-blocks",
+                                    "data": explorer_mempool_snapshot(),
+                                })
+                                .to_string()
+                            } else {
+                                filtered.to_string()
+                            };
+                            if socket.send(WsMessage::Text(client_payload.into())).await.is_err() {
+                                break;
+                            }
                         }
                         if let Some(index) = tracked_mempool_block {
                             if let Some(parsed) = parsed_payload.clone() {
@@ -237,8 +372,75 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let payload = json!({"type": "mempool-blocks", "data": explorer_mempool_snapshot()}).to_string();
-                        if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                        let mut disconnected = false;
+                        if subscriptions.blocks {
+                            let payload = json!({
+                                "type": "hello",
+                                "data": {
+                                    "espo_tip": get_espo_next_height().saturating_sub(1),
+                                }
+                            })
+                            .to_string();
+                            disconnected = socket
+                                .send(WsMessage::Text(payload.into()))
+                                .await
+                                .is_err();
+                        }
+                        if !disconnected && subscriptions.mempool_blocks {
+                            let payload = json!({
+                                "type": "mempool-blocks",
+                                "data": explorer_mempool_snapshot(),
+                            })
+                            .to_string();
+                            disconnected = socket
+                                .send(WsMessage::Text(payload.into()))
+                                .await
+                                .is_err();
+                        }
+                        if !disconnected {
+                            for txid in &subscriptions.txids {
+                                let Ok(txid) = Txid::from_str(txid) else {
+                                    continue;
+                                };
+                                let payload = explorer_tx_status_payload(&txid);
+                                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !disconnected {
+                            for address in &subscriptions.addresses {
+                                let payload = json!({
+                                    "type": "address-status",
+                                    "data": { "address": address },
+                                })
+                                .to_string();
+                                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !disconnected
+                            && let Some(index) = tracked_mempool_block
+                        {
+                            let snapshot = explorer_mempool_snapshot();
+                            let payload = json!({
+                                "type": "projected-block-transactions",
+                                "data": {
+                                    "index": index,
+                                    "sequence": snapshot.sequence,
+                                    "full": get_mempool_block_transaction_ids(index),
+                                }
+                            })
+                            .to_string();
+                            disconnected = socket
+                                .send(WsMessage::Text(payload.into()))
+                                .await
+                                .is_err();
+                        }
+                        if disconnected {
                             break;
                         }
                     }
@@ -246,8 +448,8 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                 }
             }
             _ = heartbeat.tick() => {
-                let payload = json!({"type": "ping", "ts": now_ts()}).to_string();
-                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                let payload = now_ts().to_be_bytes().to_vec();
+                if socket.send(WsMessage::Ping(payload.into())).await.is_err() {
                     break;
                 }
             }
@@ -256,20 +458,37 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                     Some(Ok(WsMessage::Close(_))) | None => break,
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
-                            let wants_mempool_blocks = parsed
+                            let is_want = parsed
                                 .get("action")
                                 .and_then(|value| value.as_str())
-                                == Some("want")
-                                && parsed
+                                == Some("want");
+                            let wants = |event_type: &str| {
+                                is_want
+                                    && parsed
                                     .get("data")
                                     .and_then(|value| value.as_array())
                                     .map(|items| {
-                                        items.iter().any(|item| {
-                                            item.as_str() == Some("mempool-blocks")
-                                        })
+                                        items.iter().any(|item| item.as_str() == Some(event_type))
                                     })
-                                    .unwrap_or(false);
-                            if wants_mempool_blocks
+                                    .unwrap_or(false)
+                            };
+                            if wants("block") {
+                                subscriptions.blocks = true;
+                                let payload = json!({
+                                    "type": "hello",
+                                    "data": {
+                                        "espo_tip": get_espo_next_height().saturating_sub(1),
+                                    }
+                                })
+                                .to_string();
+                                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            if wants("mempool-blocks") {
+                                subscriptions.mempool_blocks = true;
+                            }
+                            if wants("mempool-blocks")
                                 || parsed.get("refresh-mempool-blocks").is_some()
                                 || parsed.get("refresh_mempool_blocks").is_some()
                             {
@@ -281,6 +500,27 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                                 if socket.send(WsMessage::Text(payload.into())).await.is_err() {
                                     break;
                                 }
+                            }
+                            if wants("tx")
+                                && let Some(txid) = parsed
+                                    .get("txid")
+                                    .and_then(|value| value.as_str())
+                                    .and_then(|value| Txid::from_str(value).ok())
+                            {
+                                subscriptions.txids.insert(txid.to_string());
+                                let payload = explorer_tx_status_payload(&txid);
+                                if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            if wants("address")
+                                && let Some(address) = parsed
+                                    .get("address")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|address| !address.is_empty())
+                            {
+                                subscriptions.addresses.insert(address.to_string());
                             }
                             let requested = parsed
                                 .get("track-mempool-block")
@@ -328,18 +568,6 @@ fn now_ts() -> u64 {
         .as_secs()
 }
 
-fn strip_mempool_deltas_for_client(payload: Option<&Value>) -> Option<String> {
-    let payload = payload?;
-    if payload.get("type").and_then(|v| v.as_str()) != Some("mempool-blocks") {
-        return None;
-    }
-    let mut stripped = payload.clone();
-    if let Some(data) = stripped.get_mut("data") {
-        data["deltas"] = json!([]);
-    }
-    serde_json::to_string(&stripped).ok()
-}
-
 #[derive(Deserialize)]
 pub struct SearchGuessQuery {
     pub q: Option<String>,
@@ -381,6 +609,17 @@ pub struct AlkaneChartQuery {
 pub struct AlkaneHoldersExportQuery {
     pub alkane: Option<String>,
     pub format: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AlkaneAbiExportQuery {
+    pub alkane: Option<String>,
+    pub format: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AlkaneWasmExportQuery {
+    pub alkane: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1009,6 +1248,93 @@ pub async fn alkane_holders_export(Query(q): Query<AlkaneHoldersExportQuery>) ->
     let content_type =
         if format == "csv" { "text/csv; charset=utf-8" } else { "application/json; charset=utf-8" };
     download_response(content_type, &filename, body)
+}
+
+pub async fn alkane_abi_export(Query(q): Query<AlkaneAbiExportQuery>) -> Response {
+    let Some(raw_alkane) = q.alkane.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
+    };
+    let Some(alkane) = parse_alkane_id(raw_alkane) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
+    };
+    let format = match q.format.as_deref() {
+        Some(raw) => match AlkabiFormat::parse(Some(raw)) {
+            Some(format) => format,
+            None => return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_format"),
+        },
+        None => AlkabiFormat::Json,
+    };
+
+    let extraction_format = format;
+    let generated = tokio::task::spawn_blocking(move || {
+        let essentials_mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        let essentials_provider = EssentialsProvider::new(essentials_mdb);
+        let abi = extract_contract_alkabi(&essentials_provider, &alkane)?;
+        let filename = alkabi_download_filename(&abi.contract, extraction_format.as_str());
+        let body = extraction_format.download_body(&abi).to_string();
+        anyhow::Ok((filename, body))
+    })
+    .await;
+
+    let (filename, body) = match generated {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            eprintln!(
+                "[explorer] Alkabi export failed for {}:{}: {error:#}",
+                alkane.block, alkane.tx
+            );
+            return text_response(StatusCode::UNPROCESSABLE_ENTITY, "alkabi_export_failed");
+        }
+        Err(error) => {
+            eprintln!(
+                "[explorer] Alkabi export task failed for {}:{}: {error}",
+                alkane.block, alkane.tx
+            );
+            return text_response(StatusCode::INTERNAL_SERVER_ERROR, "alkabi_export_failed");
+        }
+    };
+    let content_type = match format {
+        AlkabiFormat::Json => "application/json; charset=utf-8",
+        AlkabiFormat::TypeScript => "text/typescript; charset=utf-8",
+    };
+    download_response(content_type, &filename, body)
+}
+
+pub async fn alkane_wasm_export(Query(q): Query<AlkaneWasmExportQuery>) -> Response {
+    let Some(raw_alkane) = q.alkane.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
+    };
+    let Some(alkane) = parse_alkane_id(raw_alkane) else {
+        return text_response(StatusCode::BAD_REQUEST, "missing_or_invalid_alkane");
+    };
+
+    let generated = tokio::task::spawn_blocking(move || {
+        let essentials_mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        let essentials_provider = EssentialsProvider::new(essentials_mdb);
+        load_contract_wasm(&essentials_provider, &alkane)
+    })
+    .await;
+
+    let wasm = match generated {
+        Ok(Ok(wasm)) => wasm,
+        Ok(Err(error)) => {
+            eprintln!(
+                "[explorer] WASM export failed for {}:{}: {error:#}",
+                alkane.block, alkane.tx
+            );
+            return text_response(StatusCode::UNPROCESSABLE_ENTITY, "wasm_export_failed");
+        }
+        Err(error) => {
+            eprintln!(
+                "[explorer] WASM export task failed for {}:{}: {error}",
+                alkane.block, alkane.tx
+            );
+            return text_response(StatusCode::INTERNAL_SERVER_ERROR, "wasm_export_failed");
+        }
+    };
+
+    let filename = format!("alkane-{}-{}.wasm", alkane.block, alkane.tx);
+    download_bytes_response("application/wasm", &filename, wasm)
 }
 
 pub async fn rune_holders_export(Query(q): Query<RuneHoldersExportQuery>) -> Response {
@@ -2430,12 +2756,36 @@ fn csv_escape_cell(raw: &str) -> String {
 }
 
 fn download_response(content_type: &'static str, filename: &str, body: String) -> Response {
+    download_bytes_response(content_type, filename, body.into_bytes())
+}
+
+fn download_bytes_response(content_type: &'static str, filename: &str, body: Vec<u8>) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\""))
         .body(Body::from(body))
         .unwrap_or_else(|_| text_response(StatusCode::INTERNAL_SERVER_ERROR, "response_failed"))
+}
+
+fn alkabi_download_filename(contract_name: &str, extension: &str) -> String {
+    let name = contract_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let name = name.trim_matches('.');
+    let name = if name.chars().any(|character| character.is_ascii_alphanumeric()) {
+        name
+    } else {
+        "alkane"
+    };
+    format!("{name}.{extension}")
 }
 
 fn text_response(status: StatusCode, body: &'static str) -> Response {
@@ -2538,5 +2888,91 @@ fn parse_u64_any(s: &str) -> Option<u64> {
         u64::from_str_radix(h, 16).ok()
     } else {
         t.parse().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{ExplorerEventSubscriptions, alkabi_download_filename, filtered_explorer_event};
+
+    fn subscriptions() -> ExplorerEventSubscriptions {
+        ExplorerEventSubscriptions {
+            blocks: true,
+            mempool_blocks: true,
+            txids: ["tracked".to_string()].into_iter().collect(),
+            addresses: ["bc1ptracked".to_string()].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn alkabi_filename_uses_the_contract_name_and_requested_extension() {
+        assert_eq!(alkabi_download_filename("AMMPool", "ts"), "AMMPool.ts");
+        assert_eq!(alkabi_download_filename("My Contract", "json"), "My_Contract.json");
+        assert_eq!(alkabi_download_filename("../", "json"), "alkane.json");
+    }
+
+    #[test]
+    fn alkabi_extracts_the_bundled_factory_wasm() {
+        let abi = alkabi::extract::extract_abi(include_bytes!("../../test_data/factory.wasm"))
+            .expect("extract bundled factory ABI");
+
+        assert!(!abi.contract.trim().is_empty());
+        assert!(!abi.methods.is_empty());
+        assert!(abi.to_json_pretty().contains("\"contract\""));
+        assert!(abi.to_ts().contains("export default"));
+    }
+
+    #[test]
+    fn websocket_drops_untracked_transaction_events() {
+        let subscriptions = subscriptions();
+        let event = json!({
+            "type": "tx",
+            "data": {
+                "event": "updated",
+                "status": "mempool",
+                "txid": "unrelated",
+                "addresses": ["bc1punrelated"],
+            }
+        });
+
+        assert!(filtered_explorer_event(&event, &subscriptions).is_none());
+    }
+
+    #[test]
+    fn websocket_narrows_confirmed_transaction_and_block_batches() {
+        let subscriptions = subscriptions();
+        for event_type in ["tx", "block"] {
+            let event = json!({
+                "type": event_type,
+                "data": {
+                    "status": "confirmed",
+                    "height": 100,
+                    "txids": ["unrelated", "tracked"],
+                }
+            });
+            let filtered = filtered_explorer_event(&event, &subscriptions).unwrap();
+
+            assert_eq!(filtered["data"]["txids"], json!(["tracked"]));
+        }
+    }
+
+    #[test]
+    fn websocket_narrows_confirmed_address_maps() {
+        let subscriptions = subscriptions();
+        let event = json!({
+            "type": "address-tx",
+            "data": {
+                "status": "confirmed",
+                "addresses": {
+                    "bc1punrelated": ["unrelated"],
+                    "bc1ptracked": ["tracked"],
+                },
+            }
+        });
+        let filtered = filtered_explorer_event(&event, &subscriptions).unwrap();
+
+        assert_eq!(filtered["data"]["addresses"], json!({ "bc1ptracked": ["tracked"] }));
     }
 }

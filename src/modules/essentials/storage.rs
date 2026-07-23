@@ -13,7 +13,9 @@ use crate::modules::essentials::utils::balances::{
     get_transfer_volume_for_alkane,
 };
 use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
-use crate::modules::essentials::utils::names::display_alkane_name;
+use crate::modules::essentials::utils::names::{
+    display_alkane_name_and_symbol, normalize_alkane_name,
+};
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RuneBalance, RunesProvider};
 use crate::runtime::mdb::{Mdb, MdbBatch};
@@ -24,7 +26,9 @@ use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use alkanes_support::proto::alkanes::AlkanesTrace;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, AddressType, BlockHash, Network, ScriptBuf, Transaction, Txid};
+use bitcoin::{
+    Address, AddressType, BlockHash, Network, ScriptBuf, Transaction, Txid, block::Header,
+};
 use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Artifact, Runestone};
@@ -68,6 +72,7 @@ const TX_POINTER_FILTER_WORDS: usize = 1 << 23;
 const TX_POINTER_FILTER_BITS: u64 = (TX_POINTER_FILTER_WORDS as u64) * 64;
 const TX_POINTER_FILTER_MASK: u64 = TX_POINTER_FILTER_BITS - 1;
 const TX_POINTER_FILTER_HASHES: u64 = 4;
+const MAX_BLOCK_TIMES_BATCH: usize = 1_000;
 
 struct TxPointerFilter {
     bits: Vec<u64>,
@@ -3045,10 +3050,13 @@ impl EssentialsProvider {
     ) -> Result<GetCirculatingSupplyResult> {
         crate::debug_timer_log!("get_circulating_supply");
         let table = self.table();
+        // Historical callers pin this provider to the requested block hash. The latest-supply key
+        // at that tree root is the supply at the requested height, including blocks where supply
+        // did not change and no per-height event row was written.
         let supply = self
             .get_raw_value(GetRawValueParams {
-                blockhash: StateAt::Latest,
-                key: table.circulating_supply_key(&params.alkane, params.height),
+                blockhash: params.blockhash,
+                key: table.circulating_supply_latest_key(&params.alkane),
             })
             .ok()
             .and_then(|resp| resp.value)
@@ -3490,8 +3498,7 @@ impl EssentialsProvider {
                 .map(|hc| hc.count)
                 .unwrap_or(0);
             let inspection_json = rec.inspection.as_ref().map(inspection_to_json);
-            let name = display_alkane_name(&rec.names);
-            let symbol = rec.symbols.first().cloned();
+            let (name, symbol) = display_alkane_name_and_symbol(&rec.names, &rec.symbols);
             items.push(json!({
                 "alkane": format!("{}:{}", rec.alkane.block, rec.alkane.tx),
                 "creation_txid": hex::encode(rec.txid),
@@ -3513,6 +3520,116 @@ impl EssentialsProvider {
                 "page": page,
                 "limit": limit,
                 "total": total,
+                "items": items,
+            }),
+        })
+    }
+
+    pub fn rpc_search_alkane(
+        &self,
+        params: RpcSearchAlkaneParams,
+    ) -> Result<RpcSearchAlkaneResult> {
+        let Some(prefix) = params.prefix.as_deref().and_then(normalize_alkane_name) else {
+            return Ok(RpcSearchAlkaneResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_prefix"
+                }),
+            });
+        };
+        let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
+        let candidate_limit = limit.saturating_mul(4).min(400) as u64;
+
+        let name_ids = self
+            .get_alkane_ids_by_name_prefix_page(GetAlkaneIdsByNamePrefixPageParams {
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+                offset: 0,
+                limit: candidate_limit,
+            })?
+            .ids;
+        let symbol_ids = self
+            .get_alkane_ids_by_symbol_prefix_page(GetAlkaneIdsBySymbolPrefixPageParams {
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+                offset: 0,
+                limit: candidate_limit,
+            })?
+            .ids;
+
+        let mut seen = HashSet::new();
+        let ids = name_ids
+            .into_iter()
+            .chain(symbol_ids)
+            .filter(|id| seen.insert(*id))
+            .collect::<Vec<_>>();
+        let records = self
+            .get_creation_records_by_id(GetCreationRecordsByIdParams {
+                blockhash: StateAt::Latest,
+                alkanes: ids.clone(),
+            })?
+            .records;
+        let holder_counts = self
+            .get_holders_counts_by_id(GetHoldersCountsByIdParams {
+                blockhash: StateAt::Latest,
+                alkanes: ids.clone(),
+            })?
+            .counts;
+
+        let mut matches = ids
+            .into_iter()
+            .zip(records)
+            .zip(holder_counts)
+            .filter_map(|((alkane, record), holder_count)| {
+                let record = record?;
+                let (name, symbol) = display_alkane_name_and_symbol(&record.names, &record.symbols);
+                let exact = name
+                    .as_deref()
+                    .and_then(normalize_alkane_name)
+                    .is_some_and(|value| value == prefix)
+                    || symbol
+                        .as_deref()
+                        .and_then(normalize_alkane_name)
+                        .is_some_and(|value| value == prefix);
+                Some((
+                    !exact,
+                    std::cmp::Reverse(holder_count),
+                    name.clone().unwrap_or_default().to_ascii_lowercase(),
+                    alkane,
+                    name,
+                    symbol,
+                    record.creation_height,
+                ))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.3.block.cmp(&right.3.block))
+                .then_with(|| left.3.tx.cmp(&right.3.tx))
+        });
+        matches.truncate(limit);
+
+        let items = matches
+            .into_iter()
+            .map(|(_, holder_count, _, alkane, name, symbol, creation_height)| {
+                json!({
+                    "alkane": format!("{}:{}", alkane.block, alkane.tx),
+                    "name": name,
+                    "symbol": symbol,
+                    "holder_count": holder_count.0,
+                    "creation_height": creation_height,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(RpcSearchAlkaneResult {
+            value: json!({
+                "ok": true,
+                "prefix": prefix,
+                "limit": limit,
                 "items": items,
             }),
         })
@@ -3575,8 +3692,7 @@ impl EssentialsProvider {
                 .unwrap_or(0)
             });
         let inspection_json = record.inspection.as_ref().map(inspection_to_json);
-        let name = display_alkane_name(&record.names);
-        let symbol = record.symbols.first().cloned();
+        let (name, symbol) = display_alkane_name_and_symbol(&record.names, &record.symbols);
 
         Ok(RpcGetAlkaneInfoResult {
             value: json!({
@@ -3592,6 +3708,75 @@ impl EssentialsProvider {
                 "symbols": record.symbols,
                 "holder_count": holder_count,
                 "inspection": inspection_json,
+            }),
+        })
+    }
+
+    pub fn rpc_get_alkabi(&self, params: RpcGetAlkabiParams) -> Result<RpcGetAlkabiResult> {
+        let Some(raw_alkane) = params.alkane.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return Ok(RpcGetAlkabiResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_alkane",
+                    "hint": "provide alkane as \"<block>:<tx>\" (hex ok)"
+                }),
+            });
+        };
+        let Some(alkane) = crate::utils::parse_alkane_id(raw_alkane) else {
+            return Ok(RpcGetAlkabiResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_alkane",
+                    "hint": "provide alkane as \"<block>:<tx>\" (hex ok)"
+                }),
+            });
+        };
+        let Some(format) = crate::modules::essentials::utils::alkabi::AlkabiFormat::parse(
+            params.format.as_deref(),
+        ) else {
+            return Ok(RpcGetAlkabiResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_format",
+                    "hint": "provide format as \"json\" or \"ts\""
+                }),
+            });
+        };
+
+        let abi =
+            match crate::modules::essentials::utils::alkabi::extract_contract_alkabi(self, &alkane)
+            {
+                Ok(abi) => abi,
+                Err(error) => {
+                    return Ok(RpcGetAlkabiResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "alkabi_generation_failed",
+                            "detail": error.to_string()
+                        }),
+                    });
+                }
+            };
+        let rendered = match format.render(&abi) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(RpcGetAlkabiResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "alkabi_generation_failed",
+                        "detail": error.to_string()
+                    }),
+                });
+            }
+        };
+
+        Ok(RpcGetAlkabiResult {
+            value: json!({
+                "ok": true,
+                "alkane": alkane.to_string(),
+                "format": format.as_str(),
+                "abi": rendered
             }),
         })
     }
@@ -3642,7 +3827,11 @@ impl EssentialsProvider {
                 value: json!({"ok": false, "error": "missing_or_invalid_height"}),
             });
         };
-        let height = height as u32;
+        let Ok(height) = u32::try_from(height) else {
+            return Ok(RpcGetBlockSummaryResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_height"}),
+            });
+        };
         let summary = self
             .get_block_summary(GetBlockSummaryParams { blockhash: StateAt::Latest, height })
             .ok()
@@ -3658,9 +3847,11 @@ impl EssentialsProvider {
             fee_median,
             fee_range,
             pool,
+            block_time,
             found,
         ) = if let Some(summary) = summary {
             let blockhash = summary.block_hash().map(|h| h.to_string());
+            let block_time = summary.block_time();
             let pool = summary.pool.map(|pool| {
                 json!({
                     "id": pool.id,
@@ -3682,10 +3873,11 @@ impl EssentialsProvider {
                 summary.fee_median,
                 summary.fee_range,
                 pool,
+                block_time,
                 true,
             )
         } else {
-            (0, 0, 0, None, None, 0.0, 0.0, Vec::new(), None, false)
+            (0, 0, 0, None, None, 0.0, 0.0, Vec::new(), None, None, false)
         };
 
         Ok(RpcGetBlockSummaryResult {
@@ -3702,6 +3894,84 @@ impl EssentialsProvider {
                 "fee_median": fee_median,
                 "fee_range": fee_range,
                 "pool": pool,
+                "block_time": block_time,
+            }),
+        })
+    }
+
+    pub fn rpc_get_block_time(
+        &self,
+        params: RpcGetBlockTimeParams,
+    ) -> Result<RpcGetBlockTimeResult> {
+        let Some(height) = params.height.and_then(|height| u32::try_from(height).ok()) else {
+            return Ok(RpcGetBlockTimeResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_height"}),
+            });
+        };
+        let summary = self.get_block_summaries_by_heights(&[height])?.into_iter().next().flatten();
+        let found = summary.is_some();
+        let block_time = summary.as_ref().and_then(BlockSummary::block_time);
+
+        Ok(RpcGetBlockTimeResult {
+            value: json!({
+                "ok": true,
+                "height": height,
+                "found": found,
+                "block_time": block_time,
+            }),
+        })
+    }
+
+    pub fn rpc_get_block_times(
+        &self,
+        params: RpcGetBlockTimesParams,
+    ) -> Result<RpcGetBlockTimesResult> {
+        let Some(raw_heights) = params.heights else {
+            return Ok(RpcGetBlockTimesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_heights"}),
+            });
+        };
+        if raw_heights.len() > MAX_BLOCK_TIMES_BATCH {
+            return Ok(RpcGetBlockTimesResult {
+                value: json!({
+                    "ok": false,
+                    "error": "too_many_heights",
+                    "max_heights": MAX_BLOCK_TIMES_BATCH,
+                }),
+            });
+        }
+        let heights = match raw_heights
+            .iter()
+            .copied()
+            .map(u32::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(heights) => heights,
+            Err(_) => {
+                return Ok(RpcGetBlockTimesResult {
+                    value: json!({"ok": false, "error": "missing_or_invalid_heights"}),
+                });
+            }
+        };
+        let summaries = self.get_block_summaries_by_heights(&heights)?;
+        let times = heights
+            .into_iter()
+            .zip(summaries)
+            .map(|(height, summary)| {
+                let found = summary.is_some();
+                let block_time = summary.as_ref().and_then(BlockSummary::block_time);
+                json!({
+                    "height": height,
+                    "found": found,
+                    "block_time": block_time,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(RpcGetBlockTimesResult {
+            value: json!({
+                "ok": true,
+                "times": times,
             }),
         })
     }
@@ -5578,6 +5848,7 @@ impl EssentialsProvider {
             .max(1)
             .min(MAX_PAGE_LIMIT as u64) as usize;
         let only_alkane_txs = params.only_alkane_txs.unwrap_or(true);
+        let include_mempool = params.include_mempool.unwrap_or(false);
         let alkane_filter = if let Some(raw_filter) =
             params.filter.as_deref().map(str::trim).filter(|s| !s.is_empty())
         {
@@ -5617,44 +5888,83 @@ impl EssentialsProvider {
                 }
             };
 
-        let mut pending_entries = pending_for_address(&address);
-        pending_entries.sort_by(|a, b| b.txid.cmp(&a.txid));
-        let pending_filtered: Vec<MempoolEntry> = pending_entries
-            .into_iter()
-            .filter(|entry| {
-                !only_alkane_txs || entry.traces.as_ref().map_or(false, |t| !t.is_empty())
-            })
-            .filter(|entry| {
-                alkane_filter.as_ref().map_or(true, |filter| {
-                    entry.traces.as_ref().map_or(false, |traces| {
-                        espo_traces_first_invoke_matches_filter(traces, filter)
-                    })
-                })
-            })
-            .collect();
-        let pending_total = pending_filtered.len();
-        let pending_slice_start = off.min(pending_total);
-        let pending_slice_end = (off + limit).min(pending_total);
-        let pending_set: HashSet<Txid> = pending_filtered.iter().map(|entry| entry.txid).collect();
-        let mut filtered_has_more = alkane_filter.is_some() && pending_slice_end < pending_total;
-
-        let mut tx_renders: Vec<AddressTxRender> = Vec::new();
-        for entry in pending_filtered
-            .iter()
-            .skip(pending_slice_start)
-            .take(pending_slice_end.saturating_sub(pending_slice_start))
-        {
-            tx_renders.push(AddressTxRender {
-                txid: entry.txid,
-                tx: entry.tx.clone(),
-                traces: entry.traces.clone(),
-                confirmations: None,
-                is_mempool: true,
-                summary: None,
+        if include_mempool && electrum_like.backend() != ElectrumLikeBackend::EsploraHttp {
+            return Ok(RpcGetAddressTransactionsResult {
+                value: json!({
+                    "ok": false,
+                    "error": "unsupported_backend",
+                    "detail": "include_mempool requires electrs_esplora_url; electrum_rpc_url is not supported"
+                }),
             });
         }
 
-        let remaining_slots = limit.saturating_sub(tx_renders.len());
+        let mempool_txids = if include_mempool {
+            match electrum_like.address_mempool_txids(&address_obj) {
+                Ok(txids) => txids,
+                Err(error) => {
+                    return Ok(RpcGetAddressTransactionsResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "electrs_mempool_fetch_failed",
+                            "detail": error.to_string()
+                        }),
+                    });
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let raw_mempool_txs = if mempool_txids.is_empty() {
+            Vec::new()
+        } else {
+            electrum_like.batch_transaction_get_raw(&mempool_txids).unwrap_or_default()
+        };
+        let mut pending_renders = Vec::new();
+        for (index, txid) in mempool_txids.into_iter().enumerate() {
+            let indexed_entry = pending_by_txid(&txid);
+            let tx = raw_mempool_txs
+                .get(index)
+                .filter(|raw| !raw.is_empty())
+                .and_then(|raw| deserialize::<Transaction>(raw).ok())
+                .or_else(|| indexed_entry.as_ref().map(|entry| entry.tx.clone()));
+            let Some(tx) = tx else {
+                eprintln!(
+                    "[rpc_get_address_transactions] failed to load electrs mempool tx {}",
+                    txid
+                );
+                continue;
+            };
+            let traces = indexed_entry.and_then(|entry| entry.traces);
+            if only_alkane_txs {
+                if let Some(filter) = alkane_filter.as_ref() {
+                    if !traces.as_ref().is_some_and(|traces| {
+                        espo_traces_first_invoke_matches_filter(traces, filter)
+                    }) {
+                        continue;
+                    }
+                } else if traces.as_ref().is_none_or(|traces| traces.is_empty())
+                    && runestone_data(&tx).1.is_empty()
+                {
+                    continue;
+                }
+            }
+            pending_renders.push(AddressTxRender {
+                txid,
+                tx,
+                traces,
+                block_height: None,
+                block_time: None,
+                confirmations: Some(0),
+                is_mempool: true,
+            });
+        }
+        let pending_total = pending_renders.len();
+        let pending_set = pending_renders.iter().map(|render| render.txid).collect::<HashSet<_>>();
+        let mut tx_renders = if page == 1 { pending_renders } else { Vec::new() };
+        let mut filtered_has_more = false;
+
+        // Pending transactions are prepended to page one and never consume confirmed-page slots.
+        let remaining_slots = limit;
         let chain_tip = get_bitcoind_rpc_client()
             .get_blockchain_info()
             .ok()
@@ -5673,7 +5983,7 @@ impl EssentialsProvider {
         let mut confirmed_total = if alkane_filter.is_some() { 0 } else { confirmed_index_total };
 
         if only_alkane_txs {
-            let confirmed_offset = off.saturating_sub(pending_total);
+            let confirmed_offset = off;
             if let Some(filter) = alkane_filter.as_ref() {
                 let target_matches =
                     confirmed_offset.saturating_add(remaining_slots).saturating_add(1);
@@ -5756,9 +6066,10 @@ impl EssentialsProvider {
                                     txid,
                                     tx,
                                     traces: (!traces.is_empty()).then_some(traces),
+                                    block_height: Some(summary.height as u64),
+                                    block_time: None,
                                     confirmations,
                                     is_mempool: false,
-                                    summary: Some(summary),
                                 });
                             }
                         }
@@ -5769,7 +6080,7 @@ impl EssentialsProvider {
                 let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
 
                 if confirmed_slice_end > confirmed_slice_start {
-                    let mut txids: Vec<Txid> = Vec::new();
+                    let mut tx_rows: Vec<(Txid, u32)> = Vec::new();
                     let range_start = confirmed_total.saturating_sub(confirmed_slice_end) as u64;
                     let range_end = confirmed_total.saturating_sub(confirmed_slice_start) as u64;
                     let ids = get_address_index_list_range(
@@ -5785,10 +6096,11 @@ impl EssentialsProvider {
                         let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
                             continue;
                         };
-                        txids.push(Txid::from_byte_array(blob.txid));
+                        tx_rows.push((Txid::from_byte_array(blob.txid), blob.height));
                     }
 
-                    if !txids.is_empty() {
+                    if !tx_rows.is_empty() {
+                        let txids = tx_rows.iter().map(|(txid, _)| *txid).collect::<Vec<_>>();
                         let raw_txs =
                             electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
 
@@ -5808,16 +6120,12 @@ impl EssentialsProvider {
                                 }
                             };
                             let summary = load_tx_summary_v2(self, txid);
-                            let confirmations =
-                                summary.as_ref().and_then(|s| {
-                                    let h = s.height as u64;
-                                    if h == 0 {
-                                        return None;
-                                    }
-                                    chain_tip.and_then(|tip| {
-                                        if tip >= h { Some(tip - h + 1) } else { None }
-                                    })
-                                });
+                            let block_height = tx_rows.get(idx).map(|(_, height)| *height as u64);
+                            let confirmations = block_height.and_then(|height| {
+                                chain_tip.and_then(|tip| {
+                                    if tip >= height { Some(tip - height + 1) } else { None }
+                                })
+                            });
                             let traces = summary
                                 .as_ref()
                                 .map(|s| traces_from_summary(txid, s))
@@ -5826,16 +6134,17 @@ impl EssentialsProvider {
                                 txid: *txid,
                                 tx,
                                 traces,
+                                block_height,
+                                block_time: None,
                                 confirmations,
                                 is_mempool: false,
-                                summary,
                             });
                         }
                     }
                 }
             }
         } else {
-            let confirmed_offset = off.saturating_sub(pending_total);
+            let confirmed_offset = off;
             let fetch_limit = remaining_slots.max(1);
             match electrum_like.address_history_page(&address_obj, confirmed_offset, fetch_limit) {
                 Ok(hist_page) => {
@@ -5884,9 +6193,10 @@ impl EssentialsProvider {
                                     txid: *txid,
                                     tx,
                                     traces,
+                                    block_height: entries_for_page[idx].height,
+                                    block_time: None,
                                     confirmations,
                                     is_mempool: false,
-                                    summary,
                                 });
                             }
                         }
@@ -5900,7 +6210,45 @@ impl EssentialsProvider {
                 }
             }
         }
-        let tx_total = pending_total + confirmed_total;
+
+        let mut seen_txids = HashSet::new();
+        tx_renders.retain(|render| seen_txids.insert(render.txid));
+
+        let mut block_heights = tx_renders
+            .iter()
+            .filter_map(|render| render.block_height)
+            .filter_map(|height| u32::try_from(height).ok())
+            .collect::<Vec<_>>();
+        block_heights.sort_unstable();
+        block_heights.dedup();
+        if !block_heights.is_empty() {
+            match self.get_block_summaries_by_heights(&block_heights) {
+                Ok(summaries) => {
+                    let block_times = block_heights
+                        .into_iter()
+                        .zip(summaries)
+                        .filter_map(|(height, summary)| {
+                            summary.and_then(|summary| {
+                                summary.block_time().map(|block_time| (height, block_time))
+                            })
+                        })
+                        .collect::<HashMap<_, _>>();
+                    for render in &mut tx_renders {
+                        render.block_time = render
+                            .block_height
+                            .and_then(|height| u32::try_from(height).ok())
+                            .and_then(|height| block_times.get(&height).copied());
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[rpc_get_address_transactions] failed to load block times: {error:#}"
+                    );
+                }
+            }
+        }
+        let tx_total = pending_total.saturating_add(confirmed_total);
+        let confirmed_render_count = tx_renders.iter().filter(|render| !render.is_mempool).count();
         let mut prev_txids: Vec<Txid> = Vec::new();
         for render in &tx_renders {
             for vin in &render.tx.input {
@@ -5940,11 +6288,12 @@ impl EssentialsProvider {
                 "address": address,
                 "page": page,
                 "limit": limit,
+                "include_mempool": include_mempool,
                 "total": if alkane_filter.is_some() { Value::Null } else { json!(tx_total) },
                 "has_more": if alkane_filter.is_some() {
                     filtered_has_more
                 } else {
-                    (off + tx_renders.len()) < tx_total
+                    off.saturating_add(confirmed_render_count) < confirmed_total
                 },
                 "transactions": transactions,
             }),
@@ -6351,11 +6700,29 @@ pub struct RpcGetAllAlkanesResult {
     pub value: Value,
 }
 
+pub struct RpcSearchAlkaneParams {
+    pub prefix: Option<String>,
+    pub limit: Option<u64>,
+}
+
+pub struct RpcSearchAlkaneResult {
+    pub value: Value,
+}
+
 pub struct RpcGetAlkaneInfoParams {
     pub alkane: Option<String>,
 }
 
 pub struct RpcGetAlkaneInfoResult {
+    pub value: Value,
+}
+
+pub struct RpcGetAlkabiParams {
+    pub alkane: Option<String>,
+    pub format: Option<String>,
+}
+
+pub struct RpcGetAlkabiResult {
     pub value: Value,
 }
 
@@ -6372,6 +6739,22 @@ pub struct RpcGetBlockSummaryParams {
 }
 
 pub struct RpcGetBlockSummaryResult {
+    pub value: Value,
+}
+
+pub struct RpcGetBlockTimeParams {
+    pub height: Option<u64>,
+}
+
+pub struct RpcGetBlockTimeResult {
+    pub value: Value,
+}
+
+pub struct RpcGetBlockTimesParams {
+    pub heights: Option<Vec<u64>>,
+}
+
+pub struct RpcGetBlockTimesResult {
     pub value: Value,
 }
 
@@ -6598,6 +6981,7 @@ pub struct RpcGetAddressTransactionsParams {
     pub page: Option<u64>,
     pub limit: Option<u64>,
     pub only_alkane_txs: Option<bool>,
+    pub include_mempool: Option<bool>,
     pub filter: Option<String>,
 }
 
@@ -6861,6 +7245,10 @@ impl BlockSummary {
             return None;
         }
         Some(BlockHash::from_byte_array(self.blockhash))
+    }
+
+    pub fn block_time(&self) -> Option<u64> {
+        deserialize::<Header>(&self.header).ok().map(|header| header.time as u64)
     }
 }
 
@@ -8318,9 +8706,10 @@ struct AddressTxRender {
     txid: Txid,
     tx: Transaction,
     traces: Option<Vec<EspoTrace>>,
+    block_height: Option<u64>,
+    block_time: Option<u64>,
     confirmations: Option<u64>,
     is_mempool: bool,
-    summary: Option<AlkaneTxSummary>,
 }
 
 fn enriched_transaction_json(
@@ -8381,9 +8770,9 @@ fn enriched_transaction_json(
 
     let mut out = Map::new();
     out.insert("txid".to_string(), json!(render.txid.to_string()));
-    out.insert("blockHeight".to_string(), json!(render.summary.as_ref().map(|s| s.height as u64)));
+    out.insert("blockHeight".to_string(), json!(render.block_height));
     out.insert("confirmations".to_string(), json!(render.confirmations));
-    out.insert("blockTime".to_string(), Value::Null);
+    out.insert("blockTime".to_string(), json!(render.block_time));
     out.insert("confirmed".to_string(), json!(!render.is_mempool));
     out.insert("fee".to_string(), fee.map(|value| json!(value)).unwrap_or(Value::Null));
     out.insert("weight".to_string(), json!(tx.weight().to_wu()));
@@ -8682,7 +9071,10 @@ mod tests {
     use crate::core::blockfetcher::BlockFetchMode;
     use crate::runtime::tree_db::{get_global_tree_db, init_global_tree_db};
     use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
-    use bitcoin::{Address, BlockHash, Network};
+    use bitcoin::{
+        Address, BlockHash, Network, Transaction, absolute::LockTime,
+        blockdata::constants::genesis_block, transaction::Version,
+    };
     use rocksdb::{DB, Options};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -8716,6 +9108,140 @@ mod tests {
             fee_range: Vec::new(),
             pool: None,
         }
+    }
+
+    #[test]
+    fn block_summary_time_decodes_indexed_header() {
+        let block = genesis_block(Network::Bitcoin);
+        let mut summary = make_block_summary(0, block.block_hash(), 1);
+        summary.header = serialize(&block.header);
+
+        assert_eq!(summary.block_time(), Some(block.header.time as u64));
+
+        summary.header.clear();
+        assert_eq!(summary.block_time(), None);
+    }
+
+    #[test]
+    fn enriched_transaction_json_uses_exact_block_height_and_time() {
+        let render = AddressTxRender {
+            txid: Txid::from_byte_array([1; 32]),
+            tx: Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: Vec::new(),
+                output: Vec::new(),
+            },
+            traces: None,
+            block_height: Some(123),
+            block_time: Some(1_700_000_000),
+            confirmations: Some(4),
+            is_mempool: false,
+        };
+
+        let value = enriched_transaction_json(&render, &HashMap::new(), Network::Bitcoin);
+
+        assert_eq!(value.get("blockHeight"), Some(&json!(123)));
+        assert_eq!(value.get("blockTime"), Some(&json!(1_700_000_000u64)));
+        assert_eq!(value.get("confirmations"), Some(&json!(4)));
+    }
+
+    #[test]
+    fn enriched_transaction_json_marks_mempool_transactions_unconfirmed() {
+        let render = AddressTxRender {
+            txid: Txid::from_byte_array([2; 32]),
+            tx: Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: Vec::new(),
+                output: Vec::new(),
+            },
+            traces: None,
+            block_height: None,
+            block_time: None,
+            confirmations: Some(0),
+            is_mempool: true,
+        };
+
+        let value = enriched_transaction_json(&render, &HashMap::new(), Network::Bitcoin);
+
+        assert_eq!(value["confirmed"], json!(false));
+        assert_eq!(value["blockHeight"], Value::Null);
+        assert_eq!(value["blockTime"], Value::Null);
+        assert_eq!(value["confirmations"], json!(0));
+    }
+
+    #[test]
+    fn block_times_rpc_preserves_requested_heights() {
+        let provider = new_provider_with_tempdb();
+
+        let response = provider
+            .rpc_get_block_times(RpcGetBlockTimesParams { heights: Some(vec![12, 4, 12]) })
+            .expect("block times response")
+            .value;
+        let heights = response["times"]
+            .as_array()
+            .expect("times array")
+            .iter()
+            .filter_map(|entry| entry["height"].as_u64())
+            .collect::<Vec<_>>();
+
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(heights, vec![12, 4, 12]);
+    }
+
+    #[test]
+    fn block_times_rpc_enforces_batch_limit() {
+        let provider = new_provider_with_tempdb();
+        let response = provider
+            .rpc_get_block_times(RpcGetBlockTimesParams {
+                heights: Some(vec![0; MAX_BLOCK_TIMES_BATCH + 1]),
+            })
+            .expect("block times response")
+            .value;
+
+        assert_eq!(response["ok"], json!(false));
+        assert_eq!(response["error"], json!("too_many_heights"));
+        assert_eq!(response["max_heights"], json!(MAX_BLOCK_TIMES_BATCH));
+    }
+
+    #[test]
+    fn search_alkane_matches_prefix_and_falls_back_symbol_to_uppercase_name() {
+        let provider = new_provider_with_tempdb();
+        let table = provider.table();
+        let mut exact = make_creation_record(1);
+        exact.names = vec!["Diesel".to_string()];
+        exact.symbols.clear();
+        let mut prefixed = make_creation_record(2);
+        prefixed.names = vec!["Diesel Fuel".to_string()];
+        prefixed.symbols = vec!["DSL-F".to_string()];
+        write_creation_rows(&provider, &[(0, exact.clone()), (1, prefixed.clone())], 2);
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (table.alkane_name_index_key("diesel", &exact.alkane), Vec::new()),
+                    (table.alkane_name_index_key("diesel fuel", &prefixed.alkane), Vec::new()),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write name index");
+
+        let response = provider
+            .rpc_search_alkane(RpcSearchAlkaneParams {
+                prefix: Some("DIE".to_string()),
+                limit: Some(10),
+            })
+            .expect("search response")
+            .value;
+        let items = response["items"].as_array().expect("items");
+
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["prefix"], json!("die"));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["alkane"], json!("1:1"));
+        assert_eq!(items[0]["name"], json!("Diesel"));
+        assert_eq!(items[0]["symbol"], json!("DIESEL"));
     }
 
     fn write_creation_rows(
@@ -8760,11 +9286,15 @@ mod tests {
             bitcoind_rpc_url: "http://127.0.0.1:8332".to_string(),
             bitcoind_rpc_user: "test".to_string(),
             bitcoind_rpc_pass: "test".to_string(),
+            b8_faucet_url: None,
+            hosts: Default::default(),
             bitcoind_blocks_dir: "/tmp".to_string(),
             reset_mempool_on_startup: false,
             rollback: None,
             view_only: true,
             db_path: db_dir.path().to_string_lossy().to_string(),
+            db_cache: false,
+            alkabi_verify_trials: 128,
             sdb_poll_ms: 100,
             indexer_block_delay_ms: 0,
             port: 0,
@@ -9302,6 +9832,33 @@ mod tests {
         let encoded = encode_alkane_info(&info).expect("encode");
         let decoded = decode_alkane_info(&encoded).expect("decode");
         assert_eq!(info, decoded);
+    }
+
+    #[test]
+    fn circulating_supply_read_does_not_require_an_exact_height_row() {
+        let provider = new_provider_with_tempdb();
+        let alkane = SchemaAlkaneId { block: 2, tx: 77623 };
+        let supply = 5_227_124_025_507u128;
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![(
+                    provider.table().circulating_supply_latest_key(&alkane),
+                    encode_u128_value(supply).expect("encode supply"),
+                )],
+                deletes: Vec::new(),
+            })
+            .expect("write latest supply");
+
+        let result = provider
+            .get_circulating_supply(GetCirculatingSupplyParams {
+                blockhash: StateAt::Latest,
+                alkane,
+                height: 957_625,
+            })
+            .expect("read supply");
+
+        assert_eq!(result.supply, supply);
     }
 
     #[test]

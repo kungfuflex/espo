@@ -1,5 +1,14 @@
 use crate::{
-    config::get_espo_next_height, modules::defs::RpcRegistry, runtime::tree_db::get_global_tree_db,
+    config::{
+        get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_next_height, get_network,
+    },
+    modules::defs::RpcRegistry,
+    runtime::{
+        mempool::{
+            MempoolBlockSummary, current_mempool_compact_snapshot, current_mempool_minimum_fee_rate,
+        },
+        tree_db::get_global_tree_db,
+    },
 };
 use axum::{
     Router,
@@ -9,10 +18,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use bitcoin::{Address, Transaction, consensus::deserialize};
+use bitcoincore_rpc::RpcApi;
 use futures::FutureExt;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tarpc::context;
 use tokio::net::TcpListener;
 
@@ -42,10 +53,25 @@ struct JsonRpcResponse {
 const JSONRPC_VERSION: &str = "2.0";
 const MAX_SAFE_INTEGER_F64: f64 = 9_007_199_254_740_991.0;
 const MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
+const MAX_RAW_TRANSACTION_HEX_LEN: usize = 8_000_000;
+const PRECISE_FEE_INCREMENT: f64 = 0.001;
 
 // Built-in root method name
 const ROOT_METHOD_GET_ESPO_HEIGHT: &str = "get_espo_height";
 const ROOT_METHOD_GET_METHOD_LINE_CHART: &str = "get_method_line_chart";
+const ROOT_METHOD_BROADCAST_TRANSACTION: &str = "broadcast_transaction";
+const ROOT_METHOD_FEE_ESTIMATES: &str = "fee_estimates";
+const ROOT_METHOD_GET_ADDRESS: &str = "get_address";
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FeeEstimates {
+    fastest_fee: f64,
+    half_hour_fee: f64,
+    hour_fee: f64,
+    economy_fee: f64,
+    minimum_fee: f64,
+}
 
 fn err_response(id: Value, code: i64, message: &str, data: Option<Value>) -> JsonRpcResponse {
     JsonRpcResponse {
@@ -70,7 +96,229 @@ fn get_espo_tip_height_response(id: Value) -> JsonRpcResponse {
 }
 
 fn is_builtin_root_method(method: &str) -> bool {
-    method == ROOT_METHOD_GET_ESPO_HEIGHT || method == ROOT_METHOD_GET_METHOD_LINE_CHART
+    matches!(
+        method,
+        ROOT_METHOD_GET_ESPO_HEIGHT
+            | ROOT_METHOD_GET_METHOD_LINE_CHART
+            | ROOT_METHOD_BROADCAST_TRANSACTION
+            | ROOT_METHOD_FEE_ESTIMATES
+            | ROOT_METHOD_GET_ADDRESS
+    )
+}
+
+fn round_to_increment(value: f64, increment: f64) -> f64 {
+    (value / increment).round() * increment
+}
+
+fn round_up_to_increment(value: f64, increment: f64) -> f64 {
+    (value / increment).ceil() * increment
+}
+
+fn round_to_three_decimals(value: f64) -> f64 {
+    (value * 1_000.0).round() / 1_000.0
+}
+
+fn optimized_median_fee(
+    block: &MempoolBlockSummary,
+    next_block: Option<&MempoolBlockSummary>,
+    previous_fee: Option<f64>,
+    minimum_fee: f64,
+    max_block_vsize: f64,
+) -> f64 {
+    let median = block.median_fee_rate.filter(|fee| fee.is_finite() && *fee >= 0.0);
+    let Some(median) = median else { return minimum_fee };
+    let use_fee = previous_fee.map(|fee| (median + fee) / 2.0).unwrap_or(median);
+    let half_full = max_block_vsize * 0.5;
+    let nearly_full = max_block_vsize * 0.95;
+
+    if block.vsize as f64 <= half_full || median < minimum_fee {
+        return minimum_fee;
+    }
+    if block.vsize as f64 <= nearly_full && next_block.is_none() {
+        let multiplier = (block.vsize as f64 - half_full) / (max_block_vsize - half_full);
+        return round_to_increment(use_fee * multiplier, PRECISE_FEE_INCREMENT).max(minimum_fee);
+    }
+    round_up_to_increment(use_fee, PRECISE_FEE_INCREMENT).max(minimum_fee)
+}
+
+fn calculate_fee_estimates(
+    blocks: &[MempoolBlockSummary],
+    minimum_fee: f64,
+    max_block_vsize: f64,
+) -> FeeEstimates {
+    let minimum_fee = if minimum_fee.is_finite() && minimum_fee >= 0.0 {
+        minimum_fee.max(PRECISE_FEE_INCREMENT)
+    } else {
+        PRECISE_FEE_INCREMENT
+    };
+
+    let first = blocks.first().map(|block| {
+        optimized_median_fee(block, blocks.get(1), None, minimum_fee, max_block_vsize)
+    });
+    let second = blocks.get(1).map(|block| {
+        optimized_median_fee(block, blocks.get(2), first, minimum_fee, max_block_vsize)
+    });
+    let third = blocks.get(2).map(|block| {
+        optimized_median_fee(block, blocks.get(3), second, minimum_fee, max_block_vsize)
+    });
+
+    let mut fastest_fee = first.unwrap_or(minimum_fee).max(minimum_fee);
+    let mut half_hour_fee = second.unwrap_or(minimum_fee).max(minimum_fee);
+    let mut hour_fee = third.unwrap_or(minimum_fee).max(minimum_fee);
+    let economy_fee = third.unwrap_or(minimum_fee).min(2.0 * minimum_fee).max(minimum_fee);
+
+    fastest_fee = fastest_fee.max(half_hour_fee).max(hour_fee).max(economy_fee);
+    half_hour_fee = half_hour_fee.max(hour_fee).max(economy_fee);
+    hour_fee = hour_fee.max(economy_fee);
+
+    FeeEstimates {
+        fastest_fee: round_to_three_decimals((fastest_fee + 0.5).max(1.0)),
+        half_hour_fee: round_to_three_decimals((half_hour_fee + 0.25).max(0.5)),
+        hour_fee: round_to_three_decimals(hour_fee),
+        economy_fee: round_to_three_decimals(economy_fee),
+        minimum_fee: round_to_three_decimals(minimum_fee),
+    }
+}
+
+fn fee_estimates_response(id: Value) -> JsonRpcResponse {
+    let snapshot = current_mempool_compact_snapshot();
+    let minimum_fee = current_mempool_minimum_fee_rate().unwrap_or(PRECISE_FEE_INCREMENT);
+    let max_block_vsize = (get_config().mempool.block_weight_units as f64 / 4.0).max(1.0);
+    let estimates = calculate_fee_estimates(&snapshot.blocks, minimum_fee, max_block_vsize);
+
+    JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION,
+        result: Some(serde_json::to_value(estimates).unwrap_or_else(|_| json!({}))),
+        error: None,
+        id,
+    }
+}
+
+fn parse_raw_transaction_params(params: Value) -> Result<Vec<u8>, String> {
+    let raw_tx = match params {
+        Value::Object(params) => params
+            .get("raw_tx")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "raw_tx is required and must be a string".to_string())?,
+        Value::Array(params) if params.len() == 1 => params[0]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "params[0] must be a raw transaction hex string".to_string())?,
+        Value::Array(_) => {
+            return Err("params must contain exactly one raw transaction hex string".to_string());
+        }
+        _ => return Err("params must be an object or a one-item array".to_string()),
+    };
+    let raw_tx = raw_tx.trim();
+    if raw_tx.is_empty() {
+        return Err("raw transaction must not be empty".to_string());
+    }
+    if raw_tx.len() > MAX_RAW_TRANSACTION_HEX_LEN {
+        return Err("raw transaction exceeds the maximum supported size".to_string());
+    }
+    let bytes =
+        hex::decode(raw_tx).map_err(|e| format!("raw transaction is not valid hex: {e}"))?;
+    deserialize::<Transaction>(&bytes)
+        .map_err(|e| format!("raw transaction could not be decoded: {e}"))?;
+    Ok(bytes)
+}
+
+async fn broadcast_transaction_response(id: Value, params: Value) -> JsonRpcResponse {
+    let raw_tx = match parse_raw_transaction_params(params) {
+        Ok(raw_tx) => raw_tx,
+        Err(detail) => return invalid_params(id, &detail),
+    };
+    let electrum = get_electrum_like();
+    let result = tokio::task::spawn_blocking(move || {
+        match electrum.transaction_broadcast_raw(&raw_tx) {
+            Ok(txid) => Ok(txid.to_string()),
+            Err(electrum_error) => {
+                eprintln!(
+                    "[rpc] configured transaction backend rejected broadcast; trying Bitcoin Core: {electrum_error:#}"
+                );
+                get_bitcoind_rpc_client()
+                    .send_raw_transaction(raw_tx.as_slice())
+                    .map(|txid| txid.to_string())
+                    .map_err(|core_error| {
+                        format!(
+                            "configured backend failed: {electrum_error:#}; Bitcoin Core fallback failed: {core_error}"
+                        )
+                    })
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(txid)) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(json!({ "txid": txid })),
+            error: None,
+            id,
+        },
+        Ok(Err(detail)) => err_response(
+            id,
+            -32000,
+            "Transaction broadcast failed",
+            Some(json!({ "detail": detail })),
+        ),
+        Err(error) => internal_error(id, &format!("transaction broadcast task failed: {error}")),
+    }
+}
+
+fn parse_address_params(params: Value) -> Result<String, String> {
+    let address = match params {
+        Value::Object(params) => params
+            .get("address")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "params.address must be a string".to_string())?,
+        Value::Array(params) if params.len() == 1 => params[0]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "params[0] must be an address string".to_string())?,
+        Value::Array(_) => {
+            return Err("params must contain exactly one address string".to_string());
+        }
+        _ => return Err("params must be an object or a one-item array".to_string()),
+    };
+    let address = address.trim();
+    if address.is_empty() {
+        return Err("address must not be empty".to_string());
+    }
+    Ok(address.to_string())
+}
+
+async fn get_address_response(id: Value, params: Value) -> JsonRpcResponse {
+    let address_raw = match parse_address_params(params) {
+        Ok(address) => address,
+        Err(detail) => return invalid_params(id, &detail),
+    };
+    let address = match Address::from_str(&address_raw)
+        .and_then(|address| address.require_network(get_network()))
+    {
+        Ok(address) => address,
+        Err(error) => return invalid_params(id, &format!("invalid address: {error}")),
+    };
+    let electrum = get_electrum_like();
+    let result = tokio::task::spawn_blocking(move || electrum.address_summary(&address)).await;
+
+    match result {
+        Ok(Ok(summary)) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(json!(summary)),
+            error: None,
+            id,
+        },
+        Ok(Err(error)) => err_response(
+            id,
+            -32000,
+            "Address lookup failed",
+            Some(json!({ "detail": format!("{error:#}") })),
+        ),
+        Err(error) => internal_error(id, &format!("address lookup task failed: {error}")),
+    }
 }
 
 fn parse_optional_u32_param(
@@ -461,8 +709,10 @@ async fn handle_single_request(
             // MUST NOT reply to a notification (even if unknown)
             return None;
         }
-        // Fire-and-forget invoke for registered methods; built-ins do nothing.
-        if !is_builtin_root_method(method) {
+        // Process side-effecting built-ins even though notifications have no response.
+        if method == ROOT_METHOD_BROADCAST_TRANSACTION {
+            let _ = broadcast_transaction_response(Value::Null, params).await;
+        } else if !is_builtin_root_method(method) {
             let cx = context::current();
             let _ = state.registry.call(cx, method, params.clone()).await;
         }
@@ -478,6 +728,15 @@ async fn handle_single_request(
     }
     if method == ROOT_METHOD_GET_METHOD_LINE_CHART {
         return Some(get_method_line_chart_response(state, id, params).await);
+    }
+    if method == ROOT_METHOD_BROADCAST_TRANSACTION {
+        return Some(broadcast_transaction_response(id, params).await);
+    }
+    if method == ROOT_METHOD_FEE_ESTIMATES {
+        return Some(fee_estimates_response(id));
+    }
+    if method == ROOT_METHOD_GET_ADDRESS {
+        return Some(get_address_response(id, params).await);
     }
 
     // Check method existence to produce -32601 at the protocol layer
@@ -582,5 +841,100 @@ async fn handle_rpc(State(state): State<Arc<RpcState>>, body: Bytes) -> Response
             let body = serde_json::to_vec(&resp).unwrap();
             json_ok(body)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{Transaction, absolute::LockTime, consensus::serialize, transaction::Version};
+
+    fn fee_block(index: usize, vsize: u64, median_fee_rate: f64) -> MempoolBlockSummary {
+        MempoolBlockSummary {
+            index,
+            tx_count: 1,
+            trace_count: 0,
+            weight: vsize.saturating_mul(4),
+            vsize,
+            total_fees: 0,
+            median_fee_rate: Some(median_fee_rate),
+            min_fee_rate: Some(median_fee_rate),
+            max_fee_rate: Some(median_fee_rate),
+            fee_range: vec![median_fee_rate],
+        }
+    }
+
+    #[test]
+    fn precise_fee_estimates_use_projected_block_medians() {
+        let blocks = vec![
+            fee_block(0, 1_000_000, 10.0),
+            fee_block(1, 1_000_000, 6.0),
+            fee_block(2, 1_000_000, 2.0),
+        ];
+
+        let estimates = calculate_fee_estimates(&blocks, 1.0, 1_000_000.0);
+
+        assert_eq!(
+            estimates,
+            FeeEstimates {
+                fastest_fee: 10.5,
+                half_hour_fee: 8.25,
+                hour_fee: 5.0,
+                economy_fee: 2.0,
+                minimum_fee: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn precise_fee_estimates_have_stable_empty_view_floors() {
+        let estimates = calculate_fee_estimates(&[], 0.1, 1_000_000.0);
+
+        assert_eq!(
+            estimates,
+            FeeEstimates {
+                fastest_fee: 1.0,
+                half_hour_fee: 0.5,
+                hour_fee: 0.1,
+                economy_fee: 0.1,
+                minimum_fee: 0.1,
+            }
+        );
+    }
+
+    #[test]
+    fn raw_transaction_params_accept_object_and_positional_forms() {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let raw = serialize(&tx);
+        let raw_hex = hex::encode(&raw);
+
+        assert_eq!(parse_raw_transaction_params(json!({ "raw_tx": raw_hex })).unwrap(), raw);
+        assert_eq!(parse_raw_transaction_params(json!([hex::encode(&raw)])).unwrap(), raw);
+    }
+
+    #[test]
+    fn raw_transaction_params_reject_invalid_payloads() {
+        assert!(parse_raw_transaction_params(json!({ "raw_tx": "not-hex" })).is_err());
+        assert!(parse_raw_transaction_params(json!([])).is_err());
+        assert!(parse_raw_transaction_params(Value::Null).is_err());
+    }
+
+    #[test]
+    fn address_params_accept_object_and_positional_forms() {
+        let address = "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv";
+        assert_eq!(parse_address_params(json!({ "address": address })).unwrap(), address);
+        assert_eq!(parse_address_params(json!([address])).unwrap(), address);
+    }
+
+    #[test]
+    fn address_params_reject_invalid_payloads() {
+        assert!(parse_address_params(json!({ "address": "" })).is_err());
+        assert!(parse_address_params(json!([])).is_err());
+        assert!(parse_address_params(Value::Null).is_err());
     }
 }

@@ -3,7 +3,7 @@ use bitcoin::{Address, Txid};
 use electrum_client::{Client as ElectrumClient, ElectrumApi, Param};
 use futures::{StreamExt, stream};
 use reqwest::Client as HttpClient;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
 use std::str::FromStr;
@@ -24,6 +24,22 @@ pub struct AddressStats {
     pub confirmed_balance: Option<u64>,
     pub total_received: Option<u64>,
     pub confirmed_utxos: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AddressSummary {
+    pub address: String,
+    pub chain_stats: AddressTxStats,
+    pub mempool_stats: AddressTxStats,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AddressTxStats {
+    pub funded_txo_count: u64,
+    pub funded_txo_sum: u64,
+    pub spent_txo_count: u64,
+    pub spent_txo_sum: u64,
+    pub tx_count: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -53,10 +69,12 @@ pub trait ElectrumLike: Send + Sync {
     fn backend(&self) -> ElectrumLikeBackend;
     fn batch_transaction_get_raw(&self, txids: &[Txid]) -> Result<Vec<Vec<u8>>>;
     fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>>;
+    fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid>;
     fn tip_height(&self) -> Result<u32>;
     fn transaction_get_outspends(&self, txid: &Txid) -> Result<Vec<Option<Txid>>>;
     fn batch_transaction_get_outspends(&self, txids: &[Txid]) -> Result<Vec<Vec<Option<Txid>>>>;
     fn transaction_get_height(&self, txid: &Txid) -> Result<Option<u64>>;
+    fn address_summary(&self, address: &Address) -> Result<AddressSummary>;
     fn address_stats(&self, address: &Address) -> Result<AddressStats>;
     fn address_history_page(
         &self,
@@ -70,6 +88,7 @@ pub trait ElectrumLike: Send + Sync {
         cursor: Option<&Txid>,
         limit: usize,
     ) -> Result<AddressHistoryPage>;
+    fn address_mempool_txids(&self, address: &Address) -> Result<Vec<Txid>>;
     fn address_utxos(&self, address: &Address) -> Result<Vec<AddressUtxo>>;
 }
 
@@ -97,6 +116,12 @@ impl ElectrumLike for ElectrumRpcClient {
 
     fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>> {
         self.client.transaction_get_raw(txid).context("electrum transaction_get_raw")
+    }
+
+    fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid> {
+        self.client
+            .transaction_broadcast_raw(raw_tx)
+            .context("electrum transaction_broadcast_raw")
     }
 
     fn tip_height(&self) -> Result<u32> {
@@ -143,6 +168,12 @@ impl ElectrumLike for ElectrumRpcClient {
         Ok(extract_height(&resp))
     }
 
+    fn address_summary(&self, _address: &Address) -> Result<AddressSummary> {
+        Err(anyhow::anyhow!(
+            "exact address summaries require an electrs/esplora HTTP backend; electrum RPC is not supported"
+        ))
+    }
+
     fn address_stats(&self, address: &Address) -> Result<AddressStats> {
         let script = address.script_pubkey();
         let balance =
@@ -170,12 +201,12 @@ impl ElectrumLike for ElectrumRpcClient {
         let script = address.script_pubkey();
         let history =
             self.client.script_get_history(&script).context("electrum script_get_history")?;
+        let history = history.into_iter().filter(|entry| entry.height > 0).collect::<Vec<_>>();
         let total = history.len();
         let slice = history.into_iter().skip(offset).take(limit);
         let mut out = Vec::new();
         for h in slice {
-            let height = if h.height > 0 { Some(h.height as u64) } else { None };
-            out.push(AddressHistoryEntry { txid: h.tx_hash, height });
+            out.push(AddressHistoryEntry { txid: h.tx_hash, height: Some(h.height as u64) });
         }
         Ok(AddressHistoryPage {
             entries: out,
@@ -191,6 +222,12 @@ impl ElectrumLike for ElectrumRpcClient {
         _limit: usize,
     ) -> Result<AddressHistoryPage> {
         Err(anyhow::anyhow!("electrum cursor pagination not supported"))
+    }
+
+    fn address_mempool_txids(&self, _address: &Address) -> Result<Vec<Txid>> {
+        Err(anyhow::anyhow!(
+            "address mempool transactions require an electrs/esplora HTTP backend; electrum RPC is not supported"
+        ))
     }
 
     fn address_utxos(&self, _address: &Address) -> Result<Vec<AddressUtxo>> {
@@ -233,6 +270,24 @@ impl EsploraElectrumLike {
         Ok((idx, bytes.to_vec()))
     }
 
+    async fn broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid> {
+        let url = format!("{}/tx", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain")
+            .body(hex::encode(raw_tx))
+            .send()
+            .await
+            .with_context(|| format!("esplora POST {url} failed"))?;
+        let status = resp.status();
+        let body = resp.text().await.context("esplora broadcast response body read failed")?;
+        if !status.is_success() {
+            bail!("esplora transaction broadcast returned {status}: {}", body.trim());
+        }
+        Txid::from_str(body.trim()).context("invalid txid in esplora broadcast response")
+    }
+
     fn block_on_result<F, T>(&self, fut: F) -> Result<T>
     where
         F: Future<Output = Result<T>>,
@@ -249,7 +304,7 @@ impl EsploraElectrumLike {
         }
     }
 
-    async fn fetch_address_summary(&self, address: &str) -> Result<EsploraAddressSummary> {
+    async fn fetch_address_summary(&self, address: &str) -> Result<AddressSummary> {
         let url = format!("{}/address/{}", self.base_url, address);
         let resp = self
             .http
@@ -261,7 +316,7 @@ impl EsploraElectrumLike {
             .with_context(|| format!("esplora GET {url} returned error status"))?;
 
         let body_str = resp.text().await.context("esplora address body read failed")?;
-        let summary: EsploraAddressSummary =
+        let summary: AddressSummary =
             serde_json::from_str(&body_str).context("esplora address json decode failed")?;
         Ok(summary)
     }
@@ -341,6 +396,12 @@ impl EsploraElectrumLike {
             serde_json::from_str(&body_str).context("esplora address txs json decode failed")?;
         Ok(txs)
     }
+
+    async fn fetch_address_mempool_txids(&self, address: &str) -> Result<Vec<Txid>> {
+        let url = format!("{}/address/{}/txs/mempool", self.base_url, address);
+        let txs = self.fetch_address_txs(&url).await?;
+        Ok(mempool_txids_from_esplora(&txs))
+    }
 }
 
 impl ElectrumLike for EsploraElectrumLike {
@@ -384,6 +445,10 @@ impl ElectrumLike for EsploraElectrumLike {
             let (_, raw) = self.fetch_one_indexed(0, txid).await?;
             Ok(raw)
         })
+    }
+
+    fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid> {
+        self.block_on_result(self.broadcast_raw(raw_tx))
     }
 
     fn tip_height(&self) -> Result<u32> {
@@ -440,6 +505,10 @@ impl ElectrumLike for EsploraElectrumLike {
         })
     }
 
+    fn address_summary(&self, address: &Address) -> Result<AddressSummary> {
+        self.block_on_result(self.fetch_address_summary(&address.to_string()))
+    }
+
     fn address_stats(&self, address: &Address) -> Result<AddressStats> {
         let addr = address.to_string();
         self.block_on_result(async {
@@ -482,7 +551,7 @@ impl ElectrumLike for EsploraElectrumLike {
             while out.len() < limit {
                 let url = match last_seen.as_ref() {
                     Some(txid) => format!("{}/address/{}/txs/chain/{}", self.base_url, addr, txid),
-                    None => format!("{}/address/{}/txs", self.base_url, addr),
+                    None => format!("{}/address/{}/txs/chain", self.base_url, addr),
                 };
                 let page = self.fetch_address_txs(&url).await?;
                 if page.is_empty() {
@@ -551,7 +620,7 @@ impl ElectrumLike for EsploraElectrumLike {
             while out.len() < limit {
                 let url = match last_seen.as_ref() {
                     Some(txid) => format!("{}/address/{}/txs/chain/{}", self.base_url, addr, txid),
-                    None => format!("{}/address/{}/txs", self.base_url, addr),
+                    None => format!("{}/address/{}/txs/chain", self.base_url, addr),
                 };
                 let page = self.fetch_address_txs(&url).await?;
                 if page.is_empty() {
@@ -592,6 +661,10 @@ impl ElectrumLike for EsploraElectrumLike {
         })
     }
 
+    fn address_mempool_txids(&self, address: &Address) -> Result<Vec<Txid>> {
+        self.block_on_result(self.fetch_address_mempool_txids(&address.to_string()))
+    }
+
     fn address_utxos(&self, address: &Address) -> Result<Vec<AddressUtxo>> {
         let addr = address.to_string();
         self.block_on_result(async {
@@ -622,18 +695,6 @@ fn extract_height(resp: &serde_json::Value) -> Option<u64> {
 }
 
 #[derive(Deserialize)]
-struct EsploraAddressSummary {
-    chain_stats: EsploraAddressChainStats,
-}
-
-#[derive(Deserialize)]
-struct EsploraAddressChainStats {
-    funded_txo_sum: u64,
-    spent_txo_sum: u64,
-    tx_count: u64,
-}
-
-#[derive(Deserialize)]
 struct EsploraUtxo {
     txid: String,
     vout: u32,
@@ -661,9 +722,18 @@ struct EsploraAddressTx {
 
 #[derive(Deserialize)]
 struct EsploraAddressTxStatus {
-    #[allow(dead_code)]
     confirmed: bool,
     block_height: Option<u64>,
+}
+
+fn mempool_txids_from_esplora(transactions: &[EsploraAddressTx]) -> Vec<Txid> {
+    let mut seen = HashSet::new();
+    transactions
+        .iter()
+        .filter(|transaction| !transaction.status.confirmed)
+        .filter_map(|transaction| Txid::from_str(&transaction.txid).ok())
+        .filter(|txid| seen.insert(*txid))
+        .collect()
 }
 
 fn extract_outspends(v: &serde_json::Value) -> Vec<Option<Txid>> {
@@ -679,4 +749,52 @@ fn extract_outspends(v: &serde_json::Value) -> Vec<Option<Txid>> {
         out.push(if spent { spender } else { None });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn address_summary_preserves_esplora_response_shape() {
+        let expected = json!({
+            "address": "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv",
+            "chain_stats": {
+                "funded_txo_count": 11,
+                "funded_txo_sum": 15_007_688_098u64,
+                "spent_txo_count": 5,
+                "spent_txo_sum": 15_007_599_040u64,
+                "tx_count": 13
+            },
+            "mempool_stats": {
+                "funded_txo_count": 0,
+                "funded_txo_sum": 0,
+                "spent_txo_count": 0,
+                "spent_txo_sum": 0,
+                "tx_count": 0
+            }
+        });
+
+        let summary: AddressSummary = serde_json::from_value(expected.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(summary).unwrap(), expected);
+    }
+
+    #[test]
+    fn esplora_mempool_txids_preserve_order_and_drop_invalid_confirmed_or_duplicate_rows() {
+        let first = "11".repeat(32);
+        let second = "22".repeat(32);
+        let transactions: Vec<EsploraAddressTx> = serde_json::from_value(json!([
+            { "txid": first, "status": { "confirmed": false, "block_height": null } },
+            { "txid": "not-a-txid", "status": { "confirmed": false, "block_height": null } },
+            { "txid": second, "status": { "confirmed": true, "block_height": 100 } },
+            { "txid": "11".repeat(32), "status": { "confirmed": false, "block_height": null } }
+        ]))
+        .unwrap();
+
+        let txids = mempool_txids_from_esplora(&transactions);
+
+        assert_eq!(txids, vec![Txid::from_str(&"11".repeat(32)).unwrap()]);
+    }
 }

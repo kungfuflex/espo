@@ -2,16 +2,17 @@ use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::storage::{
     EssentialsProvider, RpcGetAddressActivityParams, RpcGetAddressBalancesParams,
     RpcGetAddressCumulativeAlkanesParams, RpcGetAddressOutpointsParams,
-    RpcGetAddressSpendableOutpointsParams, RpcGetAddressTransactionsParams,
+    RpcGetAddressSpendableOutpointsParams, RpcGetAddressTransactionsParams, RpcGetAlkabiParams,
     RpcGetAlkaneAddressTxsParams, RpcGetAlkaneBalanceMetashrewParams,
     RpcGetAlkaneBalanceTxsByTokenParams, RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams,
     RpcGetAlkaneBlockTxsParams, RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams,
     RpcGetAlkaneTxSummaryParams, RpcGetAlkaneVolumesParams, RpcGetAllAlkanesParams,
-    RpcGetBlockSummaryParams, RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams,
-    RpcGetFactoryChildrenParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
-    RpcGetMempoolTracesParams, RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams,
-    RpcGetOrbitalVolumesParams, RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams,
-    RpcGetTransferVolumeParams, RpcPingParams,
+    RpcGetBlockSummaryParams, RpcGetBlockTimeParams, RpcGetBlockTimesParams,
+    RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams, RpcGetFactoryChildrenParams,
+    RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams,
+    RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams, RpcGetOrbitalVolumesParams,
+    RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams, RpcGetTransferVolumeParams,
+    RpcPingParams, RpcSearchAlkaneParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
@@ -149,6 +150,34 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
     }
 
     {
+        let reg_search = reg.clone();
+        let mdb_search = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_search
+                .register("search_alkane", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_search);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcSearchAlkaneParams {
+                            prefix: payload
+                                .get("prefix")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_search_alkane(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
         let reg_info = reg.clone();
         let mdb_info = Arc::clone(&mdb);
         tokio::spawn(async move {
@@ -169,6 +198,40 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                         view.rpc_get_alkane_info(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_alkabi = reg.clone();
+        let mdb_alkabi = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_alkabi
+                .register("get_alkabi", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_alkabi);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(view) => view,
+                            Err(error) => return error,
+                        };
+                        let params = RpcGetAlkabiParams {
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string),
+                            format: payload
+                                .get("format")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string),
+                        };
+                        tokio::task::spawn_blocking(move || view.rpc_get_alkabi(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -220,6 +283,57 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                         };
                         view.rpc_get_block_summary(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_block_time = reg.clone();
+        let mdb_block_time = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_block_time
+                .register("get_block_time", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_block_time);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetBlockTimeParams {
+                            height: payload.get("height").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_get_block_time(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_block_times = reg.clone();
+        let mdb_block_times = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_block_times
+                .register("get_block_times", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_block_times);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let heights = payload.get("heights").and_then(|value| {
+                            value.as_array().and_then(|items| {
+                                items.iter().map(Value::as_u64).collect::<Option<Vec<_>>>()
+                            })
+                        });
+                        let params = RpcGetBlockTimesParams { heights };
+                        view.rpc_get_block_times(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -1073,6 +1187,9 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                             only_alkane_txs: payload
                                 .get("only_alkane_txs")
+                                .and_then(|v| v.as_bool()),
+                            include_mempool: payload
+                                .get("include_mempool")
                                 .and_then(|v| v.as_bool()),
                             filter: payload
                                 .get("filter")

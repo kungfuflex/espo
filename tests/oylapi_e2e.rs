@@ -88,6 +88,8 @@ mod tests {
             bitcoind_rpc_url: String::from("http://127.0.0.1:8332"),
             bitcoind_rpc_user: String::from("test"),
             bitcoind_rpc_pass: String::from("test"),
+            b8_faucet_url: None,
+            hosts: Default::default(),
             bitcoind_blocks_dir: blocks_dir.to_str().unwrap().to_string(),
             reset_mempool_on_startup: false,
             rollback: None,

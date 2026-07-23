@@ -2,11 +2,29 @@ use axum::response::Html;
 use maud::{Markup, PreEscaped, html};
 use serde_json::json;
 
+use crate::config::get_config;
 use crate::explorer::components::header::{HeaderProps, header};
 use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::tx_view::json_viewer;
 
 const HTTP_BASE: &str = "https://api.alkanode.com";
+
+fn docs_host(configured: Option<&str>) -> &str {
+    configured.unwrap_or(HTTP_BASE).trim_end_matches('/')
+}
+
+fn docs_endpoint(host: Option<&str>, path: &str) -> String {
+    format!("{}{}", docs_host(host), path)
+}
+
+fn rpc_docs_endpoint() -> String {
+    rpc_endpoint(get_config().hosts.rpc_host.as_deref())
+}
+
+fn rpc_endpoint(configured: Option<&str>) -> String {
+    let host = docs_host(configured);
+    if host.ends_with("/rpc") { host.to_string() } else { format!("{host}/rpc") }
+}
 
 struct ModuleDoc {
     slug: &'static str,
@@ -448,6 +466,36 @@ fn method_notes(method: &MethodDoc) -> Vec<String> {
             &mut notes,
             "When `filter` is provided, `total` is `null` because the filtered total is not known without scanning the complete address history. Use `has_more` for pagination.",
         );
+        push_note(
+            &mut notes,
+            "`include_mempool` defaults to false. When true, all matching transactions currently returned by electrs `/address/:address/txs/mempool` are prepended to page 1 and do not consume confirmed pagination slots.",
+        );
+        push_note(
+            &mut notes,
+            "Mempool inclusion requires `electrs_esplora_url`. Requests with `include_mempool: true` return `unsupported_backend` when Espo is configured to use Electrum RPC instead.",
+        );
+        push_note(
+            &mut notes,
+            "Pending transactions have `confirmed: false`, `blockHeight: null`, `blockTime: null`, and `confirmations: 0`. Espo queries electrs on every included request, so dropped or RBF-replaced transactions disappear on the next poll.",
+        );
+    }
+    if method.title == "essentials.get_alkabi" {
+        push_note(
+            &mut notes,
+            "With `format: \"json\"`, `abi` is a JSON object. With `format: \"ts\"`, `abi` is a string containing a complete generated TypeScript module.",
+        );
+        push_note(
+            &mut notes,
+            "Proxy contracts resolve their indexed implementation recursively, and factory clones use their indexed factory WASM before Alkabi extraction.",
+        );
+        push_note(
+            &mut notes,
+            "Espo uses the top-level `alkabi_verify_trials` config value, which defaults to 128 and must be greater than zero. Reducible view methods include a verified `plan`; unsupported views omit it so consumers can fall back to simulation.",
+        );
+        push_note(
+            &mut notes,
+            "When top-level config `db_cache` is true, analyzed exports are persisted by network, resolved immutable WASM source, and verification trial count in `${db_path}/cache`. Concurrent misses for the same source and trial count share one job and wait for its cached result.",
+        );
     }
     if combined.contains("include_outpoints") {
         push_note(
@@ -481,6 +529,46 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     "Returns the latest Espo indexed height. Use this as the health and freshness check for clients.",
                     json!({}),
                     json!({ "height": 946000 }),
+                ),
+                rpc_doc(
+                    "broadcast_transaction",
+                    "Broadcasts a raw Bitcoin transaction through the configured electrs or Esplora backend, with Bitcoin Core as a fallback.",
+                    json!({ "raw_tx": "0200000001..." }),
+                    json!({ "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90" }),
+                ),
+                rpc_doc(
+                    "fee_estimates",
+                    "Returns precise sat/vB fee recommendations derived from Espo's projected mempool blocks. The fields match mempool.space's precise fee response shape.",
+                    json!({}),
+                    json!({
+                        "fastestFee": 1.017,
+                        "halfHourFee": 0.722,
+                        "hourFee": 0.448,
+                        "economyFee": 0.2,
+                        "minimumFee": 0.1
+                    }),
+                ),
+                rpc_doc(
+                    "get_address",
+                    "Returns the configured electrs/Esplora address summary without changing its field names or response shape. This method requires electrs_esplora_url; native Electrum RPC does not expose the exact aggregate statistics.",
+                    json!({ "address": "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv" }),
+                    json!({
+                        "address": "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv",
+                        "chain_stats": {
+                            "funded_txo_count": 11,
+                            "funded_txo_sum": 15007688098u64,
+                            "spent_txo_count": 5,
+                            "spent_txo_sum": 15007599040u64,
+                            "tx_count": 13
+                        },
+                        "mempool_stats": {
+                            "funded_txo_count": 0,
+                            "funded_txo_sum": 0,
+                            "spent_txo_count": 0,
+                            "spent_txo_sum": 0,
+                            "tx_count": 0
+                        }
+                    }),
                 ),
                 rpc_doc(
                     "get_method_line_chart",
@@ -560,15 +648,52 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_all_alkanes",
-                    "Lists Alkane creation records with basic metadata.",
+                    "Lists Alkane creation records with basic metadata. When only a name or symbol is indexed, the missing scalar field falls back to the available value; name-to-symbol fallbacks are uppercased. The raw names and symbols arrays remain unchanged.",
                     json!({ "page": 1, "limit": 1 }),
-                    json!({ "ok": true, "page": 1, "limit": 1, "total": 77735, "items": [{ "alkane": "2:77579", "name": "Beep Boop Orbited #1376", "holder_count": 1 }] }),
+                    json!({ "ok": true, "page": 1, "limit": 1, "total": 77735, "items": [{ "alkane": "2:77579", "name": "Beep Boop Orbited #1376", "symbol": "BEEP BOOP ORBITED #1376", "holder_count": 1 }] }),
+                ),
+                rpc_doc(
+                    "essentials.search_alkane",
+                    "Searches indexed Alkane names and symbols by a case-insensitive prefix. Exact matches rank first, followed by holder count. limit defaults to 20 and is capped at 100. A missing symbol falls back to the uppercased name, and a missing name falls back to the symbol.",
+                    json!({ "prefix": "die", "limit": 10 }),
+                    json!({
+                        "ok": true,
+                        "prefix": "die",
+                        "limit": 10,
+                        "items": [{
+                            "alkane": "2:0",
+                            "name": "DIESEL",
+                            "symbol": "diesel",
+                            "holder_count": 6409,
+                            "creation_height": 880000
+                        }]
+                    }),
                 ),
                 rpc_doc(
                     "essentials.get_alkane_info",
-                    "Returns the creation metadata, names, icon, and indexed details for one Alkane.",
+                    "Returns the creation metadata, names, icon, and indexed details for one Alkane. A missing scalar symbol falls back to the uppercased name, and a missing scalar name falls back to the symbol.",
                     json!({ "alkane": "2:0" }),
                     json!({ "ok": true, "alkane": "2:0", "name": "DIESEL", "symbol": "diesel", "holder_count": 6409, "creation_height": 880000 }),
+                ),
+                rpc_doc(
+                    "essentials.get_alkabi",
+                    "Extracts a contract's Alkabi ABI from its indexed WASM and synthesizes verified static plans for reducible view methods. Set format to json to return the ABI as a JSON object, or ts to return a generated TypeScript module string. Proxy implementations and factory clones resolve through the same indexed metadata used by the explorer's contract inspector. An optional height selects the indexed proxy and factory metadata at that height.",
+                    json!({ "alkane": "2:0", "format": "json" }),
+                    json!({
+                        "ok": true,
+                        "alkane": "2:0",
+                        "format": "json",
+                        "abi": {
+                            "alkabi": 1,
+                            "contract": "GenesisAlkane",
+                            "types": {},
+                            "methods": [{
+                                "name": "mint",
+                                "opcode": 77,
+                                "kind": "execute"
+                            }]
+                        }
+                    }),
                 ),
                 rpc_doc(
                     "essentials.get_factory_children",
@@ -578,9 +703,27 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_block_summary",
-                    "Returns the indexed Alkane summary for a block height.",
+                    "Returns the indexed summary, canonical block hash, serialized header, and exact Unix block time for a block height.",
                     json!({ "height": 946000 }),
-                    json!({ "ok": true, "height": 946000, "tx_count": 2864, "trace_count": 38, "interaction_count": 60, "pool": { "name": "AntPool", "slug": "antpool" } }),
+                    json!({ "ok": true, "height": 946000, "found": true, "blockhash": "0000000000000000000000000000000000000000000000000000000000000000", "header_hex": "00000020...", "block_time": 1779308930, "tx_count": 2864, "trace_count": 38, "interaction_count": 60, "pool": { "name": "AntPool", "slug": "antpool" } }),
+                ),
+                rpc_doc(
+                    "essentials.get_block_time",
+                    "Returns the exact Unix timestamp from the canonical indexed block header at one height.",
+                    json!({ "height": 946000 }),
+                    json!({ "ok": true, "height": 946000, "found": true, "block_time": 1779308930 }),
+                ),
+                rpc_doc(
+                    "essentials.get_block_times",
+                    "Returns exact Unix timestamps for up to 1,000 canonical indexed block heights in request order.",
+                    json!({ "heights": [945999, 946000] }),
+                    json!({
+                        "ok": true,
+                        "times": [
+                            { "height": 945999, "found": true, "block_time": 1779308321 },
+                            { "height": 946000, "found": true, "block_time": 1779308930 }
+                        ]
+                    }),
                 ),
                 rpc_doc(
                     "essentials.get_holders",
@@ -797,9 +940,33 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "essentials.get_address_transactions",
-                    "Returns Bitcoin transactions for an address and can be narrowed to Alkane transactions. When `filter` is provided with `only_alkane_txs`, it scans Alkane transactions until the requested page is filled and returns `total: null`.",
-                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "only_alkane_txs": true, "filter": "2:0" }),
-                    json!({ "ok": true, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "total": null, "transactions": [{ "txid": "e212e704173d61d19a280de3af2f6a5166ecf95e9a2a98f74ceeeb3de323ea1c", "blockHeight": 939827, "confirmed": true }] }),
+                    "Returns Bitcoin transactions for an address with exact indexed block heights, Unix block times, and confirmations, and can be narrowed to Alkane transactions. Pending transactions can be included from electrs REST on page 1 only. When `filter` is provided with `only_alkane_txs`, it scans Alkane transactions until the requested confirmed page is filled and returns `total: null`.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "page": 1, "limit": 1, "only_alkane_txs": true, "filter": "2:0", "include_mempool": true }),
+                    json!({
+                        "ok": true,
+                        "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8",
+                        "page": 1,
+                        "limit": 1,
+                        "include_mempool": true,
+                        "total": null,
+                        "has_more": true,
+                        "transactions": [
+                            {
+                                "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90",
+                                "blockHeight": null,
+                                "blockTime": null,
+                                "confirmations": 0,
+                                "confirmed": false
+                            },
+                            {
+                                "txid": "e212e704173d61d19a280de3af2f6a5166ecf95e9a2a98f74ceeeb3de323ea1c",
+                                "blockHeight": 939827,
+                                "blockTime": 1779308930,
+                                "confirmations": 6174,
+                                "confirmed": true
+                            }
+                        ]
+                    }),
                 ),
                 rpc_doc(
                     "essentials.get_alkane_latest_traces",
@@ -857,6 +1024,133 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     "Returns OHLCV candles for a pool or token pair over a supported timeframe.",
                     json!({ "pool": "2:53014", "timeframe": "1h", "limit": 10, "page": 1, "side": "base" }),
                     json!({ "ok": true, "candles": [{ "ts": 1710000000, "open": "1", "high": "2", "low": "1", "close": "2", "volume": "100" }] }),
+                ),
+                rpc_doc(
+                    "ammdata.get_btc_usd_candles",
+                    "Returns Espo's native indexed BTC/USD history without deriving it through an Alkane market. Supported timeframes are 10m, 1h, 4h, 1d, 1w, and 1M. Candles are newest first and prices are fixed-point integers scaled by 10^16; divide open, high, low, and close by price_scale to obtain USD. Missing buckets are forward-filled from the last indexed price, and volume is always zero because this is a price index rather than an AMM market.",
+                    json!({ "timeframe": "1h", "limit": 2, "page": 1 }),
+                    json!({
+                        "ok": true,
+                        "pair": "btc-usd",
+                        "timeframe": "1h",
+                        "page": 1,
+                        "limit": 2,
+                        "total": 1000,
+                        "has_more": true,
+                        "price_scale": "10000000000000000",
+                        "price_decimals": 16,
+                        "candles": [{
+                            "ts": 1779307200,
+                            "open": "650000000000000000000",
+                            "high": "650000000000000000000",
+                            "low": "650000000000000000000",
+                            "close": "650000000000000000000",
+                            "volume": "0"
+                        }]
+                    }),
+                ),
+                rpc_doc(
+                    "ammdata.get_alkanes_quote",
+                    "Returns current and 24-hour USD quotes for BTC and requested Alkanes. frBTC (32:0) is pegged directly to Espo's indexed BTC/USD history, so its prices and changes match BTC exactly. Other Alkane quotes prefer the configured merged <token>-derived_<quote>-usd chart, fall back to the direct <token>-usd chart, and return zero prices when neither chart exists. Current prices use the latest 10-minute close and comparison prices use hourly candle index 24. change_24h is the percentage change and change_24h_usd is the absolute price change.",
+                    json!({ "assets": ["btc", "2:0", "2:68479"] }),
+                    json!({
+                        "ok": true,
+                        "timeframe": "1h",
+                        "comparison_hours": 24,
+                        "assets": {
+                            "btc": {
+                                "name": "Bitcoin",
+                                "symbol": "BTC",
+                                "price_now_usd": "65000",
+                                "price_24h_ago_usd": "64000",
+                                "change_24h": "1.5625",
+                                "change_24h_usd": "1000",
+                                "price_now_ts": 1779307200,
+                                "price_24h_ago_ts": 1779220800
+                            },
+                            "2:0": {
+                                "name": "DIESEL",
+                                "symbol": "diesel",
+                                "price_now_usd": "0.75",
+                                "price_24h_ago_usd": "0.7",
+                                "change_24h": "7.1428",
+                                "change_24h_usd": "0.05",
+                                "price_now_ts": 1779307200,
+                                "price_24h_ago_ts": 1779220800
+                            },
+                            "2:68479": {
+                                "name": "TORTILLA",
+                                "symbol": "TORTILLA",
+                                "price_now_usd": "0",
+                                "price_24h_ago_usd": "0",
+                                "change_24h": "0.0000",
+                                "change_24h_usd": "0",
+                                "price_now_ts": null,
+                                "price_24h_ago_ts": null
+                            }
+                        }
+                    }),
+                ),
+                rpc_doc(
+                    "ammdata.get_alkane_quote",
+                    "Returns one BTC or Alkane quote using the same BTC-pegged frBTC, merged-derived, direct-USD, then zero fallback order as ammdata.get_alkanes_quote. The asset field also accepts an Alkane ID under the alkane alias.",
+                    json!({ "asset": "2:0" }),
+                    json!({
+                        "ok": true,
+                        "asset": "2:0",
+                        "timeframe": "1h",
+                        "comparison_hours": 24,
+                        "name": "DIESEL",
+                        "symbol": "diesel",
+                        "price_now_usd": "0.75",
+                        "price_24h_ago_usd": "0.7",
+                        "change_24h": "7.1428",
+                        "change_24h_usd": "0.05",
+                        "price_now_ts": 1779307200,
+                        "price_24h_ago_ts": 1779220800
+                    }),
+                ),
+                rpc_doc(
+                    "ammdata.get_portfolio_stats",
+                    "Values an address's confirmed BTC and Alkane balances at latest or an optional indexed height. Historical BTC balances are reconstructed from address transaction history, while BTC prices come from Espo's indexed BTC/USD candles. frBTC (32:0) uses that same BTC price history. The same selected-height balances are valued at current and 24-hour-old prices, so changes represent price movement without treating purchases, sales, or transfers as gains. change_24h is the percentage change and change_24h_usd is the corresponding portfolio USD value change. Alkane names and symbols fall back to each other when one is missing, with name-to-symbol fallbacks uppercased. complete is false when any balance lacks a required price.",
+                    json!({ "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "height": 946000 }),
+                    json!({
+                        "ok": true,
+                        "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8",
+                        "height": 946000,
+                        "complete": true,
+                        "unpriced_assets": [],
+                        "total_value_usd": "65150",
+                        "total_value_24h_ago_usd": "64140",
+                        "change_24h": "1.5746",
+                        "change_24h_usd": "1010",
+                        "assets": {
+                            "btc": {
+                                "name": "Bitcoin",
+                                "symbol": "BTC",
+                                "balance": "100000000",
+                                "price_now_usd": "65000",
+                                "price_24h_ago_usd": "64000",
+                                "change_24h": "1.5625",
+                                "change_24h_usd": "1000",
+                                "value_now_usd": "65000",
+                                "value_24h_ago_usd": "64000",
+                                "value_change_24h_usd": "1000"
+                            },
+                            "2:0": {
+                                "name": "DIESEL",
+                                "symbol": "diesel",
+                                "balance": "20000000000",
+                                "price_now_usd": "0.75",
+                                "price_24h_ago_usd": "0.7",
+                                "change_24h": "7.1428",
+                                "change_24h_usd": "0.05",
+                                "value_now_usd": "150",
+                                "value_24h_ago_usd": "140",
+                                "value_change_24h_usd": "10"
+                            }
+                        }
+                    }),
                 ),
                 rpc_doc(
                     "ammdata.get_token_volume",
@@ -1007,9 +1301,9 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "ammdata.get_btc_usd_price",
-                    "Returns the BTC/USD price at latest or at a requested height.",
+                    "Returns the BTC/USD price at latest or at a requested height. price is a fixed-point integer scaled by 10^16.",
                     json!({ "height": 946000 }),
-                    json!({ "ok": true, "height": 946000, "price_usd": "65000" }),
+                    json!({ "ok": true, "height": 946000, "price": "650000000000000000000", "source": "ammdata_index" }),
                 ),
                 rpc_doc(
                     "ammdata.get_total_volume_amm",
@@ -1382,8 +1676,14 @@ fn docs_modules() -> Vec<ModuleDoc> {
         ModuleDoc {
             slug: "subfrost-rpc",
             title: "Subfrost JSON-RPC",
-            intro: "frBTC wrap and unwrap event and request history methods.",
+            intro: "Current frBTC signer and wrap and unwrap event and request history methods.",
             methods: vec![
+                rpc_doc(
+                    "subfrost.get_signer",
+                    "Returns the current Subfrost signer address from the indexed /signer scriptPubKey on frBTC contract 32:0.",
+                    json!({}),
+                    json!({ "ok": true, "alkane": "32:0", "storage_key": "/signer", "script_pubkey": "0x51201d4830313fb48f68b43b07391fe1232f8488621b2cbc5fb4b26d8935e4bf1cb4", "address": "bcrt1pr4yrqvflkj8k3dpmquu3lcfr97zgscsm9j79ld9jdkynte9lrj6qlcsdcx" }),
+                ),
                 rpc_doc(
                     "subfrost.get_wrap_events_by_address",
                     "Returns frBTC wrap events for an address.",
@@ -1460,7 +1760,7 @@ fn rpc_doc(
         badge: "JSON-RPC".to_string(),
         transport: "JSON-RPC",
         description,
-        query_prefix: Some(format!("POST {HTTP_BASE}/rpc")),
+        query_prefix: Some(format!("POST {}", rpc_docs_endpoint())),
         query_fallback: pretty(&request),
         query_json: Some(request),
         response_fallback: pretty(&response),
@@ -1475,7 +1775,42 @@ fn http_doc(
     body: serde_json::Value,
     response: serde_json::Value,
 ) -> MethodDoc {
-    let endpoint = format!("{HTTP_BASE}{path}");
+    http_doc_for_host(
+        get_config().hosts.oyl_api_host.as_deref(),
+        http_method,
+        path,
+        description,
+        body,
+        response,
+    )
+}
+
+fn explorer_http_doc(
+    http_method: &'static str,
+    path: &'static str,
+    description: &'static str,
+    body: serde_json::Value,
+    response: serde_json::Value,
+) -> MethodDoc {
+    http_doc_for_host(
+        get_config().hosts.explorer_host.as_deref(),
+        http_method,
+        path,
+        description,
+        body,
+        response,
+    )
+}
+
+fn http_doc_for_host(
+    host: Option<&str>,
+    http_method: &'static str,
+    path: &'static str,
+    description: &'static str,
+    body: serde_json::Value,
+    response: serde_json::Value,
+) -> MethodDoc {
+    let endpoint = docs_endpoint(host, path);
     let query =
         if http_method == "GET" { format!("{http_method} {endpoint}") } else { pretty(&body) };
     MethodDoc {
@@ -1502,7 +1837,7 @@ fn ws_doc(
     payload: serde_json::Value,
     response: serde_json::Value,
 ) -> MethodDoc {
-    let endpoint = format!("{HTTP_BASE}{path}");
+    let endpoint = docs_endpoint(get_config().hosts.explorer_host.as_deref(), path);
     MethodDoc {
         anchor: anchor_for(path),
         title: path.to_string(),
@@ -1754,6 +2089,7 @@ fn oyl_http_docs() -> Vec<MethodDoc> {
 }
 
 fn explorer_http_docs() -> Vec<MethodDoc> {
+    let http_doc = explorer_http_doc;
     vec![
         http_doc(
             "GET",
@@ -1806,6 +2142,60 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
         ),
         http_doc(
             "GET",
+            "/api/faucet/status",
+            "Returns B8's separate rBTC and DIESEL faucet settings, spendable balances, minimum and maximum request amounts, rolling 24-hour usage, and configured caps when the regtest faucet is enabled. The top-level fields mirror rBTC for compatibility.",
+            json!({}),
+            json!({
+                "id": 1,
+                "jsonrpc": "2.0",
+                "result": {
+                    "amount": 1.0,
+                    "enabled": true,
+                    "max_amount": 1.0,
+                    "rbtc": {
+                        "amount": 1.0,
+                        "claims_last_24h": 2,
+                        "enabled": true,
+                        "min_amount": 0.1,
+                        "max_amount": 1.0,
+                        "total_available": 149.5,
+                        "max_per_address_per_day": 10.0,
+                        "max_per_day": 500.0,
+                        "max_per_ip_per_day": 10.0,
+                        "sent_last_24h": 2.0
+                    },
+                    "diesel": {
+                        "amount": 10.0,
+                        "claims_last_24h": 3,
+                        "enabled": true,
+                        "min_amount": 1.0,
+                        "max_amount": 10.0,
+                        "total_available": 3200.0,
+                        "max_per_address_per_day": 100.0,
+                        "max_per_day": 5000.0,
+                        "max_per_ip_per_day": 100.0,
+                        "sent_last_24h": 8.0
+                    }
+                }
+            }),
+        ),
+        http_doc(
+            "POST",
+            "/api/faucet/send",
+            "Requests rBTC or DIESEL within that asset's configured B8 faucet minimum and maximum for one regtest address. asset defaults to rbtc when omitted. Omitting amount retains B8's maximum-payout behavior. Available only on regtest when b8_faucet_url is configured.",
+            json!({ "address": "bcrt1q...", "amount": 3.0, "asset": "diesel" }),
+            json!({
+                "id": 1,
+                "jsonrpc": "2.0",
+                "result": {
+                    "amount": 3.0,
+                    "asset": "diesel",
+                    "txid": "7be14a09c9..."
+                }
+            }),
+        ),
+        http_doc(
+            "GET",
             "/api/search/guess?q=2%3A0",
             "Returns search suggestions and target type guesses.",
             json!({}),
@@ -1831,6 +2221,13 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
             "Exports holders for an Alkane as a downloadable response.",
             json!({}),
             json!({ "content_type": "text/csv" }),
+        ),
+        http_doc(
+            "GET",
+            "/api/alkane/wasm/export?alkane=2%3A0",
+            "Downloads the resolved contract WASM. Proxy implementations and factory clones use the same indexed source resolution as Alkabi exports.",
+            json!({}),
+            json!({ "content_type": "application/wasm", "filename": "alkane-2-0.wasm" }),
         ),
         http_doc(
             "GET",
@@ -1869,15 +2266,42 @@ fn explorer_http_docs() -> Vec<MethodDoc> {
         ),
         ws_doc(
             "/api/events/ws",
-            "Streams explorer mempool and chain events when websocket support is enabled.",
-            json!({ "type": "subscribe", "channels": ["mempool"] }),
-            json!({ "type": "mempool", "blocks": [{ "index": 0, "tx_count": 3879, "trace_count": 2119, "vsize": 998957 }] }),
+            "Streams explorer events when websocket support is enabled. Clients receive only the categories and identifiers requested with `action: want`: `block`, `mempool-blocks`, a specific `txid`, or a specific `address`. Transaction and address batches are narrowed server-side to the tracked values. A transaction request returns its current status immediately and then streams only that transaction's mempool and confirmation changes on the same connection.",
+            json!({ "action": "want", "data": ["tx"], "txid": "4d3f...9a10" }),
+            json!({ "type": "tx-status", "data": { "txid": "4d3f...9a10", "status": "confirmed", "height": 958411, "timestamp": 1784382000, "confirmations": 2 } }),
         ),
     ]
 }
 
 fn pretty(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HTTP_BASE, docs_endpoint, rpc_endpoint};
+
+    #[test]
+    fn documentation_endpoints_use_configured_hosts_without_double_slashes() {
+        assert_eq!(
+            docs_endpoint(Some("https://explorer.example.com/"), "/api/blocks"),
+            "https://explorer.example.com/api/blocks"
+        );
+        assert_eq!(
+            docs_endpoint(Some("https://oyl.example.com"), "/get-bitcoin-price"),
+            "https://oyl.example.com/get-bitcoin-price"
+        );
+    }
+
+    #[test]
+    fn rpc_endpoint_accepts_a_host_or_complete_rpc_endpoint() {
+        assert_eq!(rpc_endpoint(Some("https://rpc.example.com/")), "https://rpc.example.com/rpc");
+        assert_eq!(
+            rpc_endpoint(Some("https://rpc.example.com/rpc")),
+            "https://rpc.example.com/rpc"
+        );
+        assert_eq!(rpc_endpoint(None), format!("{HTTP_BASE}/rpc"));
+    }
 }
 
 fn anchor_for(raw: &str) -> String {

@@ -20,6 +20,7 @@ use crate::modules::essentials::storage::{
 use crate::modules::essentials::utils::balances::{
     clean_espo_sandshrew_like_trace, get_alkane_balances,
 };
+use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
@@ -615,7 +616,7 @@ pub(crate) fn get_alkane_label(
         })
         .ok()
         .and_then(|resp| resp.record)
-        .and_then(|rec| rec.symbols.first().cloned().or_else(|| rec.names.first().cloned()))
+        .and_then(|rec| display_alkane_name_and_symbol(&rec.names, &rec.symbols).1)
         .unwrap_or_else(|| format!("{}:{}", alkane.block, alkane.tx));
     cache.insert(*alkane, label.clone());
     label

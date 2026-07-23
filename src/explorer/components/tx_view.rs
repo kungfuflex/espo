@@ -27,7 +27,7 @@ use crate::modules::essentials::utils::balances::{
     OutpointLookup, project_tx_output_balances_from_traces,
 };
 use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
-use crate::modules::essentials::utils::names::display_alkane_name;
+use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
 use crate::modules::runes::storage::{RuneBalance, RunesProvider, TxRuneIo};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
@@ -611,6 +611,14 @@ fn contract_icon_url(id: &SchemaAlkaneId, mdb: &Mdb) -> String {
     alkane_icon_url(id, mdb)
 }
 
+fn contract_summary_link_id(
+    contract_id: SchemaAlkaneId,
+    active_id: SchemaAlkaneId,
+    using_proxy_template: bool,
+) -> SchemaAlkaneId {
+    if using_proxy_template { contract_id } else { active_id }
+}
+
 fn summarize_contract_call(
     trace: &EspoTrace,
     cache: &mut InspectionCache,
@@ -693,7 +701,7 @@ fn summarize_contract_call(
             }
         }
     }
-    let mut link_id = active_id;
+    let mut link_id = contract_summary_link_id(contract_id, active_id, using_proxy_template);
     let mut effective_name = contract_name;
     let mut created_meta: Option<AlkaneMetaDisplay> = None;
     if let Some((template_id, _)) = factory_pair {
@@ -1467,12 +1475,7 @@ pub(crate) fn alkane_meta(
     let mut symbol: Option<String> = None;
 
     if let Ok(Some(rec)) = load_creation_record(essentials_mdb, id) {
-        if let Some(n) = display_alkane_name(&rec.names) {
-            name = Some(n);
-        }
-        if let Some(s) = rec.symbols.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            symbol = Some(s.to_string());
-        }
+        (name, symbol) = display_alkane_name_and_symbol(&rec.names, &rec.symbols);
     }
 
     for (id_s, n, sym) in alkane_name_overrides() {
@@ -1598,5 +1601,14 @@ mod tests {
         let parsed = parse_factory_clone(Some(&inputs), Some(created));
 
         assert_eq!(parsed, Some((SchemaAlkaneId { block: 2, tx: 77597 }, Some(created))));
+    }
+
+    #[test]
+    fn proxy_summary_links_to_invoked_contract_instead_of_implementation() {
+        let proxy = SchemaAlkaneId { block: 4, tx: 65522 };
+        let implementation = SchemaAlkaneId { block: 4, tx: 65521 };
+
+        assert_eq!(contract_summary_link_id(proxy, implementation, true), proxy);
+        assert_eq!(contract_summary_link_id(proxy, implementation, false), implementation);
     }
 }

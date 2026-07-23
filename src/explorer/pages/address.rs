@@ -252,6 +252,7 @@ fn mempool_projected_balances(
     let mut contract_projector = MempoolProjectionRegistry::from_latest_indices();
 
     for item in ordered_txs {
+        contract_projector.begin_transaction();
         let mut input_totals: BTreeMap<crate::schemas::SchemaAlkaneId, u128> = BTreeMap::new();
         for vin in &item.tx.input {
             if vin.previous_output.is_null() {
@@ -276,7 +277,7 @@ fn mempool_projected_balances(
             input_balances,
             Some(&mut contract_projector),
         );
-        if projected.is_empty() {
+        if projected.is_empty() && !contract_projector.did_apply() {
             continue;
         }
         for (vout, entries) in &projected {
@@ -1340,24 +1341,26 @@ pub async fn address_page(
         &canonical_path,
         None,
         html! {
-            (header_markup)
-            @if let Some(url) = mempool_url {
-                div class="tx-mempool-row" {
-                    a class="tx-mempool-link" href=(url) target="_blank" rel="noopener noreferrer" {
-                        "view on mempool.space"
-                        (icon_arrow_up_right())
+            div data-address-summary-live="" {
+                (header_markup)
+                @if let Some(url) = mempool_url {
+                    div class="tx-mempool-row" {
+                        a class="tx-mempool-link" href=(url) target="_blank" rel="noopener noreferrer" {
+                            "view on mempool.space"
+                            (icon_arrow_up_right())
+                        }
                     }
                 }
-            }
 
-            @if !rune_balance_entries.is_empty() {
-                h2 class="h2 address-subtitle" { "Rune Balances" }
-                (rune_balances_markup)
-            }
+                @if !rune_balance_entries.is_empty() {
+                    h2 class="h2 address-subtitle" { "Rune Balances" }
+                    (rune_balances_markup)
+                }
 
-            @if !balance_entries.is_empty() {
-                h2 class="h2 address-subtitle" { "Alkane Balances" }
-                (balances_markup)
+                @if !balance_entries.is_empty() {
+                    h2 class="h2 address-subtitle" { "Alkane Balances" }
+                    (balances_markup)
+                }
             }
 
             @if let Some(default_token) = default_chart_token.as_ref() {
@@ -1502,72 +1505,74 @@ pub async fn address_page(
                     }
                 }
 
-                @if let Some(err) = history_error.as_ref() {
-                    p class="error" { (err) }
-                }
-                @if tx_total == 0 {
-                    p class="muted" { "No transactions found." }
-                } @else {
-                    div class="list" {
-                        @for item in tx_renders {
-                            @let traces_ref: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
-                            @let pill = if item.is_mempool {
-                                Some(TxPill { label: "Unconfirmed".to_string(), tone: TxPillTone::Danger })
-                            } else if let Some(c) = item.confirmations {
-                                Some(TxPill {
-                                    label: format!("{} confirmations", format_with_commas(c)),
-                                    tone: TxPillTone::Success,
-                                })
-                            } else {
-                                None
-                            };
-                            @let projected_rune_io = item.rune_io.as_ref();
-                            @let projected_balances = if item.is_mempool {
-                                projected_balances_by_tx.get(&item.txid)
-                            } else {
-                                None
-                            };
-                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, projected_balances, projected_rune_io, true, false))
-                        }
+                div data-address-transactions-live="" {
+                    @if let Some(err) = history_error.as_ref() {
+                        p class="error" { (err) }
                     }
+                    @if tx_total == 0 {
+                        p class="muted" { "No transactions found." }
+                    } @else {
+                        div class="list" {
+                            @for item in tx_renders {
+                                @let traces_ref: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
+                                @let pill = if item.is_mempool {
+                                    Some(TxPill { label: "Unconfirmed".to_string(), tone: TxPillTone::Danger })
+                                } else if let Some(c) = item.confirmations {
+                                    Some(TxPill {
+                                        label: format!("{} confirmations", format_with_commas(c)),
+                                        tone: TxPillTone::Success,
+                                    })
+                                } else {
+                                    None
+                                };
+                                @let projected_rune_io = item.rune_io.as_ref();
+                                @let projected_balances = if item.is_mempool {
+                                    projected_balances_by_tx.get(&item.txid)
+                                } else {
+                                    None
+                                };
+                                (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, None, projected_balances, projected_rune_io, true, false))
+                            }
+                        }
 
-                    div class="pager" {
-                        @if tx_has_prev {
-                            a class="pill iconbtn" href=(first_href) aria-label="First page" {
-                                (icon_pager_first())
+                        div class="pager" {
+                            @if tx_has_prev {
+                                a class="pill iconbtn" href=(first_href) aria-label="First page" {
+                                    (icon_pager_first())
+                                }
+                            } @else {
+                                span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
                             }
-                        } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_first()) }
-                        }
-                        @if tx_has_prev {
-                            a class="pill iconbtn" href=(prev_href) aria-label="Previous page" {
-                                (icon_pager_left())
+                            @if tx_has_prev {
+                                a class="pill iconbtn" href=(prev_href) aria-label="Previous page" {
+                                    (icon_pager_left())
+                                }
+                            } @else {
+                                span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
                             }
-                        } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_left()) }
-                        }
-                        span class="pager-meta muted" { "Showing "
-                            (format_with_commas(if tx_total > 0 { display_start as u64 } else { 0 }))
-                            @if tx_total > 0 {
-                                "-"
-                                (format_with_commas(display_end as u64))
+                            span class="pager-meta muted" { "Showing "
+                                (format_with_commas(if tx_total > 0 { display_start as u64 } else { 0 }))
+                                @if tx_total > 0 {
+                                    "-"
+                                    (format_with_commas(display_end as u64))
+                                }
+                                " / "
+                                (format_with_commas(tx_total as u64))
                             }
-                            " / "
-                            (format_with_commas(tx_total as u64))
-                        }
-                        @if tx_has_next {
-                            a class="pill iconbtn" href=(next_href) aria-label="Next page" {
-                                (icon_pager_right())
+                            @if tx_has_next {
+                                a class="pill iconbtn" href=(next_href) aria-label="Next page" {
+                                    (icon_pager_right())
+                                }
+                            } @else {
+                                span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
                             }
-                        } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_right()) }
-                        }
-                        @if tx_has_next && !use_cursor {
-                            a class="pill iconbtn" href=(last_href) aria-label="Last page" {
-                                (icon_pager_last())
+                            @if tx_has_next && !use_cursor {
+                                a class="pill iconbtn" href=(last_href) aria-label="Last page" {
+                                    (icon_pager_last())
+                                }
+                            } @else {
+                                span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                             }
-                        } @else {
-                            span class="pill disabled iconbtn" aria-hidden="true" { (icon_pager_last()) }
                         }
                     }
                 }
@@ -1588,15 +1593,31 @@ pub async fn address_page(
 }
 
 fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
-    let base_path_js =
-        serde_json::to_string(&explorer_path("/")).unwrap_or_else(|_| "\"/\"".into());
+    let base_path = explorer_path("/");
+    let mempool_cfg = &get_config().mempool;
+    let ws_path = mempool_cfg.websocket_path.as_deref().unwrap_or("/api/events/ws");
+    address_event_listener_script_with_events(
+        address,
+        txids,
+        &base_path,
+        ws_path,
+        mempool_cfg.websocket_enabled,
+    )
+}
+
+fn address_event_listener_script_with_events(
+    address: &str,
+    txids: &[String],
+    base_path: &str,
+    ws_path: &str,
+    ws_enabled: bool,
+) -> Markup {
+    let base_path_js = serde_json::to_string(base_path).unwrap_or_else(|_| "\"/\"".into());
     let address_js = serde_json::to_string(address).unwrap_or_else(|_| "\"\"".into());
     let txids_js = serde_json::to_string(txids).unwrap_or_else(|_| "[]".into());
-    let mempool_cfg = &get_config().mempool;
-    let ws_path = mempool_cfg.websocket_path.as_deref().unwrap_or("/api/events/ws").to_string();
     let ws_path_js =
         serde_json::to_string(&ws_path).unwrap_or_else(|_| "\"/api/events/ws\"".into());
-    let ws_enabled_js = mempool_cfg.websocket_enabled;
+    let ws_enabled_js = ws_enabled;
 
     PreEscaped(format!(
         r#"
@@ -1609,7 +1630,11 @@ fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
   const eventsEnabled = {ws_enabled_js};
   let refreshTimer = null;
   let refreshInFlight = false;
+  let refreshQueued = false;
   let retryTimer = null;
+  let socket = null;
+  let hasConnected = false;
+  let disposed = false;
 
   const normalizedBase = basePath.endsWith('/') ? basePath.slice(0, -1) : basePath;
   const wsPath = eventsPath.startsWith('/') ? `${{normalizedBase}}${{eventsPath}}` : `${{normalizedBase}}/${{eventsPath}}`;
@@ -1684,35 +1709,7 @@ fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
     }});
   }};
 
-  const executeMainScripts = (main) => {{
-    main.querySelectorAll('script').forEach((oldScript) => {{
-      if (oldScript.hasAttribute('data-address-event-listener')) return;
-      const script = document.createElement('script');
-      for (const attr of oldScript.attributes) {{
-        script.setAttribute(attr.name, attr.value);
-      }}
-      script.textContent = oldScript.textContent;
-      oldScript.replaceWith(script);
-    }});
-  }};
-
-  const syncHead = (doc) => {{
-    if (doc.title) document.title = doc.title;
-    ['description'].forEach((name) => {{
-      const next = doc.head.querySelector(`meta[name="${{name}}"]`);
-      const current = document.head.querySelector(`meta[name="${{name}}"]`);
-      if (next && current) current.setAttribute('content', next.getAttribute('content') || '');
-    }});
-    ['canonical', 'alternate'].forEach((rel) => {{
-      const current = Array.from(document.head.querySelectorAll(`link[rel="${{rel}}"]`));
-      const next = Array.from(doc.head.querySelectorAll(`link[rel="${{rel}}"]`));
-      current.forEach((node, idx) => {{
-        if (next[idx]) node.setAttribute('href', next[idx].getAttribute('href') || '');
-      }});
-    }});
-  }};
-
-  const refreshDom = async () => {{
+  const refreshLiveRegions = async () => {{
     if (refreshInFlight) return;
     refreshInFlight = true;
     try {{
@@ -1723,24 +1720,33 @@ fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
       if (!res.ok) return;
       const text = await res.text();
       const doc = new DOMParser().parseFromString(text, 'text/html');
-      const nextMain = doc.querySelector('main.app');
-      const currentMain = document.querySelector('main.app');
-      if (!nextMain || !currentMain) return;
-      syncHead(doc);
-      currentMain.replaceWith(nextMain);
-      executeMainScripts(nextMain);
+      const nextSummary = doc.querySelector('[data-address-summary-live]');
+      const currentSummary = document.querySelector('[data-address-summary-live]');
+      const nextTransactions = doc.querySelector('[data-address-transactions-live]');
+      const currentTransactions = document.querySelector('[data-address-transactions-live]');
+      if (!nextSummary || !currentSummary || !nextTransactions || !currentTransactions) return;
+      currentSummary.replaceWith(nextSummary);
+      currentTransactions.replaceWith(nextTransactions);
       initHeaderInteractions();
     }} catch (_) {{
     }} finally {{
       refreshInFlight = false;
+      if (refreshQueued) {{
+        refreshQueued = false;
+        scheduleRefresh();
+      }}
     }}
   }};
 
   const scheduleRefresh = () => {{
+    if (refreshInFlight) {{
+      refreshQueued = true;
+      return;
+    }}
     if (refreshTimer) return;
     refreshTimer = window.setTimeout(() => {{
       refreshTimer = null;
-      refreshDom();
+      refreshLiveRegions();
     }}, 450);
   }};
 
@@ -1759,6 +1765,9 @@ fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
     if (payload.type === 'address-tx') {{
       return data.address === address || addressMapContains(data.addresses) || trackedTxids.has(data.txid);
     }}
+    if (payload.type === 'address-status') {{
+      return data.address === address;
+    }}
     if (payload.type === 'tx') {{
       return (
         trackedTxids.has(data.txid) ||
@@ -1773,20 +1782,25 @@ fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
   }};
 
   const connect = () => {{
-    if (!eventsEnabled || !window.WebSocket) return;
+    if (!eventsEnabled || !window.WebSocket || disposed || socket) return;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let socket;
+    let nextSocket;
     try {{
-      socket = new WebSocket(`${{protocol}}//${{window.location.host}}${{wsPath}}`);
+      nextSocket = new WebSocket(`${{protocol}}//${{window.location.host}}${{wsPath}}`);
     }} catch (_) {{
       return;
     }}
-    socket.addEventListener('open', () => {{
+    socket = nextSocket;
+    nextSocket.addEventListener('open', () => {{
+      if (socket !== nextSocket || disposed) return;
+      if (hasConnected) scheduleRefresh();
+      hasConnected = true;
       try {{
-        socket.send(JSON.stringify({{ action: 'want', data: ['address'], address }}));
+        nextSocket.send(JSON.stringify({{ action: 'want', data: ['address'], address }}));
       }} catch (_) {{}}
     }});
-    socket.addEventListener('message', (event) => {{
+    nextSocket.addEventListener('message', (event) => {{
+      if (socket !== nextSocket || disposed) return;
       let payload;
       try {{
         payload = JSON.parse(event.data);
@@ -1795,8 +1809,11 @@ fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
       }}
       if (matchesAddress(payload)) scheduleRefresh();
     }});
-    socket.addEventListener('close', () => {{
-      if (refreshTimer || retryTimer) return;
+    nextSocket.addEventListener('close', () => {{
+      if (socket !== nextSocket) return;
+      socket = null;
+      if (disposed) return;
+      if (retryTimer) return;
       retryTimer = window.setTimeout(() => {{
         retryTimer = null;
         connect();
@@ -1805,6 +1822,16 @@ fn address_event_listener_script(address: &str, txids: &[String]) -> Markup {
   }};
 
   connect();
+  window.addEventListener('pagehide', () => {{
+    disposed = true;
+    if (refreshTimer) window.clearTimeout(refreshTimer);
+    if (retryTimer) window.clearTimeout(retryTimer);
+    const activeSocket = socket;
+    socket = null;
+    if (activeSocket && activeSocket.readyState < WebSocket.CLOSING) {{
+      try {{ activeSocket.close(1000, 'address page closed'); }} catch (_) {{}}
+    }}
+  }}, {{ once: true }});
 }})();
 </script>
 "#
@@ -2261,4 +2288,33 @@ fn address_chart_scripts() -> Markup {
 "#;
 
     PreEscaped(script.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::address_event_listener_script_with_events;
+
+    #[test]
+    fn address_listener_updates_live_regions_without_replacing_the_page() {
+        let txids =
+            vec!["0000000000000000000000000000000000000000000000000000000000000000".to_string()];
+        let script = address_event_listener_script_with_events(
+            "bcrt1qexample",
+            &txids,
+            "/",
+            "/api/events/ws",
+            true,
+        )
+        .into_string();
+
+        assert!(script.contains("[data-address-summary-live]"));
+        assert!(script.contains("[data-address-transactions-live]"));
+        assert!(script.contains("currentSummary.replaceWith(nextSummary)"));
+        assert!(script.contains("currentTransactions.replaceWith(nextTransactions)"));
+        assert!(script.contains("window.addEventListener('pagehide'"));
+        assert!(!script.contains("main.app"));
+        assert!(!script.contains("executeMainScripts"));
+        assert!(!script.contains("location.reload"));
+        assert!(!script.contains("setInterval"));
+    }
 }

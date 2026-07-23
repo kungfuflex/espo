@@ -31,11 +31,15 @@ impl TestConfigBuilder {
             bitcoind_rpc_url: "http://127.0.0.1:8332".to_string(),  // Placeholder
             bitcoind_rpc_user: "test".to_string(),
             bitcoind_rpc_pass: "test".to_string(),
+            b8_faucet_url: None,
+            hosts: Default::default(),
             bitcoind_blocks_dir: "/tmp".to_string(), // Placeholder
             reset_mempool_on_startup: false,
             rollback: None,
             view_only: true, // Default to view-only for tests
             db_path: espo_path,
+            db_cache: false,
+            alkabi_verify_trials: 128,
             sdb_poll_ms: 100, // Fast polling for tests
             indexer_block_delay_ms: 0,
             port: 0, // Let OS assign port

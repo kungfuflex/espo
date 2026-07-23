@@ -12,21 +12,35 @@ use std::io::Cursor;
 
 pub(crate) trait MempoolContractRule {
     fn project(&mut self, ctx: &ContractProjectionContext<'_>) -> Option<ContractProjection>;
+
+    fn prefer_input_projection(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct MempoolProjectionRegistry {
     rules: Vec<Box<dyn MempoolContractRule>>,
+    applied: bool,
 }
 
 impl MempoolProjectionRegistry {
     pub(crate) fn from_latest_indices() -> Self {
         Self {
             rules: vec![
-                Box::new(frbtc::FrBtcProjectionRule),
+                Box::new(frbtc::FrBtcProjectionRule::new()),
                 Box::new(amm::AmmProjectionRule::new()),
                 Box::new(fire::FireProjectionRule::new()),
             ],
+            applied: false,
         }
+    }
+
+    pub(crate) fn begin_transaction(&mut self) {
+        self.applied = false;
+    }
+
+    pub(crate) fn did_apply(&self) -> bool {
+        self.applied
     }
 }
 
@@ -34,7 +48,23 @@ impl MempoolContractProjector for MempoolProjectionRegistry {
     fn project(&mut self, ctx: ContractProjectionContext<'_>) -> Option<ContractProjection> {
         for rule in &mut self.rules {
             if let Some(projection) = rule.project(&ctx) {
+                self.applied = true;
                 return Some(projection);
+            }
+        }
+        None
+    }
+
+    fn project_from_inputs(
+        &mut self,
+        ctx: ContractProjectionContext<'_>,
+    ) -> Option<ContractProjection> {
+        for rule in &mut self.rules {
+            if rule.prefer_input_projection() {
+                if let Some(projection) = rule.project(&ctx) {
+                    self.applied = true;
+                    return Some(projection);
+                }
             }
         }
         None
