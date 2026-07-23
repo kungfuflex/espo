@@ -76,13 +76,16 @@ pub async fn run_p2p_mempool_driver(network: Network, peer_addr: SocketAddr) -> 
         match event {
             ConnectionEvent::HandshakeComplete { peer_id } => {
                 backoff = INITIAL_BACKOFF;
+                // Deliberately DO NOT send a "mempool" (BIP35) message: bitcoin Core
+                // disconnects any peer that requests it unless it was started with
+                // -peerbloomfilters=1 (off by default) — "mempool request with bloom
+                // filters disabled, disconnecting". New txs arrive automatically via
+                // `inv` relay (txrelay negotiated in the version handshake); the
+                // initial mempool snapshot comes from the RPC getrawmempool hydration
+                // in run_mempool_service. Verified against Core v31 in isolation.
                 eprintln!(
-                    "[mempool][p2p] handshake complete with peer {peer_id}; requesting mempool"
+                    "[mempool][p2p] handshake complete with peer {peer_id}; ingesting inv/tx relay"
                 );
-                // "mempool" has an empty payload (header-less).
-                if !cm.send_to_peer(peer_id, "mempool", Vec::new()) {
-                    eprintln!("[mempool][p2p] failed to queue mempool request to peer {peer_id}");
-                }
             }
             ConnectionEvent::MessageReceived { peer_id, message } => {
                 handle_message(&cm, peer_id, message, network);
