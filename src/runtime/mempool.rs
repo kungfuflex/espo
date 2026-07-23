@@ -74,6 +74,12 @@ pub enum MempoolTxReadiness {
     Hydrated,
     TracePending,
     TraceReady,
+    /// Inspected and found to have NO alkane/rune activity, so its full
+    /// `Transaction` + trace slots were dropped to save memory (lean storage).
+    /// Only the light fields (fee/vsize/weight/inputs/spent_outpoints/addresses)
+    /// are retained. Distinct from `MetadataOnly` (not-yet-hydrated) so the
+    /// hydration loop does not re-fetch it every cycle.
+    Light,
 }
 
 impl Default for MempoolTxReadiness {
@@ -2077,7 +2083,22 @@ fn build_memory_entry(
     let protostones = protostones_for_tx(&tx);
     let is_diesel_mint = is_diesel_mint_protostone(&protostones);
     let is_ug_mint = is_uncommon_goods_mint_tx(&tx);
-    let readiness = if protostones.is_empty() {
+    // Lean storage — keep the full Transaction resident ONLY for txs with
+    // alkane/rune activity (the explorer surfaces their traces/rune-IO, both
+    // computed from `tx`). A plain payment keeps its LIGHT fields
+    // (fee/vsize/weight/inputs/spent_outpoints/addresses — enough for the
+    // block-template projection and light listings) but drops the heavy `tx`
+    // and trace slots. Any alkane/rune tx necessarily carries an OP_RETURN
+    // (runestone/protostone), so op_return presence is a SAFE SUPERSET of active
+    // — we never drop the tx of a tx that could turn out to be rune-active at
+    // recalc time.
+    let active = !protostones.is_empty()
+        || is_diesel_mint
+        || is_ug_mint
+        || tx.output.iter().any(|o| o.script_pubkey.is_op_return());
+    let readiness = if !active {
+        MempoolTxReadiness::Light
+    } else if protostones.is_empty() {
         MempoolTxReadiness::Hydrated
     } else {
         MempoolTxReadiness::TracePending
@@ -2105,7 +2126,7 @@ fn build_memory_entry(
         .collect();
     MempoolTransactionStruct {
         txid,
-        tx: Some(tx),
+        tx: if active { Some(tx) } else { None },
         protostones,
         fixed_trace: None,
         fixed_trace_context: None,
@@ -2221,6 +2242,16 @@ fn upsert_memory_entry(entry: MempoolTransactionStruct) {
                 should_enqueue = !existing.protostones.is_empty()
                     && !existing.is_diesel_mint
                     && existing.fixed_trace.is_none();
+            } else if matches!(entry.readiness, MempoolTxReadiness::Light) {
+                // Inspected + inactive (lean storage): adopt the light-decoded
+                // fields and mark it Light so the hydration loop won't re-fetch
+                // it. Keep tx: None — that's the memory win. (weight/vsize/fee/
+                // inputs/spent_outpoints were already refreshed above.)
+                existing.addresses = entry.addresses;
+                existing.is_diesel_mint = entry.is_diesel_mint;
+                existing.is_ug_mint = entry.is_ug_mint;
+                existing.readiness = MempoolTxReadiness::Light;
+                should_enqueue = false;
             } else {
                 should_enqueue = false;
             }
@@ -3102,12 +3133,21 @@ fn start_mempool_hydration(network: Network) {
                 loop {
                     let idx = next.fetch_add(1, Ordering::SeqCst);
                     let Some(txid) = txids.get(idx).copied() else { break };
-                    let already_loaded = mempool_state()
+                    // Skip anything already inspected: FULL entries (tx present)
+                    // AND lean LIGHT entries (inspected, no alkane/rune activity,
+                    // tx intentionally dropped) — re-fetching the latter every
+                    // cycle would defeat the memory win.
+                    let already_inspected = mempool_state()
                         .read()
                         .ok()
-                        .and_then(|state| state.txs.get(&txid).map(|entry| entry.tx.is_some()))
+                        .and_then(|state| {
+                            state.txs.get(&txid).map(|entry| {
+                                entry.tx.is_some()
+                                    || matches!(entry.readiness, MempoolTxReadiness::Light)
+                            })
+                        })
                         .unwrap_or(false);
-                    if already_loaded {
+                    if already_inspected {
                         continue;
                     }
                     let raw_hex = match rpc.get_raw_transaction_hex(&txid, None) {
