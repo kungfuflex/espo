@@ -3456,19 +3456,37 @@ fn spawn_p2p_driver_if_enabled(cfg: &crate::config::MempoolConfig, network: Netw
     match resolve_p2p_peer(cfg) {
         Ok(peer) => {
             eprintln!("[mempool][p2p] driving mempool incrementally from peer {peer}");
-            tokio::spawn(async move {
-                loop {
-                    if let Err(e) =
-                        crate::runtime::mempool_p2p::run_p2p_mempool_driver(network, peer).await
-                    {
-                        eprintln!("[mempool][p2p] driver exited: {e:?}");
-                    }
-                    if is_shutdown_requested() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-            });
+            // Run the driver on its OWN dedicated multi-threaded runtime/thread.
+            // run_mempool_service runs on a current_thread runtime shared with the
+            // trace workers and the blocking getrawmempool hydration; on that shared
+            // single thread the p2p connection I/O gets starved and the handshake
+            // never completes. An isolated runtime keeps the socket responsive
+            // regardless of mempool-service load. (Verified: the driver stalls on the
+            // shared runtime but handshakes fine standalone, even current_thread.)
+            std::thread::Builder::new()
+                .name("mempool-p2p".into())
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .expect("build p2p mempool runtime");
+                    rt.block_on(async move {
+                        loop {
+                            if let Err(e) =
+                                crate::runtime::mempool_p2p::run_p2p_mempool_driver(network, peer)
+                                    .await
+                            {
+                                eprintln!("[mempool][p2p] driver exited: {e:?}");
+                            }
+                            if is_shutdown_requested() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    });
+                })
+                .expect("spawn mempool-p2p thread");
             true
         }
         Err(e) => {
