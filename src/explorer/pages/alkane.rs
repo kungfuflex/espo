@@ -1977,14 +1977,18 @@ pub async fn alkane_page(
                                             }
                                         }
                                         button class="holders-export-button alkabi-export-button" type="submit" data-alkabi-export-submit="" {
-                                            span data-alkabi-export-label="" { "Download" }
+                                            span data-contract-export-label="" { "Download" }
                                             span class="alkabi-export-spinner" aria-hidden="true" {}
                                         }
                                         span class="alkabi-export-status muted" role="status" aria-live="polite" data-alkabi-export-status="" {}
                                     }
-                                    form class="alkane-wasm-export-form" action=(wasm_export_action) method="get" target="alkane-wasm-download-frame" data-download-form="" {
+                                    form class="order-control alkane-wasm-export-form" action=(wasm_export_action) method="get" target="alkane-wasm-download-frame" data-download-form="" data-wasm-export-form="" {
                                         input type="hidden" name="alkane" value=(alk_str.clone());
-                                        button class="holders-export-button" type="submit" { "Download WASM" }
+                                        button class="holders-export-button alkabi-export-button alkane-wasm-export-button" type="submit" data-wasm-export-submit="" {
+                                            span data-contract-export-label="" { "Download WASM" }
+                                            span class="alkabi-export-spinner" aria-hidden="true" {}
+                                        }
+                                        span class="alkabi-export-status muted" role="status" aria-live="polite" data-wasm-export-status="" {}
                                     }
                                     iframe class="holders-export-frame" name="alkane-wasm-download-frame" title="Contract WASM download" aria-hidden="true" {}
                                     @if view_methods.is_empty() && write_methods.is_empty() {
@@ -2834,37 +2838,37 @@ fn inspect_scripts() -> Markup {
   const writeDefault = 'Providing inputs to simulate methods is not currently supported on espo';
   const blockInput = root.querySelector('[data-sim-block-input]');
   const abiForm = root.querySelector('[data-alkabi-export-form]');
+  const wasmForm = root.querySelector('[data-wasm-export-form]');
   const currentBlockTag = () => {
     const value = blockInput && typeof blockInput.value === 'string' ? blockInput.value.trim() : '';
     return value || 'latest';
   };
-  const downloadAbi = async (event) => {
+  const downloadExport = async (event, form, options) => {
     event.preventDefault();
-    if (!abiForm || abiForm.dataset.loading === '1') return;
-    const button = abiForm.querySelector('[data-alkabi-export-submit]');
-    const status = abiForm.querySelector('[data-alkabi-export-status]');
+    if (!form || form.dataset.loading === '1') return;
+    const button = form.querySelector(options.buttonSelector);
+    const status = form.querySelector(options.statusSelector);
     if (!button) return;
 
-    abiForm.dataset.loading = '1';
+    form.dataset.loading = '1';
     button.disabled = true;
     button.dataset.loading = '1';
     button.setAttribute('aria-busy', 'true');
     if (status) status.textContent = '';
 
     try {
-      const params = new URLSearchParams(new FormData(abiForm));
-      const response = await fetch(`${abiForm.action}?${params.toString()}`, {
+      const params = new URLSearchParams(new FormData(form));
+      const response = await fetch(`${form.action}?${params.toString()}`, {
         method: 'GET',
-        headers: { 'Accept': 'application/json, text/typescript' }
+        headers: { 'Accept': options.accept }
       });
       if (!response.ok) {
-        throw new Error((await response.text()) || 'ABI export failed');
+        throw new Error((await response.text()) || options.errorMessage);
       }
       const blob = await response.blob();
       const disposition = response.headers.get('Content-Disposition') || '';
       const filenameMatch = disposition.match(/filename="([^"]+)"/i);
-      const extension = params.get('format') === 'ts' ? 'ts' : 'json';
-      const filename = filenameMatch ? filenameMatch[1] : `alkane.${extension}`;
+      const filename = filenameMatch ? filenameMatch[1] : options.fallbackFilename(params);
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
@@ -2876,17 +2880,32 @@ fn inspect_scripts() -> Markup {
       window.setTimeout(() => URL.revokeObjectURL(url), 0);
     } catch (error) {
       if (status) {
-        status.textContent = error && error.message ? error.message : 'ABI export failed';
+        status.textContent = error && error.message ? error.message : options.errorMessage;
       }
     } finally {
-      abiForm.dataset.loading = '0';
+      form.dataset.loading = '0';
       button.disabled = false;
       button.dataset.loading = '0';
       button.removeAttribute('aria-busy');
     }
   };
   if (abiForm) {
-    abiForm.addEventListener('submit', downloadAbi);
+    abiForm.addEventListener('submit', (event) => downloadExport(event, abiForm, {
+      buttonSelector: '[data-alkabi-export-submit]',
+      statusSelector: '[data-alkabi-export-status]',
+      accept: 'application/json, text/typescript',
+      errorMessage: 'ABI export failed',
+      fallbackFilename: (params) => `alkane.${params.get('format') === 'ts' ? 'ts' : 'json'}`
+    }));
+  }
+  if (wasmForm) {
+    wasmForm.addEventListener('submit', (event) => downloadExport(event, wasmForm, {
+      buttonSelector: '[data-wasm-export-submit]',
+      statusSelector: '[data-wasm-export-status]',
+      accept: 'application/wasm',
+      errorMessage: 'WASM export failed',
+      fallbackFilename: () => 'alkane.wasm'
+    }));
   }
   const clearValueNode = (node) => {
     if (!node) return;

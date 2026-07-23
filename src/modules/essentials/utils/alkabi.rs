@@ -12,7 +12,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 const ALKABI_CACHE_KEY_PREFIX: &[u8] =
-    b"alkabi:7dbc691b5945e3f0c88f95cc983f3b9f4e502cee:analysis-v1:";
+    b"alkabi:56a98f830be4100c666a238986abf05c6c285272:analysis-v1:";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderedAlkabi {

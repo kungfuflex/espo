@@ -630,6 +630,9 @@ a:hover {
 .alkabi-export-button {
   min-width: 94px;
 }
+.alkane-wasm-export-button {
+  min-width: 138px;
+}
 .alkabi-export-spinner {
   display: none;
   width: 15px;
@@ -639,7 +642,7 @@ a:hover {
   border-radius: 50%;
   animation: alkabi-export-spin 700ms linear infinite;
 }
-.alkabi-export-button[data-loading="1"] [data-alkabi-export-label] {
+.alkabi-export-button[data-loading="1"] [data-contract-export-label] {
   display: none;
 }
 .alkabi-export-button[data-loading="1"] .alkabi-export-spinner {
