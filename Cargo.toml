@@ -17,6 +17,10 @@ required-features = ["binary"]
 [features]
 # Feature that's only available for non-WASM builds
 binary = []
+# Opt-in: maintain the mempool incrementally over bitcoind's P2P protocol
+# (inv/tx) via the qubitcoin-net crate instead of RPC getrawmempool polling.
+# NOT in the default set — default builds must not pull qubitcoin-net.
+p2p-mempool = ["dep:qubitcoin-net"]
 jemalloc-prof = ["binary", "dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "tikv-jemallocator/profiling"]
 test-utils = ["alkanes", "metashrew-runtime", "rockshrew-runtime", "wasmtime", "protorune/test-utils"]
 
@@ -59,6 +63,10 @@ tower-http = { version = "0.5", features = ["cors"] }
 alkanes-cli-common = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 alkabi = { git = "https://github.com/bitapeslabs/alkabi-rs", rev = "7dbc691b5945e3f0c88f95cc983f3b9f4e502cee", features = ["extract"] }
 zmq = "0.10"
+# Opt-in P2P mempool driver (feature = "p2p-mempool"). Native-only.
+# Vendored (vendor/qubitcoin/) — a minimal self-contained slice of subfrost/qubitcoin
+# (net + primitives + crypto) so the feature build needs no git creds for the private repo.
+qubitcoin-net = { path = "vendor/qubitcoin/crates/qubitcoin-net", optional = true }
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
 

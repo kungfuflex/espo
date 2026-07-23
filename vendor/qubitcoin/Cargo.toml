@@ -1,0 +1,35 @@
+# Vendored minimal slice of subfrost/qubitcoin needed by espo's opt-in
+# `p2p-mempool` feature (the qubitcoin-net P2P mempool driver). Only three
+# crates are pulled in — qubitcoin-net uses just qubitcoin-crypto +
+# qubitcoin-primitives (its qubitcoin-node/common/util/serialize deps are
+# unused and are dropped in the vendored qubitcoin-net Cargo.toml). This is a
+# SELF-CONTAINED workspace (own [workspace] table) so espo path-deps into it
+# without a git dependency on the private subfrost/qubitcoin repo. Keep in sync
+# with subfrost/qubitcoin master when the net protocol changes.
+[workspace]
+resolver = "2"
+members = [
+    "crates/qubitcoin-crypto",
+    "crates/qubitcoin-primitives",
+    "crates/qubitcoin-net",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+
+[workspace.dependencies]
+qubitcoin-crypto = { path = "crates/qubitcoin-crypto", default-features = false }
+qubitcoin-primitives = { path = "crates/qubitcoin-primitives" }
+secp256k1 = { version = "0.29" }
+bitcoin_hashes = "0.14"
+hex = "0.4"
+thiserror = "1"
+parking_lot = "0.12"
+rand = "0.8"
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+bitflags = "2"
+criterion = { version = "0.5", features = ["html_reports"] }

@@ -180,6 +180,14 @@ fn default_mempool_raw_poll_secs() -> u64 {
     60
 }
 
+fn default_mempool_source() -> String {
+    "rpc".to_string()
+}
+
+fn default_bitcoind_p2p_port() -> u16 {
+    8333
+}
+
 fn default_mempool_template_poll_secs() -> u64 {
     10
 }
@@ -440,6 +448,19 @@ pub struct MempoolConfig {
     pub populate_with_views: bool,
     #[serde(default = "default_mempool_raw_poll_secs")]
     pub raw_poll_secs: u64,
+    /// Mempool ingestion source: "rpc" (default, getrawmempool polling) or
+    /// "p2p" (incremental inv/tx over bitcoind's P2P protocol; requires the
+    /// binary to be built with --features p2p-mempool, otherwise falls back
+    /// to rpc with a warning).
+    #[serde(default = "default_mempool_source")]
+    pub source: String,
+    /// Explicit "host:port" for the P2P peer (bitcoind). When unset the peer is
+    /// derived from the bitcoind RPC host + `bitcoind_p2p_port`.
+    #[serde(default)]
+    pub p2p_peer: Option<String>,
+    /// P2P port used when deriving the peer address from the bitcoind RPC host.
+    #[serde(default = "default_bitcoind_p2p_port")]
+    pub bitcoind_p2p_port: u16,
     #[serde(default = "default_mempool_template_poll_secs")]
     pub template_poll_secs: u64,
     #[serde(default = "default_mempool_trace_workers")]
@@ -472,6 +493,9 @@ impl Default for MempoolConfig {
             enabled: default_mempool_enabled(),
             populate_with_views: false,
             raw_poll_secs: default_mempool_raw_poll_secs(),
+            source: default_mempool_source(),
+            p2p_peer: None,
+            bitcoind_p2p_port: default_bitcoind_p2p_port(),
             template_poll_secs: default_mempool_template_poll_secs(),
             trace_workers: default_mempool_trace_workers(),
             hydration_workers: default_mempool_hydration_workers(),

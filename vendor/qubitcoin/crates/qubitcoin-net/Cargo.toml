@@ -1,0 +1,24 @@
+[package]
+name = "qubitcoin-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "P2P networking for Qubitcoin: tokio-based, protocol messages, peer management"
+
+# Vendored-slice trim: qubitcoin-net's source references ONLY qubitcoin-crypto
+# and qubitcoin-primitives; the qubitcoin-common/node/util/serialize deps were
+# declared but never used (verified: no `qubitcoin_{common,node,util,serialize}`
+# reference in any src file), so they're dropped here to avoid vendoring the
+# full node (consensus/storage/rocksdb) tree into espo.
+[dependencies]
+qubitcoin-primitives = { workspace = true }
+qubitcoin-crypto = { workspace = true, features = ["native"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+bitflags = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]

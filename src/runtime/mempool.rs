@@ -309,7 +309,7 @@ struct InMemoryMempool {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct VerboseMempoolEntry {
+pub(crate) struct VerboseMempoolEntry {
     #[serde(default)]
     vsize: Option<u64>,
     #[serde(default)]
@@ -2119,7 +2119,7 @@ fn prune_trace_queue(removed: &HashSet<Txid>) {
     queue.retain(|txid| !removed.contains(txid));
 }
 
-fn build_memory_entry(
+pub(crate) fn build_memory_entry(
     txid: Txid,
     tx: Transaction,
     verbose: Option<&VerboseMempoolEntry>,
@@ -2232,7 +2232,17 @@ fn build_memory_metadata_entry(
     }
 }
 
-fn upsert_memory_entry(entry: MempoolTransactionStruct) {
+/// Returns true if the in-memory mempool already holds `txid` (used by the
+/// P2P driver to skip re-processing an already-known transaction).
+#[cfg_attr(not(feature = "p2p-mempool"), allow(dead_code))]
+pub(crate) fn memory_contains_txid(txid: &Txid) -> bool {
+    mempool_state()
+        .read()
+        .map(|state| state.txs.contains_key(txid))
+        .unwrap_or(false)
+}
+
+pub(crate) fn upsert_memory_entry(entry: MempoolTransactionStruct) {
     let txid = entry.txid;
     let Ok(mut state) = mempool_state().write() else { return };
     let mut should_enqueue = !entry.protostones.is_empty() && !entry.is_diesel_mint;
@@ -3408,6 +3418,81 @@ fn ingest_zmq_sequence(url: String) {
     });
 }
 
+/// Resolve the bitcoind P2P peer socket address: an explicit `mempool.p2p_peer`
+/// ("host:port") when set, otherwise the bitcoind RPC host + `bitcoind_p2p_port`.
+#[cfg(feature = "p2p-mempool")]
+fn resolve_p2p_peer(cfg: &crate::config::MempoolConfig) -> Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let target = if let Some(peer) =
+        cfg.p2p_peer.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
+    {
+        peer.to_string()
+    } else {
+        let url = &get_config().bitcoind_rpc_url;
+        // Extract just the host from e.g. "http://user@127.0.0.1:8332/wallet".
+        let host = url.split("://").nth(1).unwrap_or(url.as_str());
+        let host = host.split('/').next().unwrap_or(host);
+        let host = host.rsplit('@').next().unwrap_or(host);
+        let host = match host.rsplit_once(':') {
+            Some((h, _)) => h,
+            None => host,
+        };
+        format!("{host}:{}", cfg.bitcoind_p2p_port)
+    };
+    let addr = target
+        .to_socket_addrs()
+        .with_context(|| format!("resolving p2p peer '{target}'"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no socket address resolved for '{target}'"))?;
+    Ok(addr)
+}
+
+/// Spawn the P2P mempool driver when `mempool.source == "p2p"` AND the binary
+/// was built with `--features p2p-mempool`. Returns true when the incremental
+/// driver is active (callers slow the RPC reconcile in that case).
+#[cfg(feature = "p2p-mempool")]
+fn spawn_p2p_driver_if_enabled(cfg: &crate::config::MempoolConfig, network: Network) -> bool {
+    if !cfg.source.eq_ignore_ascii_case("p2p") {
+        return false;
+    }
+    match resolve_p2p_peer(cfg) {
+        Ok(peer) => {
+            eprintln!("[mempool][p2p] driving mempool incrementally from peer {peer}");
+            tokio::spawn(async move {
+                loop {
+                    if let Err(e) =
+                        crate::runtime::mempool_p2p::run_p2p_mempool_driver(network, peer).await
+                    {
+                        eprintln!("[mempool][p2p] driver exited: {e:?}");
+                    }
+                    if is_shutdown_requested() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            });
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "[mempool][p2p] could not resolve peer address ({e:?}); falling back to rpc"
+            );
+            false
+        }
+    }
+}
+
+/// Feature-off shim: warn if p2p was requested, then use the RPC path.
+#[cfg(not(feature = "p2p-mempool"))]
+fn spawn_p2p_driver_if_enabled(cfg: &crate::config::MempoolConfig, _network: Network) -> bool {
+    if cfg.source.eq_ignore_ascii_case("p2p") {
+        eprintln!(
+            "[mempool] p2p mempool requested but binary built without --features p2p-mempool; falling back to rpc"
+        );
+    }
+    false
+}
+
 pub async fn run_mempool_service(network: Network) -> Result<()> {
     let rpc = get_bitcoind_rpc_client();
     let view_url = get_metashrew_rpc_url().to_string();
@@ -3436,12 +3521,25 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
         ingest_zmq_sequence(zmq_url);
     }
 
+    // Opt-in P2P mempool driver. When active it maintains the mempool
+    // incrementally from inv/tx; the getrawmempool loop below is kept as a slow
+    // reconcile safety net. When requested but unavailable, this logs and
+    // returns false so the normal RPC path takes over unchanged.
+    let p2p_active = spawn_p2p_driver_if_enabled(&cfg, network);
+
     for _ in 0..cfg.trace_workers.max(1) {
         tokio::spawn(trace_worker(http.clone(), view_url.clone(), cfg.populate_with_views));
     }
 
     let template_poll = Duration::from_secs(cfg.template_poll_secs.max(1));
-    let raw_poll = Duration::from_secs(cfg.raw_poll_secs.max(1));
+    // In p2p mode the canonical refresh is only a reconcile net — slow it to at
+    // least 5 minutes so it doesn't fight the incremental driver.
+    let reconcile_secs = if p2p_active {
+        cfg.raw_poll_secs.max(300)
+    } else {
+        cfg.raw_poll_secs
+    };
+    let raw_poll = Duration::from_secs(reconcile_secs.max(1));
     let mut last_raw_refresh = SystemTime::now();
 
     loop {
