@@ -7,6 +7,7 @@ use crate::alkanes::trace::{
     EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
     EspoSandshrewLikeTraceStatus, EspoTrace,
 };
+use crate::alkanes::utils::clean_espo_sandshrew_like_trace;
 use crate::config::{
     debug_enabled, get_electrum_like, get_espo_db, get_metashrew, get_metashrew_sdb, get_network,
     strict_check_alkane_balances, strict_check_trace_mismatches, strict_check_utxos,
@@ -40,7 +41,6 @@ use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result, anyhow};
-use bitcoin::block::Header;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Transaction, Txid};
@@ -226,144 +226,8 @@ mod balance_delta_tests {
     }
 }
 
-pub(crate) fn clean_espo_sandshrew_like_trace(
-    trace: &EspoSandshrewLikeTrace,
-    host_function_values: &EspoHostFunctionValues,
-) -> Option<EspoSandshrewLikeTrace> {
-    let mut invokes = 0usize;
-    let mut returns = 0usize;
-    for ev in &trace.events {
-        match ev {
-            EspoSandshrewLikeTraceEvent::Invoke(_) => invokes += 1,
-            EspoSandshrewLikeTraceEvent::Return(_) => returns += 1,
-            EspoSandshrewLikeTraceEvent::Create(_) => {}
-        }
-    }
-
-    if invokes == returns {
-        return Some(trace.clone());
-    }
-    if returns < invokes {
-        return None;
-    }
-
-    let (header, coinbase, diesel, fee) = host_function_values;
-    let host_values: [&[u8]; 4] = [header, coinbase, diesel, fee];
-    let mismatch = returns.saturating_sub(invokes);
-
-    let decode_data = |data: &str| -> Option<Vec<u8>> {
-        let trimmed = data.strip_prefix("0x").unwrap_or(data);
-        if trimmed.is_empty() {
-            return Some(Vec::new());
-        }
-        hex::decode(trimmed).ok()
-    };
-
-    let host_match = |data_bytes: &[u8]| -> bool {
-        for host_bytes in host_values.iter() {
-            if data_bytes == *host_bytes {
-                return true;
-            }
-        }
-        false
-    };
-
-    let fuzzy_host_match = |data_bytes: &[u8]| -> bool {
-        if data_bytes.len() == 80 && deserialize::<Header>(data_bytes).is_ok() {
-            return true;
-        }
-        if let Ok(tx) = deserialize::<Transaction>(data_bytes) {
-            if tx.is_coinbase() {
-                return true;
-            }
-        }
-        false
-    };
-
-    let attempt_clean = |allow_fuzzy: bool| -> Option<EspoSandshrewLikeTrace> {
-        let mut remove_indices: HashSet<usize> = HashSet::new();
-        let mut candidate_stack: Vec<usize> = Vec::new();
-        let mut total_candidates = 0usize;
-        let mut depth: isize = 0;
-
-        for (idx, ev) in trace.events.iter().enumerate() {
-            match ev {
-                EspoSandshrewLikeTraceEvent::Invoke(_) => {
-                    depth += 1;
-                }
-                EspoSandshrewLikeTraceEvent::Return(ret) => {
-                    let mut is_candidate = false;
-                    if ret.status == EspoSandshrewLikeTraceStatus::Success
-                        && ret.response.alkanes.is_empty()
-                        && ret.response.storage.is_empty()
-                    {
-                        if let Some(data_bytes) = decode_data(&ret.response.data) {
-                            if host_match(&data_bytes) {
-                                is_candidate = true;
-                            } else if allow_fuzzy && fuzzy_host_match(&data_bytes) {
-                                is_candidate = true;
-                            }
-                        }
-                    }
-                    if is_candidate {
-                        total_candidates += 1;
-                        candidate_stack.push(idx);
-                    }
-
-                    depth -= 1;
-                    if depth < 0 {
-                        let Some(remove_idx) = candidate_stack.pop() else {
-                            return None;
-                        };
-                        remove_indices.insert(remove_idx);
-                        depth += 1;
-                    }
-                }
-                EspoSandshrewLikeTraceEvent::Create(_) => {}
-            }
-        }
-
-        if total_candidates < mismatch || remove_indices.len() != mismatch {
-            return None;
-        }
-
-        let mut cleaned_events =
-            Vec::with_capacity(trace.events.len().saturating_sub(remove_indices.len()));
-        for (idx, ev) in trace.events.iter().enumerate() {
-            if !remove_indices.contains(&idx) {
-                cleaned_events.push(ev.clone());
-            }
-        }
-
-        let mut cleaned_invokes = 0usize;
-        let mut cleaned_returns = 0usize;
-        let mut cleaned_depth: isize = 0;
-        for ev in &cleaned_events {
-            match ev {
-                EspoSandshrewLikeTraceEvent::Invoke(_) => {
-                    cleaned_invokes += 1;
-                    cleaned_depth += 1;
-                }
-                EspoSandshrewLikeTraceEvent::Return(_) => {
-                    cleaned_returns += 1;
-                    cleaned_depth -= 1;
-                    if cleaned_depth < 0 {
-                        return None;
-                    }
-                }
-                EspoSandshrewLikeTraceEvent::Create(_) => {}
-            }
-        }
-        if cleaned_invokes != cleaned_returns || cleaned_depth != 0 {
-            return None;
-        }
-
-        Some(EspoSandshrewLikeTrace { outpoint: trace.outpoint.clone(), events: cleaned_events })
-    };
-
-    attempt_clean(false).or_else(|| attempt_clean(true))
-}
-
+// clean_espo_sandshrew_like_trace moved to crate::alkanes::utils so every
+// module that walks trace events as a call stack shares one implementation.
 fn parse_u128_from_str(input: &str) -> Option<u128> {
     if let Some(hex) = input.strip_prefix("0x") {
         u128::from_str_radix(hex, 16).ok()

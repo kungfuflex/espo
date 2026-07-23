@@ -1,7 +1,7 @@
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceInvokeContext,
-    EspoSandshrewLikeTraceInvokeData, EspoSandshrewLikeTraceShortId, EspoTrace,
-    extract_alkane_storage, protobuf_trace_events,
+    EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
+    EspoSandshrewLikeTraceInvokeContext, EspoSandshrewLikeTraceInvokeData,
+    EspoSandshrewLikeTraceShortId, EspoTrace, extract_alkane_storage, protobuf_trace_events,
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use crate::config::{
@@ -901,7 +901,9 @@ fn diesel_trace_for_tx(
     let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events };
     let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
     let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::default();
-    let storage_changes = extract_alkane_storage(&protobuf_trace, tx).unwrap_or_default();
+    let storage_changes =
+        extract_alkane_storage(&protobuf_trace, tx, &EspoHostFunctionValues::default())
+            .unwrap_or_default();
     Some(vec![EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }])
 }
 
@@ -937,7 +939,9 @@ fn fast_trace_for_protostone(
     let sandshrew_trace =
         EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events: vec![invoke] };
     let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::default();
-    let storage_changes = extract_alkane_storage(&protobuf_trace, tx).unwrap_or_default();
+    let storage_changes =
+        extract_alkane_storage(&protobuf_trace, tx, &EspoHostFunctionValues::default())
+            .unwrap_or_default();
     let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
 
     Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })
@@ -1617,7 +1621,8 @@ fn decode_trace_hex(
     let events = protobuf_trace_events(&protobuf_trace)?;
 
     let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events };
-    let storage_changes = extract_alkane_storage(&protobuf_trace, tx)?;
+    let storage_changes =
+        extract_alkane_storage(&protobuf_trace, tx, &EspoHostFunctionValues::default())?;
     let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
 
     Ok(Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }))

@@ -841,7 +841,11 @@ fn fetch_traces_for_tx(
 
         let sandshrew_trace =
             EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
-        let storage_changes = extract_alkane_storage(&partial.protobuf_trace, tx)?;
+        let storage_changes = extract_alkane_storage(
+            &partial.protobuf_trace,
+            tx,
+            &crate::alkanes::trace::EspoHostFunctionValues::default(),
+        )?;
 
         out.push(EspoTrace {
             sandshrew_trace,
@@ -872,7 +876,11 @@ fn fetch_traces_for_tx_noheight(txid: &Txid, tx: &Transaction) -> anyhow::Result
 
         let sandshrew_trace =
             EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
-        let storage_changes = extract_alkane_storage(&partial.protobuf_trace, tx)?;
+        let storage_changes = extract_alkane_storage(
+            &partial.protobuf_trace,
+            tx,
+            &crate::alkanes::trace::EspoHostFunctionValues::default(),
+        )?;
 
         out.push(EspoTrace {
             sandshrew_trace,

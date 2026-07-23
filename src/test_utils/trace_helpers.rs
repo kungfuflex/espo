@@ -1,6 +1,7 @@
 use crate::alkanes::trace::{
-    EspoAlkanesTransaction, EspoBlock, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
-    EspoTrace, PartialEspoTrace, extract_alkane_storage, prettyify_protobuf_trace_json,
+    EspoAlkanesTransaction, EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTrace,
+    EspoSandshrewLikeTraceEvent, EspoTrace, PartialEspoTrace, extract_alkane_storage,
+    prettyify_protobuf_trace_json,
 };
 use crate::schemas::EspoOutpoint;
 /// Helpers for extracting and working with traces in tests
@@ -159,8 +160,9 @@ fn build_espo_traces(
             EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid_hex, vout), events };
 
         // Extract storage changes from the trace
-        let storage_changes = extract_alkane_storage(&partial.protobuf_trace, tx)
-            .context("Failed to extract alkane storage")?;
+        let storage_changes =
+            extract_alkane_storage(&partial.protobuf_trace, tx, &EspoHostFunctionValues::default())
+                .context("Failed to extract alkane storage")?;
 
         let outpoint =
             EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout: *vout, tx_spent: None };

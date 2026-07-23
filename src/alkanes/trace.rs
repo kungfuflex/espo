@@ -169,13 +169,28 @@ pub type AlkaneStorageChanges = HashMap<SchemaAlkaneId, HashMap<Vec<u8>, (Txid, 
 pub fn extract_alkane_storage(
     trace: &alkanes::AlkanesTrace,
     transaction: &Transaction,
+    host_function_values: &EspoHostFunctionValues,
 ) -> anyhow::Result<AlkaneStorageChanges> {
     let mut out: AlkaneStorageChanges = HashMap::new();
     let mut stack: Vec<SchemaAlkaneId> = Vec::with_capacity(16);
     let txid: Txid = transaction.compute_txid();
 
+    // Metashrew host-function calls emit bare ExitContext events with no
+    // matching EnterContext; walking those raw mispairs every frame after the
+    // first orphan and drops the root return's storage entirely. Strip the
+    // orphan returns first. If the trace cannot be rebalanced, fall back to
+    // walking it as-is (pre-existing behavior for pathological traces).
+    let removed_indices = crate::alkanes::utils::orphan_return_removals(
+        &crate::alkanes::utils::protobuf_event_views(trace),
+        host_function_values,
+    )
+    .unwrap_or_default();
+
     use alkanes::alkanes_trace_event::Event;
-    for ev in &trace.events {
+    for (idx, ev) in trace.events.iter().enumerate() {
+        if removed_indices.contains(&idx) {
+            continue;
+        }
         if let Some(evt) = &ev.event {
             match evt {
                 Event::EnterContext(enter) => {
@@ -697,31 +712,33 @@ pub fn get_espo_block_with_opts(
     // Build transactions
     let mut txs: Vec<EspoAlkanesTransaction> = Vec::with_capacity(selected.len());
     for (txid, tx) in selected.into_iter() {
-        let traces_opt: Option<Vec<EspoTrace>> =
-            if let Some(vouts_partials) = canonical_traces.traces_by_txid.remove(&txid) {
-                let txid_hex = txid.to_string();
-                let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
-                for (vout, partial) in vouts_partials {
-                    let events = protobuf_trace_events(&partial.protobuf_trace)?;
+        let traces_opt: Option<Vec<EspoTrace>> = if let Some(vouts_partials) =
+            canonical_traces.traces_by_txid.remove(&txid)
+        {
+            let txid_hex = txid.to_string();
+            let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
+            for (vout, partial) in vouts_partials {
+                let events = protobuf_trace_events(&partial.protobuf_trace)?;
 
-                    let sandshrew_trace =
-                        EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
+                let sandshrew_trace =
+                    EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
 
-                    let storage_changes = extract_alkane_storage(&partial.protobuf_trace, &tx)?;
-                    let outpoint =
-                        EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout, tx_spent: None };
+                let storage_changes =
+                    extract_alkane_storage(&partial.protobuf_trace, &tx, &host_function_values)?;
+                let outpoint =
+                    EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout, tx_spent: None };
 
-                    traces_vec.push(EspoTrace {
-                        sandshrew_trace,
-                        protobuf_trace: partial.protobuf_trace,
-                        storage_changes,
-                        outpoint,
-                    });
-                }
-                Some(traces_vec)
-            } else {
-                None
-            };
+                traces_vec.push(EspoTrace {
+                    sandshrew_trace,
+                    protobuf_trace: partial.protobuf_trace,
+                    storage_changes,
+                    outpoint,
+                });
+            }
+            Some(traces_vec)
+        } else {
+            None
+        };
         txs.push(EspoAlkanesTransaction { traces: traces_opt, transaction: tx });
     }
     eprintln!(
