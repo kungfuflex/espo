@@ -988,6 +988,37 @@ fn mempool_entry_from_state(entry: &MempoolTransactionStruct) -> Option<MempoolE
     })
 }
 
+/// Fetch + deserialize a raw tx from bitcoind on demand. Used to render a LIGHT
+/// (non-alkane/rune) mempool entry — whose full Transaction was dropped to save
+/// memory — in the unfiltered "All" views. Must be called OUTSIDE the mempool
+/// lock; the caller bounds it to the visible page.
+fn fetch_mempool_tx(txid: &Txid) -> Option<Transaction> {
+    let rpc = get_bitcoind_rpc_client();
+    let raw_hex = rpc.get_raw_transaction_hex(txid, None).ok()?;
+    let raw = hex::decode(raw_hex.trim()).ok()?;
+    deserialize::<Transaction>(&raw).ok()
+}
+
+/// Like `mempool_entry_from_state` but usable OUTSIDE the lock: a LIGHT entry's
+/// tx is fetched on demand so the "All" views still surface plain pending txs.
+fn mempool_entry_hydrating(entry: &MempoolTransactionStruct) -> Option<MempoolEntry> {
+    let tx = match entry.tx.clone() {
+        Some(tx) => tx,
+        None => fetch_mempool_tx(&entry.txid)?,
+    };
+    Some(MempoolEntry {
+        txid: entry.txid,
+        tx,
+        traces: combined_traces(entry),
+        rune_io: entry.rune_io.clone(),
+        has_alkane_action: entry_has_alkane_action(entry),
+        has_rune_action: entry_has_rune_action(entry),
+        defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
+        first_seen: entry.first_seen,
+        position: entry.position.clone(),
+    })
+}
+
 fn entry_has_alkane_action(entry: &MempoolTransactionStruct) -> bool {
     !entry.protostones.is_empty()
         || entry.fixed_trace.as_ref().map_or(false, |traces| !traces.is_empty())
@@ -1376,32 +1407,46 @@ pub fn get_mempool_block_detail(
     let tx_total = ordered.len();
     let off = limit.saturating_mul(page.saturating_sub(1));
     let end = off.saturating_add(limit).min(tx_total);
-    let txs = if off < tx_total {
+    // Snapshot the visible page (txid + entry + package rate) under the lock,
+    // then build outside it so a LIGHT entry's tx can be fetched on demand
+    // without holding the mempool lock across a bitcoind RPC.
+    let page: Vec<(Txid, MempoolTransactionStruct, f64)> = if off < tx_total {
         ordered[off..end]
             .iter()
             .filter_map(|txid| {
                 let entry = state.txs.get(txid)?;
-                let tx = entry.tx.clone()?;
-                Some(MempoolBlockTx {
-                    txid: *txid,
-                    tx,
-                    protostones: entry.protostones.clone(),
-                    traces: combined_traces(entry),
-                    rune_io: entry.rune_io.clone(),
-                    addresses: entry.addresses.clone(),
-                    first_seen: entry.first_seen,
-                    fee_sat: entry.fee_sat,
-                    vsize: entry.vsize,
-                    fee_rate: package_rates.get(txid).copied().unwrap_or(entry.fee_rate),
-                    position: entry.position.clone(),
-                    readiness: derive_readiness(entry),
-                    defer_alkane_trace_status: entry_defers_alkane_trace_status(entry),
-                })
+                let rate = package_rates.get(txid).copied().unwrap_or(entry.fee_rate);
+                Some((*txid, entry.clone(), rate))
             })
             .collect()
     } else {
         Vec::new()
     };
+    drop(state);
+    let txs: Vec<MempoolBlockTx> = page
+        .into_iter()
+        .filter_map(|(txid, entry, fee_rate)| {
+            let tx = match entry.tx.clone() {
+                Some(tx) => tx,
+                None => fetch_mempool_tx(&txid)?,
+            };
+            Some(MempoolBlockTx {
+                txid,
+                tx,
+                protostones: entry.protostones.clone(),
+                traces: combined_traces(&entry),
+                rune_io: entry.rune_io.clone(),
+                addresses: entry.addresses.clone(),
+                first_seen: entry.first_seen,
+                fee_sat: entry.fee_sat,
+                vsize: entry.vsize,
+                fee_rate,
+                position: entry.position.clone(),
+                readiness: derive_readiness(&entry),
+                defer_alkane_trace_status: entry_defers_alkane_trace_status(&entry),
+            })
+        })
+        .collect();
     Some(MempoolBlockDetail { template, tx_total, txs })
 }
 
@@ -3487,13 +3532,20 @@ pub fn pending_action_entries_for_address(
 }
 
 pub fn pending_for_address(addr: &str) -> Vec<MempoolEntry> {
-    let Ok(state) = mempool_state().read() else { return Vec::new() };
-    let mut out: Vec<MempoolEntry> = state
-        .txs
-        .values()
-        .filter(|entry| entry.addresses.iter().any(|a| a == addr))
-        .filter_map(mempool_entry_from_state)
-        .collect();
+    // Snapshot matching entries under the lock, then hydrate any LIGHT ones
+    // OUTSIDE it (a bitcoind fetch must never run while the mempool lock is
+    // held). Bounded by the address's mempool footprint.
+    let snap: Vec<MempoolTransactionStruct> = {
+        let Ok(state) = mempool_state().read() else { return Vec::new() };
+        state
+            .txs
+            .values()
+            .filter(|entry| entry.addresses.iter().any(|a| a == addr))
+            .cloned()
+            .collect()
+    };
+    let mut out: Vec<MempoolEntry> =
+        snap.iter().filter_map(mempool_entry_hydrating).collect();
     out.sort_by(|a, b| b.first_seen.cmp(&a.first_seen).then_with(|| b.txid.cmp(&a.txid)));
     out
 }
