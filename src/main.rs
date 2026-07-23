@@ -1151,7 +1151,11 @@ async fn main() -> Result<()> {
     } else {
         eprintln!("[modules] runes disabled (requires modules.runes.enable=true)");
     }
-    mods.register_module(TokenData::new());
+    if get_module_config("tokendata").is_some() {
+        mods.register_module(TokenData::new());
+    } else {
+        eprintln!("[modules] tokendata disabled (missing config)");
+    }
     if get_module_config("subfrost").is_some() {
         mods.register_module(Subfrost::new());
     } else {
