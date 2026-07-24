@@ -274,7 +274,7 @@ impl PoolMetricsIndexField {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SearchIndexField {
     Marketcap,
     Holders,
@@ -1778,6 +1778,15 @@ impl AmmDataProvider {
         Self { mdb, essentials, view_blockhash: None }
     }
 
+    /// The state a remote getter call must pin: the provider's height-pinned
+    /// view when one is set, otherwise the request's own blockhash.
+    fn effective_wire_state(&self, state: StateAt) -> StateAt {
+        match state.resolve(self.view_blockhash) {
+            Some(bh) => StateAt::Block(bh),
+            None => StateAt::Latest,
+        }
+    }
+
     pub fn with_view_blockhash(&self, blockhash: Option<BlockHash>) -> Self {
         Self {
             mdb: Arc::clone(&self.mdb),
@@ -1794,13 +1803,9 @@ impl AmmDataProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
-            return Err(anyhow!("versioned_tree_unavailable"));
-        };
-        let Some(blockhash) = tree
-            .blockhash_for_height(height_u32)
-            .map_err(|e| anyhow!("tree lookup failed: {e}"))?
-        else {
+        // Resolves via the remote espo in remote-explorer mode, the local
+        // versioned tree otherwise.
+        let Some(blockhash) = crate::config::explorer_blockhash_for_height(height_u32)? else {
             return Err(anyhow!("height_not_indexed"));
         };
         Ok(self.with_view_blockhash(Some(blockhash)))
@@ -2039,6 +2044,13 @@ impl AmmDataProvider {
         &self,
         params: GetLatestBtcUsdPriceParams,
     ) -> Result<Option<u128>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::ammdata::internal_rpc::remote_get_latest_btc_usd_price(
+                &remote, params,
+            );
+        }
         Ok(self.get_latest_btc_usd_price_entry(params)?.map(|(_, price)| price))
     }
 
@@ -2139,6 +2151,13 @@ impl AmmDataProvider {
         &self,
         params: GetListKeysByPrefixParams,
     ) -> Result<GetListKeysByPrefixResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::ammdata::internal_rpc::remote_get_list_keys_by_prefix(
+                &remote, params,
+            );
+        }
         let keys = self.raw_scan_prefix_keys_at(
             &params.prefix,
             params.blockhash.resolve(self.view_blockhash),
@@ -2150,6 +2169,13 @@ impl AmmDataProvider {
         &self,
         params: GetListEntriesDescParams,
     ) -> Result<GetListEntriesDescResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::ammdata::internal_rpc::remote_get_list_entries_desc(
+                &remote, params,
+            );
+        }
         let page = self.get_list_entries_desc_cursor(GetListEntriesDescCursorParams {
             blockhash: params.blockhash,
             prefix: params.prefix,
@@ -2234,6 +2260,11 @@ impl AmmDataProvider {
     }
 
     pub fn get_index_height(&self, params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::ammdata::internal_rpc::remote_get_index_height(&remote, params);
+        }
         crate::debug_timer_log!("get_index_height");
         let table = self.table();
         let Some(bytes) = self
@@ -2403,6 +2434,13 @@ impl AmmDataProvider {
         &self,
         params: GetTokenMetricsParams,
     ) -> Result<GetTokenMetricsResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::ammdata::internal_rpc::remote_get_token_metrics(
+                &remote, params,
+            );
+        }
         crate::debug_timer_log!("get_token_metrics");
         let table = self.table();
         let metrics = self
@@ -2421,6 +2459,13 @@ impl AmmDataProvider {
         &self,
         params: GetTokenDerivedMetricsParams,
     ) -> Result<GetTokenDerivedMetricsResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::ammdata::internal_rpc::remote_get_token_derived_metrics(
+                &remote, params,
+            );
+        }
         crate::debug_timer_log!("get_token_derived_metrics");
         let table = self.table();
         let metrics = self
@@ -2616,6 +2661,13 @@ impl AmmDataProvider {
         &self,
         params: GetTokenSearchIndexPageParams,
     ) -> Result<GetTokenSearchIndexPageResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::ammdata::internal_rpc::remote_get_token_search_index_page(
+                &remote, params,
+            );
+        }
         crate::debug_timer_log!("get_token_search_index_page");
         let table = self.table();
         let prefix = table.token_search_index_prefix(params.field, &params.prefix);
@@ -2768,6 +2820,11 @@ impl AmmDataProvider {
     }
 
     pub fn get_pool_defs(&self, params: GetPoolDefsParams) -> Result<GetPoolDefsResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::ammdata::internal_rpc::remote_get_pool_defs(&remote, params);
+        }
         crate::debug_timer_log!("get_pool_defs");
         let table = self.table();
         let defs = self
@@ -3014,6 +3071,13 @@ impl AmmDataProvider {
         &self,
         params: GetTokenActivityPageParams,
     ) -> Result<GetTokenActivityPageResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::ammdata::internal_rpc::remote_get_token_activity_page(
+                &remote, params,
+            );
+        }
         crate::debug_timer_log!("get_token_activity_page");
         let table = self.table();
         let prefix = match params.sort_by {
@@ -3250,6 +3314,11 @@ impl AmmDataProvider {
     }
 
     pub fn get_token_pools(&self, params: GetTokenPoolsParams) -> Result<GetTokenPoolsResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::ammdata::internal_rpc::remote_get_token_pools(&remote, params);
+        }
         crate::debug_timer_log!("get_token_pools");
         let table = self.table();
         let prefix = table.token_pools_prefix(&params.token);
@@ -3715,6 +3784,9 @@ impl AmmDataProvider {
     }
 
     pub fn rpc_get_candles(&self, params: RpcGetCandlesParams) -> Result<RpcGetCandlesResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::ammdata::internal_rpc::remote_rpc_get_candles(&remote, params);
+        }
         let tf = params.timeframe.as_deref().and_then(parse_timeframe).unwrap_or(Timeframe::H1);
 
         let legacy_size = params.size.map(|n| n as usize);
@@ -5058,22 +5130,26 @@ pub struct GetMultiValuesResult {
     pub values: Vec<Option<Vec<u8>>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetListKeysByPrefixParams {
     pub blockhash: StateAt,
 
     pub prefix: Vec<u8>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetListKeysByPrefixResult {
     pub keys: Vec<Vec<u8>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetListEntriesDescParams {
     pub blockhash: StateAt,
 
     pub prefix: Vec<u8>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetListEntriesDescResult {
     pub entries: Vec<(Vec<u8>, Vec<u8>)>,
 }
@@ -5122,10 +5198,12 @@ pub struct SetBatchParams {
     pub deletes: Vec<Vec<u8>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetIndexHeightParams {
     pub blockhash: StateAt,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetIndexHeightResult {
     pub height: Option<u32>,
 }
@@ -5155,6 +5233,7 @@ pub struct GetCanonicalPoolsResult {
     pub pools: Vec<SchemaCanonicalPoolEntry>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetLatestBtcUsdPriceParams {
     pub blockhash: StateAt,
 }
@@ -5170,16 +5249,19 @@ pub struct GetLatestTokenUsdCloseResult {
     pub close: Option<u128>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenMetricsParams {
     pub blockhash: StateAt,
 
     pub token: SchemaAlkaneId,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenMetricsResult {
     pub metrics: SchemaTokenMetricsV1,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenDerivedMetricsParams {
     pub blockhash: StateAt,
 
@@ -5187,6 +5269,7 @@ pub struct GetTokenDerivedMetricsParams {
     pub quote: SchemaAlkaneId,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenDerivedMetricsResult {
     pub metrics: Option<SchemaTokenMetricsV1>,
 }
@@ -5257,6 +5340,7 @@ pub struct GetTokenDerivedMetricsIndexCountResult {
     pub count: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenSearchIndexPageParams {
     pub blockhash: StateAt,
 
@@ -5267,6 +5351,7 @@ pub struct GetTokenSearchIndexPageParams {
     pub desc: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenSearchIndexPageResult {
     pub ids: Vec<SchemaAlkaneId>,
 }
@@ -5314,12 +5399,14 @@ pub struct GetFactoryPoolsResult {
     pub pools: Vec<SchemaAlkaneId>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetPoolDefsParams {
     pub blockhash: StateAt,
 
     pub pool: SchemaAlkaneId,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetPoolDefsResult {
     pub defs: Option<SchemaMarketDefs>,
 }
@@ -5436,7 +5523,7 @@ pub struct TokenSwapEntry {
     pub pool: SchemaAlkaneId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TokenActivityEntry {
     pub ts: u64,
     pub seq: u32,
@@ -5444,12 +5531,13 @@ pub struct TokenActivityEntry {
     pub kind: ActivityKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TokenActivitySortField {
     Timestamp,
     Amount,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenActivityPageParams {
     pub blockhash: StateAt,
 
@@ -5462,6 +5550,7 @@ pub struct GetTokenActivityPageParams {
     pub dir: SortDir,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenActivityPageResult {
     pub entries: Vec<TokenActivityEntry>,
     pub total: usize,
@@ -5606,12 +5695,14 @@ pub struct GetAmmHistoryPageResult {
     pub total: usize,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenPoolsParams {
     pub blockhash: StateAt,
 
     pub token: SchemaAlkaneId,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenPoolsResult {
     pub pools: Vec<SchemaAlkaneId>,
 }
@@ -5646,6 +5737,7 @@ pub struct SetReservesSnapshotParams {
     pub snapshot: HashMap<SchemaAlkaneId, SchemaPoolSnapshot>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RpcGetCandlesParams {
     pub pool: Option<String>,
     pub timeframe: Option<String>,
@@ -5656,6 +5748,7 @@ pub struct RpcGetCandlesParams {
     pub now: Option<u64>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RpcGetCandlesResult {
     pub value: Value,
 }

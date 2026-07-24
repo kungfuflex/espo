@@ -2,7 +2,18 @@ use crate::schemas::SchemaAlkaneId;
 use borsh::{BorshDeserialize, BorshSerialize};
 
 #[derive(
-    BorshSerialize, BorshDeserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
+    BorshSerialize,
+    BorshDeserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub enum TokenActivityKind {
     Buy,

@@ -180,7 +180,7 @@ mod tests {
 
     fn test_provider() -> (TempDir, AmmDataProvider) {
         let dir = TempDir::new().expect("temp dir");
-        let amm_mdb = Arc::new(Mdb::open(dir.path(), b"ammdata:").expect("open ammdata mdb"));
+        let amm_mdb = Arc::new(Mdb::open(dir.path(), b"ammdata_test:").expect("open ammdata mdb"));
         let essentials =
             Arc::new(EssentialsProvider::new(Arc::new(amm_mdb.clone_with_prefix(b"essentials:"))));
         (dir, AmmDataProvider::new(amm_mdb, essentials))

@@ -6441,6 +6441,27 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
 }
 
 fn lookup_self_balance(alk: &SchemaAlkaneId) -> Option<u128> {
+    // Remote-explorer deployments have no local metashrew; ask the remote
+    // espo's equivalent getter RPC for the self-balance instead.
+    if let Some(remote) = crate::config::explorer_remote() {
+        let id = format!("{}:{}", alk.block, alk.tx);
+        return match remote.call(
+            "essentials.get_alkane_balance_metashrew",
+            serde_json::json!({ "owner": id, "alkane": id }),
+        ) {
+            Ok(result) => result
+                .get("balance")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u128>().ok()),
+            Err(e) => {
+                eprintln!(
+                    "[balances] WARN: remote self-balance lookup failed for {}:{} ({e})",
+                    alk.block, alk.tx
+                );
+                None
+            }
+        };
+    }
     match get_metashrew().get_reserves_for_alkane(alk, alk, None) {
         Ok(val) => val,
         Err(e) => {
@@ -6458,6 +6479,11 @@ pub fn get_balance_for_address(
     provider: &EssentialsProvider,
     address: &str,
 ) -> Result<HashMap<SchemaAlkaneId, u128>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_balance_for_address(
+            &remote, blockhash, address,
+        );
+    }
     let table = provider.table();
     let len = provider
         .get_raw_value(GetRawValueParams {
@@ -6525,6 +6551,11 @@ pub fn get_alkane_balances(
     provider: &EssentialsProvider,
     owner: &SchemaAlkaneId,
 ) -> Result<HashMap<SchemaAlkaneId, u128>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_alkane_balances(
+            &remote, blockhash, owner,
+        );
+    }
     let table = provider.table();
     let mut agg: HashMap<SchemaAlkaneId, u128> = HashMap::new();
     let len = provider
@@ -6843,6 +6874,11 @@ pub fn get_outpoint_balances_with_spent(
     txid: &Txid,
     vout: u32,
 ) -> Result<OutpointLookup> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_outpoint_balances_with_spent(
+            &remote, blockhash, txid, vout,
+        );
+    }
     let spent_by = resolve_outpoint_spent_by_v2(provider, txid, vout, blockhash)?;
     let row = load_outpoint_row_v2(provider, txid, vout, blockhash)?;
     let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
@@ -6858,6 +6894,11 @@ pub fn get_outpoint_rows_batch(
     provider: &EssentialsProvider,
     outpoints: &[(Txid, u32)],
 ) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_outpoint_rows_batch(
+            &remote, blockhash, outpoints,
+        );
+    }
     let table = provider.table();
     let ids = resolve_outpoint_ids_batch_v2(provider, blockhash, outpoints)?;
     let mut unique_ids: Vec<u64> = Vec::new();
@@ -6905,6 +6946,11 @@ pub fn get_outpoint_balances_with_spent_batch(
     provider: &EssentialsProvider,
     outpoints: &[(Txid, u32)],
 ) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_outpoint_balances_with_spent_batch(
+            &remote, blockhash, outpoints,
+        );
+    }
     let table = provider.table();
     let ids = resolve_outpoint_ids_batch_v2(provider, blockhash, outpoints)?;
     let mut unique_ids: Vec<u64> = Vec::new();
@@ -6964,6 +7010,11 @@ pub fn get_holders_for_alkane(
     page: usize,
     limit: usize,
 ) -> Result<(usize /*total*/, u128 /*supply*/, Vec<HolderEntry>)> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_holders_for_alkane(
+            &remote, blockhash, alk, page, limit,
+        );
+    }
     let table = provider.table();
     let len = provider
         .get_raw_value(GetRawValueParams { blockhash, key: table.holder_list_len_key(&alk) })?
@@ -7248,6 +7299,11 @@ pub fn get_transfer_volume_for_alkane(
     page: usize,
     limit: usize,
 ) -> Result<(usize, Vec<AddressAmountEntry>)> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_transfer_volume_for_alkane(
+            &remote, blockhash, alk, page, limit,
+        );
+    }
     let table = provider.table();
     read_address_amount_prefix_page(
         blockhash,
@@ -7265,6 +7321,11 @@ pub fn get_total_received_for_alkane(
     page: usize,
     limit: usize,
 ) -> Result<(usize, Vec<AddressAmountEntry>)> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_total_received_for_alkane(
+            &remote, blockhash, alk, page, limit,
+        );
+    }
     let table = provider.table();
     read_address_amount_prefix_page(
         blockhash,

@@ -101,7 +101,7 @@ pub enum ActivityGroup {
     Events,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ActivityFilter {
     All,
     Trades,
@@ -532,7 +532,7 @@ pub enum ActivitySortKey {
     SideQuoteAmount, // "sq_absq"
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SortDir {
     Asc,
     Desc,

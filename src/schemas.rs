@@ -17,6 +17,8 @@ use std::io::ErrorKind;
     Ord,
     Hash,
     Default,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub struct SchemaAlkaneId {
     pub block: u32,

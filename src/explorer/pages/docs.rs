@@ -1805,6 +1805,37 @@ fn docs_modules() -> Vec<ModuleDoc> {
             intro: "HTTP and websocket endpoints used by the explorer interface.",
             methods: explorer_http_docs(),
         },
+        ModuleDoc {
+            slug: "internal-rpc",
+            title: "Internal getter RPC",
+            intro: "Getter-level RPC methods that let a remote espo explorer (configured with explorer_espo_rpc_host) render entirely from RPC calls against this instance: every storage getter the explorer uses is mirrored as internal.<module>_<getter>, so one getter invocation is exactly one round-trip carrying the getter's full native result. Requests carry the getter's native params struct as \"p\" (serde JSON; blockhash pins versioned state) and responses return the native result as \"r\" — simple results as plain JSON, heavy nested results (creation records, block summaries, tx summaries, pointer blobs, holder pages, rune entries) as hex-encoded Borsh in *_borsh fields, the same encoding they are stored with. Registered only when enable_internal_rpc is true, which requires internal_rpc_key: every request must carry the key as \"auth\" or it is rejected with unauthorized (the remote explorer sends it automatically from explorer_espo_rpc_key). These methods exist for trusted explorer replicas — keep them off untrusted public endpoints. The full method list mirrors the getter names in each module's internal_rpc.rs (essentials, runes, ammdata, tokendata, pizzafun, subfrost) plus internal.tree_blockhash_for_height and internal.tree_indexed_height_bounds.",
+            methods: vec![
+                rpc_doc(
+                    "internal.essentials_get_holders_count",
+                    "Representative example of a simple getter: native params in, native result out as plain JSON.",
+                    json!({ "auth": "<internal_rpc_key>", "p": { "blockhash": "Latest", "alkane": { "block": 2, "tx": 0 } } }),
+                    json!({ "ok": true, "r": { "count": 6409 } }),
+                ),
+                rpc_doc(
+                    "internal.essentials_get_creation_records_ordered_page",
+                    "Representative example of a heavy getter: the result rows are hex-encoded Borsh in the stored encoding.",
+                    json!({ "auth": "<internal_rpc_key>", "p": { "blockhash": "Latest", "offset": 0, "limit": 2, "desc": true } }),
+                    json!({ "ok": true, "r": { "records": ["01a3f2…", "01b871…"] } }),
+                ),
+                rpc_doc(
+                    "internal.tree_blockhash_for_height",
+                    "Resolves an indexed height to its canonical blockhash (internal byte order, hex); remote explorers use it for height-pinned views.",
+                    json!({ "auth": "<internal_rpc_key>", "p": { "height": 946000 } }),
+                    json!({ "ok": true, "r": { "blockhash": "0000000000000000000000000000000000000000000000000000000000000000" } }),
+                ),
+                rpc_doc(
+                    "internal.tree_indexed_height_bounds",
+                    "Returns the (min, max) indexed heights of the versioned tree, or null when nothing is indexed.",
+                    json!({ "auth": "<internal_rpc_key>", "p": {} }),
+                    json!({ "ok": true, "r": { "bounds": [880000, 946000] } }),
+                ),
+            ],
+        },
     ]
 }
 

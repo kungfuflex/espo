@@ -117,6 +117,10 @@ fn default_port() -> u16 {
     8080
 }
 
+fn default_explorer_espo_rpc_cache_ms() -> u64 {
+    2000
+}
+
 fn default_explorer_base_path() -> String {
     "/".to_string()
 }
@@ -540,6 +544,16 @@ pub struct ConfigFile {
     pub port: u16,
     #[serde(default)]
     pub explorer_host: Option<SocketAddr>,
+    #[serde(default)]
+    pub explorer_espo_rpc_host: Option<String>,
+    #[serde(default)]
+    pub explorer_espo_rpc_key: Option<String>,
+    #[serde(default = "default_explorer_espo_rpc_cache_ms")]
+    pub explorer_espo_rpc_cache_ms: u64,
+    #[serde(default)]
+    pub enable_internal_rpc: bool,
+    #[serde(default)]
+    pub internal_rpc_key: Option<String>,
     #[serde(default = "default_explorer_base_path")]
     pub explorer_base_path: String,
     #[serde(default = "default_explorer_pizza_tv_endpoint")]
@@ -608,6 +622,11 @@ pub struct AppConfig {
     pub indexer_block_delay_ms: u64,
     pub port: u16,
     pub explorer_host: Option<SocketAddr>,
+    pub explorer_espo_rpc_host: Option<String>,
+    pub explorer_espo_rpc_key: Option<String>,
+    pub explorer_espo_rpc_cache_ms: u64,
+    pub enable_internal_rpc: bool,
+    pub internal_rpc_key: Option<String>,
     pub explorer_base_path: String,
     pub explorer_pizza_tv_endpoint: String,
     pub explorer_amm_prefix: String,
@@ -692,6 +711,11 @@ impl AppConfig {
             indexer_block_delay_ms: file.indexer_block_delay_ms,
             port: file.port,
             explorer_host: file.explorer_host,
+            explorer_espo_rpc_host: normalize_optional_string(file.explorer_espo_rpc_host),
+            explorer_espo_rpc_key: normalize_optional_string(file.explorer_espo_rpc_key),
+            explorer_espo_rpc_cache_ms: file.explorer_espo_rpc_cache_ms,
+            enable_internal_rpc: file.enable_internal_rpc,
+            internal_rpc_key: normalize_optional_string(file.internal_rpc_key),
             explorer_base_path,
             explorer_pizza_tv_endpoint,
             explorer_amm_prefix,
@@ -731,15 +755,47 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
     // --- validations ---
     let db = Path::new(&cfg.readonly_metashrew_db_dir);
-    if !db.exists() {
-        anyhow::bail!("Database path does not exist: {}", cfg.readonly_metashrew_db_dir);
-    }
-    if !db.is_dir() {
-        anyhow::bail!("Database path is not a directory: {}", cfg.readonly_metashrew_db_dir);
+    let metashrew_dir_ok = db.exists() && db.is_dir();
+    if !metashrew_dir_ok {
+        // A remote-explorer deployment (explorer_espo_rpc_host) may not have a
+        // local metashrew database; SSR data comes from the remote espo's
+        // getter RPCs, so a missing metashrew dir is survivable there and
+        // fatal otherwise.
+        if cfg.explorer_espo_rpc_host.is_some() {
+            eprintln!(
+                "[config] metashrew db dir missing or invalid ({}); continuing because explorer_espo_rpc_host is set — metashrew-backed features are served remotely",
+                cfg.readonly_metashrew_db_dir
+            );
+        } else if !db.exists() {
+            anyhow::bail!("Database path does not exist: {}", cfg.readonly_metashrew_db_dir);
+        } else {
+            anyhow::bail!("Database path is not a directory: {}", cfg.readonly_metashrew_db_dir);
+        }
     }
 
     if cfg.metashrew_rpc_url.trim().is_empty() {
         anyhow::bail!("metashrew_rpc_url must be provided");
+    }
+
+    if cfg.enable_internal_rpc && cfg.internal_rpc_key.is_none() {
+        anyhow::bail!(
+            "enable_internal_rpc requires internal_rpc_key: the internal.* getter methods must never run unauthenticated"
+        );
+    }
+    if cfg.explorer_espo_rpc_host.is_some() {
+        // Remote-explorer mode replaces every explorer getter with an RPC
+        // call; indexing (and its getters) must stay local, so this mode is
+        // only valid on a view-only instance.
+        if !cfg.view_only {
+            anyhow::bail!(
+                "explorer_espo_rpc_host requires --view-only: a remote-data explorer must not index"
+            );
+        }
+        if cfg.explorer_espo_rpc_key.is_none() {
+            eprintln!(
+                "[config] WARN: explorer_espo_rpc_host is set without explorer_espo_rpc_key; internal.* calls to the remote espo will be rejected unless it runs without a key"
+            );
+        }
     }
 
     let db_root = Path::new(&cfg.db_path);
@@ -863,16 +919,25 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
     // --- init Secondary RocksDB (SDB) once ---
     // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
-    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
+    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() && metashrew_dir_ok {
         let secondary_path = get_sdb_path_for_metashrew()?;
-        let sdb = SDB::open(
+        match SDB::open(
             cfg.readonly_metashrew_db_dir.clone(),
             secondary_path,
             Duration::from_millis(cfg.sdb_poll_ms as u64),
-        )?;
-        METASHREW_SDB
-            .set(std::sync::Arc::new(sdb))
-            .map_err(|_| anyhow::anyhow!("metashrew SDB already initialized"))?;
+        ) {
+            Ok(sdb) => {
+                METASHREW_SDB
+                    .set(std::sync::Arc::new(sdb))
+                    .map_err(|_| anyhow::anyhow!("metashrew SDB already initialized"))?;
+            }
+            Err(e) if cfg.explorer_espo_rpc_host.is_some() => {
+                eprintln!(
+                    "[config] metashrew db unavailable ({e:#}); continuing because explorer_espo_rpc_host is set — metashrew-backed features are served remotely"
+                );
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // --- init ESPO RocksDB once ---
@@ -988,6 +1053,109 @@ pub fn get_espo_db() -> std::sync::Arc<DB> {
 /// Optional writable cache database for derived, reproducible results.
 pub fn get_cache_db() -> Option<std::sync::Arc<DB>> {
     CACHE_DB.get().map(std::sync::Arc::clone)
+}
+
+/// Like `get_metashrew_sdb`, but survives deployments without a local
+/// metashrew database (remote-explorer mode). Callers that can degrade
+/// should prefer this.
+pub fn try_get_metashrew_sdb() -> Option<std::sync::Arc<SDB>> {
+    METASHREW_SDB.get().map(std::sync::Arc::clone)
+}
+
+/// Whether this instance serves the `internal.*` getter RPC methods that a
+/// remote explorer needs (see `explorer_espo_rpc_host`).
+pub fn internal_rpc_enabled() -> bool {
+    get_config().enable_internal_rpc
+}
+
+/// The shared key `internal.*` requests must carry. Always present when
+/// `enable_internal_rpc` is true (enforced at startup).
+pub fn internal_rpc_key() -> Option<&'static str> {
+    get_config().internal_rpc_key.as_deref()
+}
+
+static EXPLORER_REMOTE_CLIENT: OnceLock<
+    Option<std::sync::Arc<crate::runtime::remote_espo::RemoteEspoClient>>,
+> = OnceLock::new();
+
+/// The remote espo getter-RPC client, present only when
+/// `explorer_espo_rpc_host` is configured. Startup validation guarantees that
+/// mode is view-only, so every getter caller in the process is serving the
+/// explorer and may be answered remotely.
+pub fn explorer_remote() -> Option<std::sync::Arc<crate::runtime::remote_espo::RemoteEspoClient>> {
+    EXPLORER_REMOTE_CLIENT
+        .get_or_init(|| {
+            // Tolerate uninitialized config (unit tests, diagnostic tools):
+            // no config means no remote-explorer mode. In the real binary
+            // init_config() always runs before any getter can be called.
+            let cfg = CONFIG.get()?;
+            cfg.explorer_espo_rpc_host.as_deref().map(|host| {
+                eprintln!("[explorer] SSR data source: remote espo getter rpc at {host}");
+                std::sync::Arc::new(crate::runtime::remote_espo::RemoteEspoClient::new(
+                    host,
+                    cfg.explorer_espo_rpc_key.clone(),
+                    Duration::from_millis(cfg.explorer_espo_rpc_cache_ms),
+                ))
+            })
+        })
+        .clone()
+}
+
+/// The essentials-namespace Mdb for explorer components. The Mdb itself is
+/// always local — in remote-explorer mode every getter called on it
+/// short-circuits to the remote getter RPC before touching the database.
+pub fn explorer_mdb_essentials() -> crate::runtime::mdb::Mdb {
+    crate::runtime::mdb::Mdb::from_db(get_espo_db(), b"essentials:")
+}
+
+/// Indexed height bounds for explorer views: remote getter when in
+/// remote-explorer mode, the local versioned tree otherwise.
+pub fn explorer_indexed_height_bounds() -> Option<(u32, u32)> {
+    match explorer_remote() {
+        Some(remote) => remote
+            .getter::<_, crate::runtime::internal_rpc::IndexedHeightBoundsResult>(
+                "internal.tree_indexed_height_bounds",
+                &crate::runtime::internal_rpc::IndexedHeightBoundsParams {},
+            )
+            .ok()
+            .and_then(|r| r.bounds),
+        None => crate::runtime::tree_db::get_global_tree_db()
+            .and_then(|db| db.indexed_height_bounds().ok().flatten()),
+    }
+}
+
+/// Height → canonical blockhash for explorer views: remote getter when in
+/// remote-explorer mode, the local versioned tree otherwise.
+pub fn explorer_blockhash_for_height(
+    height: u32,
+) -> Result<Option<bitcoincore_rpc::bitcoin::BlockHash>> {
+    use bitcoincore_rpc::bitcoin::hashes::Hash as _;
+    match explorer_remote() {
+        Some(remote) => {
+            let r: crate::runtime::internal_rpc::BlockhashForHeightResult = remote.getter(
+                "internal.tree_blockhash_for_height",
+                &crate::runtime::internal_rpc::BlockhashForHeightParams { height },
+            )?;
+            match r.blockhash {
+                Some(hexstr) => {
+                    let bytes = hex::decode(&hexstr)
+                        .map_err(|e| anyhow::anyhow!("bad remote blockhash hex: {e}"))?;
+                    let arr: [u8; 32] = bytes
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("remote blockhash not 32 bytes"))?;
+                    Ok(Some(bitcoincore_rpc::bitcoin::BlockHash::from_byte_array(arr)))
+                }
+                None => Ok(None),
+            }
+        }
+        None => {
+            let Some(tree) = crate::runtime::tree_db::get_global_tree_db() else {
+                anyhow::bail!("versioned_tree_unavailable");
+            };
+            tree.blockhash_for_height(height)
+                .map_err(|e| anyhow::anyhow!("tree lookup failed: {e}"))
+        }
+    }
 }
 
 /// Global accessor for the block source (blk files + RPC fallback)

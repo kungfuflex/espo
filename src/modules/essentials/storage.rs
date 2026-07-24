@@ -243,7 +243,7 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AddressIndexListKind {
     OutpointIdx,
     AlkaneTxs,
@@ -2138,6 +2138,15 @@ impl EssentialsProvider {
         Self { mdb, blob_mdb, view_blockhash: None }
     }
 
+    /// The state a remote getter call must pin: the provider's height-pinned
+    /// view when one is set, otherwise the request's own blockhash.
+    fn effective_wire_state(&self, state: StateAt) -> StateAt {
+        match state.resolve(self.view_blockhash) {
+            Some(bh) => StateAt::Block(bh),
+            None => StateAt::Latest,
+        }
+    }
+
     pub fn with_view_blockhash(&self, blockhash: Option<BlockHash>) -> Self {
         Self {
             mdb: Arc::clone(&self.mdb),
@@ -2154,13 +2163,9 @@ impl EssentialsProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
-            return Err(anyhow!("versioned_tree_unavailable"));
-        };
-        let Some(blockhash) = tree
-            .blockhash_for_height(height_u32)
-            .map_err(|e| anyhow!("tree lookup failed: {e}"))?
-        else {
+        // Resolves via the remote espo in remote-explorer mode, the local
+        // versioned tree otherwise.
+        let Some(blockhash) = crate::config::explorer_blockhash_for_height(height_u32)? else {
             return Err(anyhow!("height_not_indexed"));
         };
         Ok(self.with_view_blockhash(Some(blockhash)))
@@ -2337,6 +2342,13 @@ impl EssentialsProvider {
         &self,
         params: GetListKeysByPrefixParams,
     ) -> Result<GetListKeysByPrefixResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::essentials::internal_rpc::remote_get_list_keys_by_prefix(
+                &remote, params,
+            );
+        }
         let keys = self.raw_scan_prefix_keys_at(
             &params.prefix,
             params.blockhash.resolve(self.view_blockhash),
@@ -2348,6 +2360,13 @@ impl EssentialsProvider {
         &self,
         params: GetListEntriesDescParams,
     ) -> Result<GetListEntriesDescResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::essentials::internal_rpc::remote_get_list_entries_desc(
+                &remote, params,
+            );
+        }
         let mut entries = self.raw_scan_prefix_entries_at(
             &params.prefix,
             params.blockhash.resolve(self.view_blockhash),
@@ -2481,6 +2500,13 @@ impl EssentialsProvider {
     }
 
     pub fn get_index_height(&self, params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::essentials::internal_rpc::remote_get_index_height(
+                &remote, params,
+            );
+        }
         crate::debug_timer_log!("get_index_height");
         let table = self.table();
         let Some(bytes) = self
@@ -2512,6 +2538,15 @@ impl EssentialsProvider {
         &self,
         params: GetCreationRecordParams,
     ) -> Result<GetCreationRecordResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return Ok(GetCreationRecordResult {
+                record: crate::modules::essentials::internal_rpc::remote_get_creation_record(
+                    &remote, params,
+                )?,
+            });
+        }
         crate::debug_timer_log!("get_creation_record");
         let table = self.table();
         let key = table.alkane_creation_by_id_key(&params.alkane);
@@ -2590,6 +2625,11 @@ impl EssentialsProvider {
         &self,
         params: GetCreationRecordsOrderedPageParams,
     ) -> Result<GetCreationRecordsOrderedPageResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return Ok(GetCreationRecordsOrderedPageResult { records: crate::modules::essentials::internal_rpc::remote_get_creation_records_ordered_page(&remote, params)? });
+        }
         crate::debug_timer_log!("get_creation_records_ordered_page");
         let started = Instant::now();
         let debug = creation_debug_enabled();
@@ -2746,6 +2786,11 @@ impl EssentialsProvider {
         &self,
         params: GetAlkaneIdsByNamePrefixPageParams,
     ) -> Result<GetAlkaneIdsByNamePrefixResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::essentials::internal_rpc::remote_get_alkane_ids_by_name_prefix_page(&remote, params);
+        }
         crate::debug_timer_log!("get_alkane_ids_by_name_prefix_page");
         let table = self.table();
         let prefix = table.alkane_name_index_prefix(&params.prefix);
@@ -2845,6 +2890,13 @@ impl EssentialsProvider {
         &self,
         params: GetCreationCountParams,
     ) -> Result<GetCreationCountResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::essentials::internal_rpc::remote_get_creation_count(
+                &remote, params,
+            );
+        }
         crate::debug_timer_log!("get_creation_count");
         let table = self.table();
         let count = self
@@ -2929,6 +2981,13 @@ impl EssentialsProvider {
         &self,
         params: GetHoldersCountParams,
     ) -> Result<GetHoldersCountResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::essentials::internal_rpc::remote_get_holders_count(
+                &remote, params,
+            );
+        }
         crate::debug_timer_log!("get_holders_count");
         let table = self.table();
         let count = self
@@ -2942,6 +3001,41 @@ impl EssentialsProvider {
             .map(|entry| entry.count)
             .unwrap_or(0);
         Ok(GetHoldersCountResult { count })
+    }
+
+    /// Semantic wrapper over the latest-traces ring (length + idx rows) so
+    /// the explorer home page reads it through one getter.
+    pub fn get_latest_trace_txids(
+        &self,
+        params: GetLatestTraceTxidsParams,
+    ) -> Result<GetLatestTraceTxidsResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::essentials::internal_rpc::remote_get_latest_trace_txids(
+                &remote, params,
+            );
+        }
+        let table = self.table();
+        let state = params.blockhash.resolve(self.view_blockhash);
+        let len = self
+            .raw_get_at(&table.latest_traces_length_key(), state)?
+            .and_then(|b| {
+                if b.len() == 4 {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&b);
+                    Some(u32::from_le_bytes(arr))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        if len == 0 {
+            return Ok(GetLatestTraceTxidsResult { txids: Vec::new() });
+        }
+        let keys: Vec<Vec<u8>> = (0..len).map(|idx| table.latest_traces_idx_key(idx)).collect();
+        let values = self.raw_multi_get_at(&keys, state)?;
+        Ok(GetLatestTraceTxidsResult { txids: values.into_iter().flatten().collect() })
     }
 
     pub fn get_holders_counts_by_id(
@@ -2968,6 +3062,13 @@ impl EssentialsProvider {
         &self,
         params: GetHoldersOrderedPageParams,
     ) -> Result<GetHoldersOrderedPageResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::essentials::internal_rpc::remote_get_holders_ordered_page(
+                &remote, params,
+            );
+        }
         crate::debug_timer_log!("get_holders_ordered_page");
         let table = self.table();
         let prefix = table.alkane_holders_ordered_prefix();
@@ -3083,6 +3184,15 @@ impl EssentialsProvider {
         &self,
         params: GetBlockSummaryParams,
     ) -> Result<GetBlockSummaryResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return Ok(GetBlockSummaryResult {
+                summary: crate::modules::essentials::internal_rpc::remote_get_block_summary(
+                    &remote, params,
+                )?,
+            });
+        }
         crate::debug_timer_log!("get_block_summary");
         let summary = match params.blockhash {
             StateAt::Block(blockhash) => self.get_block_summary_by_hash(&blockhash)?,
@@ -3095,6 +3205,11 @@ impl EssentialsProvider {
         &self,
         heights: &[u32],
     ) -> Result<Vec<Option<BlockSummary>>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::essentials::internal_rpc::remote_get_block_summaries_by_heights(
+                &remote, heights,
+            );
+        }
         crate::debug_timer_log!("get_block_summaries_by_heights");
         if heights.is_empty() {
             return Ok(Vec::new());
@@ -6591,22 +6706,26 @@ pub struct GetMultiValuesResult {
     pub values: Vec<Option<Vec<u8>>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetListKeysByPrefixParams {
     pub blockhash: StateAt,
 
     pub prefix: Vec<u8>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetListKeysByPrefixResult {
     pub keys: Vec<Vec<u8>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetListEntriesDescParams {
     pub blockhash: StateAt,
 
     pub prefix: Vec<u8>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetListEntriesDescResult {
     pub entries: Vec<(Vec<u8>, Vec<u8>)>,
 }
@@ -6645,10 +6764,12 @@ pub struct SetBlobValuesIfMissingParams {
     pub puts: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetIndexHeightParams {
     pub blockhash: StateAt,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetIndexHeightResult {
     pub height: Option<u32>,
 }
@@ -6659,6 +6780,7 @@ pub struct SetIndexHeightParams {
     pub height: u32,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetCreationRecordParams {
     pub blockhash: StateAt,
 
@@ -6687,6 +6809,7 @@ pub struct GetCreationRecordsOrderedResult {
     pub records: Vec<AlkaneCreationRecord>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetCreationRecordsOrderedPageParams {
     pub blockhash: StateAt,
 
@@ -6705,10 +6828,12 @@ pub struct GetAlkaneIdsByNamePrefixParams {
     pub prefix: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetAlkaneIdsByNamePrefixResult {
     pub ids: Vec<SchemaAlkaneId>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetAlkaneIdsByNamePrefixPageParams {
     pub blockhash: StateAt,
 
@@ -6735,10 +6860,12 @@ pub struct GetAlkaneIdsBySymbolPrefixPageParams {
     pub limit: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetCreationCountParams {
     pub blockhash: StateAt,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetCreationCountResult {
     pub count: u64,
 }
@@ -6763,12 +6890,25 @@ pub struct GetFactoryChildrenResult {
     pub children: Vec<SchemaAlkaneId>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct GetLatestTraceTxidsParams {
+    pub blockhash: StateAt,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct GetLatestTraceTxidsResult {
+    /// Newest-first txids (32 bytes each) from the latest-traces ring.
+    pub txids: Vec<Vec<u8>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetHoldersCountParams {
     pub blockhash: StateAt,
 
     pub alkane: SchemaAlkaneId,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetHoldersCountResult {
     pub count: u64,
 }
@@ -6783,6 +6923,7 @@ pub struct GetHoldersCountsByIdResult {
     pub counts: Vec<u64>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetHoldersOrderedPageParams {
     pub blockhash: StateAt,
 
@@ -6791,6 +6932,7 @@ pub struct GetHoldersOrderedPageParams {
     pub desc: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetHoldersOrderedPageResult {
     pub ids: Vec<SchemaAlkaneId>,
 }
@@ -6837,6 +6979,7 @@ pub struct GetAlkaneStorageValueResult {
     pub value: Option<Vec<u8>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetBlockSummaryParams {
     pub blockhash: StateAt,
 
@@ -8272,6 +8415,11 @@ pub fn get_address_index_list_len(
     kind: AddressIndexListKind,
     address: &str,
 ) -> Result<u64> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_address_index_list_len(
+            &remote, blockhash, kind, address,
+        );
+    }
     let key = provider.table().address_index_meta_key(address, kind);
     let raw = provider
         .get_raw_value(GetRawValueParams { blockhash, key })
@@ -8295,6 +8443,11 @@ pub fn get_address_index_list_range(
     start: u64,
     end: u64,
 ) -> Result<Vec<u64>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_address_index_list_range(
+            &remote, blockhash, kind, address, start, end,
+        );
+    }
     if end <= start {
         return Ok(Vec::new());
     }
@@ -8733,6 +8886,12 @@ pub fn load_creation_record(
     mdb: &crate::runtime::mdb::Mdb,
     alkane: &SchemaAlkaneId,
 ) -> Result<Option<AlkaneCreationRecord>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_creation_record(
+            &remote,
+            GetCreationRecordParams { blockhash: StateAt::Latest, alkane: *alkane },
+        );
+    }
     let table = EssentialsTable::new(mdb);
     let key = table.alkane_creation_by_id_key(alkane);
     if let Some(bytes) = mdb.get(&key)? {
@@ -8818,6 +8977,14 @@ pub(crate) fn load_tx_pointer_blob_v3_by_id(
     provider: &EssentialsProvider,
     id: u64,
 ) -> Option<TxPointerBlobV3> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_load_tx_pointer_blob_v3_by_id(
+            &remote, id,
+        )
+        .map_err(|e| eprintln!("[remote] load_tx_pointer_blob_v3_by_id failed: {e}"))
+        .ok()
+        .flatten();
+    }
     let row_key = provider.table().tx_pointer_blob_key(id);
     let row_raw = provider
         .get_blob_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: row_key })
@@ -8830,6 +8997,14 @@ pub(crate) fn load_outpoint_pointer_blob_v3_by_id(
     provider: &EssentialsProvider,
     id: u64,
 ) -> Option<OutpointPointerBlobV3> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_load_outpoint_pointer_blob_v3_by_id(
+            &remote, id,
+        )
+        .map_err(|e| eprintln!("[remote] load_outpoint_pointer_blob_v3_by_id failed: {e}"))
+        .ok()
+        .flatten();
+    }
     let row_key = provider.table().outpoint_pointer_blob_key(id);
     let row_raw = provider
         .get_blob_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: row_key })
@@ -8842,6 +9017,12 @@ pub(crate) fn load_tx_summary_v2(
     provider: &EssentialsProvider,
     txid: &Txid,
 ) -> Option<AlkaneTxSummary> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_load_tx_summary_v2(&remote, txid)
+            .map_err(|e| eprintln!("[remote] load_tx_summary_v2 failed: {e}"))
+            .ok()
+            .flatten();
+    }
     let mut txid_arr = [0u8; 32];
     txid_arr.copy_from_slice(txid.as_byte_array());
     let packed = load_tx_packed_outflow_v2(provider, txid)?;
@@ -9699,6 +9880,11 @@ mod tests {
             indexer_block_delay_ms: 0,
             port: 0,
             explorer_host: None,
+            explorer_espo_rpc_host: None,
+            explorer_espo_rpc_key: None,
+            explorer_espo_rpc_cache_ms: 0,
+            enable_internal_rpc: false,
+            internal_rpc_key: None,
             explorer_base_path: "/".to_string(),
             explorer_pizza_tv_endpoint: "https://tv.pizza.fun".to_string(),
             explorer_amm_prefix: "https://www.oyl.io/swap".to_string(),

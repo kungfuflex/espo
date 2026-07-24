@@ -28,7 +28,7 @@ protobuf-json-mapping = "3.7.2"
 serde_json = "1.0.143"
 borsh = { version = "1.5.7", features = ["derive"] }
 futures = "0.3.31"
-bitcoin = "0.32.7"
+bitcoin = { version = "0.32.7", features = ["serde"] }
 prost = "0.12.6"
 maud = "0.26.0"
 wasm-bindgen = "0.2.121"
@@ -49,6 +49,7 @@ axum = { version = "0.8.4", features = ["ws"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 electrum-client = "0.24.0"
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+ureq = { version = "2.12", features = ["json"] }
 tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "tcp"] }
 tokio-stream = "0.1.17"
 tokio-serde = {version = "0.9.0", features = ["json"]}

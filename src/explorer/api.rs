@@ -24,7 +24,7 @@ use crate::modules::ammdata::storage::{
 };
 use crate::modules::essentials::storage::{
     BlockSummaryPool, EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
-    GetListEntriesDescParams, HolderEntry, HolderId, HoldersCountEntry, get_cached_block_summary,
+    GetListEntriesDescParams, HolderEntry, HolderId, get_cached_block_summary,
     load_creation_record,
 };
 use crate::modules::essentials::utils::alkabi::{
@@ -40,7 +40,6 @@ use crate::runtime::mempool::{
     current_mempool_compact_snapshot, get_mempool_block_transaction_ids, pending_by_txid,
     subscribe_mempool_events,
 };
-use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
@@ -58,7 +57,6 @@ use bitcoin::transaction::Version;
 use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid};
 use bitcoincore_rpc::RpcApi;
 use bitcoincore_rpc::bitcoin::Network;
-use borsh::BorshDeserialize;
 use ordinals::Runestone;
 use prost::Message;
 use protorune::protostone::Protostones;
@@ -182,8 +180,18 @@ fn explorer_tx_status_payload(txid: &Txid) -> String {
             "mempool_block": entry.position.as_ref().map(|position| position.block),
         })
     } else if let Ok(Some(height)) = get_electrum_like().transaction_get_height(txid) {
-        let timestamp =
-            get_cached_block_summary(height as u32).and_then(|summary| summary.block_time());
+        let timestamp = get_cached_block_summary(height as u32)
+            .or_else(|| {
+                let essentials_mdb = Arc::new(crate::config::explorer_mdb_essentials());
+                EssentialsProvider::new(essentials_mdb)
+                    .get_block_summary(crate::modules::essentials::storage::GetBlockSummaryParams {
+                        blockhash: StateAt::Latest,
+                        height: height as u32,
+                    })
+                    .ok()
+                    .and_then(|r| r.summary)
+            })
+            .and_then(|summary| summary.block_time());
         let tip = get_espo_next_height().saturating_sub(1) as u64;
         json!({
             "txid": txid.to_string(),
@@ -816,13 +824,17 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         search_prefix_max = search_prefix_min;
     }
 
-    fn holders_for(table: &EssentialsTable<'_>, essentials_mdb: &Mdb, alk: &SchemaAlkaneId) -> u64 {
-        essentials_mdb
-            .get(&table.holders_count_key(alk))
-            .ok()
-            .flatten()
-            .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
-            .map(|hc| hc.count)
+    fn holders_for(
+        _table: &EssentialsTable<'_>,
+        essentials_mdb: &Mdb,
+        alk: &SchemaAlkaneId,
+    ) -> u64 {
+        EssentialsProvider::new(Arc::new(essentials_mdb.clone()))
+            .get_holders_count(crate::modules::essentials::storage::GetHoldersCountParams {
+                blockhash: StateAt::Latest,
+                alkane: *alk,
+            })
+            .map(|r| r.count)
             .unwrap_or(0)
     }
 
@@ -1267,6 +1279,30 @@ pub async fn alkane_abi_export(Query(q): Query<AlkaneAbiExportQuery>) -> Respons
 
     let extraction_format = format;
     let generated = tokio::task::spawn_blocking(move || {
+        // Remote-explorer mode has no local metashrew wasm to analyze; fetch
+        // the rendered ABI from the remote espo's get_alkabi getter RPC.
+        if let Some(remote) = crate::config::explorer_remote() {
+            let result = remote.call(
+                "essentials.get_alkabi",
+                serde_json::json!({
+                    "alkane": format!("{}:{}", alkane.block, alkane.tx),
+                    "format": extraction_format.as_str(),
+                }),
+            )?;
+            let contract = result
+                .get("abi")
+                .and_then(|abi| abi.get("contract"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("contract")
+                .to_string();
+            let filename = alkabi_download_filename(&contract, extraction_format.as_str());
+            let body = match result.get("abi") {
+                Some(serde_json::Value::String(ts)) => ts.clone(),
+                Some(abi) => serde_json::to_string_pretty(abi)?,
+                None => anyhow::bail!("remote get_alkabi returned no abi"),
+            };
+            return anyhow::Ok((filename, body));
+        }
         let essentials_mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
         let essentials_provider = EssentialsProvider::new(essentials_mdb);
         let abi = extract_contract_alkabi(&essentials_provider, &alkane)?;
@@ -1309,6 +1345,22 @@ pub async fn alkane_wasm_export(Query(q): Query<AlkaneWasmExportQuery>) -> Respo
     };
 
     let generated = tokio::task::spawn_blocking(move || {
+        // Remote-explorer mode has no local metashrew; pull the bytes from
+        // the remote espo's get_alkane_wasm getter RPC.
+        if let Some(remote) = crate::config::explorer_remote() {
+            let result = remote.call(
+                "essentials.get_alkane_wasm",
+                serde_json::json!({ "alkane": format!("{}:{}", alkane.block, alkane.tx) }),
+            )?;
+            let payload = result
+                .get("wasm_base64")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("remote get_alkane_wasm returned no payload"))?;
+            use base64::Engine as _;
+            return base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .map_err(|e| anyhow::anyhow!("decode remote wasm: {e}"));
+        }
         let essentials_mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
         let essentials_provider = EssentialsProvider::new(essentials_mdb);
         load_contract_wasm(&essentials_provider, &alkane)
@@ -1633,9 +1685,7 @@ pub async fn address_chart(Query(q): Query<AddressChartQuery>) -> Json<AddressCh
             error: Some("missing_or_invalid_alkane".to_string()),
         });
     };
-    let Some((indexed_min, indexed_max)) =
-        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
-    else {
+    let Some((indexed_min, indexed_max)) = crate::config::explorer_indexed_height_bounds() else {
         return Json(AddressChartResponse {
             ok: true,
             available: false,
@@ -1780,9 +1830,7 @@ pub async fn alkane_balance_chart(
 
     let range = normalize_address_chart_range(q.range.as_deref());
     let (lookback_blocks, range_interval) = address_chart_range_params(&range);
-    let Some((indexed_min, indexed_max)) =
-        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
-    else {
+    let Some((indexed_min, indexed_max)) = crate::config::explorer_indexed_height_bounds() else {
         return Json(AddressChartResponse {
             ok: true,
             available: false,
@@ -1896,9 +1944,7 @@ pub async fn minting_price_chart(
 ) -> Json<AddressChartResponse> {
     let range = normalize_address_chart_range(q.range.as_deref());
     let (lookback_blocks, range_interval) = address_chart_range_params(&range);
-    let Some((indexed_min, indexed_max)) =
-        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
-    else {
+    let Some((indexed_min, indexed_max)) = crate::config::explorer_indexed_height_bounds() else {
         return Json(AddressChartResponse {
             ok: true,
             available: false,

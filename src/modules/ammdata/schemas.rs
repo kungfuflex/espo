@@ -23,7 +23,16 @@ pub struct SchemaCanonicalPoolEntry {
     pub quote_id: SchemaAlkaneId,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Default)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    PartialEq,
+    Debug,
+    Clone,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct SchemaTokenMetricsV1 {
     pub price_usd: u128,
     pub fdv_usd: u128,
@@ -100,14 +109,33 @@ pub struct SchemaPoolCreationInfoV1 {
     pub initial_lp_supply: u128,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Copy)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    PartialEq,
+    Debug,
+    Clone,
+    Copy,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct SchemaMarketDefs {
     pub base_alkane_id: SchemaAlkaneId,
     pub quote_alkane_id: SchemaAlkaneId,
     pub pool_alkane_id: SchemaAlkaneId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    BorshSerialize,
+    BorshDeserialize,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum ActivityKind {
     TradeBuy,
     TradeSell,
