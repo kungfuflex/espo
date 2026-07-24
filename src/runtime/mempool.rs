@@ -5,8 +5,7 @@ use crate::alkanes::trace::{
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use crate::config::{
-    get_bitcoind_rpc_client, get_config, get_last_safe_tip, get_metashrew_rpc_url,
-    get_network,
+    get_bitcoind_rpc_client, get_config, get_last_safe_tip, get_metashrew_rpc_url, get_network,
 };
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider};
 use crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch;

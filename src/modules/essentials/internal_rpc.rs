@@ -138,6 +138,20 @@ pub struct WireBalancePairsResult {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct WireBalancesAtOrBeforeParams {
+    pub blockhash: StateAt,
+    pub owner: SchemaAlkaneId,
+    pub height: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct WireBalancesAtOrBeforeResult {
+    /// Borsh hex of `Vec<(SchemaAlkaneId, u128)>`.
+    pub pairs_borsh: String,
+    pub resolved_height: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct WireAlkanePageParams {
     pub blockhash: StateAt,
     pub alkane: SchemaAlkaneId,
@@ -420,6 +434,20 @@ pub fn remote_get_alkane_balances(
     )?;
     let pairs: Vec<(SchemaAlkaneId, u128)> = borsh_unhex(&r.pairs_borsh)?;
     Ok(pairs.into_iter().collect())
+}
+
+pub fn remote_get_alkane_balances_at_or_before(
+    remote: &RemoteEspoClient,
+    blockhash: StateAt,
+    owner: &SchemaAlkaneId,
+    height: u32,
+) -> Result<(std::collections::HashMap<SchemaAlkaneId, u128>, Option<u32>)> {
+    let r: WireBalancesAtOrBeforeResult = remote.getter(
+        "internal.essentials_get_alkane_balances_at_or_before",
+        &WireBalancesAtOrBeforeParams { blockhash, owner: *owner, height },
+    )?;
+    let pairs: Vec<(SchemaAlkaneId, u128)> = borsh_unhex(&r.pairs_borsh)?;
+    Ok((pairs.into_iter().collect(), r.resolved_height))
 }
 
 pub fn remote_get_holders_for_alkane(
@@ -710,6 +738,22 @@ pub fn register_internal_getters(reg: &RpcNsRegistrar) {
         pairs.sort();
         Ok(WireBalancePairsResult { pairs_borsh: borsh_hex(&pairs)? })
     });
+    register_getter(
+        reg,
+        "essentials_get_alkane_balances_at_or_before",
+        |p: WireBalancesAtOrBeforeParams| {
+            let (map, resolved_height) =
+                crate::modules::essentials::utils::balances::get_alkane_balances_at_or_before(
+                    p.blockhash,
+                    &provider(),
+                    &p.owner,
+                    p.height,
+                )?;
+            let mut pairs: Vec<(SchemaAlkaneId, u128)> = map.into_iter().collect();
+            pairs.sort();
+            Ok(WireBalancesAtOrBeforeResult { pairs_borsh: borsh_hex(&pairs)?, resolved_height })
+        },
+    );
     register_getter(reg, "essentials_get_holders_for_alkane", |p: WireAlkanePageParams| {
         let (total, supply, holders) =
             crate::modules::essentials::utils::balances::get_holders_for_alkane(

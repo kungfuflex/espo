@@ -6481,7 +6481,9 @@ pub fn get_balance_for_address(
 ) -> Result<HashMap<SchemaAlkaneId, u128>> {
     if let Some(remote) = crate::config::explorer_remote() {
         return crate::modules::essentials::internal_rpc::remote_get_balance_for_address(
-            &remote, blockhash, address,
+            &remote,
+            provider.effective_wire_state(blockhash),
+            address,
         );
     }
     let table = provider.table();
@@ -6553,7 +6555,9 @@ pub fn get_alkane_balances(
 ) -> Result<HashMap<SchemaAlkaneId, u128>> {
     if let Some(remote) = crate::config::explorer_remote() {
         return crate::modules::essentials::internal_rpc::remote_get_alkane_balances(
-            &remote, blockhash, owner,
+            &remote,
+            provider.effective_wire_state(blockhash),
+            owner,
         );
     }
     let table = provider.table();
@@ -6633,6 +6637,14 @@ pub fn get_alkane_balances_at_or_before(
     owner: &SchemaAlkaneId,
     height: u32,
 ) -> Result<(HashMap<SchemaAlkaneId, u128>, Option<u32>)> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_alkane_balances_at_or_before(
+            &remote,
+            provider.effective_wire_state(blockhash),
+            owner,
+            height,
+        );
+    }
     let table = provider.table();
     let mut agg = HashMap::new();
     let mut resolved_height: Option<u32> = None;
@@ -6876,7 +6888,10 @@ pub fn get_outpoint_balances_with_spent(
 ) -> Result<OutpointLookup> {
     if let Some(remote) = crate::config::explorer_remote() {
         return crate::modules::essentials::internal_rpc::remote_get_outpoint_balances_with_spent(
-            &remote, blockhash, txid, vout,
+            &remote,
+            provider.effective_wire_state(blockhash),
+            txid,
+            vout,
         );
     }
     let spent_by = resolve_outpoint_spent_by_v2(provider, txid, vout, blockhash)?;
@@ -6896,7 +6911,9 @@ pub fn get_outpoint_rows_batch(
 ) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
     if let Some(remote) = crate::config::explorer_remote() {
         return crate::modules::essentials::internal_rpc::remote_get_outpoint_rows_batch(
-            &remote, blockhash, outpoints,
+            &remote,
+            provider.effective_wire_state(blockhash),
+            outpoints,
         );
     }
     let table = provider.table();
@@ -6948,7 +6965,9 @@ pub fn get_outpoint_balances_with_spent_batch(
 ) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
     if let Some(remote) = crate::config::explorer_remote() {
         return crate::modules::essentials::internal_rpc::remote_get_outpoint_balances_with_spent_batch(
-            &remote, blockhash, outpoints,
+            &remote,
+            provider.effective_wire_state(blockhash),
+            outpoints,
         );
     }
     let table = provider.table();
@@ -7012,7 +7031,11 @@ pub fn get_holders_for_alkane(
 ) -> Result<(usize /*total*/, u128 /*supply*/, Vec<HolderEntry>)> {
     if let Some(remote) = crate::config::explorer_remote() {
         return crate::modules::essentials::internal_rpc::remote_get_holders_for_alkane(
-            &remote, blockhash, alk, page, limit,
+            &remote,
+            provider.effective_wire_state(blockhash),
+            alk,
+            page,
+            limit,
         );
     }
     let table = provider.table();
@@ -7301,7 +7324,11 @@ pub fn get_transfer_volume_for_alkane(
 ) -> Result<(usize, Vec<AddressAmountEntry>)> {
     if let Some(remote) = crate::config::explorer_remote() {
         return crate::modules::essentials::internal_rpc::remote_get_transfer_volume_for_alkane(
-            &remote, blockhash, alk, page, limit,
+            &remote,
+            provider.effective_wire_state(blockhash),
+            alk,
+            page,
+            limit,
         );
     }
     let table = provider.table();
@@ -7323,7 +7350,11 @@ pub fn get_total_received_for_alkane(
 ) -> Result<(usize, Vec<AddressAmountEntry>)> {
     if let Some(remote) = crate::config::explorer_remote() {
         return crate::modules::essentials::internal_rpc::remote_get_total_received_for_alkane(
-            &remote, blockhash, alk, page, limit,
+            &remote,
+            provider.effective_wire_state(blockhash),
+            alk,
+            page,
+            limit,
         );
     }
     let table = provider.table();

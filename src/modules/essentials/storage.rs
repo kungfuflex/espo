@@ -2140,7 +2140,7 @@ impl EssentialsProvider {
 
     /// The state a remote getter call must pin: the provider's height-pinned
     /// view when one is set, otherwise the request's own blockhash.
-    fn effective_wire_state(&self, state: StateAt) -> StateAt {
+    pub(crate) fn effective_wire_state(&self, state: StateAt) -> StateAt {
         match state.resolve(self.view_blockhash) {
             Some(bh) => StateAt::Block(bh),
             None => StateAt::Latest,
@@ -8417,7 +8417,10 @@ pub fn get_address_index_list_len(
 ) -> Result<u64> {
     if let Some(remote) = crate::config::explorer_remote() {
         return crate::modules::essentials::internal_rpc::remote_get_address_index_list_len(
-            &remote, blockhash, kind, address,
+            &remote,
+            provider.effective_wire_state(blockhash),
+            kind,
+            address,
         );
     }
     let key = provider.table().address_index_meta_key(address, kind);
@@ -8445,7 +8448,12 @@ pub fn get_address_index_list_range(
 ) -> Result<Vec<u64>> {
     if let Some(remote) = crate::config::explorer_remote() {
         return crate::modules::essentials::internal_rpc::remote_get_address_index_list_range(
-            &remote, blockhash, kind, address, start, end,
+            &remote,
+            provider.effective_wire_state(blockhash),
+            kind,
+            address,
+            start,
+            end,
         );
     }
     if end <= start {

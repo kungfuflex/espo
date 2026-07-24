@@ -7,7 +7,6 @@ use crate::{
         mempool::{
             MempoolBlockSummary, current_mempool_compact_snapshot, current_mempool_minimum_fee_rate,
         },
-        tree_db::get_global_tree_db,
     },
 };
 use axum::{
@@ -475,11 +474,9 @@ fn sample_heights(range_min: u32, range_max: u32, range_interval: u32) -> Vec<u3
 }
 
 fn indexed_height_bounds() -> Result<(u32, u32), String> {
-    let Some(tree) = get_global_tree_db() else {
-        return Err("versioned_tree_unavailable".to_string());
-    };
-    tree.indexed_height_bounds()
-        .map_err(|e| format!("failed to read indexed height bounds: {e}"))?
+    // Remote-aware: client mode asks the data espo for its bounds; local
+    // instances read the versioned tree as before.
+    crate::config::explorer_indexed_height_bounds()
         .ok_or_else(|| "no indexed heights available".to_string())
 }
 
