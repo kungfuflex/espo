@@ -1135,9 +1135,11 @@ async fn main() -> Result<()> {
     } else {
         eprintln!("[modules] ammdata disabled (missing config)");
     }
-    if runes_enabled_from_global_config() {
+    // Client mode: the runes UI is on by default but the module itself (its
+    // indexing and config requirements) belongs to the data instance.
+    if runes_enabled_from_global_config() && get_module_config("runes").is_some() {
         mods.register_module(Runes::new());
-    } else {
+    } else if !crate::config::is_client_mode() {
         eprintln!("[modules] runes disabled (requires modules.runes.enable=true)");
     }
     mods.register_module(TokenData::new());

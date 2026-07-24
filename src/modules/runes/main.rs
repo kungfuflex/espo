@@ -78,7 +78,10 @@ pub fn runes_enabled_from_global_config() -> bool {
     crate::config::get_module_config("runes")
         .and_then(|value| serde_json::from_value::<RunesConfig>(value.clone()).ok())
         .map(|cfg| cfg.enable)
-        .unwrap_or(false)
+        // Client mode renders from a remote espo and assumes the backend's
+        // capabilities: runes UI is on unless explicitly disabled. Data
+        // instances keep the opt-in default.
+        .unwrap_or_else(crate::config::is_client_mode)
 }
 
 pub struct Runes {
