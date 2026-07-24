@@ -1,10 +1,8 @@
 use super::{MempoolContractRule, add_to_sheet, cellpack_from_protostone, remove_from_sheet};
-use crate::config::get_espo_db;
 use crate::modules::ammdata::consts::FRBTC_ALKANE_ID;
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::modules::essentials::utils::balances::{ContractProjection, ContractProjectionContext};
 use crate::modules::subfrost::signer::get_signer_script;
-use crate::runtime::mdb::Mdb;
 use bitcoin::{ScriptBuf, TxOut};
 use std::sync::Arc;
 
@@ -17,7 +15,7 @@ pub(crate) struct FrBtcProjectionRule {
 
 impl FrBtcProjectionRule {
     pub(crate) fn new() -> Self {
-        let mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        let mdb = Arc::new(crate::config::espo_mdb(b"essentials:"));
         let essentials_provider = EssentialsProvider::new(mdb);
         let signer_script = get_signer_script(&essentials_provider).ok().flatten();
         Self { signer_script }

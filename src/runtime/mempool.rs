@@ -5,7 +5,7 @@ use crate::alkanes::trace::{
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use crate::config::{
-    get_bitcoind_rpc_client, get_config, get_espo_db, get_last_safe_tip, get_metashrew_rpc_url,
+    get_bitcoind_rpc_client, get_config, get_last_safe_tip, get_metashrew_rpc_url,
     get_network,
 };
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider};
@@ -17,7 +17,6 @@ use crate::modules::runes::storage::{
 use crate::modules::runes::transfer::{
     OutputRuneSheets, RuneSheet, RunestoneTransfer, TransferRules,
 };
-use crate::runtime::mdb::Mdb;
 use crate::runtime::shutdown::is_shutdown_requested;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
@@ -528,7 +527,7 @@ fn rune_io_has_activity(io: &TxRuneIo) -> bool {
 fn mempool_runes_provider() -> &'static RunesProvider {
     static PROVIDER: OnceLock<RunesProvider> = OnceLock::new();
     PROVIDER.get_or_init(|| {
-        let mdb = Arc::new(Mdb::from_db(get_espo_db(), b"runes:"));
+        let mdb = Arc::new(crate::config::espo_mdb(b"runes:"));
         RunesProvider::new(mdb)
     })
 }
@@ -593,7 +592,7 @@ fn hex_u128(value: u128) -> String {
 fn mempool_essentials_provider() -> &'static EssentialsProvider {
     static PROVIDER: OnceLock<EssentialsProvider> = OnceLock::new();
     PROVIDER.get_or_init(|| {
-        let mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        let mdb = Arc::new(crate::config::espo_mdb(b"essentials:"));
         EssentialsProvider::new(mdb)
     })
 }

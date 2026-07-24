@@ -835,7 +835,13 @@ fn fetch_traces_for_tx_remote(
     txid: &Txid,
 ) -> anyhow::Result<Vec<EspoTrace>> {
     let result =
-        remote.call("essentials.get_block_traces", serde_json::json!({ "height": height }))?;
+        match remote.call("essentials.get_block_traces", serde_json::json!({ "height": height })) {
+            Ok(result) => result,
+            // The remote hasn't indexed this height yet (fresh block): render
+            // without traces instead of surfacing an error.
+            Err(e) if e.to_string().contains("height_not_indexed") => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
     let traces = result.get("traces").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let tx_hex = txid.to_string();
     let mut out: Vec<EspoTrace> = Vec::new();
