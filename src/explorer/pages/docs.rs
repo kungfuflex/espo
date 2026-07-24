@@ -497,6 +497,30 @@ fn method_notes(method: &MethodDoc) -> Vec<String> {
             "When top-level config `db_cache` is true, analyzed exports are persisted by network, resolved immutable WASM source, and verification trial count in `${db_path}/cache`. Concurrent misses for the same source and trial count share one job and wait for its cached result.",
         );
     }
+    if method.title == "essentials.get_alkane_wasm" {
+        push_note(
+            &mut notes,
+            "Cache by `sha256` (or `source`) rather than by the requested Alkane id: plain contracts are immutable, but a proxy's resolved `source` changes if its implementation is repointed.",
+        );
+        push_note(
+            &mut notes,
+            "The payload decodes with standard base64; when `encoding` is `base64+gzip`, gunzip the decoded bytes to recover the raw wasm. `sha256` and `length` always describe the raw wasm.",
+        );
+    }
+    if method.title == "essentials.search_factory_keys" {
+        push_note(
+            &mut notes,
+            "An absent key never matches any operator — including `ne` — so contracts that never set the key are excluded rather than treated as \"different value\".",
+        );
+        push_note(
+            &mut notes,
+            "Numeric operators decode the stored value as a little-endian u128 and only match values of 16 bytes or fewer; `eq`/`ne` compare the exact raw bytes. Results are ordered by child id (block, then tx), so pagination is deterministic.",
+        );
+        push_note(
+            &mut notes,
+            "There is deliberately no unscoped variant: the factory requirement keeps the scan bounded to batched point lookups over the factory-children index.",
+        );
+    }
     if combined.contains("include_outpoints") {
         push_note(
             &mut notes,
@@ -696,10 +720,57 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     }),
                 ),
                 rpc_doc(
+                    "essentials.get_alkane_wasm",
+                    "Returns a contract's WASM bytecode, resolving proxy implementations and factory clones through the same indexed metadata as the explorer's /api/alkane/wasm/export download. The payload is base64-encoded; set gzip to true to compress it first (encoding becomes base64+gzip, typically ~3x smaller). sha256 and length always describe the raw wasm regardless of transport encoding, and source reports which Alkane actually provided the bytecode after resolution — factory clones and proxies sharing one binary resolve to the same source, so caches can dedup and content-address payloads.",
+                    json!({ "alkane": "2:0", "gzip": true }),
+                    json!({
+                        "ok": true,
+                        "alkane": "2:0",
+                        "source": "2:0",
+                        "length": 174225,
+                        "sha256": "58cca703f5462c733975c068c6d1e245cc32941741f4b6e61a468257b4b5ffb6",
+                        "encoding": "base64+gzip",
+                        "payload_length": 63504,
+                        "wasm_base64": "H4sIAAAAAAAC/..."
+                    }),
+                ),
+                rpc_doc(
                     "essentials.get_factory_children",
                     "Returns child Alkane IDs indexed for a factory Alkane. The index is populated from creation records as new blocks are indexed; historical children appear after a reindex.",
                     json!({ "factory": "4:780993" }),
                     json!({ "ok": true, "factory": "4:780993", "children": ["2:80663"] }),
+                ),
+                rpc_doc(
+                    "essentials.search_factory_keys",
+                    "Searches a factory's children for contracts whose storage keys satisfy conditions. Conditions are ANDed and each requires the key to exist: eq and ne compare raw bytes (value as utf8 string or 0x-hex), gt, lt, ge and le decode the stored value as a little-endian u128 (value as decimal or 0x-hex, number or string), and exists matches any present value. A single condition can be passed as top-level key, op and value instead of the conditions array. Matched values are echoed per key in the same shape as get_keys items. Scoped to a factory by design: the scan resolves the factory-children index and does batched point lookups, capped at 8 conditions, 50,000 children and limit 1000.",
+                    json!({
+                        "factory": "4:780993",
+                        "conditions": [
+                            { "key": "/collateral_address", "op": "eq", "value": "bc1q..." },
+                            { "key": "/fire_amount", "op": "gt", "value": "13000000" }
+                        ],
+                        "page": 1,
+                        "limit": 100
+                    }),
+                    json!({
+                        "ok": true,
+                        "factory": "4:780993",
+                        "conditions": [
+                            { "key": "0x2f636f6c6c61746572616c5f61646472657373", "key_str": "/collateral_address", "op": "eq", "value": "0x626331712e2e2e" },
+                            { "key": "0x2f666972655f616d6f756e74", "key_str": "/fire_amount", "op": "gt", "value": "13000000" }
+                        ],
+                        "page": 1,
+                        "limit": 100,
+                        "total": 1,
+                        "has_more": false,
+                        "items": [{
+                            "alkane": "2:80663",
+                            "keys": {
+                                "/collateral_address": { "key_hex": "0x2f636f6c6c61746572616c5f61646472657373", "key_str": "/collateral_address", "value_hex": "0x626331712e2e2e", "value_str": "bc1q...", "value_u128": null, "last_txid": "84ec..." },
+                                "/fire_amount": { "key_hex": "0x2f666972655f616d6f756e74", "key_str": "/fire_amount", "value_hex": "0x406f400100000000", "value_str": null, "value_u128": "21000000", "last_txid": "84ec..." }
+                            }
+                        }]
+                    }),
                 ),
                 rpc_doc(
                     "essentials.get_block_summary",
