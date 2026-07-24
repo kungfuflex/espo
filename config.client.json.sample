@@ -1,0 +1,16 @@
+{
+  "__comment": "Minimal client-mode espo: renders the explorer entirely from a remote (data) espo instance. No local metashrew, no indexing, no mempool service — view-only is implied and no local database is opened (db_path is unused). The data instance must run enable_internal_rpc with internal_rpc_key.",
+  "network": "mainnet",
+
+  "explorer_espo_rpc_host": "http://data-espo:5780",
+  "explorer_espo_rpc_key": "shared-secret",
+  "explorer_espo_events_host": "http://data-espo:5081",
+
+  "bitcoind_rpc_url": "http://bitcoind:8332",
+  "bitcoind_rpc_user": "user",
+  "bitcoind_rpc_pass": "pass",
+  "electrs_esplora_url": "http://electrs:4332",
+
+  "port": 5780,
+  "explorer_host": "0.0.0.0:5081"
+}

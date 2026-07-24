@@ -7,6 +7,7 @@ pub mod mining_pools;
 mod pages;
 pub mod paths;
 pub mod phishing;
+pub mod relay;
 
 use std::net::SocketAddr;
 
@@ -87,7 +88,9 @@ pub fn explorer_router(state: ExplorerState) -> Router {
             .route("/api/faucet/send", post(faucet_send));
     }
     let mempool_cfg = &get_config().mempool;
-    if mempool_cfg.websocket_enabled {
+    // Client mode relays the data instance's events socket, so the route is
+    // needed even though the local mempool service is disabled.
+    if mempool_cfg.websocket_enabled || crate::config::get_explorer_espo_events_host().is_some() {
         let ws_path = mempool_cfg.websocket_path.as_deref().unwrap_or("/api/events/ws");
         api = api.route(ws_path, get(explorer_events_ws));
     }

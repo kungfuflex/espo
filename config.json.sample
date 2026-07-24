@@ -17,6 +17,7 @@
   "explorer_host": "127.0.0.1:8081",
   "explorer_espo_rpc_host": null,
   "explorer_espo_rpc_key": null,
+  "explorer_espo_events_host": null,
   "explorer_espo_rpc_cache_ms": 2000,
   "enable_internal_rpc": false,
   "internal_rpc_key": null,

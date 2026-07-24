@@ -7,7 +7,6 @@
 //! `SchemaTokenActivityV1` rows) travel as hex-encoded Borsh, and the diesel
 //! price getters transport their `[u8; 32]` prices as hex strings.
 
-use crate::config::get_espo_db;
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::tokendata::schemas::SchemaTokenActivityV1;
 use crate::modules::tokendata::storage::{
@@ -15,7 +14,6 @@ use crate::modules::tokendata::storage::{
     GetTokenActivityPageResult, TokenDataProvider,
 };
 use crate::runtime::internal_rpc::{borsh_hex, borsh_unhex, register_getter};
-use crate::runtime::mdb::Mdb;
 use crate::runtime::remote_espo::RemoteEspoClient;
 use crate::runtime::state_at::StateAt;
 use anyhow::{Result, anyhow};
@@ -25,7 +23,7 @@ use std::sync::Arc;
 /// Provider pinned to the wire state so internal reads resolve against the
 /// same view a locally height-pinned provider would use.
 fn provider_at(state: StateAt) -> TokenDataProvider {
-    TokenDataProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"tokendata:")))
+    TokenDataProvider::new(Arc::new(crate::config::espo_mdb(b"tokendata:")))
         .with_view_blockhash(state.to_option())
 }
 

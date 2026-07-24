@@ -20,9 +20,7 @@ use super::storage::{
 };
 use super::transfer::{OutputRuneSheets, RuneSheet, RunestoneTransfer, TransferRules};
 use crate::alkanes::trace::EspoBlock;
-use crate::config::{
-    debug_enabled, get_bitcoind_rpc_client, get_electrum_like, get_espo_db, get_network,
-};
+use crate::config::{debug_enabled, get_bitcoind_rpc_client, get_electrum_like, get_network};
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{PRICE_SCALE, SATS_PER_BTC};
 use crate::modules::ammdata::storage::AmmDataProvider;
@@ -781,12 +779,10 @@ impl<'a> BlockRunesIndexer<'a> {
     }
 
     fn btc_usd_price_at_height(&self) -> Option<u128> {
-        let essentials_provider = Arc::new(EssentialsProvider::new(Arc::new(Mdb::from_db(
-            get_espo_db(),
-            b"essentials:",
-        ))));
+        let essentials_provider =
+            Arc::new(EssentialsProvider::new(Arc::new(crate::config::espo_mdb(b"essentials:"))));
         let amm_provider = AmmDataProvider::new(
-            Arc::new(Mdb::from_db(get_espo_db(), b"ammdata:")),
+            Arc::new(crate::config::espo_mdb(b"ammdata:")),
             essentials_provider,
         );
         amm_provider
@@ -910,8 +906,7 @@ impl<'a> BlockRunesIndexer<'a> {
         block: &EspoBlock,
         block_tx_map: &HashMap<Txid, &Transaction>,
     ) -> Result<()> {
-        let essentials =
-            EssentialsProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"essentials:")));
+        let essentials = EssentialsProvider::new(Arc::new(crate::config::espo_mdb(b"essentials:")));
         let list_id = address_index_list_id_alkane_block_txs(self.height as u64);
         let total = get_address_index_list_len(
             &essentials,

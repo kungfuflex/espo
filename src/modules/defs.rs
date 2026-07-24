@@ -133,13 +133,19 @@ pub trait EspoModule: Send + Sync {
 pub struct ModuleRegistry {
     modules: Vec<Arc<dyn EspoModule>>,
     pub router: RpcRegistry,
-    module_db: Arc<DB>,
+    module_db: Option<Arc<DB>>,
 }
 
 impl ModuleRegistry {
     /// Construct from an existing Arc<DB> (one global DB shared by all modules).
     pub fn with_db(module_db: Arc<DB>) -> Self {
-        Self { modules: Vec::new(), router: RpcRegistry::default(), module_db }
+        Self { modules: Vec::new(), router: RpcRegistry::default(), module_db: Some(module_db) }
+    }
+
+    /// Client mode: no database exists; every module runs on the null Mdb
+    /// backend and serves its getters from the remote espo.
+    pub fn with_null_backend() -> Self {
+        Self { modules: Vec::new(), router: RpcRegistry::default(), module_db: None }
     }
 
     /// Convenience: open a global read-write DB at a path, create if missing.
@@ -195,7 +201,10 @@ impl ModuleRegistry {
         prefix_kv.extend_from_slice(name.as_bytes());
         prefix_kv.push(b':');
 
-        let mdb = Arc::new(Mdb::from_db(self.module_db.clone(), prefix_kv));
+        let mdb = Arc::new(match &self.module_db {
+            Some(db) => Mdb::from_db(Arc::clone(db), prefix_kv),
+            None => Mdb::null(prefix_kv),
+        });
         module.set_mdb(mdb);
 
         // --- RPC prefix like "ammdata." ---

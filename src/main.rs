@@ -1122,7 +1122,11 @@ async fn main() -> Result<()> {
     let metashrew_sdb_opt = crate::config::try_get_metashrew_sdb();
 
     // Build module registry with the global ESPO DB
-    let mut mods = ModuleRegistry::with_db(get_espo_db());
+    let mut mods = if crate::config::is_client_mode() {
+        ModuleRegistry::with_null_backend()
+    } else {
+        ModuleRegistry::with_db(get_espo_db())
+    };
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
     mods.register_module(Pizzafun::new());
@@ -1179,7 +1183,7 @@ async fn main() -> Result<()> {
         start_height = forced_start;
     }
 
-    let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
+    let essentials_mdb = crate::config::espo_mdb(b"essentials:");
     let loaded = preload_block_summary_cache(&essentials_mdb);
     if loaded > 0 {
         eprintln!("[cache] preloaded {} block summaries", loaded);

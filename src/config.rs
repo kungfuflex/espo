@@ -509,9 +509,11 @@ impl<'de> Deserialize<'de> for DebugBackupConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigFile {
+    #[serde(default)]
     pub readonly_metashrew_db_dir: String,
     #[serde(default)]
     pub electrum_rpc_url: Option<String>,
+    #[serde(default)]
     pub metashrew_rpc_url: String,
     #[serde(default)]
     pub electrs_esplora_url: Option<String>,
@@ -548,6 +550,8 @@ pub struct ConfigFile {
     pub explorer_espo_rpc_host: Option<String>,
     #[serde(default)]
     pub explorer_espo_rpc_key: Option<String>,
+    #[serde(default)]
+    pub explorer_espo_events_host: Option<String>,
     #[serde(default = "default_explorer_espo_rpc_cache_ms")]
     pub explorer_espo_rpc_cache_ms: u64,
     #[serde(default)]
@@ -624,6 +628,7 @@ pub struct AppConfig {
     pub explorer_host: Option<SocketAddr>,
     pub explorer_espo_rpc_host: Option<String>,
     pub explorer_espo_rpc_key: Option<String>,
+    pub explorer_espo_events_host: Option<String>,
     pub explorer_espo_rpc_cache_ms: u64,
     pub enable_internal_rpc: bool,
     pub internal_rpc_key: Option<String>,
@@ -713,6 +718,7 @@ impl AppConfig {
             explorer_host: file.explorer_host,
             explorer_espo_rpc_host: normalize_optional_string(file.explorer_espo_rpc_host),
             explorer_espo_rpc_key: normalize_optional_string(file.explorer_espo_rpc_key),
+            explorer_espo_events_host: normalize_optional_string(file.explorer_espo_events_host),
             explorer_espo_rpc_cache_ms: file.explorer_espo_rpc_cache_ms,
             enable_internal_rpc: file.enable_internal_rpc,
             internal_rpc_key: normalize_optional_string(file.internal_rpc_key),
@@ -773,7 +779,7 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
         }
     }
 
-    if cfg.metashrew_rpc_url.trim().is_empty() {
+    if cfg.metashrew_rpc_url.trim().is_empty() && cfg.explorer_espo_rpc_host.is_none() {
         anyhow::bail!("metashrew_rpc_url must be provided");
     }
 
@@ -783,38 +789,54 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
         );
     }
     if cfg.explorer_espo_rpc_host.is_some() {
-        // Remote-explorer mode replaces every explorer getter with an RPC
-        // call; indexing (and its getters) must stay local, so this mode is
-        // only valid on a view-only instance.
+        // Client mode: this instance renders entirely from the remote espo's
+        // getter RPCs. Indexing (and its getters) must stay local-only, so
+        // client mode forces view-only — zero indexing, zero mempool service.
         if !cfg.view_only {
-            anyhow::bail!(
-                "explorer_espo_rpc_host requires --view-only: a remote-data explorer must not index"
+            eprintln!(
+                "[config] explorer_espo_rpc_host set: forcing view-only (client mode does zero indexing)"
             );
+            cfg.view_only = true;
         }
         if cfg.explorer_espo_rpc_key.is_none() {
             eprintln!(
                 "[config] WARN: explorer_espo_rpc_host is set without explorer_espo_rpc_key; internal.* calls to the remote espo will be rejected unless it runs without a key"
             );
         }
+        if cfg.enable_internal_rpc {
+            anyhow::bail!(
+                "enable_internal_rpc cannot be combined with explorer_espo_rpc_host: a client-mode espo has no local data to serve"
+            );
+        }
+        if cfg.block_source_mode != BlockFetchMode::RpcOnly {
+            eprintln!(
+                "[config] client mode: forcing block_source_mode=rpc-only (no local block index)"
+            );
+            cfg.block_source_mode = BlockFetchMode::RpcOnly;
+        }
     }
 
+    let client_mode = cfg.explorer_espo_rpc_host.is_some();
     let db_root = Path::new(&cfg.db_path);
-    if !db_root.exists() {
-        fs::create_dir_all(db_root)
-            .map_err(|e| anyhow::anyhow!("Failed to create db_path {}: {e}", cfg.db_path))?;
-    } else if !db_root.is_dir() {
-        anyhow::bail!("db_path is not a directory: {}", cfg.db_path);
+    if !client_mode {
+        if !db_root.exists() {
+            fs::create_dir_all(db_root)
+                .map_err(|e| anyhow::anyhow!("Failed to create db_path {}: {e}", cfg.db_path))?;
+        } else if !db_root.is_dir() {
+            anyhow::bail!("db_path is not a directory: {}", cfg.db_path);
+        }
+
+        let tmp = db_root.join("tmp");
+        if !tmp.exists() {
+            fs::create_dir_all(&tmp).map_err(|e| {
+                anyhow::anyhow!("Failed to create tmp dbs dir {}: {e}", tmp.display())
+            })?;
+        } else if !tmp.is_dir() {
+            anyhow::bail!("Temporary dbs dir is not a directory: {}", tmp.display());
+        }
     }
 
-    let tmp = db_root.join("tmp");
-    if !tmp.exists() {
-        fs::create_dir_all(&tmp)
-            .map_err(|e| anyhow::anyhow!("Failed to create tmp dbs dir {}: {e}", tmp.display()))?;
-    } else if !tmp.is_dir() {
-        anyhow::bail!("Temporary dbs dir is not a directory: {}", tmp.display());
-    }
-
-    if cfg.db_cache {
+    if cfg.db_cache && !client_mode {
         let cache = db_root.join("cache");
         if !cache.exists() {
             fs::create_dir_all(&cache).map_err(|e| {
@@ -825,13 +847,15 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
         }
     }
 
-    let espo_dir = db_root.join("espo");
-    if !espo_dir.exists() {
-        fs::create_dir_all(&espo_dir).map_err(|e| {
-            anyhow::anyhow!("Failed to create espo db dir {}: {e}", espo_dir.display())
-        })?;
-    } else if !espo_dir.is_dir() {
-        anyhow::bail!("espo db dir is not a directory: {}", espo_dir.display());
+    if !client_mode {
+        let espo_dir = db_root.join("espo");
+        if !espo_dir.exists() {
+            fs::create_dir_all(&espo_dir).map_err(|e| {
+                anyhow::anyhow!("Failed to create espo db dir {}: {e}", espo_dir.display())
+            })?;
+        } else if !espo_dir.is_dir() {
+            anyhow::bail!("espo db dir is not a directory: {}", espo_dir.display());
+        }
     }
 
     if cfg.block_source_mode != BlockFetchMode::RpcOnly {
@@ -946,29 +970,35 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
     if !espo_read_only {
         espo_opts.create_if_missing(true);
     }
-    let espo_path = Path::new(&cfg.db_path).join("espo");
-    let espo_db = if espo_read_only {
-        std::sync::Arc::new(DB::open_for_read_only(&espo_opts, espo_path, false)?)
+    if client_mode {
+        // Client mode: no local database at all. Every provider runs on the
+        // null Mdb backend and every getter answers from the remote espo.
+        eprintln!("[config] client mode: no local espo database will be opened");
     } else {
-        std::sync::Arc::new(DB::open(&espo_opts, espo_path)?)
-    };
-    ESPO_DB
-        .set(espo_db.clone())
-        .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
+        let espo_path = Path::new(&cfg.db_path).join("espo");
+        let espo_db = if espo_read_only {
+            std::sync::Arc::new(DB::open_for_read_only(&espo_opts, espo_path, false)?)
+        } else {
+            std::sync::Arc::new(DB::open(&espo_opts, espo_path)?)
+        };
+        ESPO_DB
+            .set(espo_db.clone())
+            .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
 
-    if cfg.db_cache {
-        let mut cache_opts = Options::default();
-        cache_opts.create_if_missing(true);
-        configure_cache_rocksdb_options(&mut cache_opts);
-        let cache_path = Path::new(&cfg.db_path).join("cache");
-        let cache_db = std::sync::Arc::new(DB::open(&cache_opts, &cache_path)?);
-        CACHE_DB
-            .set(cache_db)
-            .map_err(|_| anyhow::anyhow!("Cache DB already initialized"))?;
-        eprintln!("[cache] persistent cache DB enabled at {}", cache_path.display());
+        if cfg.db_cache {
+            let mut cache_opts = Options::default();
+            cache_opts.create_if_missing(true);
+            configure_cache_rocksdb_options(&mut cache_opts);
+            let cache_path = Path::new(&cfg.db_path).join("cache");
+            let cache_db = std::sync::Arc::new(DB::open(&cache_opts, &cache_path)?);
+            CACHE_DB
+                .set(cache_db)
+                .map_err(|_| anyhow::anyhow!("Cache DB already initialized"))?;
+            eprintln!("[cache] persistent cache DB enabled at {}", cache_path.display());
+        }
+
+        init_global_tree_db(espo_db.clone())?;
     }
-
-    init_global_tree_db(espo_db.clone())?;
 
     // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
     if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
@@ -1101,11 +1131,32 @@ pub fn explorer_remote() -> Option<std::sync::Arc<crate::runtime::remote_espo::R
         .clone()
 }
 
-/// The essentials-namespace Mdb for explorer components. The Mdb itself is
-/// always local — in remote-explorer mode every getter called on it
-/// short-circuits to the remote getter RPC before touching the database.
+/// The data espo's explorer base URL for live-data relaying (events
+/// websocket + mempool endpoints). Client-mode only.
+pub fn get_explorer_espo_events_host() -> Option<&'static str> {
+    get_config().explorer_espo_events_host.as_deref()
+}
+
+/// Whether this instance is a client-mode espo (renders from a remote espo,
+/// owns no local database).
+pub fn is_client_mode() -> bool {
+    CONFIG.get().map(|cfg| cfg.explorer_espo_rpc_host.is_some()).unwrap_or(false)
+}
+
+/// The Mdb for a module namespace: the local espo database normally, the
+/// database-less null backend in client mode (where every getter answers
+/// from the remote espo before touching storage).
+pub fn espo_mdb(prefix: &[u8]) -> crate::runtime::mdb::Mdb {
+    if is_client_mode() {
+        crate::runtime::mdb::Mdb::null(prefix)
+    } else {
+        crate::runtime::mdb::Mdb::from_db(get_espo_db(), prefix)
+    }
+}
+
+/// The essentials-namespace Mdb for explorer components.
 pub fn explorer_mdb_essentials() -> crate::runtime::mdb::Mdb {
-    crate::runtime::mdb::Mdb::from_db(get_espo_db(), b"essentials:")
+    espo_mdb(b"essentials:")
 }
 
 /// Indexed height bounds for explorer views: remote getter when in

@@ -2,8 +2,8 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
 };
 use crate::config::{
-    get_address_index_chunk_size, get_bitcoind_rpc_client, get_electrum_like, get_espo_db,
-    get_metashrew, get_network,
+    get_address_index_chunk_size, get_bitcoind_rpc_client, get_electrum_like, get_metashrew,
+    get_network,
 };
 use crate::modules::essentials::utils::balances::{
     SignedU128, get_address_activity_for_address, get_alkane_balances,
@@ -9094,7 +9094,7 @@ fn mempool_trace_to_json(txid: &Txid, trace: &EspoTrace) -> Value {
 fn spendable_outpoints_runes_provider() -> &'static RunesProvider {
     static PROVIDER: OnceLock<RunesProvider> = OnceLock::new();
     PROVIDER.get_or_init(|| {
-        let mdb = Arc::new(Mdb::from_db(get_espo_db(), b"runes:"));
+        let mdb = Arc::new(crate::config::espo_mdb(b"runes:"));
         RunesProvider::new(mdb)
     })
 }
@@ -9882,6 +9882,7 @@ mod tests {
             explorer_host: None,
             explorer_espo_rpc_host: None,
             explorer_espo_rpc_key: None,
+            explorer_espo_events_host: None,
             explorer_espo_rpc_cache_ms: 0,
             enable_internal_rpc: false,
             internal_rpc_key: None,

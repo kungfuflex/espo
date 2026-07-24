@@ -10,7 +10,6 @@
 //! pages) travel as hex-encoded Borsh — the same encoding they are stored
 //! with, so the wire contract cannot drift from the storage schema.
 
-use crate::config::get_espo_db;
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::storage::{
     AddressIndexListKind, AlkaneTxSummary, EssentialsProvider, GetAlkaneIdsByNamePrefixPageParams,
@@ -23,7 +22,6 @@ use crate::modules::essentials::storage::{
 };
 use crate::modules::essentials::utils::inspections::AlkaneCreationRecord;
 use crate::runtime::internal_rpc::{borsh_hex, borsh_unhex, register_getter};
-use crate::runtime::mdb::Mdb;
 use crate::runtime::remote_espo::RemoteEspoClient;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
@@ -34,7 +32,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 fn provider() -> EssentialsProvider {
-    EssentialsProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"essentials:")))
+    EssentialsProvider::new(Arc::new(crate::config::espo_mdb(b"essentials:")))
 }
 
 fn txid_hex(txid: &Txid) -> String {

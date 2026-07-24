@@ -9,7 +9,7 @@ use crate::alkanes::trace::{
 };
 use crate::alkanes::utils::clean_espo_sandshrew_like_trace;
 use crate::config::{
-    debug_enabled, get_electrum_like, get_espo_db, get_metashrew, get_metashrew_sdb, get_network,
+    debug_enabled, get_electrum_like, get_metashrew, get_metashrew_sdb, get_network,
     strict_check_alkane_balances, strict_check_trace_mismatches, strict_check_utxos,
 };
 use crate::debug;
@@ -111,7 +111,7 @@ struct TraceSourceFlow {
 
 fn ammdata_mdb() -> Arc<Mdb> {
     AMMDATA_MDB
-        .get_or_init(|| Arc::new(Mdb::from_db(get_espo_db(), b"ammdata:")))
+        .get_or_init(|| Arc::new(crate::config::espo_mdb(b"ammdata:")))
         .clone()
 }
 

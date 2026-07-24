@@ -46,6 +46,7 @@ impl TestConfigBuilder {
             explorer_host: None,
             explorer_espo_rpc_host: None,
             explorer_espo_rpc_key: None,
+            explorer_espo_events_host: None,
             explorer_espo_rpc_cache_ms: 0,
             enable_internal_rpc: false,
             internal_rpc_key: None,

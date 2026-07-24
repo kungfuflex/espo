@@ -10,7 +10,6 @@
 //! Borsh — the same encoding they are stored with, so the wire contract
 //! cannot drift from the storage schema.
 
-use crate::config::get_espo_db;
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::runes::inscriptions::RuneIcon;
 use crate::modules::runes::storage::{
@@ -19,7 +18,6 @@ use crate::modules::runes::storage::{
     RunesProvider, SchemaRuneId, TxRuneIo,
 };
 use crate::runtime::internal_rpc::{borsh_hex, borsh_unhex, register_getter};
-use crate::runtime::mdb::Mdb;
 use crate::runtime::remote_espo::RemoteEspoClient;
 use anyhow::{Result, anyhow};
 use bitcoin::Txid;
@@ -28,7 +26,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 fn provider() -> RunesProvider {
-    RunesProvider::new(Arc::new(Mdb::from_db(get_espo_db(), b"runes:")))
+    RunesProvider::new(Arc::new(crate::config::espo_mdb(b"runes:")))
 }
 
 fn txid_hex(txid: &Txid) -> String {

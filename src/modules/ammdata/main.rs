@@ -9,7 +9,7 @@ use super::storage::{
 use super::utils::activity::decode_activity_v1;
 use crate::alkanes::trace::EspoBlock;
 use crate::alkanes::trace::EspoSandshrewLikeTraceInvokeData;
-use crate::config::{debug_enabled, get_espo_db, get_network};
+use crate::config::{debug_enabled, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::{AmmDataConfig, DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
@@ -691,7 +691,7 @@ impl EspoModule for AmmData {
     }
 
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
-        let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
+        let essentials_mdb = crate::config::espo_mdb(b"essentials:");
         let essentials_provider = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
         self.provider = Some(Arc::new(AmmDataProvider::new(mdb.clone(), essentials_provider)));
         match self.load_index_height() {

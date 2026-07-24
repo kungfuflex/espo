@@ -34,6 +34,7 @@ fn init_test_config_from_run_sh() {
         explorer_host: Some("0.0.0.0:5779".parse().expect("parse explorer_host")),
         explorer_espo_rpc_host: None,
         explorer_espo_rpc_key: None,
+        explorer_espo_events_host: None,
         explorer_espo_rpc_cache_ms: 0,
         enable_internal_rpc: false,
         internal_rpc_key: None,

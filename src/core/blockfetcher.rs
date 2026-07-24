@@ -17,7 +17,7 @@ use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::config::{get_bitcoind_rpc_client, get_espo_db};
+use crate::config::get_bitcoind_rpc_client;
 use crate::consts::alkanes_genesis_block;
 use crate::runtime::mdb::Mdb;
 use crate::utils::fee_rates::{
@@ -129,8 +129,8 @@ impl BlkOrRpcBlockSource {
         rpc: &'static CoreClient,
         mode: BlockFetchMode,
     ) -> Result<Self> {
-        let db = get_espo_db(); // Arc<DB> from config
-        let mdb = Mdb::from_db(db, Self::MDB_PREFIX);
+        // Null-backed in client mode (rpc-only there, so the blk index is unused).
+        let mdb = crate::config::espo_mdb(Self::MDB_PREFIX.as_bytes());
 
         // Precompute the “stop at genesis” hash for this network (if > 0)
         let genesis_stop_hash = if Self::uses_blk_index(mode) {

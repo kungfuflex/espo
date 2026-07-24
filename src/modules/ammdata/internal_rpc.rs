@@ -8,7 +8,6 @@
 //! view to the wire blockhash so getters that read `StateAt::Latest`
 //! internally still serve height-pinned views correctly.
 
-use crate::config::get_espo_db;
 use crate::modules::ammdata::storage::{
     AmmDataProvider, GetIndexHeightParams, GetIndexHeightResult, GetLatestBtcUsdPriceParams,
     GetListEntriesDescParams, GetListEntriesDescResult, GetListKeysByPrefixParams,
@@ -21,7 +20,6 @@ use crate::modules::ammdata::storage::{
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::runtime::internal_rpc::register_getter;
-use crate::runtime::mdb::Mdb;
 use crate::runtime::remote_espo::RemoteEspoClient;
 use crate::runtime::state_at::StateAt;
 use anyhow::Result;
@@ -31,10 +29,8 @@ use std::sync::Arc;
 /// internally resolve it against the view blockhash, so pinning here makes the
 /// remote result match what a locally height-pinned provider would return.
 fn provider_at(state: StateAt) -> AmmDataProvider {
-    let db = get_espo_db();
-    let essentials =
-        EssentialsProvider::new(Arc::new(Mdb::from_db(Arc::clone(&db), b"essentials:")));
-    AmmDataProvider::new(Arc::new(Mdb::from_db(db, b"ammdata:")), Arc::new(essentials))
+    let essentials = EssentialsProvider::new(Arc::new(crate::config::espo_mdb(b"essentials:")));
+    AmmDataProvider::new(Arc::new(crate::config::espo_mdb(b"ammdata:")), Arc::new(essentials))
         .with_view_blockhash(state.to_option())
 }
 
