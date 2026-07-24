@@ -6,13 +6,13 @@ use crate::modules::essentials::storage::{
     RpcGetAlkaneAddressTxsParams, RpcGetAlkaneBalanceMetashrewParams,
     RpcGetAlkaneBalanceTxsByTokenParams, RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams,
     RpcGetAlkaneBlockTxsParams, RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams,
-    RpcGetAlkaneTxSummaryParams, RpcGetAlkaneVolumesParams, RpcGetAllAlkanesParams,
-    RpcGetBlockSummaryParams, RpcGetBlockTimeParams, RpcGetBlockTimesParams,
-    RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams, RpcGetFactoryChildrenParams,
-    RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams,
-    RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams, RpcGetOrbitalVolumesParams,
-    RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams, RpcGetTransferVolumeParams,
-    RpcPingParams, RpcSearchAlkaneParams, RpcSearchFactoryKeysParams,
+    RpcGetAlkaneTxSummaryParams, RpcGetAlkaneVolumesParams, RpcGetAlkaneWasmParams,
+    RpcGetAllAlkanesParams, RpcGetBlockSummaryParams, RpcGetBlockTimeParams,
+    RpcGetBlockTimesParams, RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams,
+    RpcGetFactoryChildrenParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
+    RpcGetMempoolTracesParams, RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams,
+    RpcGetOrbitalVolumesParams, RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams,
+    RpcGetTransferVolumeParams, RpcPingParams, RpcSearchAlkaneParams, RpcSearchFactoryKeysParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
@@ -227,6 +227,37 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(str::to_string),
                         };
                         tokio::task::spawn_blocking(move || view.rpc_get_alkabi(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_wasm = reg.clone();
+        let mdb_wasm = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_wasm
+                .register("get_alkane_wasm", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_wasm);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(view) => view,
+                            Err(error) => return error,
+                        };
+                        let params = RpcGetAlkaneWasmParams {
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string),
+                            gzip: payload.get("gzip").and_then(|value| value.as_bool()),
+                        };
+                        tokio::task::spawn_blocking(move || view.rpc_get_alkane_wasm(params))
                             .await
                             .ok()
                             .and_then(Result::ok)

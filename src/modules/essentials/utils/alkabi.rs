@@ -90,6 +90,19 @@ pub fn load_contract_wasm(
     load_contract_wasm_from_source(&contract_wasm_source(provider, alkane))
 }
 
+/// Like `load_contract_wasm`, but also reports which alkane actually provided
+/// the bytecode (after proxy/factory resolution) so callers can dedup and
+/// content-address the payload.
+pub fn load_contract_wasm_with_source(
+    provider: &EssentialsProvider,
+    alkane: &SchemaAlkaneId,
+) -> Result<(Vec<u8>, SchemaAlkaneId)> {
+    let source = contract_wasm_source(provider, alkane);
+    get_metashrew()
+        .get_alkane_wasm_bytes_prefer_first_version(&source)?
+        .context("contract wasm not found")
+}
+
 fn contract_wasm_source(provider: &EssentialsProvider, alkane: &SchemaAlkaneId) -> SchemaAlkaneId {
     resolve_contract_wasm_source(alkane, provider).unwrap_or(*alkane)
 }

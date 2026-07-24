@@ -3919,6 +3919,79 @@ impl EssentialsProvider {
         })
     }
 
+    /// RPC equivalent of the explorer's `/api/alkane/wasm/export` download:
+    /// resolves the alkane's bytecode source (following proxy/factory
+    /// indirection) and returns the wasm as base64, plus content metadata
+    /// (`sha256` of the raw bytes, raw `length`, resolved `source`) so a
+    /// caching layer can content-address, validate and dedup payloads.
+    pub fn rpc_get_alkane_wasm(
+        &self,
+        params: RpcGetAlkaneWasmParams,
+    ) -> Result<RpcGetAlkaneWasmResult> {
+        let Some(raw_alkane) = params.alkane.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return Ok(RpcGetAlkaneWasmResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_alkane",
+                    "hint": "provide alkane as \"<block>:<tx>\" (hex ok)"
+                }),
+            });
+        };
+        let Some(alkane) = crate::utils::parse_alkane_id(raw_alkane) else {
+            return Ok(RpcGetAlkaneWasmResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_alkane",
+                    "hint": "provide alkane as \"<block>:<tx>\" (hex ok)"
+                }),
+            });
+        };
+        let gzip = params.gzip.unwrap_or(false);
+
+        let (wasm, source) =
+            match crate::modules::essentials::utils::alkabi::load_contract_wasm_with_source(
+                self, &alkane,
+            ) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    return Ok(RpcGetAlkaneWasmResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "wasm_export_failed",
+                            "detail": error.to_string()
+                        }),
+                    });
+                }
+            };
+
+        let (encoding, payload_len, wasm_base64) = match encode_wasm_payload(&wasm, gzip) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Ok(RpcGetAlkaneWasmResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "wasm_export_failed",
+                        "detail": error.to_string()
+                    }),
+                });
+            }
+        };
+
+        Ok(RpcGetAlkaneWasmResult {
+            value: json!({
+                "ok": true,
+                "alkane": format!("{}:{}", alkane.block, alkane.tx),
+                "source": format!("{}:{}", source.block, source.tx),
+                "length": wasm.len(),
+                "sha256": wasm_sha256_hex(&wasm),
+                "encoding": encoding,
+                "payload_length": payload_len,
+                "wasm_base64": wasm_base64,
+            }),
+        })
+    }
+
     pub fn rpc_get_factory_children(
         &self,
         params: RpcGetFactoryChildrenParams,
@@ -6881,6 +6954,16 @@ pub struct RpcGetAlkabiResult {
     pub value: Value,
 }
 
+pub struct RpcGetAlkaneWasmParams {
+    pub alkane: Option<String>,
+    /// Gzip the payload before base64-encoding (wasm compresses ~3-4x).
+    pub gzip: Option<bool>,
+}
+
+pub struct RpcGetAlkaneWasmResult {
+    pub value: Value,
+}
+
 pub struct RpcGetFactoryChildrenParams {
     pub factory: Option<String>,
 }
@@ -9125,6 +9208,24 @@ fn parse_alkane_from_str(s: &str) -> Option<SchemaAlkaneId> {
     Some(SchemaAlkaneId { block: parse_u32(parts[0])?, tx: parse_u64(parts[1])? })
 }
 
+/// Encode a wasm payload for JSON transport. Returns (encoding label,
+/// payload byte length before base64, base64 string).
+fn encode_wasm_payload(wasm: &[u8], gzip: bool) -> Result<(&'static str, usize, String)> {
+    use base64::Engine as _;
+    let (encoding, payload) = if gzip {
+        ("base64+gzip", std::borrow::Cow::Owned(alkanes_support::gz::compress(wasm.to_vec())?))
+    } else {
+        ("base64", std::borrow::Cow::Borrowed(wasm))
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_ref());
+    Ok((encoding, payload.len(), encoded))
+}
+
+fn wasm_sha256_hex(wasm: &[u8]) -> String {
+    use bitcoin::hashes::{Hash as _, sha256};
+    hex::encode(sha256::Hash::hash(wasm).to_byte_array())
+}
+
 const MAX_KV_SEARCH_CONDITIONS: usize = 8;
 const MAX_KV_SEARCH_CHILDREN: usize = 50_000;
 const MAX_KV_SEARCH_LIMIT: usize = 1000;
@@ -10500,6 +10601,54 @@ mod tests {
         assert_eq!(page2["total"], json!(2));
         assert_eq!(page2["has_more"], json!(false));
         assert_eq!(matched_alkanes(&page2), vec!["2:11"]);
+    }
+
+    #[test]
+    fn wasm_payload_encoding_round_trips() {
+        use base64::Engine as _;
+        let wasm: Vec<u8> = (0u16..2048).map(|i| (i % 251) as u8).collect();
+
+        let (encoding, payload_len, b64) = encode_wasm_payload(&wasm, false).expect("raw encode");
+        assert_eq!(encoding, "base64");
+        assert_eq!(payload_len, wasm.len());
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(&b64).expect("b64 decode"),
+            wasm
+        );
+
+        let (encoding, payload_len, b64) = encode_wasm_payload(&wasm, true).expect("gzip encode");
+        assert_eq!(encoding, "base64+gzip");
+        let compressed =
+            base64::engine::general_purpose::STANDARD.decode(&b64).expect("b64 decode");
+        assert_eq!(payload_len, compressed.len());
+        assert!(compressed.len() < wasm.len(), "payload should compress");
+        assert_eq!(alkanes_support::gz::decompress(compressed).expect("gunzip"), wasm);
+
+        // sha256 of the raw bytes is the stable content address regardless of
+        // transport encoding.
+        assert_eq!(
+            wasm_sha256_hex(b"hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn get_alkane_wasm_rejects_bad_alkane() {
+        let provider = new_provider_with_tempdb();
+        let response = provider
+            .rpc_get_alkane_wasm(RpcGetAlkaneWasmParams { alkane: None, gzip: None })
+            .expect("response")
+            .value;
+        assert_eq!(response["error"], json!("missing_or_invalid_alkane"));
+
+        let response = provider
+            .rpc_get_alkane_wasm(RpcGetAlkaneWasmParams {
+                alkane: Some("nope".to_string()),
+                gzip: None,
+            })
+            .expect("response")
+            .value;
+        assert_eq!(response["error"], json!("missing_or_invalid_alkane"));
     }
 
     #[test]
