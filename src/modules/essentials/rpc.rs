@@ -12,7 +12,7 @@ use crate::modules::essentials::storage::{
     RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams,
     RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams, RpcGetOrbitalVolumesParams,
     RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams, RpcGetTransferVolumeParams,
-    RpcPingParams, RpcSearchAlkaneParams,
+    RpcPingParams, RpcSearchAlkaneParams, RpcSearchFactoryKeysParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
@@ -259,6 +259,46 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.to_string()),
                         };
                         view.rpc_get_factory_children(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_search_factory_keys = reg.clone();
+        let mdb_search_factory_keys = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_search_factory_keys
+                .register("search_factory_keys", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_search_factory_keys);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcSearchFactoryKeysParams {
+                            factory: payload
+                                .get("factory")
+                                .or_else(|| payload.get("factory_alkane"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            conditions: payload
+                                .get("conditions")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| arr.to_vec()),
+                            key: payload.get("key").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            op: payload.get("op").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            value: payload.get("value").cloned(),
+                            try_decode_utf8: payload
+                                .get("try_decode_utf8")
+                                .and_then(|v| v.as_bool()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_search_factory_keys(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }

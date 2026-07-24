@@ -3462,6 +3462,144 @@ impl EssentialsProvider {
         })
     }
 
+    /// Search a factory's children for contracts whose storage keys satisfy a
+    /// set of conditions (ANDed). Scoping to a factory keeps the scan bounded
+    /// to point lookups over an existing index — there is deliberately no
+    /// unscoped variant, since arbitrary key/value scans over every contract
+    /// would be a DoS vector.
+    pub fn rpc_search_factory_keys(
+        &self,
+        params: RpcSearchFactoryKeysParams,
+    ) -> Result<RpcSearchFactoryKeysResult> {
+        let err = |error: &str, hint: &str| -> Result<RpcSearchFactoryKeysResult> {
+            Ok(RpcSearchFactoryKeysResult {
+                value: json!({"ok": false, "error": error, "hint": hint}),
+            })
+        };
+
+        let Some(factory) = params.factory.as_deref().and_then(parse_alkane_from_str) else {
+            return err(
+                "missing_or_invalid_factory",
+                "provide factory as \"<block>:<tx>\" (hex ok)",
+            );
+        };
+
+        // Conditions: either an explicit `conditions` array or the single
+        // top-level key/op/value shorthand.
+        let raw_conditions: Vec<Value> = match params.conditions {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => match params.key.as_deref() {
+                Some(key) => vec![json!({
+                    "key": key,
+                    "op": params.op.clone().unwrap_or_else(|| "eq".to_string()),
+                    "value": params.value.clone(),
+                })],
+                None => Vec::new(),
+            },
+        };
+        if raw_conditions.is_empty() {
+            return err(
+                "missing_conditions",
+                "provide conditions: [{key, op, value}] or top-level key/op/value; ops: eq, ne, gt, lt, ge, le, exists",
+            );
+        }
+        if raw_conditions.len() > MAX_KV_SEARCH_CONDITIONS {
+            return err("too_many_conditions", "at most 8 conditions per query");
+        }
+        let mut conditions: Vec<KvSearchCondition> = Vec::with_capacity(raw_conditions.len());
+        for raw in &raw_conditions {
+            match KvSearchCondition::parse(raw) {
+                Ok(cond) => conditions.push(cond),
+                Err(hint) => return err("invalid_condition", &hint),
+            }
+        }
+
+        let try_decode_utf8 = params.try_decode_utf8.unwrap_or(true);
+        let limit = (params.limit.unwrap_or(100).max(1) as usize).min(MAX_KV_SEARCH_LIMIT);
+        let page = params.page.unwrap_or(1).max(1) as usize;
+
+        let table = self.table();
+        let children = self
+            .get_factory_children(GetFactoryChildrenParams { blockhash: StateAt::Latest, factory })?
+            .children;
+        if children.len() > MAX_KV_SEARCH_CHILDREN {
+            return err("factory_too_large", "factory has too many children for a key/value scan");
+        }
+
+        // Evaluate conditions in order, narrowing the survivor set each pass.
+        // Every condition requires the key to exist on the contract (an
+        // absent key never matches, including `ne`).
+        let mut survivors: Vec<SchemaAlkaneId> = children;
+        let mut matched_values: HashMap<SchemaAlkaneId, Map<String, Value>> = HashMap::new();
+        for cond in &conditions {
+            if survivors.is_empty() {
+                break;
+            }
+            let keys: Vec<Vec<u8>> =
+                survivors.iter().map(|child| table.kv_row_key(child, &cond.key)).collect();
+            let values = self
+                .get_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
+                .values;
+            let mut next: Vec<SchemaAlkaneId> = Vec::new();
+            for (child, raw) in survivors.iter().zip(values.into_iter()) {
+                let Some(raw) = raw else { continue };
+                let (last_txid, value_bytes) = split_txid_value(&raw);
+                if !cond.matches(value_bytes) {
+                    continue;
+                }
+                let key_hex = fmt_bytes_hex(&cond.key);
+                let key_str_val = utf8_or_null(&cond.key);
+                let top_key = if try_decode_utf8 {
+                    if let Value::String(s) = &key_str_val { s.clone() } else { key_hex.clone() }
+                } else {
+                    key_hex.clone()
+                };
+                matched_values.entry(*child).or_default().insert(
+                    top_key,
+                    json!({
+                        "key_hex":    key_hex,
+                        "key_str":    key_str_val,
+                        "value_hex":  fmt_bytes_hex(value_bytes),
+                        "value_str":  utf8_or_null(value_bytes),
+                        "value_u128": u128_le_or_null(value_bytes),
+                        "last_txid":  last_txid.map(Value::String).unwrap_or(Value::Null),
+                    }),
+                );
+                next.push(*child);
+            }
+            survivors = next;
+        }
+
+        let total = survivors.len();
+        let offset = limit.saturating_mul(page.saturating_sub(1));
+        let end = (offset + limit).min(total);
+        let window = if offset >= total { &[][..] } else { &survivors[offset..end] };
+        let has_more = end < total;
+
+        let items: Vec<Value> = window
+            .iter()
+            .map(|child| {
+                json!({
+                    "alkane": format!("{}:{}", child.block, child.tx),
+                    "keys": Value::Object(matched_values.remove(child).unwrap_or_default()),
+                })
+            })
+            .collect();
+
+        Ok(RpcSearchFactoryKeysResult {
+            value: json!({
+                "ok": true,
+                "factory": format!("{}:{}", factory.block, factory.tx),
+                "conditions": conditions.iter().map(KvSearchCondition::describe).collect::<Vec<_>>(),
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "has_more": has_more,
+                "items": items,
+            }),
+        })
+    }
+
     pub fn rpc_get_all_alkanes(
         &self,
         params: RpcGetAllAlkanesParams,
@@ -6691,6 +6829,23 @@ pub struct RpcGetKeysResult {
     pub value: Value,
 }
 
+pub struct RpcSearchFactoryKeysParams {
+    pub factory: Option<String>,
+    /// Explicit condition objects: [{key, op, value}, …] (ANDed).
+    pub conditions: Option<Vec<Value>>,
+    /// Single-condition shorthand used when `conditions` is absent.
+    pub key: Option<String>,
+    pub op: Option<String>,
+    pub value: Option<Value>,
+    pub try_decode_utf8: Option<bool>,
+    pub limit: Option<u64>,
+    pub page: Option<u64>,
+}
+
+pub struct RpcSearchFactoryKeysResult {
+    pub value: Value,
+}
+
 pub struct RpcGetAllAlkanesParams {
     pub page: Option<u64>,
     pub limit: Option<u64>,
@@ -8970,6 +9125,150 @@ fn parse_alkane_from_str(s: &str) -> Option<SchemaAlkaneId> {
     Some(SchemaAlkaneId { block: parse_u32(parts[0])?, tx: parse_u64(parts[1])? })
 }
 
+const MAX_KV_SEARCH_CONDITIONS: usize = 8;
+const MAX_KV_SEARCH_CHILDREN: usize = 50_000;
+const MAX_KV_SEARCH_LIMIT: usize = 1000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KvSearchOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Ge,
+    Le,
+    Exists,
+}
+
+impl KvSearchOp {
+    fn parse(raw: &str) -> Option<Self> {
+        Some(match raw.to_ascii_lowercase().as_str() {
+            "eq" | "=" | "==" => Self::Eq,
+            "ne" | "!=" | "<>" => Self::Ne,
+            "gt" | ">" => Self::Gt,
+            "lt" | "<" => Self::Lt,
+            "ge" | ">=" => Self::Ge,
+            "le" | "<=" => Self::Le,
+            "exists" => Self::Exists,
+            _ => return None,
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Gt => "gt",
+            Self::Lt => "lt",
+            Self::Ge => "ge",
+            Self::Le => "le",
+            Self::Exists => "exists",
+        }
+    }
+}
+
+struct KvSearchCondition {
+    key: Vec<u8>,
+    op: KvSearchOp,
+    /// Comparison payload for eq/ne (raw bytes, hex `0x…` or literal string).
+    value_bytes: Option<Vec<u8>>,
+    /// Comparison payload for gt/lt/ge/le; stored values decode as LE u128.
+    value_u128: Option<u128>,
+}
+
+impl KvSearchCondition {
+    fn parse(raw: &Value) -> std::result::Result<Self, String> {
+        let obj = raw
+            .as_object()
+            .ok_or_else(|| "each condition must be an object {key, op, value}".to_string())?;
+        let key_raw = obj
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "condition.key must be a string (utf8 or 0x-hex)".to_string())?;
+        let key = parse_key_str_to_bytes(key_raw)
+            .ok_or_else(|| format!("condition.key could not be parsed: {key_raw}"))?;
+        let op_raw = obj.get("op").and_then(|v| v.as_str()).unwrap_or("eq");
+        let op = KvSearchOp::parse(op_raw)
+            .ok_or_else(|| format!("unknown op '{op_raw}' (eq, ne, gt, lt, ge, le, exists)"))?;
+
+        let value = obj.get("value");
+        let mut value_bytes = None;
+        let mut value_u128 = None;
+        match op {
+            KvSearchOp::Exists => {}
+            KvSearchOp::Eq | KvSearchOp::Ne => {
+                let raw_val = value.and_then(|v| v.as_str()).ok_or_else(|| {
+                    "eq/ne conditions need value as a string (utf8 or 0x-hex bytes)".to_string()
+                })?;
+                value_bytes =
+                    Some(parse_key_str_to_bytes(raw_val).ok_or_else(|| {
+                        format!("condition.value could not be parsed: {raw_val}")
+                    })?);
+            }
+            KvSearchOp::Gt | KvSearchOp::Lt | KvSearchOp::Ge | KvSearchOp::Le => {
+                let parsed = match value {
+                    Some(Value::Number(num)) => num.as_u64().map(|v| v as u128),
+                    Some(Value::String(s)) => {
+                        let trimmed = s.trim();
+                        if let Some(hex) = trimmed.strip_prefix("0x") {
+                            u128::from_str_radix(hex, 16).ok()
+                        } else {
+                            trimmed.parse::<u128>().ok()
+                        }
+                    }
+                    _ => None,
+                };
+                value_u128 = Some(parsed.ok_or_else(|| {
+                    "numeric conditions need value as a u128 (decimal or 0x-hex, string ok)"
+                        .to_string()
+                })?);
+            }
+        }
+        Ok(Self { key, op, value_bytes, value_u128 })
+    }
+
+    /// Whether a present stored value satisfies the condition. Callers handle
+    /// key absence (an absent key never matches any op).
+    fn matches(&self, stored: &[u8]) -> bool {
+        match self.op {
+            KvSearchOp::Exists => true,
+            KvSearchOp::Eq => Some(stored) == self.value_bytes.as_deref(),
+            KvSearchOp::Ne => Some(stored) != self.value_bytes.as_deref(),
+            KvSearchOp::Gt | KvSearchOp::Lt | KvSearchOp::Ge | KvSearchOp::Le => {
+                if stored.len() > 16 {
+                    return false;
+                }
+                let mut acc: u128 = 0;
+                for (i, &byte) in stored.iter().enumerate() {
+                    acc |= (byte as u128) << (i * 8);
+                }
+                let Some(target) = self.value_u128 else { return false };
+                match self.op {
+                    KvSearchOp::Gt => acc > target,
+                    KvSearchOp::Lt => acc < target,
+                    KvSearchOp::Ge => acc >= target,
+                    KvSearchOp::Le => acc <= target,
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    fn describe(&self) -> Value {
+        json!({
+            "key": fmt_bytes_hex(&self.key),
+            "key_str": utf8_or_null(&self.key),
+            "op": self.op.as_str(),
+            "value": self
+                .value_bytes
+                .as_ref()
+                .map(|b| Value::String(fmt_bytes_hex(b)))
+                .or_else(|| self.value_u128.map(|v| Value::String(v.to_string())))
+                .unwrap_or(Value::Null),
+        })
+    }
+}
+
 fn parse_key_str_to_bytes(s: &str) -> Option<Vec<u8>> {
     if let Some(hex) = s.strip_prefix("0x") {
         if hex.len() % 2 == 0 && !hex.is_empty() {
@@ -10042,5 +10341,208 @@ mod tests {
         assert!(get_cached_block_summary(2).is_none());
         cache_block_summary(2, canonical_summary);
         assert_eq!(get_cached_block_summary(2).and_then(|summary| summary.block_hash()), Some(h2));
+    }
+
+    fn seed_factory_kv_fixture(provider: &EssentialsProvider) -> SchemaAlkaneId {
+        let table = provider.table();
+        let factory = SchemaAlkaneId { block: 4, tx: 797 };
+        let a = SchemaAlkaneId { block: 2, tx: 10 };
+        let b = SchemaAlkaneId { block: 2, tx: 11 };
+        let c = SchemaAlkaneId { block: 2, tx: 12 };
+
+        let kv_row = |txid_byte: u8, value: &[u8]| -> Vec<u8> {
+            let mut row = vec![txid_byte; 32];
+            row.extend_from_slice(value);
+            row
+        };
+
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for child in [&a, &b, &c] {
+            puts.push((table.alkane_factory_child_key(&factory, child), Vec::new()));
+        }
+        puts.push((table.kv_row_key(&a, b"/collateral_address"), kv_row(0x11, b"bc1qalice")));
+        puts.push((table.kv_row_key(&b, b"/collateral_address"), kv_row(0x22, b"bc1qbob")));
+        puts.push((
+            table.kv_row_key(&a, b"/fire_amount"),
+            kv_row(0x33, &1_000_000u128.to_le_bytes()),
+        ));
+        puts.push((
+            table.kv_row_key(&b, b"/fire_amount"),
+            kv_row(0x44, &2_600_000_000u128.to_le_bytes()),
+        ));
+        // Short (8-byte) LE value: numeric decoding must handle < 16 bytes.
+        puts.push((table.kv_row_key(&c, b"/fire_amount"), kv_row(0x55, &500u64.to_le_bytes())));
+
+        provider
+            .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+            .expect("seed factory kv fixture");
+        factory
+    }
+
+    fn search_factory_keys(
+        provider: &EssentialsProvider,
+        conditions: Value,
+        limit: Option<u64>,
+        page: Option<u64>,
+    ) -> Value {
+        provider
+            .rpc_search_factory_keys(RpcSearchFactoryKeysParams {
+                factory: Some("4:797".to_string()),
+                conditions: conditions.as_array().map(|arr| arr.to_vec()),
+                key: None,
+                op: None,
+                value: None,
+                try_decode_utf8: None,
+                limit,
+                page,
+            })
+            .expect("search response")
+            .value
+    }
+
+    fn matched_alkanes(response: &Value) -> Vec<String> {
+        response["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .map(|item| item["alkane"].as_str().expect("alkane id").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn search_factory_keys_matches_exact_value() {
+        let provider = new_provider_with_tempdb();
+        seed_factory_kv_fixture(&provider);
+
+        let response = search_factory_keys(
+            &provider,
+            json!([{"key": "/collateral_address", "op": "eq", "value": "bc1qalice"}]),
+            None,
+            None,
+        );
+
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(matched_alkanes(&response), vec!["2:10"]);
+        let keys = &response["items"][0]["keys"]["/collateral_address"];
+        assert_eq!(keys["value_str"], json!("bc1qalice"));
+        assert_eq!(keys["last_txid"], json!("11".repeat(32)));
+    }
+
+    #[test]
+    fn search_factory_keys_numeric_operands_decode_le_values() {
+        let provider = new_provider_with_tempdb();
+        seed_factory_kv_fixture(&provider);
+
+        let gt = search_factory_keys(
+            &provider,
+            json!([{"key": "/fire_amount", "op": "gt", "value": "1000000"}]),
+            None,
+            None,
+        );
+        assert_eq!(matched_alkanes(&gt), vec!["2:11"]);
+
+        let range = search_factory_keys(
+            &provider,
+            json!([
+                {"key": "/fire_amount", "op": "ge", "value": 500},
+                {"key": "/fire_amount", "op": "le", "value": "1000000"},
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(matched_alkanes(&range), vec!["2:10", "2:12"]);
+    }
+
+    #[test]
+    fn search_factory_keys_ands_conditions_across_keys() {
+        let provider = new_provider_with_tempdb();
+        seed_factory_kv_fixture(&provider);
+
+        let response = search_factory_keys(
+            &provider,
+            json!([
+                {"key": "/fire_amount", "op": "ge", "value": 1000},
+                {"key": "/collateral_address", "op": "eq", "value": "bc1qbob"},
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(matched_alkanes(&response), vec!["2:11"]);
+    }
+
+    #[test]
+    fn search_factory_keys_absent_key_never_matches() {
+        let provider = new_provider_with_tempdb();
+        seed_factory_kv_fixture(&provider);
+
+        // 2:12 has no /collateral_address row: `ne` must not treat the
+        // missing key as "different value".
+        let response = search_factory_keys(
+            &provider,
+            json!([{"key": "/collateral_address", "op": "ne", "value": "bc1qalice"}]),
+            None,
+            None,
+        );
+        assert_eq!(matched_alkanes(&response), vec!["2:11"]);
+    }
+
+    #[test]
+    fn search_factory_keys_exists_and_pagination() {
+        let provider = new_provider_with_tempdb();
+        seed_factory_kv_fixture(&provider);
+
+        let page2 = search_factory_keys(
+            &provider,
+            json!([{"key": "/collateral_address", "op": "exists"}]),
+            Some(1),
+            Some(2),
+        );
+        assert_eq!(page2["total"], json!(2));
+        assert_eq!(page2["has_more"], json!(false));
+        assert_eq!(matched_alkanes(&page2), vec!["2:11"]);
+    }
+
+    #[test]
+    fn search_factory_keys_rejects_bad_input() {
+        let provider = new_provider_with_tempdb();
+        seed_factory_kv_fixture(&provider);
+
+        let missing_factory = provider
+            .rpc_search_factory_keys(RpcSearchFactoryKeysParams {
+                factory: None,
+                conditions: None,
+                key: Some("/x".to_string()),
+                op: None,
+                value: Some(json!("y")),
+                try_decode_utf8: None,
+                limit: None,
+                page: None,
+            })
+            .expect("response")
+            .value;
+        assert_eq!(missing_factory["error"], json!("missing_or_invalid_factory"));
+
+        let bad_op = search_factory_keys(
+            &provider,
+            json!([{"key": "/x", "op": "like", "value": "y"}]),
+            None,
+            None,
+        );
+        assert_eq!(bad_op["error"], json!("invalid_condition"));
+
+        let no_conditions = provider
+            .rpc_search_factory_keys(RpcSearchFactoryKeysParams {
+                factory: Some("4:797".to_string()),
+                conditions: None,
+                key: None,
+                op: None,
+                value: None,
+                try_decode_utf8: None,
+                limit: None,
+                page: None,
+            })
+            .expect("response")
+            .value;
+        assert_eq!(no_conditions["error"], json!("missing_conditions"));
     }
 }
