@@ -2169,6 +2169,10 @@ impl AmmDataProvider {
         &self,
         params: GetListEntriesDescParams,
     ) -> Result<GetListEntriesDescResult> {
+        // Unbounded scan of a whole list — the remaining cost of the history
+        // endpoints now that they no longer hydrate every record, so it is
+        // worth seeing in the debug timings.
+        crate::debug_timer_log!("get_list_entries_desc");
         if let Some(remote) = crate::config::explorer_remote() {
             let mut params = params;
             params.blockhash = self.effective_wire_state(params.blockhash);
