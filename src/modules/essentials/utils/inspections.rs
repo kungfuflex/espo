@@ -183,6 +183,27 @@ fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
     Some(SchemaAlkaneId { block: u32::try_from(block).ok()?, tx: u64::try_from(tx).ok()? })
 }
 
+/// The implementation (or beacon) pointer stored by an upgradeable proxy.
+///
+/// This is a semantic getter rather than a raw KV read so client-mode
+/// explorers can resolve it against the remote espo — without it, proxy
+/// contracts (e.g. the AMM) lose their implementation ABI and every call
+/// renders as a generic "contract call".
+pub fn get_proxy_implementation(
+    provider: &EssentialsProvider,
+    alkane: &SchemaAlkaneId,
+) -> Option<SchemaAlkaneId> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_proxy_implementation(
+            &remote, alkane,
+        )
+        .map_err(|e| eprintln!("[remote] get_proxy_implementation failed: {e}"))
+        .ok()
+        .flatten();
+    }
+    proxy_target_from_db(alkane, provider)
+}
+
 fn proxy_target_from_db(
     alkane: &SchemaAlkaneId,
     provider: &EssentialsProvider,
@@ -217,7 +238,7 @@ pub fn resolve_proxy_target_recursive(
         if !is_upgradeable_proxy(&inspection) {
             return (current != *start).then_some(current);
         }
-        let next = proxy_target_from_db(&current, provider)?;
+        let next = get_proxy_implementation(provider, &current)?;
         if !seen.insert(next) {
             return None;
         }

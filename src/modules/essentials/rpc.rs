@@ -256,6 +256,20 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|value| value.as_str())
                                 .map(str::to_string),
                             gzip: payload.get("gzip").and_then(|value| value.as_bool()),
+                            resolve: payload
+                                .get("resolve")
+                                .and_then(|value| value.as_bool())
+                                // `no_resolution: true` is accepted as the
+                                // inverse spelling of `resolve: false`.
+                                .or_else(|| {
+                                    payload
+                                        .get("no_resolution")
+                                        .and_then(|value| value.as_bool())
+                                        .map(|no_resolution| !no_resolution)
+                                }),
+                            first_version: payload
+                                .get("first_version")
+                                .and_then(|value| value.as_bool()),
                         };
                         tokio::task::spawn_blocking(move || view.rpc_get_alkane_wasm(params))
                             .await

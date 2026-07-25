@@ -380,21 +380,6 @@ fn decode_trace_response(data_hex: &str) -> Option<String> {
     if trimmed.is_empty() { None } else { Some(trimmed) }
 }
 
-fn kv_row_key(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(1 + 4 + 8 + 2 + skey.len());
-    v.push(0x01);
-    v.extend_from_slice(&alk.block.to_be_bytes());
-    v.extend_from_slice(&alk.tx.to_be_bytes());
-    let len = u16::try_from(skey.len()).unwrap_or(u16::MAX);
-    v.extend_from_slice(&len.to_be_bytes());
-    if len as usize != skey.len() {
-        v.extend_from_slice(&skey[..(len as usize)]);
-    } else {
-        v.extend_from_slice(skey);
-    }
-    v
-}
-
 fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
     if raw.len() < 32 {
         return None;
@@ -420,16 +405,11 @@ fn kv_implementation_value(
         }
     }
     let mut meta = cache.get(alk).cloned().unwrap_or_default();
-    let lookup = |key| {
-        mdb.get(&kv_row_key(alk, key)).ok().flatten().and_then(|raw| {
-            if raw.len() >= 32 {
-                decode_kv_implementation(&raw[32..])
-            } else {
-                decode_kv_implementation(&raw)
-            }
-        })
-    };
-    let implementation = lookup(KV_KEY_IMPLEMENTATION).or_else(|| lookup(KV_KEY_BEACON));
+    // Semantic getter (remote-capable in client mode) rather than a raw KV read.
+    let implementation = crate::modules::essentials::utils::inspections::get_proxy_implementation(
+        &provider_from_mdb(mdb),
+        alk,
+    );
     meta.implementation = Some(implementation);
     cache.insert(*alk, meta.clone());
     implementation

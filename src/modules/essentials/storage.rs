@@ -4063,22 +4063,28 @@ impl EssentialsProvider {
             });
         };
         let gzip = params.gzip.unwrap_or(false);
+        let resolve = params.resolve.unwrap_or(true);
 
-        let (wasm, source) =
-            match crate::modules::essentials::utils::alkabi::load_contract_wasm_with_source(
-                self, &alkane,
-            ) {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    return Ok(RpcGetAlkaneWasmResult {
-                        value: json!({
-                            "ok": false,
-                            "error": "wasm_export_failed",
-                            "detail": error.to_string()
-                        }),
-                    });
-                }
-            };
+        let loaded = if resolve {
+            crate::modules::essentials::utils::alkabi::load_contract_wasm_with_source(self, &alkane)
+        } else {
+            crate::modules::essentials::utils::alkabi::load_contract_wasm_no_resolution(
+                &alkane,
+                params.first_version.unwrap_or(false),
+            )
+        };
+        let (wasm, source) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return Ok(RpcGetAlkaneWasmResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "wasm_export_failed",
+                        "detail": error.to_string()
+                    }),
+                });
+            }
+        };
 
         let (encoding, payload_len, wasm_base64) = match encode_wasm_payload(&wasm, gzip) {
             Ok(encoded) => encoded,
@@ -7101,6 +7107,14 @@ pub struct RpcGetAlkaneWasmParams {
     pub alkane: Option<String>,
     /// Gzip the payload before base64-encoding (wasm compresses ~3-4x).
     pub gzip: Option<bool>,
+    /// Resolve proxy implementations before loading (default true). Set false
+    /// to load exactly what the alkanes runtime's `get_alkane_binary` would:
+    /// factory-pointer recursion and gunzip only, no `/implementation` or
+    /// `/beacon` hop.
+    pub resolve: Option<bool>,
+    /// With `resolve: false`, load the first stored version of the payload
+    /// instead of the current one (default false — the runtime loads current).
+    pub first_version: Option<bool>,
 }
 
 pub struct RpcGetAlkaneWasmResult {
@@ -10831,7 +10845,12 @@ mod tests {
     fn get_alkane_wasm_rejects_bad_alkane() {
         let provider = new_provider_with_tempdb();
         let response = provider
-            .rpc_get_alkane_wasm(RpcGetAlkaneWasmParams { alkane: None, gzip: None })
+            .rpc_get_alkane_wasm(RpcGetAlkaneWasmParams {
+                alkane: None,
+                gzip: None,
+                resolve: None,
+                first_version: None,
+            })
             .expect("response")
             .value;
         assert_eq!(response["error"], json!("missing_or_invalid_alkane"));
@@ -10840,6 +10859,8 @@ mod tests {
             .rpc_get_alkane_wasm(RpcGetAlkaneWasmParams {
                 alkane: Some("nope".to_string()),
                 gzip: None,
+                resolve: None,
+                first_version: None,
             })
             .expect("response")
             .value;

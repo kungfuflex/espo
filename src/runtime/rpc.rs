@@ -3,10 +3,8 @@ use crate::{
         get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_next_height, get_network,
     },
     modules::defs::RpcRegistry,
-    runtime::{
-        mempool::{
-            MempoolBlockSummary, current_mempool_compact_snapshot, current_mempool_minimum_fee_rate,
-        },
+    runtime::mempool::{
+        MempoolBlockSummary, current_mempool_compact_snapshot, current_mempool_minimum_fee_rate,
     },
 };
 use axum::{

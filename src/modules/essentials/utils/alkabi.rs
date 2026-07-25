@@ -90,6 +90,27 @@ pub fn load_contract_wasm(
     load_contract_wasm_from_source(&contract_wasm_source(provider, alkane))
 }
 
+/// Load bytecode exactly the way the alkanes runtime's `get_alkane_binary`
+/// does: read `/alkanes/{id}`, recurse when the payload is a 32-byte factory
+/// pointer, otherwise gunzip. No proxy hop — `/implementation` and `/beacon`
+/// are never consulted, matching the runtime.
+///
+/// `prefer_first_version` selects the first stored version of the payload
+/// instead of the current one; the runtime always loads the current one, so
+/// simulate-style callers want `false`.
+pub fn load_contract_wasm_no_resolution(
+    alkane: &SchemaAlkaneId,
+    prefer_first_version: bool,
+) -> Result<(Vec<u8>, SchemaAlkaneId)> {
+    let metashrew = get_metashrew();
+    let loaded = if prefer_first_version {
+        metashrew.get_alkane_wasm_bytes_prefer_first_version(alkane)?
+    } else {
+        metashrew.get_alkane_wasm_bytes(alkane)?
+    };
+    loaded.context("contract wasm not found")
+}
+
 /// Like `load_contract_wasm`, but also reports which alkane actually provided
 /// the bytecode (after proxy/factory resolution) so callers can dedup and
 /// content-address the payload.

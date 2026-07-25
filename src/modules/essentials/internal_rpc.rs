@@ -152,6 +152,16 @@ pub struct WireBalancesAtOrBeforeResult {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct WireProxyImplementationParams {
+    pub alkane: SchemaAlkaneId,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct WireProxyImplementationResult {
+    pub implementation: Option<SchemaAlkaneId>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct WireAlkanePageParams {
     pub blockhash: StateAt,
     pub alkane: SchemaAlkaneId,
@@ -448,6 +458,17 @@ pub fn remote_get_alkane_balances_at_or_before(
     )?;
     let pairs: Vec<(SchemaAlkaneId, u128)> = borsh_unhex(&r.pairs_borsh)?;
     Ok((pairs.into_iter().collect(), r.resolved_height))
+}
+
+pub fn remote_get_proxy_implementation(
+    remote: &RemoteEspoClient,
+    alkane: &SchemaAlkaneId,
+) -> Result<Option<SchemaAlkaneId>> {
+    let r: WireProxyImplementationResult = remote.getter(
+        "internal.essentials_get_proxy_implementation",
+        &WireProxyImplementationParams { alkane: *alkane },
+    )?;
+    Ok(r.implementation)
 }
 
 pub fn remote_get_holders_for_alkane(
@@ -752,6 +773,19 @@ pub fn register_internal_getters(reg: &RpcNsRegistrar) {
             let mut pairs: Vec<(SchemaAlkaneId, u128)> = map.into_iter().collect();
             pairs.sort();
             Ok(WireBalancesAtOrBeforeResult { pairs_borsh: borsh_hex(&pairs)?, resolved_height })
+        },
+    );
+    register_getter(
+        reg,
+        "essentials_get_proxy_implementation",
+        |p: WireProxyImplementationParams| {
+            Ok(WireProxyImplementationResult {
+                implementation:
+                    crate::modules::essentials::utils::inspections::get_proxy_implementation(
+                        &provider(),
+                        &p.alkane,
+                    ),
+            })
         },
     );
     register_getter(reg, "essentials_get_holders_for_alkane", |p: WireAlkanePageParams| {
