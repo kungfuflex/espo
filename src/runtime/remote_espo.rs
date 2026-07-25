@@ -3,6 +3,8 @@
 //! on a remote espo instance instead of a local database read. One getter call
 //! is one RPC round-trip carrying the getter's full typed result.
 //!
+//! `explorer_espo_rpc_host` is used verbatim as the endpoint URL.
+//!
 //! `internal.*` methods additionally carry the shared `explorer_espo_rpc_key`
 //! as `"auth"`; the remote (running with `enable_internal_rpc: true` and
 //! `internal_rpc_key`) rejects them otherwise.
@@ -36,9 +38,10 @@ pub struct RemoteEspoClient {
 
 impl RemoteEspoClient {
     pub fn new(host: &str, auth_key: Option<String>, cache_ttl: Duration) -> Self {
-        let trimmed = host.trim_end_matches('/');
-        let rpc_url =
-            if trimmed.ends_with("/rpc") { trimmed.to_string() } else { format!("{trimmed}/rpc") };
+        // The configured host is used exactly as written — no "/rpc" (or any
+        // other) suffix is appended, so operators keep full control of the
+        // endpoint path.
+        let rpc_url = host.trim().to_string();
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
@@ -223,6 +226,21 @@ mod tests {
             .expect("cached call");
         assert_eq!(second, DemoResult { count: 42 });
         assert_eq!(client.total_calls(), 1);
+    }
+
+    #[test]
+    fn configured_host_is_used_verbatim() {
+        // No suffixing, no trailing-slash rewriting: whatever the operator
+        // configures is the endpoint that gets called.
+        for host in [
+            "http://127.0.0.1:5778/rpc",
+            "http://127.0.0.1:5778",
+            "http://example.com/espo/custom-path",
+            "http://example.com/rpc/",
+        ] {
+            let client = RemoteEspoClient::new(host, None, Duration::ZERO);
+            assert_eq!(client.rpc_url(), host);
+        }
     }
 
     #[test]

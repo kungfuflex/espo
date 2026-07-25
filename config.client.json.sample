@@ -1,8 +1,8 @@
 {
-  "__comment": "Minimal client-mode espo: renders the explorer entirely from a remote (data) espo instance. No local metashrew, no indexing, no mempool service — view-only is implied, no local database is opened (db_path is unused), and no modules section is needed — the client assumes the backend's capabilities (runes UI is on by default; add modules.ammdata.derived_liquidity only if you want chart-annotation parity with the data instance). The data instance must run enable_internal_rpc with internal_rpc_key.",
+  "__comment": "Minimal client-mode espo: renders the explorer entirely from a remote (data) espo instance. No local metashrew, no indexing, no mempool service — view-only is implied, no local database is opened (db_path is unused), and no modules section is needed — the client assumes the backend's capabilities (runes UI is on by default; add modules.ammdata.derived_liquidity only if you want chart-annotation parity with the data instance). The data instance must run enable_internal_rpc with internal_rpc_key. explorer_espo_rpc_host is used verbatim as the JSON-RPC endpoint — include the /rpc path.",
   "network": "mainnet",
 
-  "explorer_espo_rpc_host": "http://data-espo:5780",
+  "explorer_espo_rpc_host": "http://data-espo:5780/rpc",
   "explorer_espo_rpc_key": "shared-secret",
   "explorer_espo_events_host": "http://data-espo:5081",
 
