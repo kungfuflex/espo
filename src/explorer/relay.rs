@@ -107,6 +107,40 @@ pub async fn piped_events_socket(local: WebSocket, events_host: String) {
     }
 }
 
+/// Proxy a rendered explorer page from the data instance.
+///
+/// Used for the projected-mempool-block page: it renders from live mempool
+/// service state (raw transactions, protostones, traces) that a client-mode
+/// instance deliberately does not run, so the page is served by the instance
+/// that owns that state — the same relay approach as the events websocket and
+/// the mempool-blocks snapshot.
+pub async fn proxy_explorer_page(events_host: &str, path_and_query: &str) -> Response {
+    let url = format!("{}{}", events_host.trim_end_matches('/'), path_and_query);
+    let response = match reqwest::get(&url).await {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("[relay] upstream page fetch failed ({url}): {e}");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/html; charset=utf-8")
+        .to_string();
+    match response.bytes().await {
+        Ok(body) => (status, [(axum::http::header::CONTENT_TYPE, content_type)], body.to_vec())
+            .into_response(),
+        Err(e) => {
+            eprintln!("[relay] upstream page body failed ({url}): {e}");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
 /// Proxy the data instance's mempool-blocks snapshot.
 pub async fn proxy_mempool_blocks(events_host: &str) -> Response {
     let url = upstream_mempool_blocks_url(events_host);
