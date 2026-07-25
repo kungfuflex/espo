@@ -3235,6 +3235,103 @@ pub fn pending_action_entries_for_address(
     out
 }
 
+/// Transactions currently held in the in-memory mempool. Callers use this to
+/// skip pending work entirely when no mempool service is running (client mode
+/// keeps an empty store and answers from the data instance).
+pub fn mempool_tx_count() -> usize {
+    mempool_state().read().map(|state| state.txs.len()).unwrap_or(0)
+}
+
+/// One page of an address's pending transactions, newest first, with the total
+/// number of matches.
+///
+/// Matching a mempool transaction to an address is cheap in two of the three
+/// cases: the entry carries its own output addresses, and a chained spend of
+/// another mempool transaction's output can be resolved from the store. The
+/// third — a transaction spending a *confirmed* output of the address — is
+/// only visible through that output's owner, and used to be resolved by
+/// enumerating every outpoint the address had ever held (112k blob reads for a
+/// busy address, which is what made those pages take minutes). That case now
+/// arrives as `candidate_txids`: the caller passes the mempool txids the
+/// address index already attributes to this address, so the cost is bounded by
+/// the address's mempool activity instead of its entire history.
+///
+/// Only entries inside the requested window are materialised — a match outside
+/// it costs one txid.
+pub fn pending_page_for_address(
+    addr: &str,
+    network: Network,
+    include_alkanes: bool,
+    include_runes: bool,
+    actions_only: bool,
+    candidate_txids: &HashSet<Txid>,
+    offset: usize,
+    limit: usize,
+) -> (Vec<MempoolEntry>, usize) {
+    let Ok(state) = mempool_state().read() else {
+        return (Vec::new(), 0);
+    };
+    pending_page_from_state(
+        &state,
+        addr,
+        network,
+        include_alkanes,
+        include_runes,
+        actions_only,
+        candidate_txids,
+        offset,
+        limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pending_page_from_state(
+    state: &InMemoryMempool,
+    addr: &str,
+    network: Network,
+    include_alkanes: bool,
+    include_runes: bool,
+    actions_only: bool,
+    candidate_txids: &HashSet<Txid>,
+    offset: usize,
+    limit: usize,
+) -> (Vec<MempoolEntry>, usize) {
+    if actions_only && !include_alkanes && !include_runes {
+        return (Vec::new(), 0);
+    }
+
+    let mut matches: Vec<(u64, Txid)> = Vec::new();
+    for (txid, entry) in state.txs.iter() {
+        // Entries without a transaction body cannot be rendered, so they are
+        // left out of the total as well — it counts what this page can show.
+        if entry.tx.is_none() {
+            continue;
+        }
+        if actions_only
+            && !((include_alkanes && entry_has_alkane_action(entry))
+                || (include_runes && entry_has_rune_action(entry)))
+        {
+            continue;
+        }
+        let matched = entry.addresses.iter().any(|address| address == addr)
+            || candidate_txids.contains(txid)
+            || entry_spends_mempool_output_to_address(entry, addr, network, state);
+        if matched {
+            matches.push((entry.first_seen, *txid));
+        }
+    }
+
+    let total = matches.len();
+    matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let entries = matches
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .filter_map(|(_, txid)| state.txs.get(&txid).and_then(mempool_entry_from_state))
+        .collect();
+    (entries, total)
+}
+
 pub fn pending_for_address(addr: &str) -> Vec<MempoolEntry> {
     let Ok(state) = mempool_state().read() else { return Vec::new() };
     let mut out: Vec<MempoolEntry> = state
@@ -3464,5 +3561,148 @@ mod tests {
         let traces = fast_traces_for_tx(&txid, &tx, &[protostone]).expect("fast traces");
 
         assert!(traces.is_empty());
+    }
+
+    /// The address page asks for one window of pending transactions. Matches
+    /// come from three places — the entry's own output addresses, txids the
+    /// address index attributes to the address, and chained spends of another
+    /// mempool transaction's output — and only the window is materialised.
+    #[test]
+    fn pending_page_matches_all_three_ways_and_pages() {
+        use bitcoin::WPubkeyHash;
+        use bitcoin::hashes::Hash as _;
+
+        let spk = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([7u8; 20]));
+        let addr = Address::from_script(spk.as_script(), Network::Bitcoin)
+            .expect("address from script")
+            .to_string();
+
+        let paying_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::ZERO, script_pubkey: spk.clone() }],
+        };
+
+        let mut state = InMemoryMempool::default();
+
+        // Pays the address directly.
+        let (paying_txid, mut paying) = mempool_transaction(1, 100, 1000);
+        paying.tx = Some(paying_tx.clone());
+        paying.addresses = vec![addr.clone()];
+        paying.first_seen = 30;
+        state.txs.insert(paying_txid, paying);
+
+        // Spends a confirmed output of the address: nothing in the entry says
+        // so, it is only known because the address index named it.
+        let (spending_txid, mut spending) = mempool_transaction(2, 100, 1000);
+        spending.tx = Some(sample_tx());
+        spending.first_seen = 20;
+        state.txs.insert(spending_txid, spending);
+
+        // Spends the mempool output that pays the address.
+        let (chained_txid, mut chained) = mempool_transaction(3, 100, 1000);
+        let mut chained_tx = sample_tx();
+        chained_tx.input[0].previous_output = OutPoint { txid: paying_txid, vout: 0 };
+        chained.spent_outpoints = vec![OutPoint { txid: paying_txid, vout: 0 }];
+        chained.tx = Some(chained_tx);
+        chained.first_seen = 40;
+        state.txs.insert(chained_txid, chained);
+
+        // Unrelated to the address.
+        let (other_txid, mut other) = mempool_transaction(4, 100, 1000);
+        other.tx = Some(sample_tx());
+        other.first_seen = 50;
+        state.txs.insert(other_txid, other);
+
+        // Matches the address but has no transaction body, so it cannot be
+        // rendered and must not inflate the total.
+        let (bodyless_txid, mut bodyless) = mempool_transaction(5, 100, 1000);
+        bodyless.addresses = vec![addr.clone()];
+        bodyless.first_seen = 60;
+        state.txs.insert(bodyless_txid, bodyless);
+
+        let candidates: HashSet<Txid> = [spending_txid].into_iter().collect();
+
+        let (page, total) = pending_page_from_state(
+            &state,
+            &addr,
+            Network::Bitcoin,
+            true,
+            true,
+            false,
+            &candidates,
+            0,
+            10,
+        );
+        assert_eq!(total, 3, "paying + spending + chained, not the unrelated or bodyless one");
+        let ids: Vec<Txid> = page.iter().map(|e| e.txid).collect();
+        assert_eq!(ids, vec![chained_txid, paying_txid, spending_txid], "newest first");
+
+        // Windows: only the requested slice comes back, total is unchanged.
+        let (first, total_first) = pending_page_from_state(
+            &state,
+            &addr,
+            Network::Bitcoin,
+            true,
+            true,
+            false,
+            &candidates,
+            0,
+            2,
+        );
+        assert_eq!(total_first, 3);
+        assert_eq!(
+            first.iter().map(|e| e.txid).collect::<Vec<_>>(),
+            vec![chained_txid, paying_txid]
+        );
+
+        let (second, total_second) = pending_page_from_state(
+            &state,
+            &addr,
+            Network::Bitcoin,
+            true,
+            true,
+            false,
+            &candidates,
+            2,
+            2,
+        );
+        assert_eq!(total_second, 3);
+        assert_eq!(second.iter().map(|e| e.txid).collect::<Vec<_>>(), vec![spending_txid]);
+
+        let (past_end, _) = pending_page_from_state(
+            &state,
+            &addr,
+            Network::Bitcoin,
+            true,
+            true,
+            false,
+            &candidates,
+            10,
+            2,
+        );
+        assert!(past_end.is_empty());
+
+        // None of these carry an alkane or rune action, so the action-filtered
+        // tabs show nothing.
+        let (actions, actions_total) = pending_page_from_state(
+            &state,
+            &addr,
+            Network::Bitcoin,
+            true,
+            true,
+            true,
+            &candidates,
+            0,
+            10,
+        );
+        assert!(actions.is_empty());
+        assert_eq!(actions_total, 0);
     }
 }
