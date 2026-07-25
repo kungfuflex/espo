@@ -215,11 +215,18 @@ impl RemoteEspoClient {
         }
 
         let result = self.call(method, json!({ "p": p }))?;
-        let r = result.get("r").cloned().unwrap_or(Value::Null);
-        let decoded: R = serde_json::from_value(r.clone())
+        // Prefer the opaque-text envelope: it survives intermediaries that
+        // re-serialize JSON and would otherwise turn large u128s into floats.
+        // Fall back to the legacy value envelope for data instances that
+        // predate it.
+        let json = match result.get("r_json").and_then(Value::as_str) {
+            Some(text) => text.to_string(),
+            None => serde_json::to_string(result.get("r").unwrap_or(&Value::Null))
+                .map_err(|e| anyhow!("re-encode result of {method}: {e}"))?,
+        };
+        let decoded: R = serde_json::from_str(&json)
             .map_err(|e| anyhow!("deserialize result of {method}: {e}"))?;
         if let Some(ck) = cache_key {
-            let json = serde_json::to_string(&r).unwrap_or_default();
             let size = json.len();
             if size > 0 && size <= GETTER_CACHE_MAX_ENTRY_BYTES {
                 let mut cache = self.getter_cache.lock().unwrap();
@@ -296,9 +303,11 @@ mod tests {
             assert_eq!(request["method"].as_str(), Some(expected_method));
             assert_eq!(request["params"]["auth"].as_str(), Some("sekrit"));
             assert_eq!(request["params"]["p"]["alkane"]["block"].as_u64(), Some(2));
-            let reply = serde_json::to_string(
-                &json!({ "jsonrpc": "2.0", "id": 1, "result": { "ok": true, "r": reply_r } }),
-            )
+            let reply = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ok": true, "r_json": serde_json::to_string(&reply_r).unwrap() },
+            }))
             .unwrap();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -306,6 +315,25 @@ mod tests {
                 reply
             );
             stream.write_all(response.as_bytes()).expect("write");
+        });
+        format!("http://{addr}")
+    }
+
+    /// Mock that replies with a fixed raw body, so tests can pin exact wire
+    /// forms (including ones serde_json would never produce itself).
+    fn spawn_mock_raw(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut tmp = [0u8; 4096];
+            let _ = stream.read(&mut tmp);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
         });
         format!("http://{addr}")
     }
@@ -347,6 +375,30 @@ mod tests {
             let client = RemoteEspoClient::new(host, None, Duration::ZERO);
             assert_eq!(client.rpc_url(), host);
         }
+    }
+
+    /// A large u128 must survive the round trip exactly. The value envelope
+    /// is text precisely so intermediaries that re-serialize JSON cannot turn
+    /// it into a float (640460000000000000000 -> 6.4046e20), which used to
+    /// make the typed decode fail and silently blank out mint prices.
+    #[test]
+    fn getter_decodes_large_u128_from_text_envelope() {
+        let host = spawn_mock_raw(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true,"r_json":"640460000000000000000"}}"#,
+        );
+        let client = RemoteEspoClient::new(&host, None, Duration::ZERO);
+        let price: u128 = client.getter("internal.demo", &()).expect("decode u128");
+        assert_eq!(price, 640_460_000_000_000_000_000u128);
+    }
+
+    /// The float form a re-serializing proxy produces must be rejected loudly
+    /// rather than silently decoded as something else.
+    #[test]
+    fn float_mangled_u128_fails_to_decode() {
+        let host = spawn_mock_raw(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true,"r":6.4046e20}}"#);
+        let client = RemoteEspoClient::new(&host, None, Duration::ZERO);
+        let err = client.getter::<_, u128>("internal.demo", &()).expect_err("must not decode");
+        assert!(err.to_string().contains("deserialize result"), "got: {err}");
     }
 
     #[test]

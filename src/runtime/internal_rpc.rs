@@ -78,8 +78,15 @@ where
                 };
                 let handle = tokio::task::spawn_blocking(move || f(params));
                 match handle.await {
-                    Ok(Ok(result)) => match serde_json::to_value(&result) {
-                        Ok(r) => json!({ "ok": true, "r": r }),
+                    // The result travels as opaque JSON TEXT ("r_json"), not as
+                    // a JSON value. Getter results carry u128s (prices,
+                    // balances, supplies) that exceed f64's exact range, and any
+                    // intermediary that re-serializes JSON — a proxy, or any
+                    // client whose JSON numbers are doubles — silently rewrites
+                    // them (640460000000000000000 becomes 6.4046e20), after
+                    // which the typed decode fails. Text is immune.
+                    Ok(Ok(result)) => match serde_json::to_string(&result) {
+                        Ok(text) => json!({ "ok": true, "r_json": text }),
                         Err(e) => err("internal_error", &format!("serialize result: {e}")),
                     },
                     Ok(Err(e)) => err("getter_failed", &format!("{e:#}")),
