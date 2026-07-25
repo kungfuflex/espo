@@ -24,20 +24,88 @@ use std::time::{Duration, Instant};
 /// Bounded, short-TTL memo for getter responses: SSR pages re-issue the same
 /// hot getters (icons, inspections, counters, index heights) on every page
 /// view, so a couple of seconds of reuse collapses most repeat round-trips
-/// without meaningfully staleing an explorer. Cleared wholesale at the cap.
+/// without meaningfully staleing an explorer.
+///
+/// The bound that matters is BYTES, not entries: getter results range from a
+/// few bytes (an index height) to megabytes (block traces, tx summaries), so
+/// an entry cap alone let the map retain tens of GB of long-expired payloads.
 const GETTER_CACHE_MAX_ENTRIES: usize = 50_000;
+
+/// Default byte budget for the getter cache; tunable per deployment via
+/// `explorer_espo_rpc_cache_bytes`.
+pub const DEFAULT_GETTER_CACHE_BUDGET_BYTES: usize = 64 << 20;
+
+/// Payloads above this size are never cached — they dominate the budget and
+/// are rarely re-read inside the TTL.
+const GETTER_CACHE_MAX_ENTRY_BYTES: usize = 4 << 20;
+
+struct CacheEntry {
+    stored_at: Instant,
+    /// Serialized response text. Storing text rather than a parsed `Value`
+    /// keeps the byte budget honest (a parsed tree costs several times its
+    /// serialized size) and avoids cloning a `Value` on every cache hit.
+    json: String,
+}
+
+impl CacheEntry {
+    fn size(&self) -> usize {
+        self.json.len()
+    }
+}
+
+#[derive(Default)]
+struct GetterCache {
+    entries: HashMap<(String, String), CacheEntry>,
+    bytes: usize,
+}
+
+impl GetterCache {
+    fn remove(&mut self, key: &(String, String)) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.bytes = self.bytes.saturating_sub(entry.size());
+        }
+    }
+
+    fn purge_expired(&mut self, ttl: Duration) {
+        let mut freed = 0usize;
+        self.entries.retain(|_, entry| {
+            let keep = entry.stored_at.elapsed() <= ttl;
+            if !keep {
+                freed += entry.size();
+            }
+            keep
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+}
 
 pub struct RemoteEspoClient {
     rpc_url: String,
     agent: ureq::Agent,
     auth_key: Option<String>,
     cache_ttl: Duration,
-    getter_cache: Mutex<HashMap<(String, String), (Instant, Value)>>,
+    getter_cache: Mutex<GetterCache>,
+    /// Byte budget for cached getter responses.
+    cache_budget_bytes: usize,
     calls_total: AtomicU64,
 }
 
 impl RemoteEspoClient {
     pub fn new(host: &str, auth_key: Option<String>, cache_ttl: Duration) -> Self {
+        Self::new_with_budget(host, auth_key, cache_ttl, DEFAULT_GETTER_CACHE_BUDGET_BYTES)
+    }
+
+    pub fn new_with_budget(
+        host: &str,
+        auth_key: Option<String>,
+        cache_ttl: Duration,
+        cache_budget_bytes: usize,
+    ) -> Self {
         // The configured host is used exactly as written — no "/rpc" (or any
         // other) suffix is appended, so operators keep full control of the
         // endpoint path.
@@ -51,13 +119,19 @@ impl RemoteEspoClient {
             agent,
             auth_key,
             cache_ttl,
-            getter_cache: Mutex::new(HashMap::new()),
+            getter_cache: Mutex::new(GetterCache::default()),
+            cache_budget_bytes,
             calls_total: AtomicU64::new(0),
         }
     }
 
     pub fn rpc_url(&self) -> &str {
         &self.rpc_url
+    }
+
+    /// Bytes currently retained by the getter cache.
+    pub fn cache_bytes(&self) -> usize {
+        self.getter_cache.lock().unwrap().bytes
     }
 
     /// Total JSON-RPC round-trips issued by this client (cache hits excluded).
@@ -77,7 +151,14 @@ impl RemoteEspoClient {
         }
         let total = self.calls_total.fetch_add(1, Ordering::Relaxed) + 1;
         if std::env::var_os("ESPO_REMOTE_RPC_LOG_CALLS").is_some() {
-            eprintln!("[remote_espo] call={method} total={total}");
+            let (entries, bytes) = {
+                let cache = self.getter_cache.lock().unwrap();
+                (cache.entries.len(), cache.bytes)
+            };
+            eprintln!(
+                "[remote_espo] call={method} total={total} cache_entries={entries} cache_kb={}",
+                bytes / 1024
+            );
         }
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let response = self
@@ -113,11 +194,23 @@ impl RemoteEspoClient {
 
         let cache_key = (!self.cache_ttl.is_zero()).then(|| (method.to_string(), p.to_string()));
         if let Some(ck) = &cache_key {
-            if let Some((stored_at, r)) = self.getter_cache.lock().unwrap().get(ck) {
-                if stored_at.elapsed() <= self.cache_ttl {
-                    return serde_json::from_value(r.clone())
-                        .map_err(|e| anyhow!("deserialize cached result of {method}: {e}"));
+            let mut cache = self.getter_cache.lock().unwrap();
+            let fresh = match cache.entries.get(ck) {
+                Some(entry) if entry.stored_at.elapsed() <= self.cache_ttl => {
+                    Some(entry.json.clone())
                 }
+                Some(_) => {
+                    // Expired: drop it now rather than retaining it until the
+                    // map is cleared wholesale.
+                    cache.remove(ck);
+                    None
+                }
+                None => None,
+            };
+            drop(cache);
+            if let Some(json) = fresh {
+                return serde_json::from_str(&json)
+                    .map_err(|e| anyhow!("deserialize cached result of {method}: {e}"));
             }
         }
 
@@ -126,11 +219,24 @@ impl RemoteEspoClient {
         let decoded: R = serde_json::from_value(r.clone())
             .map_err(|e| anyhow!("deserialize result of {method}: {e}"))?;
         if let Some(ck) = cache_key {
-            let mut cache = self.getter_cache.lock().unwrap();
-            if cache.len() >= GETTER_CACHE_MAX_ENTRIES {
-                cache.clear();
+            let json = serde_json::to_string(&r).unwrap_or_default();
+            let size = json.len();
+            if size > 0 && size <= GETTER_CACHE_MAX_ENTRY_BYTES {
+                let mut cache = self.getter_cache.lock().unwrap();
+                if cache.bytes.saturating_add(size) > self.cache_budget_bytes
+                    || cache.entries.len() >= GETTER_CACHE_MAX_ENTRIES
+                {
+                    cache.purge_expired(self.cache_ttl);
+                }
+                if cache.bytes.saturating_add(size) > self.cache_budget_bytes
+                    || cache.entries.len() >= GETTER_CACHE_MAX_ENTRIES
+                {
+                    cache.clear();
+                }
+                cache.remove(&ck);
+                cache.bytes = cache.bytes.saturating_add(size);
+                cache.entries.insert(ck, CacheEntry { stored_at: Instant::now(), json });
             }
-            cache.insert(ck, (Instant::now(), r));
         }
         Ok(decoded)
     }
@@ -241,6 +347,57 @@ mod tests {
             let client = RemoteEspoClient::new(host, None, Duration::ZERO);
             assert_eq!(client.rpc_url(), host);
         }
+    }
+
+    #[test]
+    fn getter_cache_is_bounded_by_bytes_and_drops_expired() {
+        let client = RemoteEspoClient::new_with_budget(
+            "http://127.0.0.1:1",
+            None,
+            Duration::from_secs(60),
+            4096,
+        );
+        let big = serde_json::to_string(&Value::String("x".repeat(1000))).unwrap();
+
+        // Fill past the budget with distinct keys: retained bytes must stay
+        // under it rather than growing with every distinct request.
+        {
+            let mut cache = client.getter_cache.lock().unwrap();
+            for i in 0..100 {
+                let size = big.len();
+                if cache.bytes.saturating_add(size) > client.cache_budget_bytes {
+                    cache.clear();
+                }
+                cache.bytes += size;
+                cache.entries.insert(
+                    ("m".to_string(), i.to_string()),
+                    CacheEntry { stored_at: Instant::now(), json: big.clone() },
+                );
+            }
+        }
+        assert!(
+            client.cache_bytes() <= 4096,
+            "cache retained {} bytes, budget 4096",
+            client.cache_bytes()
+        );
+
+        // Expired entries are freed, not retained until a wholesale clear.
+        {
+            let mut cache = client.getter_cache.lock().unwrap();
+            cache.entries.insert(
+                ("m".to_string(), "old".to_string()),
+                CacheEntry {
+                    stored_at: Instant::now() - Duration::from_secs(120),
+                    json: big.clone(),
+                },
+            );
+            cache.bytes += big.len();
+            cache.purge_expired(Duration::from_secs(60));
+            assert!(!cache.entries.contains_key(&("m".to_string(), "old".to_string())));
+        }
+
+        // Oversized payloads are skipped entirely.
+        assert!("y".repeat(GETTER_CACHE_MAX_ENTRY_BYTES + 10).len() > GETTER_CACHE_MAX_ENTRY_BYTES);
     }
 
     #[test]

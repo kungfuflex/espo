@@ -121,6 +121,10 @@ fn default_explorer_espo_rpc_cache_ms() -> u64 {
     2000
 }
 
+fn default_explorer_espo_rpc_cache_bytes() -> u64 {
+    crate::runtime::remote_espo::DEFAULT_GETTER_CACHE_BUDGET_BYTES as u64
+}
+
 fn default_explorer_base_path() -> String {
     "/".to_string()
 }
@@ -554,6 +558,8 @@ pub struct ConfigFile {
     pub explorer_espo_events_host: Option<String>,
     #[serde(default = "default_explorer_espo_rpc_cache_ms")]
     pub explorer_espo_rpc_cache_ms: u64,
+    #[serde(default = "default_explorer_espo_rpc_cache_bytes")]
+    pub explorer_espo_rpc_cache_bytes: u64,
     #[serde(default)]
     pub enable_internal_rpc: bool,
     #[serde(default)]
@@ -630,6 +636,7 @@ pub struct AppConfig {
     pub explorer_espo_rpc_key: Option<String>,
     pub explorer_espo_events_host: Option<String>,
     pub explorer_espo_rpc_cache_ms: u64,
+    pub explorer_espo_rpc_cache_bytes: u64,
     pub enable_internal_rpc: bool,
     pub internal_rpc_key: Option<String>,
     pub explorer_base_path: String,
@@ -720,6 +727,7 @@ impl AppConfig {
             explorer_espo_rpc_key: normalize_optional_string(file.explorer_espo_rpc_key),
             explorer_espo_events_host: normalize_optional_string(file.explorer_espo_events_host),
             explorer_espo_rpc_cache_ms: file.explorer_espo_rpc_cache_ms,
+            explorer_espo_rpc_cache_bytes: file.explorer_espo_rpc_cache_bytes,
             enable_internal_rpc: file.enable_internal_rpc,
             internal_rpc_key: normalize_optional_string(file.internal_rpc_key),
             explorer_base_path,
@@ -1121,10 +1129,11 @@ pub fn explorer_remote() -> Option<std::sync::Arc<crate::runtime::remote_espo::R
             let cfg = CONFIG.get()?;
             cfg.explorer_espo_rpc_host.as_deref().map(|host| {
                 eprintln!("[explorer] SSR data source: remote espo getter rpc at {host}");
-                std::sync::Arc::new(crate::runtime::remote_espo::RemoteEspoClient::new(
+                std::sync::Arc::new(crate::runtime::remote_espo::RemoteEspoClient::new_with_budget(
                     host,
                     cfg.explorer_espo_rpc_key.clone(),
                     Duration::from_millis(cfg.explorer_espo_rpc_cache_ms),
+                    cfg.explorer_espo_rpc_cache_bytes as usize,
                 ))
             })
         })

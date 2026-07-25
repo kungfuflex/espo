@@ -19,6 +19,7 @@
   "explorer_espo_rpc_key": null,
   "explorer_espo_events_host": null,
   "explorer_espo_rpc_cache_ms": 2000,
+  "explorer_espo_rpc_cache_bytes": 67108864,
   "enable_internal_rpc": false,
   "internal_rpc_key": null,
   "explorer_base_path": "/",

@@ -36,6 +36,7 @@ fn init_test_config_from_run_sh() {
         explorer_espo_rpc_key: None,
         explorer_espo_events_host: None,
         explorer_espo_rpc_cache_ms: 0,
+        explorer_espo_rpc_cache_bytes: 0,
         enable_internal_rpc: false,
         internal_rpc_key: None,
         explorer_base_path: "/".to_string(),

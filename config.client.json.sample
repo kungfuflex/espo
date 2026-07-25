@@ -6,6 +6,8 @@
   "explorer_espo_rpc_key": "shared-secret",
   "explorer_espo_events_host": "http://data-espo:5081",
 
+  "__cache_note": "explorer_espo_rpc_cache_ms/_bytes bound the getter response cache (defaults 2000ms / 64 MiB of response text). Raise the byte budget for more dedup on high-traffic explorers, or set either to 0 to disable caching.",
+
   "bitcoind_rpc_url": "http://bitcoind:8332",
   "bitcoind_rpc_user": "user",
   "bitcoind_rpc_pass": "pass",
