@@ -11,6 +11,9 @@ pub mod relay;
 
 use std::net::SocketAddr;
 
+use crate::modules::essentials::storage::{EssentialsProvider, GetHoldersOrderedPageParams};
+use crate::modules::runes::storage::RunesProvider;
+use crate::runtime::state_at::StateAt;
 use api::{
     address_chart, alkane_abi_export, alkane_balance_chart, alkane_chart, alkane_holders_export,
     alkane_wasm_export, carousel_blocks, explorer_events_ws, mempool_blocks, minting_price_chart,
@@ -39,9 +42,7 @@ use pages::state::ExplorerState;
 use pages::tx::tx_page;
 use tokio::net::TcpListener;
 
-use crate::config::{
-    get_config, get_espo_next_height, get_explorer_base_path, get_explorer_networks, get_network,
-};
+use crate::config::{get_config, get_explorer_base_path, get_explorer_networks, get_network};
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use components::layout::{favicon, style, waves_light};
 use faucet::{faucet_enabled, faucet_send, faucet_status};
@@ -143,10 +144,41 @@ async fn robots_txt() -> impl IntoResponse {
     let sitemap = current_public_base_url()
         .map(|base| format!("{base}/sitemap.xml"))
         .unwrap_or_else(|| "/sitemap.xml".to_string());
-    let body = format!(
-        "User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /static/\nSitemap: {sitemap}\n"
-    );
+    let body = robots_body(get_explorer_base_path(), &sitemap);
     (StatusCode::OK, [(CONTENT_TYPE, "text/plain; charset=utf-8")], body)
+}
+
+/// Crawlable surface: the English and Chinese homepages, and Alkane token
+/// pages in both locales. Everything else — blocks, transactions, addresses,
+/// runes, docs, search, APIs and assets — is disallowed.
+///
+/// `Allow` beats `Disallow` on longest match, and `$` anchors the end of the
+/// path, so the bare `/$` rule exposes the homepage without exposing every
+/// path beneath it.
+fn robots_body(base_path: &str, sitemap: &str) -> String {
+    let base = base_path.trim_end_matches('/');
+    let path = |suffix: &str| format!("{base}{suffix}");
+    let mut body = String::from("User-agent: *\n");
+    for allow in [
+        path("/$"),
+        path("/zh$"),
+        path("/zh/$"),
+        path("/docs$"),
+        path("/zh/docs$"),
+        path("/alkane/"),
+        path("/zh/alkane/"),
+    ] {
+        body.push_str("Allow: ");
+        body.push_str(&allow);
+        body.push('\n');
+    }
+    body.push_str("Disallow: ");
+    body.push_str(&path("/"));
+    body.push('\n');
+    body.push_str("Sitemap: ");
+    body.push_str(sitemap);
+    body.push('\n');
+    body
 }
 
 async fn sitemap_xml() -> impl IntoResponse {
@@ -162,27 +194,36 @@ async fn sitemap_xml() -> impl IntoResponse {
         }
     };
 
-    let tip = get_espo_next_height().saturating_sub(1) as u64;
-    let latest_start = tip.saturating_sub(49);
-    let mut paths: Vec<String> = vec![
-        "/".to_string(),
-        "/zh".to_string(),
-        "/alkanes".to_string(),
-        "/zh/alkanes".to_string(),
-        "/docs".to_string(),
-        "/zh/docs".to_string(),
-    ];
+    // Crawlable surface only (see robots_body): homepages, docs, and the top
+    // alkanes/runes in both locales. Block pages are deliberately absent —
+    // they churn every block and are disallowed to crawlers.
+    const SITEMAP_TOP_LIMIT: usize = 20;
+    let mut paths: Vec<String> =
+        vec!["/".to_string(), "/zh".to_string(), "/docs".to_string(), "/zh/docs".to_string()];
+
+    let essentials =
+        EssentialsProvider::new(std::sync::Arc::new(crate::config::espo_mdb(b"essentials:")));
+    if let Ok(top_alkanes) = essentials.get_holders_ordered_page(GetHoldersOrderedPageParams {
+        blockhash: StateAt::Latest,
+        offset: 0,
+        limit: SITEMAP_TOP_LIMIT as u64,
+        desc: true,
+    }) {
+        for alkane in top_alkanes.ids {
+            let id = format!("{}:{}", alkane.block, alkane.tx);
+            paths.push(format!("/alkane/{id}"));
+            paths.push(format!("/zh/alkane/{id}"));
+        }
+    }
+
     if runes_enabled_from_global_config() {
-        paths.push("/runes".to_string());
-        paths.push("/zh/runes".to_string());
-    }
-    if faucet_enabled() {
-        paths.push("/faucet".to_string());
-        paths.push("/zh/faucet".to_string());
-    }
-    for height in (latest_start..=tip).rev() {
-        paths.push(format!("/block/{height}"));
-        paths.push(format!("/zh/block/{height}"));
+        let runes = RunesProvider::new(std::sync::Arc::new(crate::config::espo_mdb(b"runes:")));
+        if let Ok(top_runes) = runes.get_top_runes(1, SITEMAP_TOP_LIMIT) {
+            for (entry, _holders) in top_runes {
+                paths.push(format!("/rune/{}", entry.id));
+                paths.push(format!("/zh/rune/{}", entry.id));
+            }
+        }
     }
 
     let mut xml = String::from(
@@ -231,4 +272,36 @@ fn current_public_base_url() -> Option<String> {
     }?;
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+#[cfg(test)]
+mod robots_tests {
+    use super::robots_body;
+
+    #[test]
+    fn allows_only_homepages_and_alkane_pages() {
+        let body = robots_body("/", "https://espo.sh/sitemap.xml");
+        let allows: Vec<&str> =
+            body.lines().filter_map(|line| line.strip_prefix("Allow: ")).collect();
+        assert_eq!(
+            allows,
+            vec!["/$", "/zh$", "/zh/$", "/docs$", "/zh/docs$", "/alkane/", "/zh/alkane/"]
+        );
+        assert!(body.lines().any(|line| line == "Disallow: /"));
+        assert!(body.starts_with("User-agent: *\n"));
+        assert!(body.ends_with("Sitemap: https://espo.sh/sitemap.xml\n"));
+
+        // The anchored homepage rule must not read as a prefix rule that
+        // would expose everything under it.
+        assert!(!allows.contains(&"/"));
+    }
+
+    #[test]
+    fn respects_a_non_root_base_path() {
+        let body = robots_body("/explorer", "https://espo.sh/sitemap.xml");
+        assert!(body.contains("Allow: /explorer/$\n"));
+        assert!(body.contains("Allow: /explorer/zh$\n"));
+        assert!(body.contains("Allow: /explorer/alkane/\n"));
+        assert!(body.contains("Disallow: /explorer/\n"));
+    }
 }
