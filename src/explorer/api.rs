@@ -17,7 +17,6 @@ use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overri
 use crate::explorer::mining_pools::MiningPoolDisplay;
 use crate::explorer::pages::common::{ALKANE_SCALE, fmt_alkane_amount, fmt_scaled_amount};
 use crate::explorer::paths::explorer_path;
-use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::ammdata::storage::{
     AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
@@ -824,12 +823,11 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     let mut seen_runes: HashSet<SchemaRuneId> = HashSet::new();
     let mut txid: Vec<SearchGuessItem> = Vec::new();
     let mut addresses: Vec<SearchGuessItem> = Vec::new();
-    let search_cfg = AmmDataConfig::load_from_global_config().ok();
-    let search_index_enabled = search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
-    let mut search_prefix_min =
-        search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
-    let mut search_prefix_max =
-        search_cfg.as_ref().map(|c| c.search_prefix_max_len as usize).unwrap_or(6);
+    // Resolved from the data instance in client mode (no local modules config).
+    let search_cfg = crate::modules::ammdata::internal_rpc::explorer_amm_config();
+    let search_index_enabled = search_cfg.search_index_enabled;
+    let mut search_prefix_min = search_cfg.search_prefix_min_len as usize;
+    let mut search_prefix_max = search_cfg.search_prefix_max_len as usize;
     if search_prefix_min == 0 {
         search_prefix_min = 2;
     }
@@ -1466,20 +1464,8 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
     let range = normalize_chart_range(q.range.as_deref());
     let (timeframe, limit) = chart_range_params(&range);
 
-    let cfg = match AmmDataConfig::load_from_global_config() {
-        Ok(cfg) => cfg,
-        Err(_) => {
-            return Json(AlkaneChartResponse {
-                ok: true,
-                available: false,
-                range,
-                source: None,
-                quote: None,
-                candles: Vec::new(),
-                error: None,
-            });
-        }
-    };
+    // Resolved from the data instance in client mode (no local modules config).
+    let amm_cfg = crate::modules::ammdata::internal_rpc::explorer_amm_config();
 
     let essentials_mdb = Arc::new(crate::config::espo_mdb(b"essentials:"));
     let essentials_provider = Arc::new(EssentialsProvider::new(essentials_mdb));
@@ -1497,16 +1483,16 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
         let pool = format!("{}-usd", alkane_id_str(&alkane));
         if candles_available(&provider, &pool, timeframe) {
             source = Some("usd".to_string());
-        } else if let Some(derived_cfg) = cfg.derived_liquidity.as_ref() {
-            for entry in &derived_cfg.derived_quotes {
+        } else {
+            for quote_alkane in &amm_cfg.derived_quotes {
                 let pool = format!(
                     "{}-derived_{}-usd",
                     alkane_id_str(&alkane),
-                    alkane_id_str(&entry.alkane)
+                    alkane_id_str(quote_alkane)
                 );
                 if candles_available(&provider, &pool, timeframe) {
                     source = Some("derived".to_string());
-                    quote = Some(alkane_id_str(&entry.alkane));
+                    quote = Some(alkane_id_str(quote_alkane));
                     break;
                 }
             }

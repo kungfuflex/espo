@@ -25,7 +25,6 @@ use crate::explorer::pages::common::{fmt_alkane_amount, format_integer};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{current_language, explorer_path};
 use crate::explorer::phishing::{is_phishing_alkane, phishing_warning_for};
-use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, FRBTC_ALKANE_ID, PRICE_SCALE, SATS_PER_BTC};
 use crate::modules::ammdata::schemas::{SchemaTokenMetricsV1, Timeframe};
 use crate::modules::ammdata::storage::{
@@ -864,11 +863,9 @@ pub async fn alkane_page(
         });
     let token_activity_filtered_by_quote = token_activity_quote_filter.is_some();
 
-    let derived_quotes: Vec<SchemaAlkaneId> = AmmDataConfig::load_from_global_config()
-        .ok()
-        .and_then(|c| c.derived_liquidity)
-        .map(|dl| dl.derived_quotes.into_iter().map(|q| q.alkane).collect())
-        .unwrap_or_default();
+    // Resolved from the data instance in client mode (no local modules config).
+    let derived_quotes: Vec<SchemaAlkaneId> =
+        crate::modules::ammdata::internal_rpc::explorer_amm_config().derived_quotes;
     let is_derived_quote_token = is_diesel;
     let has_prefix = |rel_prefix: Vec<u8>| -> bool {
         amm_provider

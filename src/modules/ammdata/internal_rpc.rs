@@ -119,7 +119,69 @@ pub fn remote_get_list_keys_by_prefix(
 // Server-side registrations.
 // ---------------------------------------------------------------------------
 
+/// The subset of the data instance's ammdata config the explorer needs to
+/// render: which quotes have derived markets (chart availability and the
+/// derived-metrics lookup) and the alkane search-index settings.
+///
+/// Client-mode explorers carry no modules config of their own — they assume
+/// the backend's capabilities — so they read this from the data instance.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct ExplorerAmmConfig {
+    pub derived_quotes: Vec<crate::schemas::SchemaAlkaneId>,
+    pub search_index_enabled: bool,
+    pub search_prefix_min_len: u8,
+    pub search_prefix_max_len: u8,
+}
+
+impl Default for ExplorerAmmConfig {
+    fn default() -> Self {
+        Self {
+            derived_quotes: Vec::new(),
+            search_index_enabled: false,
+            search_prefix_min_len: 2,
+            search_prefix_max_len: 6,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct WireExplorerAmmConfigParams {}
+
+fn local_explorer_amm_config() -> ExplorerAmmConfig {
+    let Ok(cfg) = crate::modules::ammdata::config::AmmDataConfig::load_from_global_config() else {
+        return ExplorerAmmConfig::default();
+    };
+    ExplorerAmmConfig {
+        derived_quotes: cfg
+            .derived_liquidity
+            .as_ref()
+            .map(|dl| dl.derived_quotes.iter().map(|q| q.alkane).collect())
+            .unwrap_or_default(),
+        search_index_enabled: cfg.search_index_enabled,
+        search_prefix_min_len: cfg.search_prefix_min_len,
+        search_prefix_max_len: cfg.search_prefix_max_len,
+    }
+}
+
+/// Resolved for the current deployment: the remote data instance's config in
+/// client mode, this instance's own config otherwise.
+pub fn explorer_amm_config() -> ExplorerAmmConfig {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return remote
+            .getter::<_, ExplorerAmmConfig>(
+                "internal.ammdata_explorer_config",
+                &WireExplorerAmmConfigParams {},
+            )
+            .map_err(|e| eprintln!("[remote] ammdata_explorer_config failed: {e}"))
+            .unwrap_or_default();
+    }
+    local_explorer_amm_config()
+}
+
 pub fn register_internal_getters(reg: &RpcNsRegistrar) {
+    register_getter(reg, "ammdata_explorer_config", |_p: WireExplorerAmmConfigParams| {
+        Ok(local_explorer_amm_config())
+    });
     register_getter(reg, "ammdata_get_latest_btc_usd_price", |p: GetLatestBtcUsdPriceParams| {
         provider_at(p.blockhash).get_latest_btc_usd_price(p)
     });
