@@ -15,9 +15,18 @@ path = "src/main.rs"
 required-features = ["binary"]
 
 [features]
-# Feature that's only available for non-WASM builds
-binary = []
-jemalloc-prof = ["binary", "dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "tikv-jemallocator/profiling"]
+# Feature that's only available for non-WASM builds.
+#
+# The binary always runs on jemalloc: glibc's malloc never returns freed
+# request/block buffers to the OS (per-thread arenas plus a dynamic mmap
+# threshold that ratchets to 32 MiB), so a long-running espo accumulates tens
+# of GB of freed-but-retained heap until it OOMs. `unprefixed_malloc_on_
+# supported_platforms` routes RocksDB's C++ allocations through jemalloc too.
+binary = [
+    "dep:tikv-jemallocator",
+    "tikv-jemallocator/unprefixed_malloc_on_supported_platforms",
+]
+jemalloc-prof = ["binary", "dep:tikv-jemalloc-ctl", "tikv-jemallocator/profiling"]
 test-utils = ["alkanes", "metashrew-runtime", "rockshrew-runtime", "wasmtime", "protorune/test-utils"]
 
 [dependencies]

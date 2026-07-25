@@ -31,6 +31,16 @@ after the binary is built, configure `config.json` (see `sample.config.json`) an
 
 To serve the current database without running the indexer or mempool service, append `--view-only` to the command. This keeps the RPC server (and explorer if enabled) available for read-only access to the existing data.
 
+### Allocator
+
+The binary links jemalloc (including for RocksDB's C++ allocations) and compiles
+its own tuning in - nothing to set at deploy time. This is not optional: under
+glibc's malloc, espo's per-request and per-block buffers are freed but never
+returned to the OS (per-thread arenas that only shrink from the top, plus an
+mmap threshold that ratchets to 32 MiB), so RSS climbs monotonically into tens
+of GB until the process is OOM-killed. `MALLOC_CONF` still overrides the
+compiled defaults, which is how `jemalloc_profile` heap profiling is enabled.
+
 The explorer API documentation can use deployment-specific public hosts. The `hosts` object and each field are optional; omitted values fall back to `https://api.alkanode.com`.
 
 ```json
