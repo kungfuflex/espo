@@ -923,6 +923,12 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     json!({ "ok": true, "outpoint": "ee46dd269ba0f826b0dc9f78de1875fab3ab80983e51e741ffdfa6f3b7d4aef7:0", "items": [{ "alkane": "2:0", "amount": "30950001348973" }] }),
                 ),
                 rpc_doc(
+                    "essentials.get_runtime_balances_metashrew",
+                    "Returns the protocol's runtime balance sheet — Alkanes held by the runtime itself rather than by any outpoint. Takes no parameters; there is one sheet for the whole protocol, and it is always read at the metashrew tip (a `height` is validated like every other method here but does not select a historical sheet). Entries use the same shape as the ones inside get_outpoint_balances, minus the outpoint, and are ordered by Alkane id.",
+                    json!({}),
+                    json!({ "ok": true, "entries": [{ "alkane": "2:0", "amount": "9445870526523" }] }),
+                ),
+                rpc_doc(
                     "essentials.get_block_traces",
                     "Returns Alkane traces indexed for a block height.",
                     json!({ "height": 946000 }),

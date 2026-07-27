@@ -5466,6 +5466,47 @@ impl EssentialsProvider {
         })
     }
 
+    /// The protocol's runtime balance sheet, read straight from metashrew.
+    ///
+    /// Entries carry the same shape as the ones inside `get_outpoint_balances`'
+    /// items — an `alkane` id and a stringified `amount` — minus the outpoint,
+    /// so a caller can parse both the same way. Amounts are u128 and would not
+    /// survive JSON numbers.
+    ///
+    /// Always reflects the metashrew tip: the caller's `height` is resolved for
+    /// consistency with the other methods, but there is no historical sheet to
+    /// select.
+    pub fn rpc_get_runtime_balances_metashrew(
+        &self,
+        _params: RpcGetRuntimeBalancesMetashrewParams,
+    ) -> Result<RpcGetRuntimeBalancesMetashrewResult> {
+        let entries = match get_metashrew().get_runtime_alkane_balances() {
+            Ok(entries) => entries,
+            Err(_) => {
+                return Ok(RpcGetRuntimeBalancesMetashrewResult {
+                    value: json!({"ok": false, "error": "metashrew_error"}),
+                });
+            }
+        };
+
+        let entry_list: Vec<Value> = entries
+            .into_iter()
+            .map(|(alkane, amount)| {
+                json!({
+                    "alkane": format!("{}:{}", alkane.block, alkane.tx),
+                    "amount": amount.to_string()
+                })
+            })
+            .collect();
+
+        Ok(RpcGetRuntimeBalancesMetashrewResult {
+            value: json!({
+                "ok": true,
+                "entries": entry_list
+            }),
+        })
+    }
+
     pub fn rpc_get_block_traces(
         &self,
         params: RpcGetBlockTracesParams,
@@ -7307,6 +7348,13 @@ pub struct RpcGetOutpointBalancesParams {
 }
 
 pub struct RpcGetOutpointBalancesResult {
+    pub value: Value,
+}
+
+/// No parameters: the protocol has exactly one runtime balance sheet.
+pub struct RpcGetRuntimeBalancesMetashrewParams {}
+
+pub struct RpcGetRuntimeBalancesMetashrewResult {
     pub value: Value,
 }
 

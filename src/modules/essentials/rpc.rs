@@ -11,8 +11,9 @@ use crate::modules::essentials::storage::{
     RpcGetBlockTimesParams, RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams,
     RpcGetFactoryChildrenParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
     RpcGetMempoolTracesParams, RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams,
-    RpcGetOrbitalVolumesParams, RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams,
-    RpcGetTransferVolumeParams, RpcPingParams, RpcSearchAlkaneParams, RpcSearchFactoryKeysParams,
+    RpcGetOrbitalVolumesParams, RpcGetOutpointBalancesParams, RpcGetRuntimeBalancesMetashrewParams,
+    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcPingParams, RpcSearchAlkaneParams,
+    RpcSearchFactoryKeysParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
@@ -1061,6 +1062,32 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                         view.rpc_get_outpoint_balances(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_runtime_bal = reg.clone();
+        let mdb_runtime_bal = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_runtime_bal
+                .register("get_runtime_balances_metashrew", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_runtime_bal);
+                    async move {
+                        // Takes no parameters — there is one runtime sheet for
+                        // the whole protocol. The view is still resolved so the
+                        // method is registered like every other one here.
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        view.rpc_get_runtime_balances_metashrew(
+                            RpcGetRuntimeBalancesMetashrewParams {},
+                        )
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;

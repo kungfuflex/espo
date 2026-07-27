@@ -413,24 +413,60 @@ impl MetashrewAdapter {
         outpoint: &OutPoint,
     ) -> Result<Vec<(SupportAlkaneId, u128)>> {
         let ptr = self.outpoint_runes_ptr(db, outpoint)?;
+        self.balance_sheet_from_id_to_balance(db, &ptr)
+    }
+
+    /// Current contents of a protorune balance sheet.
+    ///
+    /// `/id_to_balance` is a map keyed by the 32-byte rune id whose value is
+    /// overwritten on every save, so the latest version of each entry is the
+    /// live balance. This is the authoritative view: the sibling `/runes` and
+    /// `/balances` lists are append-only — every save pushes another pair, so
+    /// they accumulate the entire history (57M entries on mainnet's runtime
+    /// sheet) rather than describing the sheet as it stands.
+    fn balance_sheet_from_id_to_balance(
+        &self,
+        db: &SDB,
+        ptr: &SdbPointer<'_>,
+    ) -> Result<Vec<(SupportAlkaneId, u128)>> {
         let id_base = ptr.keyword("/id_to_balance");
         let walk_prefix = id_base.key_with_label();
 
-        let mut seen_ids: HashSet<Vec<u8>> = HashSet::new();
-        let mut it = db.iterator(IteratorMode::From(&walk_prefix, Direction::Forward));
-        while let Some(Ok((k, _v))) = it.next() {
-            if !k.starts_with(&walk_prefix) {
+        // Collect the ids by seeking from one to the next rather than iterating
+        // every key under the prefix. Each id's value is a version list, and a
+        // heavily written id accumulates one entry per write: the protocol's
+        // runtime sheet has 90M keys under this prefix, 89.9M of them belonging
+        // to a single alkane. Walking them all took ~15s; seeking past each
+        // id's versions visits one key per id.
+        let mut ids: Vec<Vec<u8>> = Vec::new();
+        let mut iter = db.as_db().raw_iterator();
+        let mut probe = walk_prefix.clone();
+        loop {
+            iter.seek(&probe);
+            let Some(key) = iter.key() else {
+                break;
+            };
+            if !key.starts_with(&walk_prefix) {
                 break;
             }
-            let suffix = &k[walk_prefix.len()..];
+            let suffix = &key[walk_prefix.len()..];
             if suffix.len() < 32 {
+                // Shorter than an id: step just past it and carry on.
+                probe = key.to_vec();
+                probe.push(0);
                 continue;
             }
-            seen_ids.insert(suffix[..32].to_vec());
+            let id = suffix[..32].to_vec();
+            // Everything belonging to this id is `<prefix><id>/…`, and `/`
+            // (0x2f) sorts below 0xff, so this lands on the next id.
+            probe = walk_prefix.clone();
+            probe.extend_from_slice(&id);
+            probe.push(0xff);
+            ids.push(id);
         }
 
-        let mut out = Vec::new();
-        for id_bytes in seen_ids {
+        let mut out = Vec::with_capacity(ids.len());
+        for id_bytes in ids {
             let balance = id_base.select(&id_bytes).get_value::<u128>();
             if balance == 0 {
                 continue;
@@ -882,6 +918,19 @@ impl MetashrewAdapter {
             return Ok(map_out);
         }
         let ptr = self.outpoint_runes_ptr(db, &outpoint)?;
+        self.balance_sheet_entries(&ptr, "outpoint")
+    }
+
+    /// Read a protorune balance sheet stored under `ptr`: two index-matched
+    /// lists, `/runes` (ids) and `/balances` (amounts). Zeroed entries are left
+    /// behind in the lists rather than removed, so they are skipped here.
+    ///
+    /// `label` names the sheet in the length-mismatch diagnostics.
+    fn balance_sheet_entries(
+        &self,
+        ptr: &SdbPointer<'_>,
+        label: &str,
+    ) -> Result<Vec<(SupportAlkaneId, u128)>> {
         let runes_base = ptr.keyword("/runes");
         let balances_base = ptr.keyword("/balances");
 
@@ -898,15 +947,16 @@ impl MetashrewAdapter {
         }
         if balances_len < runes_len {
             return Err(anyhow!(
-                "outpoint balance array missing balances: runes_len={} balances_len={}",
+                "{} balance array missing balances: runes_len={} balances_len={}",
+                label,
                 runes_len,
                 balances_len
             ));
         }
         if balances_len > runes_len {
             eprintln!(
-                "[metashrew] outpoint balance arrays: extra balances ignored (runes_len={} balances_len={})",
-                runes_len, balances_len
+                "[metashrew] {} balance arrays: extra balances ignored (runes_len={} balances_len={})",
+                label, runes_len, balances_len
             );
         }
 
@@ -922,6 +972,33 @@ impl MetashrewAdapter {
         }
 
         Ok(out)
+    }
+
+    /// The protocol's runtime balance sheet — alkanes held by the runtime
+    /// itself rather than by any outpoint. There is exactly one, at
+    /// `/runes/proto/<protocol_tag>/runtime/balance`, laid out like an
+    /// outpoint's sheet and read the same way: the `/id_to_balance` map first,
+    /// falling back to the append-only lists only when the map is empty.
+    ///
+    /// Entries are returned ordered by alkane id so repeated calls agree.
+    pub fn get_runtime_alkane_balances_with_db(
+        &self,
+        db: &SDB,
+    ) -> Result<Vec<(SupportAlkaneId, u128)>> {
+        let table = self.rune_table(db);
+        let mut out = self.balance_sheet_from_id_to_balance(db, &table.RUNTIME_BALANCE)?;
+        if out.is_empty() {
+            out = self.balance_sheet_entries(&table.RUNTIME_BALANCE, "runtime")?;
+        }
+        out.sort_by_key(|(alkane, _)| (alkane.block, alkane.tx));
+        Ok(out)
+    }
+
+    pub fn get_runtime_alkane_balances(&self) -> Result<Vec<(SupportAlkaneId, u128)>> {
+        let db = crate::config::try_get_metashrew_sdb()
+            .ok_or_else(|| anyhow!("metashrew database is not configured"))?;
+        db.catch_up_now().context("metashrew catch_up before runtime balances")?;
+        self.get_runtime_alkane_balances_with_db(db.as_ref())
     }
 
     pub fn get_outpoint_alkane_balances(
