@@ -26,14 +26,14 @@ fn rpc_endpoint(configured: Option<&str>) -> String {
     if host.ends_with("/rpc") { host.to_string() } else { format!("{host}/rpc") }
 }
 
-struct ModuleDoc {
-    slug: &'static str,
-    title: &'static str,
-    intro: &'static str,
-    methods: Vec<MethodDoc>,
+pub(super) struct ModuleDoc {
+    pub(super) slug: &'static str,
+    pub(super) title: &'static str,
+    pub(super) intro: &'static str,
+    pub(super) methods: Vec<MethodDoc>,
 }
 
-struct MethodDoc {
+pub(super) struct MethodDoc {
     anchor: String,
     title: String,
     badge: String,
@@ -546,53 +546,13 @@ fn docs_modules() -> Vec<ModuleDoc> {
         ModuleDoc {
             slug: "root-rpc",
             title: "Root JSON-RPC",
-            intro: "Built-in methods available without a module prefix.",
+            intro: "Espo's own built-in methods, available without a module prefix. Proxies onto the Bitcoin backends live under btc.* instead.",
             methods: vec![
                 rpc_doc(
                     "get_espo_height",
                     "Returns the latest Espo indexed height. Use this as the health and freshness check for clients.",
                     json!({}),
                     json!({ "height": 946000 }),
-                ),
-                rpc_doc(
-                    "broadcast_transaction",
-                    "Broadcasts a raw Bitcoin transaction through the configured electrs or Esplora backend, with Bitcoin Core as a fallback.",
-                    json!({ "raw_tx": "0200000001..." }),
-                    json!({ "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90" }),
-                ),
-                rpc_doc(
-                    "fee_estimates",
-                    "Returns precise sat/vB fee recommendations derived from Espo's projected mempool blocks. The fields match mempool.space's precise fee response shape.",
-                    json!({}),
-                    json!({
-                        "fastestFee": 1.017,
-                        "halfHourFee": 0.722,
-                        "hourFee": 0.448,
-                        "economyFee": 0.2,
-                        "minimumFee": 0.1
-                    }),
-                ),
-                rpc_doc(
-                    "get_address",
-                    "Returns the configured electrs/Esplora address summary without changing its field names or response shape. This method requires electrs_esplora_url; native Electrum RPC does not expose the exact aggregate statistics.",
-                    json!({ "address": "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv" }),
-                    json!({
-                        "address": "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv",
-                        "chain_stats": {
-                            "funded_txo_count": 11,
-                            "funded_txo_sum": 15007688098u64,
-                            "spent_txo_count": 5,
-                            "spent_txo_sum": 15007599040u64,
-                            "tx_count": 13
-                        },
-                        "mempool_stats": {
-                            "funded_txo_count": 0,
-                            "funded_txo_sum": 0,
-                            "spent_txo_count": 0,
-                            "spent_txo_sum": 0,
-                            "tx_count": 0
-                        }
-                    }),
                 ),
                 rpc_doc(
                     "get_method_line_chart",
@@ -619,6 +579,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
             ],
         },
+        super::docs_btc::btc_module_doc(),
         ModuleDoc {
             slug: "essentials-rpc",
             title: "Essentials JSON-RPC",
@@ -1845,7 +1806,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
     ]
 }
 
-fn rpc_doc(
+pub(super) fn rpc_doc(
     method: &'static str,
     description: &'static str,
     params: serde_json::Value,

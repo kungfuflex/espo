@@ -4,6 +4,7 @@ pub mod alkanes;
 pub mod block;
 pub mod common;
 pub mod docs;
+pub mod docs_btc;
 pub mod faucet;
 pub mod home;
 pub mod rune;
