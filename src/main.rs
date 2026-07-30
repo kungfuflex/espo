@@ -22,9 +22,37 @@ pub mod schemas;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod utils;
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "jemalloc-prof"))]
+/// espo runs on jemalloc, not the system allocator.
+///
+/// Every request and every indexed block allocates and frees large short-lived
+/// buffers (RPC payload strings, serde trees, tx/outpoint vectors, trace
+/// payloads). glibc's malloc keeps that memory: freed blocks land in one of up
+/// to `8 * ncpu` per-thread arenas, each arena's 64 MiB heaps only shrink when
+/// the *top* of the heap is free, and the dynamic mmap threshold ratchets up to
+/// 32 MiB the first time a large mmap'd block is freed — after which large
+/// allocations come from the arenas and stop being returned to the OS on free.
+/// The result is monotonic RSS growth (hundreds of 64 MiB arena heaps, tens of
+/// GB) that ends in an OOM even though live memory is a small fraction of it.
+///
+/// jemalloc returns unused pages on a timer instead, which holds RSS at the
+/// live working set.
+#[cfg(not(target_arch = "wasm32"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Compiled-in jemalloc configuration, so a deployment needs no environment
+/// variables to get bounded memory:
+/// - `background_thread:true` purges on a dedicated thread rather than only
+///   when an allocating thread happens to notice a decay deadline;
+/// - `dirty_decay_ms:1000` returns dirty pages a second after they go unused;
+/// - `muzzy_decay_ms:0` hands the pages straight back to the OS instead of
+///   parking them in the muzzy state.
+///
+/// `MALLOC_CONF` in the environment still overrides these (the profiling
+/// workflow in `runtime::jemalloc_prof` relies on that).
+#[cfg(not(target_arch = "wasm32"))]
+#[unsafe(export_name = "malloc_conf")]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 use std::net::SocketAddr;
 use std::path::Path;
