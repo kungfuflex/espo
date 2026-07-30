@@ -111,7 +111,13 @@ pub fn protobuf_event_views(trace: &alkanes_pb::AlkanesTrace) -> Vec<CleanEventV
                 };
                 CleanEventView::Return { candidate_data }
             }
-            Some(Event::CreateAlkane(_)) | None => CleanEventView::Other,
+            // CreateAlkane plus the newer develop-branch trace events
+            // (kungfuflex/alkanes-rs: ReceiveIntent / ValueTransfer) do not push
+            // or pop the call stack, so they are Other for invoke/return balancing.
+            Some(Event::CreateAlkane(_))
+            | Some(Event::ReceiveIntent(_))
+            | Some(Event::ValueTransfer(_))
+            | None => CleanEventView::Other,
         })
         .collect()
 }
