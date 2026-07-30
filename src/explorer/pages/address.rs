@@ -36,8 +36,7 @@ use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::essentials::storage::BalanceEntry;
 use crate::modules::essentials::storage::{
     AddressIndexListKind, AlkaneTxSummary, get_address_index_list_len,
-    get_address_index_list_range, load_outpoint_pointer_blob_v3_by_id,
-    load_tx_pointer_blob_v3_by_id, load_tx_summary_v2,
+    get_address_index_list_range, load_tx_pointer_blob_v3_by_id, load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_rows_batch,
@@ -46,9 +45,9 @@ use crate::modules::essentials::utils::balances::{
 use crate::modules::runes::main::runes_enabled_from_global_config;
 use crate::modules::runes::storage::{RunesProvider, TxRuneIo};
 use crate::runtime::mempool::{
-    MempoolBlockTx, MempoolEntry, MempoolProjectedPosition, get_mempool_block_spenders,
-    get_mempool_block_transactions_for_targets, pending_action_entries_for_address,
-    pending_by_txid, pending_for_address,
+    MempoolBlockTx, MempoolProjectedPosition, get_mempool_block_spenders,
+    get_mempool_block_transactions_for_targets, mempool_tx_count, pending_by_txid,
+    pending_page_for_address,
 };
 use crate::runtime::mempool_projection::MempoolProjectionRegistry;
 use crate::runtime::state_at::StateAt;
@@ -197,37 +196,6 @@ fn sandshrew_to_espo_trace(txid: &Txid, trace: &EspoSandshrewLikeTrace) -> Optio
         storage_changes: HashMap::new(),
         outpoint: EspoOutpoint { txid: trace_txid.to_byte_array().to_vec(), vout, tx_spent: None },
     })
-}
-
-fn live_alkane_outpoints_for_address(
-    provider: &crate::modules::essentials::storage::EssentialsProvider,
-    address: &str,
-) -> HashSet<(Txid, u32)> {
-    let outpoint_len = get_address_index_list_len(
-        provider,
-        StateAt::Latest,
-        AddressIndexListKind::OutpointIdx,
-        address,
-    )
-    .unwrap_or(0);
-    if outpoint_len == 0 {
-        return HashSet::new();
-    }
-    get_address_index_list_range(
-        provider,
-        StateAt::Latest,
-        AddressIndexListKind::OutpointIdx,
-        address,
-        0,
-        outpoint_len,
-    )
-    .unwrap_or_default()
-    .into_iter()
-    .filter_map(|id| {
-        let blob = load_outpoint_pointer_blob_v3_by_id(provider, id)?;
-        Some((Txid::from_byte_array(blob.txid), blob.vout))
-    })
-    .collect()
 }
 
 fn aggregate_balances(
@@ -482,50 +450,56 @@ pub async fn address_page(
 
     let off = limit.saturating_mul(page.saturating_sub(1));
     let pending_t0 = Instant::now();
-    let live_alkane_outpoints = if matches!(tx_filter, TxFilter::Action | TxFilter::Alkane) {
-        live_alkane_outpoints_for_address(&state.essentials_provider(), &address_str)
-    } else {
+    // Which mempool transactions touch this address is a question the address
+    // index can answer directly, and it indexes spends as well as receipts.
+    // Deriving it instead from the address's own outpoints meant reading every
+    // outpoint it had ever held — the single reason a busy address's page could
+    // hang for minutes. Skipped entirely when no mempool service is running,
+    // which is the case in client mode.
+    let mempool_txs = mempool_tx_count();
+    let candidate_txids: HashSet<Txid> = if mempool_txs == 0 {
         HashSet::new()
-    };
-    let live_rune_outpoints: HashSet<(Txid, u32)> =
-        if runes_enabled && matches!(tx_filter, TxFilter::Action | TxFilter::Rune) {
-            runes_provider
-                .get_address_outpoints(&address_str)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(txid, vout, _)| (txid, vout))
-                .collect()
-        } else {
-            HashSet::new()
-        };
-    let mut pending_filtered: Vec<MempoolEntry> = if tx_filter == TxFilter::All {
-        pending_for_address(&address_str)
     } else {
-        pending_action_entries_for_address(
+        // Only the Esplora backend can answer this; on Electrum RPC the page
+        // falls back to matching outputs and chained mempool spends alone.
+        electrum_like
+            .address_mempool_txids(&address)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    };
+    let (pending_page, pending_total) = if mempool_txs == 0 {
+        (Vec::new(), 0)
+    } else {
+        pending_page_for_address(
             &address_str,
             state.network,
-            matches!(tx_filter, TxFilter::Action | TxFilter::Alkane),
-            runes_enabled && matches!(tx_filter, TxFilter::Action | TxFilter::Rune),
-            &live_alkane_outpoints,
-            &live_rune_outpoints,
+            matches!(tx_filter, TxFilter::All | TxFilter::Action | TxFilter::Alkane),
+            runes_enabled && matches!(tx_filter, TxFilter::All | TxFilter::Action | TxFilter::Rune),
+            tx_filter != TxFilter::All,
+            &candidate_txids,
+            off,
+            limit,
         )
     };
-    pending_filtered
-        .sort_by(|a, b| b.first_seen.cmp(&a.first_seen).then_with(|| b.txid.cmp(&a.txid)));
-    let pending_total = pending_filtered.len();
     log_address_page_perf(
         &address_str,
         "mempool.pending_for_address",
         pending_t0,
         &format!(
-            "filter={:?} live_alkane_outpoints={} live_rune_outpoints={} pending_filtered={}",
+            "filter={:?} mempool_txs={} candidates={} pending_total={} rendered={}",
             tx_filter,
-            live_alkane_outpoints.len(),
-            live_rune_outpoints.len(),
-            pending_total
+            mempool_txs,
+            candidate_txids.len(),
+            pending_total,
+            pending_page.len()
         ),
     );
-    let pending_set: HashSet<Txid> = pending_filtered.iter().map(|e| e.txid).collect();
+    let pending_set: HashSet<Txid> = candidate_txids
+        .iter()
+        .copied()
+        .chain(pending_page.iter().map(|e| e.txid))
+        .collect();
 
     let mut tx_renders: Vec<AddressTxRender> = Vec::new();
     let mut history_error: Option<String> = None;
@@ -533,13 +507,8 @@ pub async fn address_page(
     let tx_has_prev = page > 1;
     let tx_total: usize;
 
-    let pending_slice_start = off.min(pending_total);
-    let pending_slice_end = (off + limit).min(pending_total);
-    for entry in pending_filtered
-        .iter()
-        .skip(pending_slice_start)
-        .take(pending_slice_end.saturating_sub(pending_slice_start))
-    {
+    // `pending_page` is already the window for this page.
+    for entry in pending_page.iter() {
         tx_renders.push(AddressTxRender {
             txid: entry.txid,
             tx: entry.tx.clone(),
