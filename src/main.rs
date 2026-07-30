@@ -1234,14 +1234,37 @@ async fn main() -> Result<()> {
     }));
     eprintln!("[rpc] listening on {}", addr);
 
-    // Optional SSR explorer server
+    // Optional SSR explorer server.
+    //
+    // The subfrost deployment consumes only espo's backend RPC/view API
+    // (explorer.subfrost.io is our own frontend); it never uses espo's built-in
+    // server-rendered explorer. That SSR frontend is also the OOM-prone path —
+    // its address page walked an address's entire outpoint history per request.
+    // So the SSR listener is gated behind ESPO_EXPLORER_ENABLED and defaults to
+    // OFF here, even when `explorer_host` is configured. run_rpc (above) and the
+    // OylAPI module are unaffected. Set ESPO_EXPLORER_ENABLED=true to restore it.
+    let explorer_enabled = std::env::var("ESPO_EXPLORER_ENABLED")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
     if let Some(explorer_addr) = cfg.explorer_host {
-        service_handles.push(tokio::spawn(async move {
-            if let Err(e) = run_explorer(explorer_addr).await {
-                eprintln!("[explorer] server error: {e:?}");
-            }
-        }));
-        eprintln!("[explorer] listening on {}", explorer_addr);
+        if explorer_enabled {
+            service_handles.push(tokio::spawn(async move {
+                if let Err(e) = run_explorer(explorer_addr).await {
+                    eprintln!("[explorer] server error: {e:?}");
+                }
+            }));
+            eprintln!("[explorer] listening on {}", explorer_addr);
+        } else {
+            eprintln!(
+                "[explorer] SSR frontend disabled (explorer_host={} configured but ESPO_EXPLORER_ENABLED is not set); RPC/view API + OylAPI remain up",
+                explorer_addr
+            );
+        }
     }
 
     let height_cell = Arc::new(AtomicU32::new(start_height));
