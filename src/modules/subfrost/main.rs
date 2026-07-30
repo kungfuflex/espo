@@ -12,11 +12,11 @@ use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceInvokeData,
     EspoSandshrewLikeTraceStatus, EspoSandshrewLikeTraceTransfer,
 };
+use crate::alkanes::utils::clean_espo_sandshrew_like_trace;
 use crate::config::{debug_enabled, get_electrum_like, get_network};
 use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::EssentialsProvider;
-use crate::modules::essentials::utils::balances::clean_espo_sandshrew_like_trace;
 use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;

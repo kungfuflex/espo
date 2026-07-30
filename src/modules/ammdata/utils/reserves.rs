@@ -5,8 +5,8 @@ use crate::{
     alkanes::trace::{
         EspoAlkanesTransaction, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
     },
+    alkanes::utils::clean_espo_sandshrew_like_trace,
     modules::ammdata::schemas::SchemaMarketDefs,
-    modules::essentials::utils::balances::clean_espo_sandshrew_like_trace,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::VecDeque;

@@ -1,6 +1,7 @@
 use crate::alkanes::trace::{
-    EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
+    EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
 };
+use crate::alkanes::utils::clean_espo_sandshrew_like_trace;
 use crate::config::{debug_enabled, get_electrum_like};
 use crate::modules::ammdata::consts::CanonicalQuoteUnit;
 use crate::modules::ammdata::schemas::{
@@ -17,9 +18,7 @@ use crate::modules::essentials::storage::{
     EssentialsProvider, GetCreationIdsInBlockParams, GetCreationRecordParams,
     GetLatestCirculatingSupplyParams, load_tx_summary_v2,
 };
-use crate::modules::essentials::utils::balances::{
-    clean_espo_sandshrew_like_trace, get_alkane_balances,
-};
+use crate::modules::essentials::utils::balances::get_alkane_balances;
 use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
@@ -66,7 +65,12 @@ fn parse_pool_defs_from_creation_summary(
 ) -> Option<(SchemaAlkaneId, SchemaAlkaneId, Option<SchemaAlkaneId>)> {
     let mut stack: Vec<EspoSandshrewLikeTraceShortId> = Vec::new();
     for trace in &summary.traces {
-        for ev in &trace.events {
+        // Stored summaries don't carry their block's host-function values, so
+        // clean with defaults (fuzzy header/coinbase matching still applies);
+        // fall back to the raw events when the trace cannot be rebalanced.
+        let cleaned = clean_espo_sandshrew_like_trace(trace, &EspoHostFunctionValues::default());
+        let events = cleaned.as_ref().map(|t| t.events.as_slice()).unwrap_or(&trace.events);
+        for ev in events {
             match ev {
                 EspoSandshrewLikeTraceEvent::Invoke(inv) => {
                     stack.push(inv.context.myself.clone());

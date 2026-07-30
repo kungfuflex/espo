@@ -2,7 +2,7 @@ use super::{
     MempoolContractRule, add_to_sheet, alkane_id_from_parts, cellpack_from_protostone,
     remove_from_sheet,
 };
-use crate::config::{get_espo_db, get_network};
+use crate::config::get_network;
 use crate::modules::ammdata::consts::get_amm_contract;
 use crate::modules::ammdata::schemas::SchemaPoolSnapshot;
 use crate::modules::ammdata::storage::{
@@ -12,7 +12,6 @@ use crate::modules::essentials::storage::EssentialsProvider;
 use crate::modules::essentials::utils::balances::{
     ContractProjection, ContractProjectionContext, ProjectionSheet,
 };
-use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use std::collections::HashMap;
@@ -513,9 +512,8 @@ impl AmmProjectionRule {
 fn amm_provider() -> &'static AmmDataProvider {
     static PROVIDER: OnceLock<AmmDataProvider> = OnceLock::new();
     PROVIDER.get_or_init(|| {
-        let db = get_espo_db();
-        let amm_mdb = Arc::new(Mdb::from_db(Arc::clone(&db), b"ammdata:"));
-        let essentials_mdb = Arc::new(Mdb::from_db(db, b"essentials:"));
+        let amm_mdb = Arc::new(crate::config::espo_mdb(b"ammdata:"));
+        let essentials_mdb = Arc::new(crate::config::espo_mdb(b"essentials:"));
         AmmDataProvider::new(amm_mdb, Arc::new(EssentialsProvider::new(essentials_mdb)))
     })
 }

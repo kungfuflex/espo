@@ -37,7 +37,7 @@ protobuf-json-mapping = "3.7.2"
 serde_json = "1.0.143"
 borsh = { version = "1.5.7", features = ["derive"] }
 futures = "0.3.31"
-bitcoin = "0.32.7"
+bitcoin = { version = "0.32.7", features = ["serde"] }
 prost = "0.12.6"
 maud = "0.26.0"
 wasm-bindgen = "0.2.121"
@@ -58,6 +58,9 @@ axum = { version = "0.8.4", features = ["ws"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 electrum-client = "0.24.0"
 reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+ureq = { version = "2.12", features = ["json"] }
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "tcp"] }
 tokio-stream = "0.1.17"
 tokio-serde = {version = "0.9.0", features = ["json"]}
@@ -66,7 +69,7 @@ alloy-primitives = "0.8.7"
 bitcoincore-rpc = "0.19.0"
 tower-http = { version = "0.5", features = ["cors"] }
 alkanes-cli-common = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
-alkabi = { git = "https://github.com/bitapeslabs/alkabi-rs", rev = "7dbc691b5945e3f0c88f95cc983f3b9f4e502cee", features = ["extract"] }
+alkabi = { git = "https://github.com/bitapeslabs/alkabi-rs", rev = "56a98f830be4100c666a238986abf05c6c285272", features = ["extract"] }
 zmq = "0.10"
 # P2P mempool driver (always compiled; opt in at runtime via --mempool-p2p). Native-only.
 # Vendored (vendor/qubitcoin/) — a minimal self-contained slice of subfrost/qubitcoin

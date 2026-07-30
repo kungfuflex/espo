@@ -6,13 +6,14 @@ use crate::modules::essentials::storage::{
     RpcGetAlkaneAddressTxsParams, RpcGetAlkaneBalanceMetashrewParams,
     RpcGetAlkaneBalanceTxsByTokenParams, RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams,
     RpcGetAlkaneBlockTxsParams, RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams,
-    RpcGetAlkaneTxSummaryParams, RpcGetAlkaneVolumesParams, RpcGetAllAlkanesParams,
-    RpcGetBlockSummaryParams, RpcGetBlockTimeParams, RpcGetBlockTimesParams,
-    RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams, RpcGetFactoryChildrenParams,
-    RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams,
-    RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams, RpcGetOrbitalVolumesParams,
-    RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams, RpcGetTransferVolumeParams,
-    RpcPingParams, RpcSearchAlkaneParams,
+    RpcGetAlkaneTxSummaryParams, RpcGetAlkaneVolumesParams, RpcGetAlkaneWasmParams,
+    RpcGetAllAlkanesParams, RpcGetBlockSummaryParams, RpcGetBlockTimeParams,
+    RpcGetBlockTimesParams, RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams,
+    RpcGetFactoryChildrenParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
+    RpcGetMempoolTracesParams, RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams,
+    RpcGetOrbitalVolumesParams, RpcGetOutpointBalancesParams, RpcGetRuntimeBalancesMetashrewParams,
+    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcPingParams, RpcSearchAlkaneParams,
+    RpcSearchFactoryKeysParams,
 };
 use crate::runtime::mempool::current_mempool_memory_stats;
 use serde_json::{Value, json};
@@ -239,6 +240,51 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
     }
 
     {
+        let reg_wasm = reg.clone();
+        let mdb_wasm = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_wasm
+                .register("get_alkane_wasm", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_wasm);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(view) => view,
+                            Err(error) => return error,
+                        };
+                        let params = RpcGetAlkaneWasmParams {
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string),
+                            gzip: payload.get("gzip").and_then(|value| value.as_bool()),
+                            resolve: payload
+                                .get("resolve")
+                                .and_then(|value| value.as_bool())
+                                // `no_resolution: true` is accepted as the
+                                // inverse spelling of `resolve: false`.
+                                .or_else(|| {
+                                    payload
+                                        .get("no_resolution")
+                                        .and_then(|value| value.as_bool())
+                                        .map(|no_resolution| !no_resolution)
+                                }),
+                            first_version: payload
+                                .get("first_version")
+                                .and_then(|value| value.as_bool()),
+                        };
+                        tokio::task::spawn_blocking(move || view.rpc_get_alkane_wasm(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
         let reg_factory_children = reg.clone();
         let mdb_factory_children = Arc::clone(&mdb);
         tokio::spawn(async move {
@@ -259,6 +305,46 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.to_string()),
                         };
                         view.rpc_get_factory_children(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_search_factory_keys = reg.clone();
+        let mdb_search_factory_keys = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_search_factory_keys
+                .register("search_factory_keys", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_search_factory_keys);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcSearchFactoryKeysParams {
+                            factory: payload
+                                .get("factory")
+                                .or_else(|| payload.get("factory_alkane"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            conditions: payload
+                                .get("conditions")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| arr.to_vec()),
+                            key: payload.get("key").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            op: payload.get("op").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            value: payload.get("value").cloned(),
+                            try_decode_utf8: payload
+                                .get("try_decode_utf8")
+                                .and_then(|v| v.as_bool()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                        };
+                        view.rpc_search_factory_keys(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -976,6 +1062,32 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                         view.rpc_get_outpoint_balances(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_runtime_bal = reg.clone();
+        let mdb_runtime_bal = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_runtime_bal
+                .register("get_runtime_balances_metashrew", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_runtime_bal);
+                    async move {
+                        // Takes no parameters — there is one runtime sheet for
+                        // the whole protocol. The view is still resolved so the
+                        // method is registered like every other one here.
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        view.rpc_get_runtime_balances_metashrew(
+                            RpcGetRuntimeBalancesMetashrewParams {},
+                        )
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;

@@ -1,0 +1,18 @@
+{
+  "__comment": "Minimal client-mode espo: renders the explorer entirely from a remote (data) espo instance. No local metashrew, no indexing, no mempool service — view-only is implied, no local database is opened (db_path is unused), and no modules section is needed — the client assumes the backend's capabilities (runes UI is on by default; add modules.ammdata.derived_liquidity only if you want chart-annotation parity with the data instance). The data instance must run enable_internal_rpc with internal_rpc_key. explorer_espo_rpc_host is used verbatim as the JSON-RPC endpoint — include the /rpc path.",
+  "network": "mainnet",
+
+  "explorer_espo_rpc_host": "http://data-espo:5780/rpc",
+  "explorer_espo_rpc_key": "shared-secret",
+  "explorer_espo_events_host": "http://data-espo:5081",
+
+  "__cache_note": "explorer_espo_rpc_cache_ms/_bytes bound the getter response cache (defaults 2000ms / 64 MiB of response text). Raise the byte budget for more dedup on high-traffic explorers, or set either to 0 to disable caching.",
+
+  "bitcoind_rpc_url": "http://bitcoind:8332",
+  "bitcoind_rpc_user": "user",
+  "bitcoind_rpc_pass": "pass",
+  "electrs_esplora_url": "http://electrs:4332",
+
+  "port": 5780,
+  "explorer_host": "0.0.0.0:5081"
+}

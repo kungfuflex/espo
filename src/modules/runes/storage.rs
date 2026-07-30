@@ -48,6 +48,8 @@ struct RuneUndoChange {
     PartialOrd,
     Ord,
     Hash,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub struct SchemaRuneId {
     pub block: u64,
@@ -190,7 +192,17 @@ pub struct RuneMintActivity {
     pub success: bool,
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum RuneActivityKind {
     Etch,
     Mint,
@@ -223,7 +235,7 @@ pub struct RuneActivity {
     pub success: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuneActivityScope {
     All,
     Market,
@@ -242,7 +254,7 @@ impl RuneActivityScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuneActivitySortField {
     Timestamp,
     Amount,
@@ -257,13 +269,13 @@ impl RuneActivitySortField {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SortDir {
     Desc,
     Asc,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GetRuneActivityPageParams {
     pub id: SchemaRuneId,
     pub address: Option<String>,
@@ -297,19 +309,19 @@ pub struct RuneActivityPage {
     pub entries: Vec<RuneActivity>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuneBalanceHistoryPoint {
     pub height: u32,
     pub amount: u128,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuneAddressAmountEntry {
     pub address: String,
     pub amount: u128,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RuneVolumeKind {
     TransferVolume,
     TotalReceived,
@@ -390,6 +402,9 @@ impl RunesProvider {
     }
 
     pub fn get_index_height(&self) -> Result<Option<u32>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_index_height(&remote);
+        }
         Ok(self.mdb.get(INDEX_HEIGHT_KEY)?.and_then(|bytes| {
             (bytes.len() == 4).then(|| {
                 let mut arr = [0u8; 4];
@@ -413,6 +428,11 @@ impl RunesProvider {
         &self,
         height: u32,
     ) -> Result<Option<[u8; 32]>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_uncommon_goods_avg_price_paid_usd_by_height(
+                &remote, height,
+            );
+        }
         let Some(bytes) = self.mdb.get(&uncommon_goods_avg_price_usd_by_height_key(height))? else {
             return Ok(None);
         };
@@ -428,6 +448,11 @@ impl RunesProvider {
         &self,
         max_height: u32,
     ) -> Result<Vec<(u32, [u8; 32])>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_uncommon_goods_avg_price_paid_usd_points_through_height(
+                &remote, max_height,
+            );
+        }
         let prefix = uncommon_goods_avg_price_usd_by_height_prefix();
         let entries = self.mdb.scan_prefix_entries(&prefix)?;
         let mut out = Vec::new();
@@ -694,10 +719,16 @@ impl RunesProvider {
     }
 
     pub fn get_rune(&self, id: SchemaRuneId) -> Result<Option<RuneEntry>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_rune(&remote, id);
+        }
         self.get_entry(&entry_key(id))
     }
 
     pub fn get_rune_by_query(&self, query: &str) -> Result<Option<RuneEntry>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_rune_by_query(&remote, query);
+        }
         if let Some(id) = parse_rune_id(query) {
             return self.get_rune(id);
         }
@@ -710,6 +741,11 @@ impl RunesProvider {
     }
 
     pub fn get_runes_by_name_prefix(&self, query: &str, limit: usize) -> Result<Vec<RuneEntry>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_runes_by_name_prefix(
+                &remote, query, limit,
+            );
+        }
         let normalized = normalize_name(query);
         if normalized.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -747,6 +783,11 @@ impl RunesProvider {
         &self,
         address: &str,
     ) -> Result<Vec<(Txid, u32, OutpointRuneBalances)>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_address_outpoints(
+                &remote, address,
+            );
+        }
         let mut rows = Vec::new();
         for key in self.mdb.scan_prefix_keys(&address_outpoint_prefix(address))? {
             let Some((txid, vout)) = decode_address_outpoint_key(address, &key) else {
@@ -777,6 +818,11 @@ impl RunesProvider {
         page: usize,
         limit: usize,
     ) -> Result<Vec<(String, u128)>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_holders(
+                &remote, id, page, limit,
+            );
+        }
         let prefix = holder_prefix(id);
         let mut rows: Vec<(String, u128)> = Vec::new();
         for item in self.mdb.scan_prefix_entries(&prefix)? {
@@ -802,6 +848,11 @@ impl RunesProvider {
         limit: usize,
         desc: bool,
     ) -> Result<Vec<(RuneEntry, u64)>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_runes_by_holders(
+                &remote, page, limit, desc,
+            );
+        }
         let mut rows = Vec::new();
         if limit == 0 {
             return Ok(rows);
@@ -869,6 +920,11 @@ impl RunesProvider {
         limit: usize,
         desc: bool,
     ) -> Result<Vec<(RuneEntry, u64)>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_runes_by_age(
+                &remote, page, limit, desc,
+            );
+        }
         let mut rows = Vec::new();
         for item in self.mdb.scan_prefix_entries(b"/rune/by_id/")? {
             let (_key, value) = item;
@@ -890,14 +946,25 @@ impl RunesProvider {
     }
 
     pub fn get_holders_count(&self, id: SchemaRuneId) -> Result<u64> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_holders_count(&remote, id);
+        }
         Ok(self.mdb.get(&holders_count_key(id))?.and_then(|v| decode_u64(&v)).unwrap_or(0))
     }
 
     pub fn get_rune_count(&self) -> Result<u64> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_rune_count(&remote);
+        }
         Ok(self.mdb.scan_prefix_keys(b"/rune/by_id/")?.len() as u64)
     }
 
     pub fn get_address_balances(&self, address: &str) -> Result<Vec<(SchemaRuneId, u128)>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_address_balances(
+                &remote, address,
+            );
+        }
         let prefix = address_balance_prefix(address);
         let mut out = Vec::new();
         for item in self.mdb.scan_prefix_entries(&prefix)? {
@@ -922,6 +989,11 @@ impl RunesProvider {
         range_max: u32,
         interval: u32,
     ) -> Result<Vec<RuneBalanceHistoryPoint>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_address_balance_history_points(
+                &remote, address, id, range_min, range_max, interval,
+            );
+        }
         if range_min > range_max {
             return Ok(Vec::new());
         }
@@ -1018,6 +1090,11 @@ impl RunesProvider {
         page: usize,
         limit: usize,
     ) -> Result<(usize, Vec<RuneAddressAmountEntry>)> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_volume(
+                &remote, id, kind, page, limit,
+            );
+        }
         let len = self
             .mdb
             .get(&rune_volume_list_len_key(kind, id))?
@@ -1052,6 +1129,11 @@ impl RunesProvider {
         &self,
         params: GetRuneActivityPageParams,
     ) -> Result<RuneActivityPage> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_rune_activity_page(
+                &remote, params,
+            );
+        }
         let prefix = match params.address.as_ref() {
             Some(address) => rune_address_token_activity_index_prefix(
                 address,
@@ -1173,10 +1255,16 @@ impl RunesProvider {
     }
 
     pub fn get_tx_io(&self, txid: &Txid) -> Result<Option<TxRuneIo>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_tx_io(&remote, txid);
+        }
         self.get_entry(&tx_io_key(txid))
     }
 
     pub fn get_block_tx_count(&self, height: u64) -> Result<u64> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_block_tx_count(&remote, height);
+        }
         self.get_tx_index_len(&rune_tx_block_list_key(height))
     }
 
@@ -1186,6 +1274,11 @@ impl RunesProvider {
         start: u64,
         end: u64,
     ) -> Result<Vec<RuneTxPointerBlob>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_block_tx_range(
+                &remote, height, start, end,
+            );
+        }
         self.get_tx_index_pointer_range(
             RuneTxIndexKind::Block,
             &rune_tx_block_list_key(height),
@@ -1195,6 +1288,11 @@ impl RunesProvider {
     }
 
     pub fn get_address_tx_count(&self, address: &str) -> Result<u64> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_address_tx_count(
+                &remote, address,
+            );
+        }
         self.get_tx_index_len(&rune_tx_address_list_key(address))
     }
 
@@ -1204,6 +1302,11 @@ impl RunesProvider {
         start: u64,
         end: u64,
     ) -> Result<Vec<RuneTxPointerBlob>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_address_tx_range(
+                &remote, address, start, end,
+            );
+        }
         self.get_tx_index_pointer_range(
             RuneTxIndexKind::Address,
             &rune_tx_address_list_key(address),
@@ -1213,6 +1316,11 @@ impl RunesProvider {
     }
 
     pub fn get_action_block_tx_count(&self, height: u64) -> Result<u64> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_action_block_tx_count(
+                &remote, height,
+            );
+        }
         self.get_tx_index_len(&action_tx_block_list_key(height))
     }
 
@@ -1222,6 +1330,11 @@ impl RunesProvider {
         start: u64,
         end: u64,
     ) -> Result<Vec<ActionTxPointerBlob>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_action_block_tx_range(
+                &remote, height, start, end,
+            );
+        }
         self.get_action_tx_index_pointer_range(
             RuneTxIndexKind::ActionBlock,
             &action_tx_block_list_key(height),
@@ -1231,6 +1344,11 @@ impl RunesProvider {
     }
 
     pub fn get_action_address_tx_count(&self, address: &str) -> Result<u64> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_action_address_tx_count(
+                &remote, address,
+            );
+        }
         self.get_tx_index_len(&action_tx_address_list_key(address))
     }
 
@@ -1240,6 +1358,11 @@ impl RunesProvider {
         start: u64,
         end: u64,
     ) -> Result<Vec<ActionTxPointerBlob>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_action_address_tx_range(
+                &remote, address, start, end,
+            );
+        }
         self.get_action_tx_index_pointer_range(
             RuneTxIndexKind::ActionAddress,
             &action_tx_address_list_key(address),
@@ -1249,6 +1372,9 @@ impl RunesProvider {
     }
 
     pub fn get_rune_icon(&self, id: SchemaRuneId) -> Result<Option<RuneIcon>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::runes::internal_rpc::remote_get_rune_icon(&remote, id);
+        }
         self.get_entry(&rune_icon_key(id))
     }
 

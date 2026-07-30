@@ -13,13 +13,13 @@ use crate::modules::ammdata::storage::{
     GetAddressPoolBurnsPageParams, GetAddressPoolCreationsPageParams,
     GetAddressPoolMintsPageParams, GetAddressPoolSwapsPageParams, GetAddressTokenSwapsPageParams,
     GetCanonicalPoolPricesParams, GetFactoryPoolsParams, GetIndexHeightParams,
-    GetLatestBtcUsdPriceParams, GetLatestTokenUsdCloseParams, GetListEntriesDescParams,
-    GetPoolActivityEntriesParams, GetPoolCreationInfoParams, GetPoolCreationsPageParams,
-    GetPoolDefsParams, GetPoolFactoryParams, GetPoolIdsByNamePrefixParams,
-    GetPoolLpSupplyLatestParams, GetPoolMetricsParams, GetPoolMetricsV2Params,
-    GetTokenDerivedMetricsByIdParams, GetTokenDerivedMetricsIndexCountParams,
-    GetTokenDerivedMetricsIndexPageParams, GetTokenDerivedMetricsParams,
-    GetTokenDerivedSearchIndexPageParams, GetTokenMetricsByIdParams,
+    GetLatestBtcUsdPriceParams, GetLatestTokenUsdCloseParams, GetListEntriesDescCursorParams,
+    GetListEntriesDescParams, GetPoolActivityEntriesParams, GetPoolCreationInfoParams,
+    GetPoolCreationsPageParams, GetPoolDefsParams, GetPoolFactoryParams,
+    GetPoolIdsByNamePrefixParams, GetPoolLpSupplyLatestParams, GetPoolMetricsParams,
+    GetPoolMetricsV2Params, GetTokenDerivedMetricsByIdParams,
+    GetTokenDerivedMetricsIndexCountParams, GetTokenDerivedMetricsIndexPageParams,
+    GetTokenDerivedMetricsParams, GetTokenDerivedSearchIndexPageParams, GetTokenMetricsByIdParams,
     GetTokenMetricsIndexCountParams, GetTokenMetricsIndexPageParams, GetTokenMetricsParams,
     GetTokenPoolsParams, GetTokenSearchIndexPageParams, GetTokenSwapsPageParams, SearchIndexField,
     TokenMetricsIndexField, decode_full_candle_v1,
@@ -3248,20 +3248,48 @@ fn scale_price_u128(value: u128) -> f64 {
     (value as f64) / (PRICE_SCALE as f64)
 }
 
+/// Daily buckets that can fall inside the 7-day window, plus slack for a
+/// partial bucket at either edge.
+const CANDLE_VOLUME_7D_BUCKETS: usize = 16;
+
+/// Sums a pool's daily candle volumes as a fallback for missing v2 metrics.
+///
+/// `need_all_time` decides how much of the list is read: an all-time sum has to
+/// walk every candle the pool ever produced, but the 7-day sum only needs the
+/// newest buckets. Reading the whole history for a 7-day number is what made
+/// this the dominant cost of `get_all_pools_details` — long-lived pools that
+/// have gone quiet have the largest candle lists and are exactly the ones whose
+/// 7-day volume is zero.
 fn pool_candle_volume_sums(
     blockhash: StateAt,
     state: &OylApiState,
     pool: &SchemaAlkaneId,
     now_ts: u64,
+    need_all_time: bool,
 ) -> Result<(u128, u128, u128, u128)> {
     let bucket_now = bucket_start_for(now_ts, Timeframe::D1);
     let window_start = bucket_now.saturating_sub(6 * Timeframe::D1.duration_secs());
     let table = state.ammdata.table();
     let prefix = table.candle_ns_prefix(pool, Timeframe::D1);
-    let entries = state
-        .ammdata
-        .get_list_entries_desc(GetListEntriesDescParams { blockhash: blockhash.clone(), prefix })?
-        .entries;
+    let entries = if need_all_time {
+        state
+            .ammdata
+            .get_list_entries_desc(GetListEntriesDescParams {
+                blockhash: blockhash.clone(),
+                prefix,
+            })?
+            .entries
+    } else {
+        state
+            .ammdata
+            .get_list_entries_desc_cursor(GetListEntriesDescCursorParams {
+                blockhash: blockhash.clone(),
+                prefix,
+                cursor: None,
+                limit: CANDLE_VOLUME_7D_BUCKETS,
+            })?
+            .entries
+    };
 
     let mut token0_volume_7d = 0u128;
     let mut token1_volume_7d = 0u128;
@@ -3615,7 +3643,14 @@ fn collect_amm_history_items(
         parsed.push(entry);
     }
 
-    let needs_pre_page_filter = successful_only || include_total;
+    // Only `successful_only` needs the activity records of entries outside the
+    // requested page, because success lives in the record rather than the key.
+    // `include_total` does not: the key list has already been read and filtered
+    // by kind, so its length IS the total. Hydrating every historical entry to
+    // produce a count made this the most expensive read in the API (a full
+    // `get_activity_entries` over all AMM history on every request).
+    let parsed_total = parsed.len();
+    let needs_pre_page_filter = successful_only;
     let candidates: Vec<AmmHistoryEntry> = if needs_pre_page_filter {
         parsed
     } else {
@@ -3654,7 +3689,16 @@ fn collect_amm_history_items(
         }
     }
 
-    let total = if include_total { total } else { 0 };
+    let total = if !include_total {
+        0
+    } else if needs_pre_page_filter {
+        total
+    } else {
+        // Counted from the key list. This differs from the hydrated count only
+        // for a listed entry whose activity record is missing, which would be
+        // an indexing inconsistency rather than a normal state.
+        parsed_total
+    };
     Ok((out, total))
 }
 
@@ -4962,8 +5006,11 @@ fn build_pool_details(
     let mut pool_volume_all_time_usd =
         pool_metrics_v2.as_ref().map(|m| m.pool_volume_all_time_usd).unwrap_or(0);
     if pool_volume_7d_usd == 0 || pool_volume_all_time_usd == 0 {
+        // Only walk the full candle history when the all-time sum is the value
+        // actually missing; a missing 7-day sum needs the newest buckets alone.
+        let need_all_time = pool_volume_all_time_usd == 0;
         if let Ok((token0_volume_7d, token1_volume_7d, token0_volume_all, token1_volume_all)) =
-            pool_candle_volume_sums(blockhash.clone(), state, &pool, now_ts)
+            pool_candle_volume_sums(blockhash.clone(), state, &pool, now_ts, need_all_time)
         {
             let use_quote_volume = canonical_units.contains_key(&token1);
             let fallback_7d = if use_quote_volume {

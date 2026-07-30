@@ -1,4 +1,4 @@
-use crate::config::{debug_enabled, get_config, get_espo_db};
+use crate::config::{debug_enabled, get_config};
 use crate::debug;
 use crate::modules::ammdata::consts::ammdata_genesis_block;
 use crate::modules::ammdata::storage::{
@@ -51,11 +51,11 @@ impl EspoModule for OylApi {
     }
 
     fn set_mdb(&mut self, _mdb: Arc<Mdb>) {
-        let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
+        let essentials_mdb = crate::config::espo_mdb(b"essentials:");
         let essentials = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
-        let amm_mdb = Mdb::from_db(get_espo_db(), b"ammdata:");
+        let amm_mdb = crate::config::espo_mdb(b"ammdata:");
         let ammdata = Arc::new(AmmDataProvider::new(Arc::new(amm_mdb), essentials.clone()));
-        let subfrost_mdb = Mdb::from_db(get_espo_db(), b"subfrost:");
+        let subfrost_mdb = crate::config::espo_mdb(b"subfrost:");
         let subfrost = Arc::new(SubfrostProvider::new(Arc::new(subfrost_mdb)));
         self.essentials = Some(essentials);
         self.ammdata = Some(ammdata);

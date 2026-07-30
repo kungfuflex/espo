@@ -1,5 +1,5 @@
 use super::{MempoolContractRule, add_to_sheet, alkane_id_from_parts, cellpack_from_protostone};
-use crate::config::{get_espo_db, get_network};
+use crate::config::get_network;
 use crate::modules::ammdata::consts::FRBTC_ALKANE_ID;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetMultiValuesParams, GetRawValueParams, decode_u128_value,
@@ -7,7 +7,6 @@ use crate::modules::essentials::storage::{
 use crate::modules::essentials::utils::balances::{
     ContractProjection, ContractProjectionContext, ProjectionSheet,
 };
-use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use bitcoin::Network;
@@ -519,8 +518,7 @@ fn lock_multiplier(duration: u128) -> u128 {
 fn essentials_provider() -> &'static EssentialsProvider {
     static PROVIDER: OnceLock<EssentialsProvider> = OnceLock::new();
     PROVIDER.get_or_init(|| {
-        let db = get_espo_db();
-        let essentials_mdb = Arc::new(Mdb::from_db(db, b"essentials:"));
+        let essentials_mdb = Arc::new(crate::config::espo_mdb(b"essentials:"));
         EssentialsProvider::new(essentials_mdb)
     })
 }

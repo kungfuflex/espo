@@ -1,12 +1,12 @@
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceInvokeContext,
-    EspoSandshrewLikeTraceInvokeData, EspoSandshrewLikeTraceShortId, EspoTrace,
-    extract_alkane_storage, protobuf_trace_events,
+    EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
+    EspoSandshrewLikeTraceInvokeContext, EspoSandshrewLikeTraceInvokeData,
+    EspoSandshrewLikeTraceShortId, EspoTrace, extract_alkane_storage, protobuf_trace_events,
 };
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use crate::config::{
-    TraceFormat, get_bitcoind_rpc_client, get_config, get_espo_db, get_last_safe_tip,
-    get_metashrew_rpc_url, get_network, trace_format,
+    TraceFormat, get_bitcoind_rpc_client, get_config, get_last_safe_tip, get_metashrew_rpc_url,
+    get_network, trace_format,
 };
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider};
 use crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch;
@@ -17,7 +17,6 @@ use crate::modules::runes::storage::{
 use crate::modules::runes::transfer::{
     OutputRuneSheets, RuneSheet, RunestoneTransfer, TransferRules,
 };
-use crate::runtime::mdb::Mdb;
 use crate::runtime::shutdown::is_shutdown_requested;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
@@ -534,7 +533,7 @@ fn rune_io_has_activity(io: &TxRuneIo) -> bool {
 fn mempool_runes_provider() -> &'static RunesProvider {
     static PROVIDER: OnceLock<RunesProvider> = OnceLock::new();
     PROVIDER.get_or_init(|| {
-        let mdb = Arc::new(Mdb::from_db(get_espo_db(), b"runes:"));
+        let mdb = Arc::new(crate::config::espo_mdb(b"runes:"));
         RunesProvider::new(mdb)
     })
 }
@@ -599,7 +598,7 @@ fn hex_u128(value: u128) -> String {
 fn mempool_essentials_provider() -> &'static EssentialsProvider {
     static PROVIDER: OnceLock<EssentialsProvider> = OnceLock::new();
     PROVIDER.get_or_init(|| {
-        let mdb = Arc::new(Mdb::from_db(get_espo_db(), b"essentials:"));
+        let mdb = Arc::new(crate::config::espo_mdb(b"essentials:"));
         EssentialsProvider::new(mdb)
     })
 }
@@ -907,7 +906,9 @@ fn diesel_trace_for_tx(
     let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events };
     let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
     let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::default();
-    let storage_changes = extract_alkane_storage(&protobuf_trace, tx).unwrap_or_default();
+    let storage_changes =
+        extract_alkane_storage(&protobuf_trace, tx, &EspoHostFunctionValues::default())
+            .unwrap_or_default();
     Some(vec![EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint }])
 }
 
@@ -943,7 +944,9 @@ fn fast_trace_for_protostone(
     let sandshrew_trace =
         EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events: vec![invoke] };
     let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::default();
-    let storage_changes = extract_alkane_storage(&protobuf_trace, tx).unwrap_or_default();
+    let storage_changes =
+        extract_alkane_storage(&protobuf_trace, tx, &EspoHostFunctionValues::default())
+            .unwrap_or_default();
     let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
 
     Some(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })
@@ -1682,7 +1685,8 @@ fn build_espo_trace(
     let events = protobuf_trace_events(&protobuf_trace)?;
 
     let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events };
-    let storage_changes = extract_alkane_storage(&protobuf_trace, tx)?;
+    let storage_changes =
+        extract_alkane_storage(&protobuf_trace, tx, &EspoHostFunctionValues::default())?;
     let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
 
     Ok(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })

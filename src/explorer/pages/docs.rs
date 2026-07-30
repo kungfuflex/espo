@@ -26,14 +26,14 @@ fn rpc_endpoint(configured: Option<&str>) -> String {
     if host.ends_with("/rpc") { host.to_string() } else { format!("{host}/rpc") }
 }
 
-struct ModuleDoc {
-    slug: &'static str,
-    title: &'static str,
-    intro: &'static str,
-    methods: Vec<MethodDoc>,
+pub(super) struct ModuleDoc {
+    pub(super) slug: &'static str,
+    pub(super) title: &'static str,
+    pub(super) intro: &'static str,
+    pub(super) methods: Vec<MethodDoc>,
 }
 
-struct MethodDoc {
+pub(super) struct MethodDoc {
     anchor: String,
     title: String,
     badge: String,
@@ -497,6 +497,30 @@ fn method_notes(method: &MethodDoc) -> Vec<String> {
             "When top-level config `db_cache` is true, analyzed exports are persisted by network, resolved immutable WASM source, and verification trial count in `${db_path}/cache`. Concurrent misses for the same source and trial count share one job and wait for its cached result.",
         );
     }
+    if method.title == "essentials.get_alkane_wasm" {
+        push_note(
+            &mut notes,
+            "Cache by `sha256` (or `source`) rather than by the requested Alkane id: plain contracts are immutable, but a proxy's resolved `source` changes if its implementation is repointed.",
+        );
+        push_note(
+            &mut notes,
+            "The payload decodes with standard base64; when `encoding` is `base64+gzip`, gunzip the decoded bytes to recover the raw wasm. `sha256` and `length` always describe the raw wasm.",
+        );
+    }
+    if method.title == "essentials.search_factory_keys" {
+        push_note(
+            &mut notes,
+            "An absent key never matches any operator — including `ne` — so contracts that never set the key are excluded rather than treated as \"different value\".",
+        );
+        push_note(
+            &mut notes,
+            "Numeric operators decode the stored value as a little-endian u128 and only match values of 16 bytes or fewer; `eq`/`ne` compare the exact raw bytes. Results are ordered by child id (block, then tx), so pagination is deterministic.",
+        );
+        push_note(
+            &mut notes,
+            "There is deliberately no unscoped variant: the factory requirement keeps the scan bounded to batched point lookups over the factory-children index.",
+        );
+    }
     if combined.contains("include_outpoints") {
         push_note(
             &mut notes,
@@ -522,53 +546,13 @@ fn docs_modules() -> Vec<ModuleDoc> {
         ModuleDoc {
             slug: "root-rpc",
             title: "Root JSON-RPC",
-            intro: "Built-in methods available without a module prefix.",
+            intro: "Espo's own built-in methods, available without a module prefix. Proxies onto the Bitcoin backends live under btc.* instead.",
             methods: vec![
                 rpc_doc(
                     "get_espo_height",
                     "Returns the latest Espo indexed height. Use this as the health and freshness check for clients.",
                     json!({}),
                     json!({ "height": 946000 }),
-                ),
-                rpc_doc(
-                    "broadcast_transaction",
-                    "Broadcasts a raw Bitcoin transaction through the configured electrs or Esplora backend, with Bitcoin Core as a fallback.",
-                    json!({ "raw_tx": "0200000001..." }),
-                    json!({ "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90" }),
-                ),
-                rpc_doc(
-                    "fee_estimates",
-                    "Returns precise sat/vB fee recommendations derived from Espo's projected mempool blocks. The fields match mempool.space's precise fee response shape.",
-                    json!({}),
-                    json!({
-                        "fastestFee": 1.017,
-                        "halfHourFee": 0.722,
-                        "hourFee": 0.448,
-                        "economyFee": 0.2,
-                        "minimumFee": 0.1
-                    }),
-                ),
-                rpc_doc(
-                    "get_address",
-                    "Returns the configured electrs/Esplora address summary without changing its field names or response shape. This method requires electrs_esplora_url; native Electrum RPC does not expose the exact aggregate statistics.",
-                    json!({ "address": "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv" }),
-                    json!({
-                        "address": "1wiz18xYmhRX6xStj2b9t1rwWX4GKUgpv",
-                        "chain_stats": {
-                            "funded_txo_count": 11,
-                            "funded_txo_sum": 15007688098u64,
-                            "spent_txo_count": 5,
-                            "spent_txo_sum": 15007599040u64,
-                            "tx_count": 13
-                        },
-                        "mempool_stats": {
-                            "funded_txo_count": 0,
-                            "funded_txo_sum": 0,
-                            "spent_txo_count": 0,
-                            "spent_txo_sum": 0,
-                            "tx_count": 0
-                        }
-                    }),
                 ),
                 rpc_doc(
                     "get_method_line_chart",
@@ -595,6 +579,7 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
             ],
         },
+        super::docs_btc::btc_module_doc(),
         ModuleDoc {
             slug: "essentials-rpc",
             title: "Essentials JSON-RPC",
@@ -696,10 +681,57 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     }),
                 ),
                 rpc_doc(
+                    "essentials.get_alkane_wasm",
+                    "Returns a contract's WASM bytecode, resolving proxy implementations and factory clones through the same indexed metadata as the explorer's /api/alkane/wasm/export download. The payload is base64-encoded; set gzip to true to compress it first (encoding becomes base64+gzip, typically ~3x smaller). sha256 and length always describe the raw wasm regardless of transport encoding, and source reports which Alkane actually provided the bytecode after resolution — factory clones and proxies sharing one binary resolve to the same source, so caches can dedup and content-address payloads. Set resolve to false (or no_resolution to true) to load exactly what the alkanes runtime's get_alkane_binary would: read /alkanes/{id}, recurse when the payload is a 32-byte factory pointer, otherwise gunzip — no /implementation or /beacon hop, so a proxy returns its own bytecode rather than its implementation's. That mode also loads the CURRENT stored payload, which for upgraded built-ins (DIESEL 2:0, frBTC 32:0, frSIGIL 32:1) is the binary the runtime executes today; pass first_version to get the original payload instead (the default resolved path always reports the first version). The response envelope is identical in both modes.",
+                    json!({ "alkane": "2:0", "gzip": true, "resolve": false }),
+                    json!({
+                        "ok": true,
+                        "alkane": "2:0",
+                        "source": "2:0",
+                        "length": 174225,
+                        "sha256": "58cca703f5462c733975c068c6d1e245cc32941741f4b6e61a468257b4b5ffb6",
+                        "encoding": "base64+gzip",
+                        "payload_length": 63504,
+                        "wasm_base64": "H4sIAAAAAAAC/..."
+                    }),
+                ),
+                rpc_doc(
                     "essentials.get_factory_children",
                     "Returns child Alkane IDs indexed for a factory Alkane. The index is populated from creation records as new blocks are indexed; historical children appear after a reindex.",
                     json!({ "factory": "4:780993" }),
                     json!({ "ok": true, "factory": "4:780993", "children": ["2:80663"] }),
+                ),
+                rpc_doc(
+                    "essentials.search_factory_keys",
+                    "Searches a factory's children for contracts whose storage keys satisfy conditions. Conditions are ANDed and each requires the key to exist: eq and ne compare raw bytes (value as utf8 string or 0x-hex), gt, lt, ge and le decode the stored value as a little-endian u128 (value as decimal or 0x-hex, number or string), and exists matches any present value. A single condition can be passed as top-level key, op and value instead of the conditions array. Matched values are echoed per key in the same shape as get_keys items. Scoped to a factory by design: the scan resolves the factory-children index and does batched point lookups, capped at 8 conditions, 50,000 children and limit 1000.",
+                    json!({
+                        "factory": "4:780993",
+                        "conditions": [
+                            { "key": "/collateral_address", "op": "eq", "value": "bc1q..." },
+                            { "key": "/fire_amount", "op": "gt", "value": "13000000" }
+                        ],
+                        "page": 1,
+                        "limit": 100
+                    }),
+                    json!({
+                        "ok": true,
+                        "factory": "4:780993",
+                        "conditions": [
+                            { "key": "0x2f636f6c6c61746572616c5f61646472657373", "key_str": "/collateral_address", "op": "eq", "value": "0x626331712e2e2e" },
+                            { "key": "0x2f666972655f616d6f756e74", "key_str": "/fire_amount", "op": "gt", "value": "13000000" }
+                        ],
+                        "page": 1,
+                        "limit": 100,
+                        "total": 1,
+                        "has_more": false,
+                        "items": [{
+                            "alkane": "2:80663",
+                            "keys": {
+                                "/collateral_address": { "key_hex": "0x2f636f6c6c61746572616c5f61646472657373", "key_str": "/collateral_address", "value_hex": "0x626331712e2e2e", "value_str": "bc1q...", "value_u128": null, "last_txid": "84ec..." },
+                                "/fire_amount": { "key_hex": "0x2f666972655f616d6f756e74", "key_str": "/fire_amount", "value_hex": "0x406f400100000000", "value_str": null, "value_u128": "21000000", "last_txid": "84ec..." }
+                            }
+                        }]
+                    }),
                 ),
                 rpc_doc(
                     "essentials.get_block_summary",
@@ -850,6 +882,12 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     "Returns Alkane balances assigned to a specific outpoint.",
                     json!({ "outpoint": "ee46dd269ba0f826b0dc9f78de1875fab3ab80983e51e741ffdfa6f3b7d4aef7:0" }),
                     json!({ "ok": true, "outpoint": "ee46dd269ba0f826b0dc9f78de1875fab3ab80983e51e741ffdfa6f3b7d4aef7:0", "items": [{ "alkane": "2:0", "amount": "30950001348973" }] }),
+                ),
+                rpc_doc(
+                    "essentials.get_runtime_balances_metashrew",
+                    "Returns the protocol's runtime balance sheet — Alkanes held by the runtime itself rather than by any outpoint. Takes no parameters; there is one sheet for the whole protocol, and it is always read at the metashrew tip (a `height` is validated like every other method here but does not select a historical sheet). Entries use the same shape as the ones inside get_outpoint_balances, minus the outpoint, and are ordered by Alkane id.",
+                    json!({}),
+                    json!({ "ok": true, "entries": [{ "alkane": "2:0", "amount": "9445870526523" }] }),
                 ),
                 rpc_doc(
                     "essentials.get_block_traces",
@@ -1734,10 +1772,41 @@ fn docs_modules() -> Vec<ModuleDoc> {
             intro: "HTTP and websocket endpoints used by the explorer interface.",
             methods: explorer_http_docs(),
         },
+        ModuleDoc {
+            slug: "internal-rpc",
+            title: "Internal getter RPC",
+            intro: "Getter-level RPC methods that let a remote espo explorer (configured with explorer_espo_rpc_host, which is used verbatim as the endpoint URL and so must include the /rpc path) render entirely from RPC calls against this instance: every storage getter the explorer uses is mirrored as internal.<module>_<getter>, so one getter invocation is exactly one round-trip carrying the getter's full native result. Requests carry the getter's native params struct as \"p\" (serde JSON; blockhash pins versioned state) and responses return the native result as \"r\" — simple results as plain JSON, heavy nested results (creation records, block summaries, tx summaries, pointer blobs, holder pages, rune entries) as hex-encoded Borsh in *_borsh fields, the same encoding they are stored with. Registered only when enable_internal_rpc is true, which requires internal_rpc_key: every request must carry the key as \"auth\" or it is rejected with unauthorized (the remote explorer sends it automatically from explorer_espo_rpc_key). These methods exist for trusted explorer replicas — keep them off untrusted public endpoints. The full method list mirrors the getter names in each module's internal_rpc.rs (essentials, runes, ammdata, tokendata, pizzafun, subfrost) plus internal.tree_blockhash_for_height and internal.tree_indexed_height_bounds.",
+            methods: vec![
+                rpc_doc(
+                    "internal.essentials_get_holders_count",
+                    "Representative example of a simple getter: native params in, native result out as plain JSON.",
+                    json!({ "auth": "<internal_rpc_key>", "p": { "blockhash": "Latest", "alkane": { "block": 2, "tx": 0 } } }),
+                    json!({ "ok": true, "r": { "count": 6409 } }),
+                ),
+                rpc_doc(
+                    "internal.essentials_get_creation_records_ordered_page",
+                    "Representative example of a heavy getter: the result rows are hex-encoded Borsh in the stored encoding.",
+                    json!({ "auth": "<internal_rpc_key>", "p": { "blockhash": "Latest", "offset": 0, "limit": 2, "desc": true } }),
+                    json!({ "ok": true, "r": { "records": ["01a3f2…", "01b871…"] } }),
+                ),
+                rpc_doc(
+                    "internal.tree_blockhash_for_height",
+                    "Resolves an indexed height to its canonical blockhash (internal byte order, hex); remote explorers use it for height-pinned views.",
+                    json!({ "auth": "<internal_rpc_key>", "p": { "height": 946000 } }),
+                    json!({ "ok": true, "r": { "blockhash": "0000000000000000000000000000000000000000000000000000000000000000" } }),
+                ),
+                rpc_doc(
+                    "internal.tree_indexed_height_bounds",
+                    "Returns the (min, max) indexed heights of the versioned tree, or null when nothing is indexed.",
+                    json!({ "auth": "<internal_rpc_key>", "p": {} }),
+                    json!({ "ok": true, "r": { "bounds": [880000, 946000] } }),
+                ),
+            ],
+        },
     ]
 }
 
-fn rpc_doc(
+pub(super) fn rpc_doc(
     method: &'static str,
     description: &'static str,
     params: serde_json::Value,

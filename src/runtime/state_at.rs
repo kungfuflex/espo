@@ -1,6 +1,6 @@
 use bitcoin::BlockHash;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum StateAt {
     Latest,
     Block(BlockHash),

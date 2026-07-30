@@ -1,5 +1,6 @@
 pub mod config;
 pub mod consts;
+pub mod internal_rpc;
 pub mod main;
 pub mod price_feeds;
 pub mod rpc;

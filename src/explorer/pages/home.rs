@@ -4,7 +4,6 @@ use axum::extract::State;
 use axum::response::Html;
 use bitcoin::Txid;
 use bitcoin::hashes::Hash;
-use borsh::BorshDeserialize;
 use maud::{Markup, html};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -22,8 +21,8 @@ use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summari
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    AlkaneTxSummary, EssentialsProvider, EssentialsTable, GetHoldersOrderedPageParams,
-    HoldersCountEntry, load_creation_record, load_tx_summary_v2,
+    AlkaneTxSummary, EssentialsProvider, GetHoldersOrderedPageParams, load_creation_record,
+    load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
 use crate::modules::runes::main::runes_enabled_from_global_config;
@@ -45,7 +44,6 @@ fn load_top_alkanes_by_holders(
         return rows;
     }
 
-    let table = EssentialsTable::new(mdb);
     let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
     let ids = provider
         .get_holders_ordered_page(GetHoldersOrderedPageParams {
@@ -61,12 +59,12 @@ fn load_top_alkanes_by_holders(
             break;
         }
         let Some(rec) = load_creation_record(mdb, &alk).ok().flatten() else { continue };
-        let holders = mdb
-            .get(&table.holders_count_key(&alk))
-            .ok()
-            .flatten()
-            .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
-            .map(|hc| hc.count)
+        let holders = provider
+            .get_holders_count(crate::modules::essentials::storage::GetHoldersCountParams {
+                blockhash: StateAt::Latest,
+                alkane: alk,
+            })
+            .map(|r| r.count)
             .unwrap_or(0);
 
         let id = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
@@ -124,37 +122,18 @@ fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<A
         return out;
     }
 
-    let table = EssentialsTable::new(mdb);
-    let mut txid_vals: Vec<Option<Vec<u8>>> = Vec::new();
-
-    // Newer layout: /alkane_latest_traces/v2/{length,idx}
-    let len = mdb
-        .get(&table.latest_traces_length_key())
-        .ok()
-        .flatten()
-        .and_then(|b| {
-            if b.len() == 4 {
-                let mut arr = [0u8; 4];
-                arr.copy_from_slice(&b);
-                Some(u32::from_le_bytes(arr))
-            } else {
-                None
-            }
+    let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
+    // Newer layout: /alkane_latest_traces/v2/{length,idx}, read via the getter.
+    let txid_vals: Vec<Option<Vec<u8>>> = provider
+        .get_latest_trace_txids(crate::modules::essentials::storage::GetLatestTraceTxidsParams {
+            blockhash: StateAt::Latest,
         })
-        .unwrap_or(0);
-    if len > 0 {
-        let mut keys = Vec::with_capacity(len as usize);
-        for idx in 0..len {
-            keys.push(table.latest_traces_idx_key(idx));
-        }
-        txid_vals = mdb.multi_get(&keys).unwrap_or_default();
-    }
+        .map(|r| r.txids.into_iter().map(Some).collect())
+        .unwrap_or_default();
 
     if txid_vals.is_empty() {
         return out;
     }
-
-    let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
 
     for v in txid_vals {
         if out.len() >= limit {

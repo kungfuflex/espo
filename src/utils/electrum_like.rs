@@ -69,6 +69,11 @@ pub trait ElectrumLike: Send + Sync {
     fn backend(&self) -> ElectrumLikeBackend;
     fn batch_transaction_get_raw(&self, txids: &[Txid]) -> Result<Vec<Vec<u8>>>;
     fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>>;
+    /// A transaction in the address-index's own JSON shape, paired with its raw
+    /// hex, or `None` when the index has never seen it. The JSON is passed
+    /// through untouched so callers get whatever the backend reports —
+    /// prevouts, fee, status — rather than an espo-flavoured subset.
+    fn transaction_details(&self, txid: &Txid) -> Result<Option<(serde_json::Value, String)>>;
     fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid>;
     fn tip_height(&self) -> Result<u32>;
     fn transaction_get_outspends(&self, txid: &Txid) -> Result<Vec<Option<Txid>>>;
@@ -116,6 +121,12 @@ impl ElectrumLike for ElectrumRpcClient {
 
     fn transaction_get_raw(&self, txid: &Txid) -> Result<Vec<u8>> {
         self.client.transaction_get_raw(txid).context("electrum transaction_get_raw")
+    }
+
+    fn transaction_details(&self, _txid: &Txid) -> Result<Option<(serde_json::Value, String)>> {
+        bail!(
+            "transaction details require an electrs/esplora HTTP backend; electrum RPC is not supported"
+        )
     }
 
     fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid> {
@@ -268,6 +279,48 @@ impl EsploraElectrumLike {
 
         let bytes = resp.bytes().await.context("esplora response body read failed")?;
         Ok((idx, bytes.to_vec()))
+    }
+
+    /// `/tx/{txid}` for the JSON and `/tx/{txid}/hex` for the raw hex. A 404
+    /// from either means esplora has no such transaction, confirmed or in the
+    /// mempool, which is a `None` rather than an error.
+    async fn fetch_transaction_details(
+        &self,
+        txid: &Txid,
+    ) -> Result<Option<(serde_json::Value, String)>> {
+        let url = format!("{}/tx/{}", self.base_url, txid);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("esplora GET {url} failed"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("esplora GET {url} returned error status"))?;
+        let body = resp.text().await.context("esplora tx body read failed")?;
+        let tx: serde_json::Value =
+            serde_json::from_str(&body).context("esplora tx json decode failed")?;
+
+        let hex_url = format!("{}/tx/{}/hex", self.base_url, txid);
+        let hex_resp = self
+            .http
+            .get(&hex_url)
+            .send()
+            .await
+            .with_context(|| format!("esplora GET {hex_url} failed"))?;
+        if hex_resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let hex_resp = hex_resp
+            .error_for_status()
+            .with_context(|| format!("esplora GET {hex_url} returned error status"))?;
+        let raw_hex = hex_resp.text().await.context("esplora tx hex body read failed")?;
+
+        Ok(Some((tx, raw_hex.trim().to_string())))
     }
 
     async fn broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid> {
@@ -445,6 +498,10 @@ impl ElectrumLike for EsploraElectrumLike {
             let (_, raw) = self.fetch_one_indexed(0, txid).await?;
             Ok(raw)
         })
+    }
+
+    fn transaction_details(&self, txid: &Txid) -> Result<Option<(serde_json::Value, String)>> {
+        self.block_on_result(self.fetch_transaction_details(txid))
     }
 
     fn transaction_broadcast_raw(&self, raw_tx: &[u8]) -> Result<Txid> {

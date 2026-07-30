@@ -7,8 +7,9 @@ use crate::alkanes::trace::{
     EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
     EspoSandshrewLikeTraceStatus, EspoTrace,
 };
+use crate::alkanes::utils::clean_espo_sandshrew_like_trace;
 use crate::config::{
-    debug_enabled, get_electrum_like, get_espo_db, get_metashrew, get_metashrew_sdb, get_network,
+    debug_enabled, get_electrum_like, get_metashrew, get_metashrew_sdb, get_network,
     strict_check_alkane_balances, strict_check_trace_mismatches, strict_check_utxos,
 };
 use crate::debug;
@@ -40,7 +41,6 @@ use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result, anyhow};
-use bitcoin::block::Header;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Transaction, Txid};
@@ -111,7 +111,7 @@ struct TraceSourceFlow {
 
 fn ammdata_mdb() -> Arc<Mdb> {
     AMMDATA_MDB
-        .get_or_init(|| Arc::new(Mdb::from_db(get_espo_db(), b"ammdata:")))
+        .get_or_init(|| Arc::new(crate::config::espo_mdb(b"ammdata:")))
         .clone()
 }
 
@@ -226,144 +226,8 @@ mod balance_delta_tests {
     }
 }
 
-pub(crate) fn clean_espo_sandshrew_like_trace(
-    trace: &EspoSandshrewLikeTrace,
-    host_function_values: &EspoHostFunctionValues,
-) -> Option<EspoSandshrewLikeTrace> {
-    let mut invokes = 0usize;
-    let mut returns = 0usize;
-    for ev in &trace.events {
-        match ev {
-            EspoSandshrewLikeTraceEvent::Invoke(_) => invokes += 1,
-            EspoSandshrewLikeTraceEvent::Return(_) => returns += 1,
-            EspoSandshrewLikeTraceEvent::Create(_) => {}
-        }
-    }
-
-    if invokes == returns {
-        return Some(trace.clone());
-    }
-    if returns < invokes {
-        return None;
-    }
-
-    let (header, coinbase, diesel, fee) = host_function_values;
-    let host_values: [&[u8]; 4] = [header, coinbase, diesel, fee];
-    let mismatch = returns.saturating_sub(invokes);
-
-    let decode_data = |data: &str| -> Option<Vec<u8>> {
-        let trimmed = data.strip_prefix("0x").unwrap_or(data);
-        if trimmed.is_empty() {
-            return Some(Vec::new());
-        }
-        hex::decode(trimmed).ok()
-    };
-
-    let host_match = |data_bytes: &[u8]| -> bool {
-        for host_bytes in host_values.iter() {
-            if data_bytes == *host_bytes {
-                return true;
-            }
-        }
-        false
-    };
-
-    let fuzzy_host_match = |data_bytes: &[u8]| -> bool {
-        if data_bytes.len() == 80 && deserialize::<Header>(data_bytes).is_ok() {
-            return true;
-        }
-        if let Ok(tx) = deserialize::<Transaction>(data_bytes) {
-            if tx.is_coinbase() {
-                return true;
-            }
-        }
-        false
-    };
-
-    let attempt_clean = |allow_fuzzy: bool| -> Option<EspoSandshrewLikeTrace> {
-        let mut remove_indices: HashSet<usize> = HashSet::new();
-        let mut candidate_stack: Vec<usize> = Vec::new();
-        let mut total_candidates = 0usize;
-        let mut depth: isize = 0;
-
-        for (idx, ev) in trace.events.iter().enumerate() {
-            match ev {
-                EspoSandshrewLikeTraceEvent::Invoke(_) => {
-                    depth += 1;
-                }
-                EspoSandshrewLikeTraceEvent::Return(ret) => {
-                    let mut is_candidate = false;
-                    if ret.status == EspoSandshrewLikeTraceStatus::Success
-                        && ret.response.alkanes.is_empty()
-                        && ret.response.storage.is_empty()
-                    {
-                        if let Some(data_bytes) = decode_data(&ret.response.data) {
-                            if host_match(&data_bytes) {
-                                is_candidate = true;
-                            } else if allow_fuzzy && fuzzy_host_match(&data_bytes) {
-                                is_candidate = true;
-                            }
-                        }
-                    }
-                    if is_candidate {
-                        total_candidates += 1;
-                        candidate_stack.push(idx);
-                    }
-
-                    depth -= 1;
-                    if depth < 0 {
-                        let Some(remove_idx) = candidate_stack.pop() else {
-                            return None;
-                        };
-                        remove_indices.insert(remove_idx);
-                        depth += 1;
-                    }
-                }
-                EspoSandshrewLikeTraceEvent::Create(_) => {}
-            }
-        }
-
-        if total_candidates < mismatch || remove_indices.len() != mismatch {
-            return None;
-        }
-
-        let mut cleaned_events =
-            Vec::with_capacity(trace.events.len().saturating_sub(remove_indices.len()));
-        for (idx, ev) in trace.events.iter().enumerate() {
-            if !remove_indices.contains(&idx) {
-                cleaned_events.push(ev.clone());
-            }
-        }
-
-        let mut cleaned_invokes = 0usize;
-        let mut cleaned_returns = 0usize;
-        let mut cleaned_depth: isize = 0;
-        for ev in &cleaned_events {
-            match ev {
-                EspoSandshrewLikeTraceEvent::Invoke(_) => {
-                    cleaned_invokes += 1;
-                    cleaned_depth += 1;
-                }
-                EspoSandshrewLikeTraceEvent::Return(_) => {
-                    cleaned_returns += 1;
-                    cleaned_depth -= 1;
-                    if cleaned_depth < 0 {
-                        return None;
-                    }
-                }
-                EspoSandshrewLikeTraceEvent::Create(_) => {}
-            }
-        }
-        if cleaned_invokes != cleaned_returns || cleaned_depth != 0 {
-            return None;
-        }
-
-        Some(EspoSandshrewLikeTrace { outpoint: trace.outpoint.clone(), events: cleaned_events })
-    };
-
-    attempt_clean(false).or_else(|| attempt_clean(true))
-}
-
+// clean_espo_sandshrew_like_trace moved to crate::alkanes::utils so every
+// module that walks trace events as a call stack shares one implementation.
 fn parse_u128_from_str(input: &str) -> Option<u128> {
     if let Some(hex) = input.strip_prefix("0x") {
         u128::from_str_radix(hex, 16).ok()
@@ -6577,6 +6441,27 @@ pub fn bulk_update_balances_for_block_with_factory_hints(
 }
 
 fn lookup_self_balance(alk: &SchemaAlkaneId) -> Option<u128> {
+    // Remote-explorer deployments have no local metashrew; ask the remote
+    // espo's equivalent getter RPC for the self-balance instead.
+    if let Some(remote) = crate::config::explorer_remote() {
+        let id = format!("{}:{}", alk.block, alk.tx);
+        return match remote.call(
+            "essentials.get_alkane_balance_metashrew",
+            serde_json::json!({ "owner": id, "alkane": id }),
+        ) {
+            Ok(result) => result
+                .get("balance")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u128>().ok()),
+            Err(e) => {
+                eprintln!(
+                    "[balances] WARN: remote self-balance lookup failed for {}:{} ({e})",
+                    alk.block, alk.tx
+                );
+                None
+            }
+        };
+    }
     match get_metashrew().get_reserves_for_alkane(alk, alk, None) {
         Ok(val) => val,
         Err(e) => {
@@ -6594,6 +6479,13 @@ pub fn get_balance_for_address(
     provider: &EssentialsProvider,
     address: &str,
 ) -> Result<HashMap<SchemaAlkaneId, u128>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_balance_for_address(
+            &remote,
+            provider.effective_wire_state(blockhash),
+            address,
+        );
+    }
     let table = provider.table();
     let len = provider
         .get_raw_value(GetRawValueParams {
@@ -6661,6 +6553,13 @@ pub fn get_alkane_balances(
     provider: &EssentialsProvider,
     owner: &SchemaAlkaneId,
 ) -> Result<HashMap<SchemaAlkaneId, u128>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_alkane_balances(
+            &remote,
+            provider.effective_wire_state(blockhash),
+            owner,
+        );
+    }
     let table = provider.table();
     let mut agg: HashMap<SchemaAlkaneId, u128> = HashMap::new();
     let len = provider
@@ -6738,6 +6637,14 @@ pub fn get_alkane_balances_at_or_before(
     owner: &SchemaAlkaneId,
     height: u32,
 ) -> Result<(HashMap<SchemaAlkaneId, u128>, Option<u32>)> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_alkane_balances_at_or_before(
+            &remote,
+            provider.effective_wire_state(blockhash),
+            owner,
+            height,
+        );
+    }
     let table = provider.table();
     let mut agg = HashMap::new();
     let mut resolved_height: Option<u32> = None;
@@ -6979,6 +6886,14 @@ pub fn get_outpoint_balances_with_spent(
     txid: &Txid,
     vout: u32,
 ) -> Result<OutpointLookup> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_outpoint_balances_with_spent(
+            &remote,
+            provider.effective_wire_state(blockhash),
+            txid,
+            vout,
+        );
+    }
     let spent_by = resolve_outpoint_spent_by_v2(provider, txid, vout, blockhash)?;
     let row = load_outpoint_row_v2(provider, txid, vout, blockhash)?;
     let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
@@ -6994,6 +6909,13 @@ pub fn get_outpoint_rows_batch(
     provider: &EssentialsProvider,
     outpoints: &[(Txid, u32)],
 ) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_outpoint_rows_batch(
+            &remote,
+            provider.effective_wire_state(blockhash),
+            outpoints,
+        );
+    }
     let table = provider.table();
     let ids = resolve_outpoint_ids_batch_v2(provider, blockhash, outpoints)?;
     let mut unique_ids: Vec<u64> = Vec::new();
@@ -7041,6 +6963,13 @@ pub fn get_outpoint_balances_with_spent_batch(
     provider: &EssentialsProvider,
     outpoints: &[(Txid, u32)],
 ) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_outpoint_balances_with_spent_batch(
+            &remote,
+            provider.effective_wire_state(blockhash),
+            outpoints,
+        );
+    }
     let table = provider.table();
     let ids = resolve_outpoint_ids_batch_v2(provider, blockhash, outpoints)?;
     let mut unique_ids: Vec<u64> = Vec::new();
@@ -7100,6 +7029,15 @@ pub fn get_holders_for_alkane(
     page: usize,
     limit: usize,
 ) -> Result<(usize /*total*/, u128 /*supply*/, Vec<HolderEntry>)> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_holders_for_alkane(
+            &remote,
+            provider.effective_wire_state(blockhash),
+            alk,
+            page,
+            limit,
+        );
+    }
     let table = provider.table();
     let len = provider
         .get_raw_value(GetRawValueParams { blockhash, key: table.holder_list_len_key(&alk) })?
@@ -7384,6 +7322,15 @@ pub fn get_transfer_volume_for_alkane(
     page: usize,
     limit: usize,
 ) -> Result<(usize, Vec<AddressAmountEntry>)> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_transfer_volume_for_alkane(
+            &remote,
+            provider.effective_wire_state(blockhash),
+            alk,
+            page,
+            limit,
+        );
+    }
     let table = provider.table();
     read_address_amount_prefix_page(
         blockhash,
@@ -7401,6 +7348,15 @@ pub fn get_total_received_for_alkane(
     page: usize,
     limit: usize,
 ) -> Result<(usize, Vec<AddressAmountEntry>)> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return crate::modules::essentials::internal_rpc::remote_get_total_received_for_alkane(
+            &remote,
+            provider.effective_wire_state(blockhash),
+            alk,
+            page,
+            limit,
+        );
+    }
     let table = provider.table();
     read_address_amount_prefix_page(
         blockhash,

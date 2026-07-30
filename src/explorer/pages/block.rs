@@ -400,10 +400,8 @@ pub async fn block_page(
         .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
         .unwrap_or(false);
     let runes_provider = RunesProvider::new(Arc::new(state.runes_mdb.clone()));
-    let tokendata_provider = TokenDataProvider::new(Arc::new(crate::runtime::mdb::Mdb::from_db(
-        crate::config::get_espo_db(),
-        b"tokendata:",
-    )));
+    let tokendata_provider =
+        TokenDataProvider::new(Arc::new(crate::config::espo_mdb(b"tokendata:")));
     let canonical_path = format!("/block/{height}");
 
     let block_hash = match rpc.get_block_hash(height) {
@@ -1129,7 +1127,18 @@ pub async fn mempool_block_page(
     State(state): State<ExplorerState>,
     Path(display_index): Path<usize>,
     Query(q): Query<BlockPageQuery>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
+    // Client mode runs no mempool service, so this page is rendered by the
+    // instance that owns the live mempool state.
+    if let Some(events_host) = crate::config::get_explorer_espo_events_host() {
+        let query = raw_query.map(|query| format!("?{query}")).unwrap_or_default();
+        return crate::explorer::relay::proxy_explorer_page(
+            events_host,
+            &format!("/mempool-block/{display_index}{query}"),
+        )
+        .await;
+    }
     let network = get_network();
     let electrum_like = get_electrum_like();
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;

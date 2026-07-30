@@ -3,7 +3,6 @@ use super::schemas::{SchemaUnwrapRequestV1, SchemaWrapEventV1};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
-use crate::runtime::tree_db::get_global_tree_db;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -227,6 +226,15 @@ impl SubfrostProvider {
         Self { mdb, view_blockhash: None }
     }
 
+    /// The state a remote getter call must pin: the provider's height-pinned
+    /// view when one is set, otherwise the request's own blockhash.
+    fn effective_wire_state(&self, state: StateAt) -> StateAt {
+        match state.resolve(self.view_blockhash) {
+            Some(bh) => StateAt::Block(bh),
+            None => StateAt::Latest,
+        }
+    }
+
     pub fn with_view_blockhash(&self, blockhash: Option<BlockHash>) -> Self {
         Self { mdb: Arc::clone(&self.mdb), view_blockhash: blockhash }
     }
@@ -239,13 +247,9 @@ impl SubfrostProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
-            return Err(anyhow!("versioned_tree_unavailable"));
-        };
-        let Some(blockhash) = tree
-            .blockhash_for_height(height_u32)
-            .map_err(|e| anyhow!("tree lookup failed: {e}"))?
-        else {
+        // Resolves via the remote espo in remote-explorer mode, the local
+        // versioned tree otherwise.
+        let Some(blockhash) = crate::config::explorer_blockhash_for_height(height_u32)? else {
             return Err(anyhow!("height_not_indexed"));
         };
         Ok(self.with_view_blockhash(Some(blockhash)))
@@ -290,6 +294,25 @@ impl SubfrostProvider {
 
     fn read_u64_len(&self, key: &[u8]) -> Result<u64> {
         Ok(self.raw_get(key)?.and_then(|v| decode_u64_le(&v)).unwrap_or(0))
+    }
+
+    /// Keys for the newest-first window `[offset, offset + limit)` of a dense,
+    /// append-ordered list of `len` items. Item `len - 1` is the newest.
+    fn list_window_keys_desc(
+        &self,
+        list_prefix: &[u8],
+        len: usize,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<Vec<u8>> {
+        if offset >= len || limit == 0 {
+            return Vec::new();
+        }
+        let table = self.table();
+        let take = limit.min(len - offset);
+        (0..take)
+            .map(|i| table.list_item_key(list_prefix, (len - 1 - offset - i) as u64))
+            .collect()
     }
 
     fn read_event_list_all(&self, list_prefix: &[u8]) -> Result<Vec<SchemaWrapEventV1>> {
@@ -537,6 +560,13 @@ impl SubfrostProvider {
     }
 
     pub fn get_index_height(&self, params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::subfrost::internal_rpc::remote_get_index_height(
+                &remote, params,
+            );
+        }
         crate::debug_timer_log!("get_index_height");
         let table = self.table();
         let Some(bytes) = self
@@ -708,6 +738,26 @@ fn read_events_from_list(
     limit: usize,
     successful: Option<bool>,
 ) -> Result<GetWrapEventsResult> {
+    // Unfiltered reads are the hot path (the "all events" RPCs and the Oyl
+    // history endpoints call this on every request). The list is dense and
+    // append-ordered, so the requested page is a contiguous window at its tail
+    // and the total is the stored length: read `limit` items instead of
+    // fetching and decoding the entire history to return 25 rows.
+    if successful.is_none() {
+        let table = provider.table();
+        let len = provider.read_u64_len(&table.list_length_key(list_prefix))? as usize;
+        if len == 0 {
+            return Ok(GetWrapEventsResult { entries: Vec::new(), total: 0 });
+        }
+        let keys = provider.list_window_keys_desc(list_prefix, len, offset, limit);
+        let mut entries = Vec::with_capacity(keys.len());
+        for raw in provider.raw_multi_get(&keys)? {
+            let Some(raw) = raw else { continue };
+            entries.push(decode_wrap_event(&raw)?);
+        }
+        return Ok(GetWrapEventsResult { entries, total: len });
+    }
+
     let all = provider.read_event_list_all(list_prefix)?;
     if all.is_empty() {
         return Ok(GetWrapEventsResult { entries: Vec::new(), total: 0 });
@@ -743,6 +793,22 @@ fn read_unwrap_requests_from_list(
     limit: usize,
     fulfilled: Option<bool>,
 ) -> Result<GetUnwrapRequestsResult> {
+    // Same windowed read as `read_events_from_list` when nothing is filtered.
+    if fulfilled.is_none() {
+        let table = provider.table();
+        let len = provider.read_u64_len(&table.list_length_key(list_prefix))? as usize;
+        if len == 0 {
+            return Ok(GetUnwrapRequestsResult { entries: Vec::new(), total: 0 });
+        }
+        let keys = provider.list_window_keys_desc(list_prefix, len, offset, limit);
+        let mut entries = Vec::with_capacity(keys.len());
+        for raw in provider.raw_multi_get(&keys)? {
+            let Some(raw) = raw else { continue };
+            entries.push(decode_unwrap_request(&raw)?);
+        }
+        return Ok(GetUnwrapRequestsResult { entries, total: len });
+    }
+
     let all = provider.read_unwrap_request_list_all(list_prefix)?;
     if all.is_empty() {
         return Ok(GetUnwrapRequestsResult { entries: Vec::new(), total: 0 });
@@ -820,10 +886,12 @@ pub struct BuildUnwrapTotalPointAppendsParams {
     pub points: Vec<UnwrapTotalPoint>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetIndexHeightParams {
     pub blockhash: StateAt,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetIndexHeightResult {
     pub height: Option<u32>,
 }
@@ -947,7 +1015,7 @@ mod tests {
 
     fn test_provider() -> (TempDir, SubfrostProvider) {
         let dir = TempDir::new().expect("temp dir");
-        let mdb = Arc::new(Mdb::open(dir.path(), b"subfrost:").expect("open mdb"));
+        let mdb = Arc::new(Mdb::open(dir.path(), b"subfrost_test:").expect("open mdb"));
         (dir, SubfrostProvider::new(mdb))
     }
 
@@ -1133,5 +1201,79 @@ mod tests {
             .expect("read address row");
         assert_eq!(by_addr.total, 1);
         assert_eq!(by_addr.entries[0].fulfillment_tx, Some([8; 32]));
+    }
+
+    /// The unfiltered event reads answer from the list length plus a window of
+    /// item keys instead of loading the whole list. Every page must still match
+    /// what a full read-and-slice produced, at every offset, including the
+    /// ragged last page and past-the-end offsets.
+    #[test]
+    fn windowed_event_pages_match_a_full_scan() {
+        let (_dir, provider) = test_provider();
+        let list_prefix = provider.table().WRAP_EVENTS_ALL.key().to_vec();
+
+        let events: Vec<SchemaWrapEventV1> = (0..37u8)
+            .map(|i| SchemaWrapEventV1 {
+                timestamp: 1_000 + u64::from(i),
+                txid: [i; 32],
+                amount: u128::from(i) * 7,
+                address_spk: vec![0x51, i],
+                // Mixed success so the filtered path stays exercised too.
+                success: i % 3 != 0,
+            })
+            .collect();
+
+        let puts = provider
+            .build_event_list_appends(BuildEventListAppendsParams {
+                list_prefix: list_prefix.clone(),
+                events: events.clone(),
+            })
+            .expect("build appends");
+        provider
+            .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+            .expect("write appends");
+
+        // Reference: what the previous implementation returned — the whole list,
+        // newest first, sliced by offset/limit.
+        let newest_first: Vec<SchemaWrapEventV1> = events.iter().rev().cloned().collect();
+
+        for (offset, limit) in
+            [(0, 10), (10, 10), (30, 10), (36, 10), (37, 10), (0, 1), (0, 100), (5, 0)]
+        {
+            let page = provider
+                .get_wrap_events_all(GetWrapEventsAllParams {
+                    blockhash: StateAt::Latest,
+                    offset,
+                    limit,
+                    successful: None,
+                    height: None,
+                    height_present: false,
+                })
+                .expect("read page");
+            let expected: Vec<&SchemaWrapEventV1> =
+                newest_first.iter().skip(offset).take(limit).collect();
+            assert_eq!(page.total, events.len(), "total at offset={offset} limit={limit}");
+            assert_eq!(page.entries.len(), expected.len(), "len at offset={offset} limit={limit}");
+            for (got, want) in page.entries.iter().zip(expected) {
+                assert_eq!(got.txid, want.txid, "txid at offset={offset} limit={limit}");
+                assert_eq!(got.amount, want.amount);
+                assert_eq!(got.timestamp, want.timestamp);
+            }
+        }
+
+        // The filtered path still counts matches rather than the list length.
+        let successful = provider
+            .get_wrap_events_all(GetWrapEventsAllParams {
+                blockhash: StateAt::Latest,
+                offset: 0,
+                limit: 5,
+                successful: Some(true),
+                height: None,
+                height_present: false,
+            })
+            .expect("read successful");
+        assert_eq!(successful.total, events.iter().filter(|e| e.success).count());
+        assert!(successful.entries.iter().all(|e| e.success));
+        assert_eq!(successful.entries.len(), 5);
     }
 }

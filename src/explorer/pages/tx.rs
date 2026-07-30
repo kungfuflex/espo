@@ -824,11 +824,65 @@ pub async fn tx_page(State(state): State<ExplorerState>, Path(txid_str): Path<St
     .into_response()
 }
 
+/// Remote-mode trace fetch: pull the block's stored traces from the remote
+/// espo via the public `essentials.get_block_traces` getter RPC and keep the
+/// ones for this txid. The sandshrew-like events are what the tx view
+/// renders; protobuf/storage enrichment is metashrew-local and intentionally
+/// omitted here.
+fn fetch_traces_for_tx_remote(
+    remote: &crate::runtime::remote_espo::RemoteEspoClient,
+    height: u64,
+    txid: &Txid,
+) -> anyhow::Result<Vec<EspoTrace>> {
+    let result =
+        match remote.call("essentials.get_block_traces", serde_json::json!({ "height": height })) {
+            Ok(result) => result,
+            // The remote hasn't indexed this height yet (fresh block): render
+            // without traces instead of surfacing an error.
+            Err(e) if e.to_string().contains("height_not_indexed") => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+    let traces = result.get("traces").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let tx_hex = txid.to_string();
+    let mut out: Vec<EspoTrace> = Vec::new();
+    for trace in traces {
+        let Some(outpoint) = trace.get("outpoint").and_then(|v| v.as_str()) else { continue };
+        let Some((trace_txid, vout_str)) = outpoint.split_once(':') else { continue };
+        if !trace_txid.eq_ignore_ascii_case(&tx_hex) {
+            continue;
+        }
+        let Ok(vout) = vout_str.parse::<u32>() else { continue };
+        let Some(events_value) = trace.get("events") else { continue };
+        let Ok(events) = serde_json::from_value::<
+            Vec<crate::alkanes::trace::EspoSandshrewLikeTraceEvent>,
+        >(events_value.clone()) else {
+            continue;
+        };
+        out.push(EspoTrace {
+            sandshrew_trace: EspoSandshrewLikeTrace {
+                outpoint: format!("{tx_hex}:{vout}"),
+                events,
+            },
+            protobuf_trace: Default::default(),
+            storage_changes: Default::default(),
+            outpoint: crate::schemas::EspoOutpoint {
+                txid: txid.to_byte_array().to_vec(),
+                vout,
+                tx_spent: None,
+            },
+        });
+    }
+    Ok(out)
+}
+
 fn fetch_traces_for_tx(
     height: u64,
     txid: &Txid,
     tx: &Transaction,
 ) -> anyhow::Result<Vec<EspoTrace>> {
+    if let Some(remote) = crate::config::explorer_remote() {
+        return fetch_traces_for_tx_remote(&remote, height, txid);
+    }
     let partials = traces_for_block_as_prost(height)?;
     let mut out: Vec<EspoTrace> = Vec::new();
     let tx_hex = txid.to_string();
@@ -841,7 +895,11 @@ fn fetch_traces_for_tx(
 
         let sandshrew_trace =
             EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
-        let storage_changes = extract_alkane_storage(&partial.protobuf_trace, tx)?;
+        let storage_changes = extract_alkane_storage(
+            &partial.protobuf_trace,
+            tx,
+            &crate::alkanes::trace::EspoHostFunctionValues::default(),
+        )?;
 
         out.push(EspoTrace {
             sandshrew_trace,
@@ -860,6 +918,12 @@ fn is_metashrew_missing_stored_block_hash(err: &anyhow::Error) -> bool {
 }
 
 fn fetch_traces_for_tx_noheight(txid: &Txid, tx: &Transaction) -> anyhow::Result<Vec<EspoTrace>> {
+    // Remote mode has no local metashrew to scan for unindexed/mempool txids;
+    // confirmed txs are covered by fetch_traces_for_tx_remote via the remote's
+    // stored block traces.
+    if crate::config::explorer_remote().is_some() {
+        return Ok(Vec::new());
+    }
     let partials = get_metashrew().traces_for_tx(txid)?;
     let mut out: Vec<EspoTrace> = Vec::new();
     let tx_hex = txid.to_string();
@@ -872,7 +936,11 @@ fn fetch_traces_for_tx_noheight(txid: &Txid, tx: &Transaction) -> anyhow::Result
 
         let sandshrew_trace =
             EspoSandshrewLikeTrace { outpoint: format!("{tx_hex}:{vout}"), events };
-        let storage_changes = extract_alkane_storage(&partial.protobuf_trace, tx)?;
+        let storage_changes = extract_alkane_storage(
+            &partial.protobuf_trace,
+            tx,
+            &crate::alkanes::trace::EspoHostFunctionValues::default(),
+        )?;
 
         out.push(EspoTrace {
             sandshrew_trace,

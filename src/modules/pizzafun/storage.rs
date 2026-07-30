@@ -2,7 +2,6 @@ use super::consts::PRIORITY_SERIES_ALKANES;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::state_at::StateAt;
-use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
@@ -10,7 +9,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize, serde::Serialize, serde::Deserialize)]
 pub struct SeriesEntry {
     pub series_id: String,
     pub alkane_id: SchemaAlkaneId,
@@ -198,10 +197,12 @@ impl<'a> PizzafunTable<'a> {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetIndexHeightParams {
     pub blockhash: StateAt,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetIndexHeightResult {
     pub height: Option<u32>,
 }
@@ -222,6 +223,7 @@ pub struct GetSeriesByIdsParams {
     pub series_ids: Vec<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetSeriesByAlkaneParams {
     pub blockhash: StateAt,
     pub alkane: SchemaAlkaneId,
@@ -248,6 +250,15 @@ impl PizzafunProvider {
         Self { mdb, view_blockhash: None }
     }
 
+    /// The state a remote getter call must pin: the provider's height-pinned
+    /// view when one is set, otherwise the request's own blockhash.
+    fn effective_wire_state(&self, state: StateAt) -> StateAt {
+        match state.resolve(self.view_blockhash) {
+            Some(bh) => StateAt::Block(bh),
+            None => StateAt::Latest,
+        }
+    }
+
     pub fn with_view_blockhash(&self, blockhash: Option<BlockHash>) -> Self {
         Self { mdb: Arc::clone(&self.mdb), view_blockhash: blockhash }
     }
@@ -260,13 +271,9 @@ impl PizzafunProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
-            return Err(anyhow!("versioned_tree_unavailable"));
-        };
-        let Some(blockhash) = tree
-            .blockhash_for_height(height_u32)
-            .map_err(|e| anyhow!("tree lookup failed: {e}"))?
-        else {
+        // Resolves via the remote espo in remote-explorer mode, the local
+        // versioned tree otherwise.
+        let Some(blockhash) = crate::config::explorer_blockhash_for_height(height_u32)? else {
             return Err(anyhow!("height_not_indexed"));
         };
         Ok(self.with_view_blockhash(Some(blockhash)))
@@ -379,6 +386,13 @@ impl PizzafunProvider {
     }
 
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = _params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::pizzafun::internal_rpc::remote_get_index_height(
+                &remote, params,
+            );
+        }
         crate::debug_timer_log!("pizzafun.get_index_height");
         let table = self.table();
         let Some(bytes) = self
@@ -452,6 +466,13 @@ impl PizzafunProvider {
         &self,
         params: GetSeriesByAlkaneParams,
     ) -> Result<Option<SeriesEntry>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::pizzafun::internal_rpc::remote_get_series_by_alkane(
+                &remote, params,
+            );
+        }
         if let Some((base_name, priority_alkane)) = priority_family_for_alkane(&params.alkane) {
             if !self.priority_family_seeded(base_name, priority_alkane, params.blockhash)? {
                 return Ok(Some(SeriesEntry {

@@ -3,11 +3,8 @@ use crate::{
         get_bitcoind_rpc_client, get_config, get_electrum_like, get_espo_next_height, get_network,
     },
     modules::defs::RpcRegistry,
-    runtime::{
-        mempool::{
-            MempoolBlockSummary, current_mempool_compact_snapshot, current_mempool_minimum_fee_rate,
-        },
-        tree_db::get_global_tree_db,
+    runtime::mempool::{
+        MempoolBlockSummary, current_mempool_compact_snapshot, current_mempool_minimum_fee_rate,
     },
 };
 use axum::{
@@ -18,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use bitcoin::{Address, Transaction, consensus::deserialize};
+use bitcoin::{Address, Transaction, Txid, consensus::deserialize};
 use bitcoincore_rpc::RpcApi;
 use futures::FutureExt;
 use serde::Serialize;
@@ -56,12 +53,45 @@ const MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
 const MAX_RAW_TRANSACTION_HEX_LEN: usize = 8_000_000;
 const PRECISE_FEE_INCREMENT: f64 = 0.001;
 
-// Built-in root method name
-const ROOT_METHOD_GET_ESPO_HEIGHT: &str = "get_espo_height";
-const ROOT_METHOD_GET_METHOD_LINE_CHART: &str = "get_method_line_chart";
-const ROOT_METHOD_BROADCAST_TRANSACTION: &str = "broadcast_transaction";
-const ROOT_METHOD_FEE_ESTIMATES: &str = "fee_estimates";
-const ROOT_METHOD_GET_ADDRESS: &str = "get_address";
+/// Bitcoin Core caps a package at 25 transactions.
+const MAX_PACKAGE_TRANSACTIONS: usize = 25;
+
+/// Methods espo answers itself, before the module registry is consulted.
+///
+/// The `btc.*` ones are proxies onto the Bitcoin backends — electrs/Esplora and
+/// Bitcoin Core — rather than anything espo indexes, which is why they carry
+/// their own namespace instead of sitting unprefixed beside `get_espo_height`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuiltinMethod {
+    GetEspoHeight,
+    GetMethodLineChart,
+    BtcGetTransaction,
+    BtcGetAddress,
+    BtcBroadcastTransaction,
+    BtcSubmitPackage,
+    BtcFeeEstimates,
+}
+
+/// Resolves a method name to a built-in, or `None` to fall through to the
+/// module registry.
+///
+/// The Bitcoin proxies answer under `btc.*` only. Their former unprefixed
+/// spellings — `get_transaction`, `get_address`, `broadcast_transaction`,
+/// `submit_package`, `fee_estimates` — are gone rather than aliased, so a
+/// client still using one gets `-32601` instead of silently depending on a
+/// name that no longer appears in the documentation.
+fn builtin_method(method: &str) -> Option<BuiltinMethod> {
+    match method {
+        "get_espo_height" => Some(BuiltinMethod::GetEspoHeight),
+        "get_method_line_chart" => Some(BuiltinMethod::GetMethodLineChart),
+        "btc.get_transaction" => Some(BuiltinMethod::BtcGetTransaction),
+        "btc.get_address" => Some(BuiltinMethod::BtcGetAddress),
+        "btc.broadcast_transaction" => Some(BuiltinMethod::BtcBroadcastTransaction),
+        "btc.submit_package" => Some(BuiltinMethod::BtcSubmitPackage),
+        "btc.fee_estimates" => Some(BuiltinMethod::BtcFeeEstimates),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,14 +126,26 @@ fn get_espo_tip_height_response(id: Value) -> JsonRpcResponse {
 }
 
 fn is_builtin_root_method(method: &str) -> bool {
-    matches!(
-        method,
-        ROOT_METHOD_GET_ESPO_HEIGHT
-            | ROOT_METHOD_GET_METHOD_LINE_CHART
-            | ROOT_METHOD_BROADCAST_TRANSACTION
-            | ROOT_METHOD_FEE_ESTIMATES
-            | ROOT_METHOD_GET_ADDRESS
-    )
+    builtin_method(method).is_some()
+}
+
+async fn builtin_response(
+    builtin: BuiltinMethod,
+    state: &RpcState,
+    id: Value,
+    params: Value,
+) -> JsonRpcResponse {
+    match builtin {
+        BuiltinMethod::GetEspoHeight => get_espo_tip_height_response(id),
+        BuiltinMethod::GetMethodLineChart => {
+            get_method_line_chart_response(state, id, params).await
+        }
+        BuiltinMethod::BtcGetTransaction => get_transaction_response(id, params).await,
+        BuiltinMethod::BtcGetAddress => get_address_response(id, params).await,
+        BuiltinMethod::BtcBroadcastTransaction => broadcast_transaction_response(id, params).await,
+        BuiltinMethod::BtcSubmitPackage => submit_package_response(id, params).await,
+        BuiltinMethod::BtcFeeEstimates => fee_estimates_response(id),
+    }
 }
 
 fn round_to_increment(value: f64, increment: f64) -> f64 {
@@ -264,6 +306,138 @@ async fn broadcast_transaction_response(id: Value, params: Value) -> JsonRpcResp
             Some(json!({ "detail": detail })),
         ),
         Err(error) => internal_error(id, &format!("transaction broadcast task failed: {error}")),
+    }
+}
+
+fn parse_txid_params(params: Value) -> Result<Txid, String> {
+    let txid = match params {
+        Value::Object(params) => params
+            .get("txid")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "txid is required and must be a string".to_string())?,
+        Value::Array(params) if params.len() == 1 => params[0]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "params[0] must be a txid string".to_string())?,
+        Value::Array(_) => {
+            return Err("params must contain exactly one txid string".to_string());
+        }
+        _ => return Err("params must be an object or a one-item array".to_string()),
+    };
+    Txid::from_str(txid.trim()).map_err(|e| format!("invalid txid: {e}"))
+}
+
+async fn get_transaction_response(id: Value, params: Value) -> JsonRpcResponse {
+    let txid = match parse_txid_params(params) {
+        Ok(txid) => txid,
+        Err(detail) => return invalid_params(id, &detail),
+    };
+    let electrum = get_electrum_like();
+    let result = tokio::task::spawn_blocking(move || electrum.transaction_details(&txid)).await;
+
+    match result {
+        Ok(Ok(Some((tx, hex)))) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(json!({ "ok": true, "found": true, "tx": tx, "hex": hex })),
+            error: None,
+            id,
+        },
+        // A transaction the index has never seen is an answer, not a failure.
+        Ok(Ok(None)) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(json!({ "ok": true, "found": false })),
+            error: None,
+            id,
+        },
+        Ok(Err(error)) => err_response(
+            id,
+            -32000,
+            "Transaction lookup failed",
+            Some(json!({ "detail": format!("{error:#}") })),
+        ),
+        Err(error) => internal_error(id, &format!("transaction lookup task failed: {error}")),
+    }
+}
+
+/// Raw transaction hexes for a package submission, in the order given: Core
+/// expects the parents before the child they fund.
+fn parse_package_params(params: Value) -> Result<Vec<String>, String> {
+    let entries = match params {
+        Value::Object(params) => params
+            .get("txs")
+            .ok_or_else(|| {
+                "txs is required and must be an array of raw transaction hex".to_string()
+            })?
+            .clone(),
+        Value::Array(params) if params.len() == 1 && params[0].is_array() => params[0].clone(),
+        Value::Array(params) => Value::Array(params),
+        _ => return Err("params must be an object or an array".to_string()),
+    };
+    let Value::Array(entries) = entries else {
+        return Err("txs must be an array of raw transaction hex strings".to_string());
+    };
+    if entries.is_empty() {
+        return Err("txs must contain at least one raw transaction".to_string());
+    }
+    if entries.len() > MAX_PACKAGE_TRANSACTIONS {
+        return Err(format!(
+            "a package may contain at most {MAX_PACKAGE_TRANSACTIONS} transactions"
+        ));
+    }
+
+    let mut out = Vec::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(raw) = entry.as_str() else {
+            return Err(format!("txs[{idx}] must be a raw transaction hex string"));
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err(format!("txs[{idx}] must not be empty"));
+        }
+        if raw.len() > MAX_RAW_TRANSACTION_HEX_LEN {
+            return Err(format!("txs[{idx}] exceeds the maximum supported size"));
+        }
+        let bytes = hex::decode(raw).map_err(|e| format!("txs[{idx}] is not valid hex: {e}"))?;
+        deserialize::<Transaction>(&bytes)
+            .map_err(|e| format!("txs[{idx}] could not be decoded: {e}"))?;
+        out.push(raw.to_string());
+    }
+    Ok(out)
+}
+
+/// Submits a package straight to Bitcoin Core's `submitpackage`, for callers
+/// who need related transactions accepted together — a child paying for its
+/// parent, say — which broadcasting one at a time cannot express.
+///
+/// Core's reply is passed through untouched under `result`: it reports per
+/// transaction, and a package can partly succeed, so collapsing it into a
+/// single status would lose the part the caller needs.
+async fn submit_package_response(id: Value, params: Value) -> JsonRpcResponse {
+    let txs = match parse_package_params(params) {
+        Ok(txs) => txs,
+        Err(detail) => return invalid_params(id, &detail),
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        get_bitcoind_rpc_client().call::<Value>("submitpackage", &[json!(txs)])
+    })
+    .await;
+
+    match result {
+        Ok(Ok(value)) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(json!({ "ok": true, "result": value })),
+            error: None,
+            id,
+        },
+        Ok(Err(error)) => err_response(
+            id,
+            -32000,
+            "Package submission failed",
+            Some(json!({ "detail": format!("{error}") })),
+        ),
+        Err(error) => internal_error(id, &format!("package submission task failed: {error}")),
     }
 }
 
@@ -475,11 +649,9 @@ fn sample_heights(range_min: u32, range_max: u32, range_interval: u32) -> Vec<u3
 }
 
 fn indexed_height_bounds() -> Result<(u32, u32), String> {
-    let Some(tree) = get_global_tree_db() else {
-        return Err("versioned_tree_unavailable".to_string());
-    };
-    tree.indexed_height_bounds()
-        .map_err(|e| format!("failed to read indexed height bounds: {e}"))?
+    // Remote-aware: client mode asks the data espo for its bounds; local
+    // instances read the versioned tree as before.
+    crate::config::explorer_indexed_height_bounds()
         .ok_or_else(|| "no indexed heights available".to_string())
 }
 
@@ -710,11 +882,18 @@ async fn handle_single_request(
             return None;
         }
         // Process side-effecting built-ins even though notifications have no response.
-        if method == ROOT_METHOD_BROADCAST_TRANSACTION {
-            let _ = broadcast_transaction_response(Value::Null, params).await;
-        } else if !is_builtin_root_method(method) {
-            let cx = context::current();
-            let _ = state.registry.call(cx, method, params.clone()).await;
+        match builtin_method(method) {
+            Some(BuiltinMethod::BtcBroadcastTransaction) => {
+                let _ = broadcast_transaction_response(Value::Null, params).await;
+            }
+            Some(BuiltinMethod::BtcSubmitPackage) => {
+                let _ = submit_package_response(Value::Null, params).await;
+            }
+            Some(_) => {}
+            None => {
+                let cx = context::current();
+                let _ = state.registry.call(cx, method, params.clone()).await;
+            }
         }
         return None;
     }
@@ -722,21 +901,9 @@ async fn handle_single_request(
     // Normal call (must produce a response)
     let id = id_opt.unwrap(); // safe
 
-    // If the built-in root method is requested, handle immediately.
-    if method == ROOT_METHOD_GET_ESPO_HEIGHT {
-        return Some(get_espo_tip_height_response(id));
-    }
-    if method == ROOT_METHOD_GET_METHOD_LINE_CHART {
-        return Some(get_method_line_chart_response(state, id, params).await);
-    }
-    if method == ROOT_METHOD_BROADCAST_TRANSACTION {
-        return Some(broadcast_transaction_response(id, params).await);
-    }
-    if method == ROOT_METHOD_FEE_ESTIMATES {
-        return Some(fee_estimates_response(id));
-    }
-    if method == ROOT_METHOD_GET_ADDRESS {
-        return Some(get_address_response(id, params).await);
+    // If a built-in is requested, handle immediately.
+    if let Some(builtin) = builtin_method(method) {
+        return Some(builtin_response(builtin, state, id, params).await);
     }
 
     // Check method existence to produce -32601 at the protocol layer

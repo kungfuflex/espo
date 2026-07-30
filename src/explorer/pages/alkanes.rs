@@ -1,7 +1,6 @@
 use crate::runtime::state_at::StateAt;
 use axum::extract::{Query, State};
 use axum::response::Html;
-use borsh::BorshDeserialize;
 use maud::{Markup, html};
 use serde::Deserialize;
 
@@ -16,8 +15,7 @@ use crate::explorer::pages::common::format_integer;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    EssentialsTable, GetCreationRecordsOrderedPageParams, GetHoldersOrderedPageParams,
-    HoldersCountEntry, load_creation_record,
+    GetCreationRecordsOrderedPageParams, GetHoldersOrderedPageParams, load_creation_record,
 };
 use crate::modules::essentials::utils::inspections::AlkaneCreationRecord;
 use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
@@ -111,32 +109,21 @@ pub async fn alkanes_page(
     let provider = state.essentials_provider();
     let field = SortField::from_query(q.order.as_deref());
     let dir = SortDir::from_query(q.order.as_deref(), q.dir.as_deref());
-    let table = EssentialsTable::new(&state.essentials_mdb);
 
-    let total: u64 = state
-        .essentials_mdb
-        .get(&table.alkane_creation_count_key())
-        .ok()
-        .flatten()
-        .and_then(|b| {
-            if b.len() == 8 {
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(&b);
-                Some(u64::from_le_bytes(arr))
-            } else {
-                None
-            }
+    let total: u64 = provider
+        .get_creation_count(crate::modules::essentials::storage::GetCreationCountParams {
+            blockhash: StateAt::Latest,
         })
+        .map(|r| r.count)
         .unwrap_or(0);
 
     let holders_for = |rec: &AlkaneCreationRecord| {
-        state
-            .essentials_mdb
-            .get(&table.holders_count_key(&rec.alkane))
-            .ok()
-            .flatten()
-            .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
-            .map(|hc| hc.count)
+        provider
+            .get_holders_count(crate::modules::essentials::storage::GetHoldersCountParams {
+                blockhash: StateAt::Latest,
+                alkane: rec.alkane,
+            })
+            .map(|r| r.count)
             .unwrap_or(0)
     };
 

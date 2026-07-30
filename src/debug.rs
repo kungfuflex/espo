@@ -127,7 +127,8 @@ static DEBUG_MDB: OnceLock<Mdb> = OnceLock::new();
 static TIMER_STATE: OnceLock<Mutex<TimerState>> = OnceLock::new();
 
 fn debug_mdb() -> &'static Mdb {
-    DEBUG_MDB.get_or_init(|| Mdb::from_db(crate::config::get_espo_db(), b"debug_metrics:"))
+    // Null-backed in client mode: metrics writes are discarded (no local db).
+    DEBUG_MDB.get_or_init(|| crate::config::espo_mdb(b"debug_metrics:"))
 }
 
 fn timer_state() -> &'static Mutex<TimerState> {

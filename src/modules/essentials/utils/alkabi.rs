@@ -12,7 +12,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 const ALKABI_CACHE_KEY_PREFIX: &[u8] =
-    b"alkabi:7dbc691b5945e3f0c88f95cc983f3b9f4e502cee:analysis-v1:";
+    b"alkabi:56a98f830be4100c666a238986abf05c6c285272:analysis-v1:";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderedAlkabi {
@@ -88,6 +88,40 @@ pub fn load_contract_wasm(
     alkane: &SchemaAlkaneId,
 ) -> Result<Vec<u8>> {
     load_contract_wasm_from_source(&contract_wasm_source(provider, alkane))
+}
+
+/// Load bytecode exactly the way the alkanes runtime's `get_alkane_binary`
+/// does: read `/alkanes/{id}`, recurse when the payload is a 32-byte factory
+/// pointer, otherwise gunzip. No proxy hop — `/implementation` and `/beacon`
+/// are never consulted, matching the runtime.
+///
+/// `prefer_first_version` selects the first stored version of the payload
+/// instead of the current one; the runtime always loads the current one, so
+/// simulate-style callers want `false`.
+pub fn load_contract_wasm_no_resolution(
+    alkane: &SchemaAlkaneId,
+    prefer_first_version: bool,
+) -> Result<(Vec<u8>, SchemaAlkaneId)> {
+    let metashrew = get_metashrew();
+    let loaded = if prefer_first_version {
+        metashrew.get_alkane_wasm_bytes_prefer_first_version(alkane)?
+    } else {
+        metashrew.get_alkane_wasm_bytes(alkane)?
+    };
+    loaded.context("contract wasm not found")
+}
+
+/// Like `load_contract_wasm`, but also reports which alkane actually provided
+/// the bytecode (after proxy/factory resolution) so callers can dedup and
+/// content-address the payload.
+pub fn load_contract_wasm_with_source(
+    provider: &EssentialsProvider,
+    alkane: &SchemaAlkaneId,
+) -> Result<(Vec<u8>, SchemaAlkaneId)> {
+    let source = contract_wasm_source(provider, alkane);
+    get_metashrew()
+        .get_alkane_wasm_bytes_prefer_first_version(&source)?
+        .context("contract wasm not found")
 }
 
 fn contract_wasm_source(provider: &EssentialsProvider, alkane: &SchemaAlkaneId) -> SchemaAlkaneId {

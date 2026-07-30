@@ -5,7 +5,7 @@ use super::storage::{
     scopes_for_source,
 };
 use crate::alkanes::trace::EspoBlock;
-use crate::config::{debug_enabled, get_electrum_like, get_espo_db, get_network};
+use crate::config::{debug_enabled, get_electrum_like, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, PRICE_SCALE, SATS_PER_BTC};
@@ -92,13 +92,10 @@ impl EspoModule for TokenData {
     }
 
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
-        let db = get_espo_db();
-        let essentials_provider = Arc::new(EssentialsProvider::new(Arc::new(Mdb::from_db(
-            Arc::clone(&db),
-            b"essentials:",
-        ))));
+        let essentials_provider =
+            Arc::new(EssentialsProvider::new(Arc::new(crate::config::espo_mdb(b"essentials:"))));
         let amm_provider = Arc::new(AmmDataProvider::new(
-            Arc::new(Mdb::from_db(db, b"ammdata:")),
+            Arc::new(crate::config::espo_mdb(b"ammdata:")),
             Arc::clone(&essentials_provider),
         ));
         self.essentials_provider = Some(essentials_provider);

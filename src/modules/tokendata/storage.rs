@@ -2,7 +2,6 @@ use super::schemas::{SchemaTokenActivityV1, TokenActivityKind, TokenActivitySour
 use crate::config::get_address_index_chunk_size;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::state_at::StateAt;
-use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
@@ -22,7 +21,7 @@ const PTR_ENTITY_ACTIVITY_ROW: &[u8] = b"activity_row";
 const PTR_ENTITY_ACTIVITY_INDEX_CHUNK: &[u8] = b"activity_index_chunk";
 const ACTIVITY_INDEX_INLINE_CAP: usize = 8;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TokenActivityScope {
     All,
     Market,
@@ -39,13 +38,13 @@ impl TokenActivityScope {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TokenActivitySortField {
     Timestamp,
     Amount,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SortDir {
     Desc,
     Asc,
@@ -309,6 +308,15 @@ impl TokenDataProvider {
         Self { mdb, blob_mdb, view_blockhash: None }
     }
 
+    /// The state a remote getter call must pin: the provider's height-pinned
+    /// view when one is set, otherwise the request's own blockhash.
+    fn effective_wire_state(&self, state: StateAt) -> StateAt {
+        match state.resolve(self.view_blockhash) {
+            Some(bh) => StateAt::Block(bh),
+            None => StateAt::Latest,
+        }
+    }
+
     pub fn with_view_blockhash(&self, blockhash: Option<BlockHash>) -> Self {
         Self {
             mdb: Arc::clone(&self.mdb),
@@ -325,13 +333,9 @@ impl TokenDataProvider {
             return Err(anyhow!("missing_or_invalid_height"));
         };
         let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
-        let Some(tree) = get_global_tree_db() else {
-            return Err(anyhow!("versioned_tree_unavailable"));
-        };
-        let Some(blockhash) = tree
-            .blockhash_for_height(height_u32)
-            .map_err(|e| anyhow!("tree lookup failed: {e}"))?
-        else {
+        // Resolves via the remote espo in remote-explorer mode, the local
+        // versioned tree otherwise.
+        let Some(blockhash) = crate::config::explorer_blockhash_for_height(height_u32)? else {
             return Err(anyhow!("height_not_indexed"));
         };
         Ok(self.with_view_blockhash(Some(blockhash)))
@@ -413,6 +417,13 @@ impl TokenDataProvider {
     }
 
     pub fn get_index_height(&self, params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::tokendata::internal_rpc::remote_get_index_height(
+                &remote, params,
+            );
+        }
         let table = self.table();
         let Some(bytes) = self
             .raw_get_at(&table.index_height_key(), params.blockhash.resolve(self.view_blockhash))?
@@ -437,6 +448,9 @@ impl TokenDataProvider {
     }
 
     pub fn get_diesel_avg_price_paid_usd_by_height(&self, height: u32) -> Result<Option<[u8; 32]>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::tokendata::internal_rpc::remote_get_diesel_avg_price_paid_usd_by_height(&remote, height);
+        }
         let Some(bytes) =
             self.raw_get_at(&self.table().diesel_avg_price_usd_by_height_key(height), None)?
         else {
@@ -454,6 +468,9 @@ impl TokenDataProvider {
         &self,
         max_height: u32,
     ) -> Result<Vec<(u32, [u8; 32])>> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::tokendata::internal_rpc::remote_get_diesel_avg_price_paid_usd_points_through_height(&remote, max_height);
+        }
         let table = self.table();
         let prefix = table.diesel_avg_price_usd_by_height_prefix();
         let entries = self.mdb.scan_prefix_entries(&prefix)?;
@@ -1017,6 +1034,13 @@ impl TokenDataProvider {
         &self,
         params: GetTokenActivityPageParams,
     ) -> Result<GetTokenActivityPageResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            let mut params = params;
+            params.blockhash = self.effective_wire_state(params.blockhash);
+            return crate::modules::tokendata::internal_rpc::remote_get_token_activity_page(
+                &remote, params,
+            );
+        }
         let table = self.table();
         let timestamp_prefix = table.token_activity_prefix(params.scope, &params.token);
         let source_sort = if params.start_time.is_some() || params.end_time.is_some() {
@@ -1391,10 +1415,12 @@ impl TokenDataProvider {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetIndexHeightParams {
     pub blockhash: StateAt,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetIndexHeightResult {
     pub height: Option<u32>,
 }
@@ -1414,6 +1440,7 @@ pub struct SetBlobBatchParams {
     pub puts: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct GetTokenActivityPageParams {
     pub blockhash: StateAt,
     pub token: SchemaAlkaneId,
@@ -1428,7 +1455,7 @@ pub struct GetTokenActivityPageParams {
     pub quote_amount_filter: Option<TokenActivityQuoteAmountFilter>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenActivityQuoteAmountFilter {
     pub quote: SchemaAlkaneId,
     pub min_amount: u128,
