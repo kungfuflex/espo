@@ -16,8 +16,9 @@ use crate::modules::runes::storage::RunesProvider;
 use crate::runtime::state_at::StateAt;
 use api::{
     address_chart, alkane_abi_export, alkane_balance_chart, alkane_chart, alkane_holders_export,
-    alkane_wasm_export, carousel_blocks, explorer_events_ws, mempool_blocks, minting_price_chart,
-    rune_holders_export, search_guess, simulate_contract,
+    alkane_wasm_export, block_txs, carousel_blocks, explorer_events_ws, mempool_block_txs,
+    mempool_blocks, mempool_tx_projection, minting_price_chart, rune_holders_export, search_guess,
+    simulate_contract,
 };
 use axum::Router;
 use axum::extract::Request;
@@ -48,7 +49,22 @@ use components::layout::{favicon, style, waves_light};
 use faucet::{faucet_enabled, faucet_send, faucet_status};
 use paths::with_language;
 
-pub fn explorer_router(state: ExplorerState) -> Router {
+/// Build the explorer surface.
+///
+/// `pages_enabled` selects whether the SERVER-RENDERED pages are mounted. The JSON API
+/// and the events websocket are mounted either way, because they are not the
+/// same product: explorer.subfrost.io renders itself and only proxies espo's
+/// live feeds (block carousel, mempool-block projection, per-tx projection,
+/// events websocket) from here.
+///
+/// That distinction is the whole point. The SSR pages are the OOM-prone path
+/// (the address page walked an address's entire outpoint history per request),
+/// so `main` gates them behind ESPO_EXPLORER_ENABLED and leaves them off. When
+/// that gate also took the listener down it silently took the JSON feeds with
+/// it: the frontend's carousel fell back to bare heights with no fee rate and
+/// "0 traces", and its mempool projection fell back to the esplora fee
+/// histogram. Both were live on mainnet.
+pub fn explorer_router(state: ExplorerState, pages_enabled: bool) -> Router {
     let runes_enabled = runes_enabled_from_global_config();
     let mut pages = Router::new()
         .route("/", get(home_page))
@@ -71,6 +87,10 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/api/blocks/carousel", get(carousel_blocks))
         .route("/api/block/pool", get(block_mining_pool_api))
         .route("/api/mempool/blocks", get(mempool_blocks))
+        .route("/api/mempool/tx/{txid}", get(mempool_tx_projection))
+        // Per-transaction cells for the block visualisation, mempool and mined.
+        .route("/api/mempool/block/{index}/txs", get(mempool_block_txs))
+        .route("/api/block/{height}/txs", get(block_txs))
         .route("/api/search/guess", get(search_guess))
         .route("/api/alkane/simulate", post(simulate_contract))
         .route("/api/alkane/abi/export", get(alkane_abi_export))
@@ -114,26 +134,28 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .merge(assets.clone())
         .layer(middleware::from_fn(chinese_language_middleware));
 
-    Router::new()
-        .merge(pages)
-        .merge(api)
-        .merge(assets)
-        .merge(seo)
-        .nest("/zh", chinese)
-        .with_state(state)
+    let mut app = Router::new().merge(api.clone());
+    if pages_enabled {
+        app = app.merge(pages).merge(assets).merge(seo).nest("/zh", chinese);
+    } else {
+        // The API is still served under /zh so a locale-prefixed frontend can
+        // proxy the same feeds without special-casing its base path.
+        app = app.nest("/zh", api);
+    }
+    app.with_state(state)
 }
 
 async fn chinese_language_middleware(req: Request, next: Next) -> Response {
     with_language(ExplorerLanguage::Chinese, next.run(req)).await
 }
 
-pub async fn run_explorer(addr: SocketAddr) -> anyhow::Result<()> {
+pub async fn run_explorer(addr: SocketAddr, pages_enabled: bool) -> anyhow::Result<()> {
     let state = ExplorerState::new();
     let base_path = get_explorer_base_path();
     let app = if base_path == "/" {
-        explorer_router(state)
+        explorer_router(state, pages_enabled)
     } else {
-        Router::new().nest(base_path, explorer_router(state))
+        Router::new().nest(base_path, explorer_router(state, pages_enabled))
     };
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;

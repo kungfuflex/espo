@@ -32,8 +32,8 @@ pub fn upstream_events_ws_url(events_host: &str) -> String {
     format!("{ws_base}/api/events/ws")
 }
 
-fn upstream_mempool_blocks_url(events_host: &str) -> String {
-    format!("{}/api/mempool/blocks", events_host.trim_end_matches('/'))
+fn upstream_mempool_url(events_host: &str, path: &str) -> String {
+    format!("{}{}", events_host.trim_end_matches('/'), path)
 }
 
 /// Bidirectionally pipe one local websocket client to the data instance's
@@ -143,7 +143,12 @@ pub async fn proxy_explorer_page(events_host: &str, path_and_query: &str) -> Res
 
 /// Proxy the data instance's mempool-blocks snapshot.
 pub async fn proxy_mempool_blocks(events_host: &str) -> Response {
-    let url = upstream_mempool_blocks_url(events_host);
+    proxy_mempool_json(events_host, "/api/mempool/blocks").await
+}
+
+/// Proxy one of the data instance's mempool JSON endpoints verbatim.
+pub async fn proxy_mempool_json(events_host: &str, path: &str) -> Response {
+    let url = upstream_mempool_url(events_host, path);
     let response = match reqwest::get(&url).await {
         Ok(response) => response,
         Err(e) => {

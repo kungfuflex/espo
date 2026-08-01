@@ -1028,6 +1028,8 @@ mod tests {
             min_fee_rate: Some(median_fee_rate),
             max_fee_rate: Some(median_fee_rate),
             fee_range: vec![median_fee_rate],
+            diesel_mint_count: 0,
+            diesel_value_per_mint: 0,
         }
     }
 

@@ -129,6 +129,10 @@ pub struct MempoolBlockTemplate {
     pub min_fee_rate: Option<f64>,
     pub max_fee_rate: Option<f64>,
     pub fee_range: Vec<f64>,
+    /// How many DIESEL mints are competing for this projected block's reward.
+    pub diesel_mint_count: usize,
+    /// What each of them is projected to receive (sats of DIESEL).
+    pub diesel_value_per_mint: u128,
     pub transaction_ids: Vec<String>,
 }
 
@@ -228,6 +232,8 @@ pub struct MempoolBlockSummary {
     pub min_fee_rate: Option<f64>,
     pub max_fee_rate: Option<f64>,
     pub fee_range: Vec<f64>,
+    pub diesel_mint_count: usize,
+    pub diesel_value_per_mint: u128,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -572,13 +578,16 @@ fn cellpack_from_protostone(
     TryInto::<alkanes_support::cellpack::Cellpack>::try_into(values).ok()
 }
 
+/// DIESEL, the genesis alkane. Mint is opcode 77.
+const DIESEL_ALKANE_ID: SchemaAlkaneId = SchemaAlkaneId { block: 2, tx: 0 };
+
 fn is_diesel_mint_protostone(protostones: &[Protostone]) -> bool {
     protostones.iter().any(|protostone| {
         let Some(cellpack) = cellpack_from_protostone(protostone) else {
             return false;
         };
-        cellpack.target.block == 2
-            && cellpack.target.tx == 0
+        cellpack.target.block == DIESEL_ALKANE_ID.block as u128
+            && cellpack.target.tx == DIESEL_ALKANE_ID.tx as u128
             && cellpack.inputs.first() == Some(&77)
     })
 }
@@ -591,8 +600,33 @@ fn block_subsidy_sats(height: u64) -> u64 {
     5_000_000_000u64 >> halvings
 }
 
+/// What one DIESEL mint is worth in a block that contains `total_mints` of them.
+///
+/// Mirrors `create_upgraded_mint_transfer` in alkanes-std-genesis-alkane-upgraded
+/// (and its `precompile_diesel` twin): the miner keeps the fees above the subsidy,
+/// DIESEL takes a cut of those capped at half the reward, and whatever is left is
+/// split evenly across every mint in the block. A mint is NOT worth the reward.
+/// It is worth the reward divided by however many others land beside it.
+fn projected_diesel_value_per_mint(reward: u128, block_fees: u128, total_mints: u128) -> u128 {
+    if total_mints == 0 {
+        return 0;
+    }
+    let diesel_fee = std::cmp::min(reward / 2, block_fees);
+    reward.saturating_sub(diesel_fee) / total_mints
+}
+
 fn hex_u128(value: u128) -> String {
     format!("0x{value:x}")
+}
+
+/// 16-byte little-endian hex, the encoding alkanes uses for a u128 return blob.
+fn hex_u128_le(value: u128) -> String {
+    let mut out = String::with_capacity(2 + 32);
+    out.push_str("0x");
+    for byte in value.to_le_bytes() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn mempool_essentials_provider() -> &'static EssentialsProvider {
@@ -856,11 +890,25 @@ fn project_rune_io_for_block(
     out
 }
 
+/// Project one DIESEL mint's synthetic trace.
+///
+/// The shape mirrors a real upgraded-genesis mint (invoke → the two precompiled
+/// extcall returns → the mint return), and every value that depends on the block
+/// this tx is projected into is filled in from the template: `mint_amount` is the
+/// tx's SHARE of the reward (see `projected_diesel_value_per_mint`), not the whole
+/// reward, and `total_mints` / `total_miner_fee` are echoed so the trace agrees
+/// with the number it reports.
+///
+/// The template's own alkane/storage values are placeholders copied from a real
+/// mainnet mint, so they must all be REPLACED here, never merged with. A value
+/// left in place is another transaction's, credited to this one.
 fn diesel_trace_for_tx(
     txid: &Txid,
     tx: &Transaction,
     vout: u32,
     mint_amount: u128,
+    total_mints: u128,
+    total_miner_fee: u128,
     input_balances: &[BalanceEntry],
 ) -> Option<Vec<EspoTrace>> {
     let mut raw: Value = serde_json::from_str(include_str!("diesel-mint-trace.json")).ok()?;
@@ -869,17 +917,15 @@ fn diesel_trace_for_tx(
         .filter(|entry| entry.amount > 0)
         .map(|entry| alkane_transfer_json(&entry.alkane, entry.amount))
         .collect();
+    // Incoming = whatever the tx actually carries in. A mint takes no DIESEL as
+    // input, so there is nothing to seed here beyond the spent balances.
     if let Some(incoming) = raw
         .get_mut(0)
         .and_then(|v| v.get_mut("data"))
         .and_then(|v| v.get_mut("context"))
         .and_then(|v| v.get_mut("incomingAlkanes"))
-        .and_then(|v| v.as_array_mut())
     {
-        if let Some(first) = incoming.get_mut(0) {
-            first["value"] = Value::String(hex_u128(mint_amount));
-        }
-        incoming.extend(input_transfer_json.iter().cloned());
+        *incoming = Value::Array(input_transfer_json.clone());
     }
     if let Some(v) = raw
         .get_mut(0)
@@ -889,17 +935,38 @@ fn diesel_trace_for_tx(
     {
         *v = json!(vout);
     }
-    if let Some(alkanes) = raw
+    // Events 1 and 2 are the returns of the two precompiled extcalls the mint
+    // makes: number_diesel_mints, then total_miner_fee.
+    if let Some(v) = raw
+        .get_mut(1)
+        .and_then(|v| v.get_mut("data"))
+        .and_then(|v| v.get_mut("response"))
+    {
+        v["data"] = Value::String(hex_u128_le(total_mints));
+        v["storage"] = Value::Array(Vec::new());
+    }
+    if let Some(v) = raw
+        .get_mut(2)
+        .and_then(|v| v.get_mut("data"))
+        .and_then(|v| v.get_mut("response"))
+    {
+        v["data"] = Value::String(hex_u128_le(total_miner_fee));
+        v["storage"] = Value::Array(Vec::new());
+    }
+    // The mint return forwards the incoming alkanes and appends the newly minted
+    // DIESEL, in that order (CallResponse::forward + push).
+    if let Some(response) = raw
         .get_mut(3)
         .and_then(|v| v.get_mut("data"))
         .and_then(|v| v.get_mut("response"))
-        .and_then(|v| v.get_mut("alkanes"))
-        .and_then(|v| v.as_array_mut())
     {
-        if let Some(first) = alkanes.get_mut(0) {
-            first["value"] = Value::String(hex_u128(mint_amount));
-        }
-        alkanes.extend(input_transfer_json);
+        let mut alkanes = input_transfer_json;
+        alkanes.push(alkane_transfer_json(&DIESEL_ALKANE_ID, mint_amount));
+        response["alkanes"] = Value::Array(alkanes);
+        // The template's storage deltas (/fees, /totalsupply, the /tx-hashes/ key)
+        // belong to the mint it was captured from. We cannot know this tx's values
+        // before it is mined, and a stale one reads as fact, so project none.
+        response["storage"] = Value::Array(Vec::new());
     }
 
     let events: Vec<EspoSandshrewLikeTraceEvent> = serde_json::from_value(raw).ok()?;
@@ -1105,6 +1172,8 @@ fn block_summary(template: &MempoolBlockTemplate) -> MempoolBlockSummary {
         min_fee_rate: template.min_fee_rate,
         max_fee_rate: template.max_fee_rate,
         fee_range: template.fee_range.clone(),
+        diesel_mint_count: template.diesel_mint_count,
+        diesel_value_per_mint: template.diesel_value_per_mint,
     }
 }
 
@@ -1123,6 +1192,8 @@ fn ensure_regtest_mempool_template(templates: &mut Vec<MempoolBlockTemplate>, ne
         min_fee_rate: Some(0.0),
         max_fee_rate: Some(0.0),
         fee_range: Vec::new(),
+        diesel_mint_count: 0,
+        diesel_value_per_mint: 0,
         transaction_ids: Vec::new(),
     });
 }
@@ -1341,6 +1412,71 @@ pub fn get_mempool_block_transaction_ids(index: usize) -> Vec<String> {
         .find(|template| template.index == index)
         .map(|template| template.transaction_ids.clone())
         .unwrap_or_default()
+}
+
+/// One transaction as a cell in a block visualisation: how much room it takes
+/// (vsize), what it paid for that room (fee rate), and what it is.
+///
+/// Deliberately flat and small. A block holds 2,000 to 4,500 transactions, and
+/// the point of the view is the whole block at once, so every field here is one
+/// a treemap actually draws with.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BlockTxCell {
+    pub txid: String,
+    pub vsize: u64,
+    pub fee_rate: f64,
+    /// Calls an alkanes contract (protocol tag 1 protostone with a cellpack).
+    pub alkane: bool,
+    /// The alkanes call is a DIESEL mint (2:0, opcode 77).
+    pub diesel_mint: bool,
+    pub rune: bool,
+}
+
+/// Every transaction in a projected block, in the order the template packs
+/// them: highest effective fee rate first, which is the order a miner fills.
+///
+/// This is the mempool half of the block visualisation. Everything it needs is
+/// already in memory, so it costs a read lock and a clone.
+pub fn mempool_block_cells(index: usize) -> Vec<BlockTxCell> {
+    let Ok(state) = mempool_state().read() else { return Vec::new() };
+    let Some(template) = state.templates.iter().find(|t| t.index == index) else {
+        return Vec::new();
+    };
+    let mut cells: Vec<(u64, BlockTxCell)> = template
+        .transaction_ids
+        .iter()
+        .filter_map(|txid| {
+            let parsed = Txid::from_str(txid).ok()?;
+            let entry = state.txs.get(&parsed)?;
+            let offset = entry.position.as_ref().map(|p| p.vsize).unwrap_or(u64::MAX);
+            Some((
+                offset,
+                BlockTxCell {
+                    txid: txid.clone(),
+                    vsize: entry.vsize,
+                    fee_rate: entry.fee_rate,
+                    alkane: entry_has_alkane_action(entry),
+                    diesel_mint: entry.is_diesel_mint,
+                    rune: entry_has_rune_action(entry),
+                },
+            ))
+        })
+        .collect();
+    // position.vsize is the running offset the template assigned, so sorting by
+    // it reproduces the packing order without recomputing it.
+    cells.sort_by_key(|(offset, _)| *offset);
+    cells.into_iter().map(|(_, cell)| cell).collect()
+}
+
+/// Classify a raw transaction the way the mempool classifies its own entries,
+/// for transactions that are already mined and so are not in the mempool.
+pub fn classify_block_tx(tx: &Transaction) -> (bool, bool) {
+    let protostones = protostones_for_tx(tx);
+    if protostones.is_empty() {
+        return (false, false);
+    }
+    let alkane = protostones.iter().any(|p| cellpack_from_protostone(p).is_some());
+    (alkane, is_diesel_mint_protostone(&protostones))
 }
 
 pub fn get_mempool_transactions(txids: &[Txid]) -> HashMap<Txid, Transaction> {
@@ -2863,18 +2999,32 @@ fn recalculate_memory_templates() {
             .filter(|txid| template_state.get(*txid).map(|tx| tx.is_diesel_mint).unwrap_or(false))
             .copied()
             .collect();
-        let per_mint = if diesel_mints.is_empty() {
-            0
-        } else {
-            block_subsidy_sats(next_height + index as u64) as u128 / diesel_mints.len() as u128
-        };
+        // The reward split needs the block's total fees, which the miner claims in
+        // the coinbase alongside the subsidy, so sum them before projecting mints
+        // rather than in the accounting pass further down.
+        let block_fees: u128 = txids
+            .iter()
+            .filter_map(|txid| template_state.get(txid))
+            .map(|tx| tx.fee_sat as u128)
+            .sum();
+        let reward = block_subsidy_sats(next_height + index as u64) as u128;
+        let total_mints = diesel_mints.len() as u128;
+        let per_mint = projected_diesel_value_per_mint(reward, block_fees, total_mints);
+        let total_miner_fee = reward.saturating_add(block_fees);
         for txid in &diesel_mints {
             if let Some(tx) = template_state.get_mut(txid) {
                 if let Some(transaction) = tx.tx.as_ref() {
                     let vout = shadow_base(transaction);
                     let input_balances = input_alkane_balances_for_tx(transaction);
-                    tx.diesel_trace =
-                        diesel_trace_for_tx(txid, transaction, vout, per_mint, &input_balances);
+                    tx.diesel_trace = diesel_trace_for_tx(
+                        txid,
+                        transaction,
+                        vout,
+                        per_mint,
+                        total_mints,
+                        total_miner_fee,
+                        &input_balances,
+                    );
                 }
             }
         }
@@ -2931,6 +3081,8 @@ fn recalculate_memory_templates() {
             min_fee_rate,
             max_fee_rate,
             fee_range,
+            diesel_mint_count: diesel_mints.len(),
+            diesel_value_per_mint: per_mint,
             transaction_ids: txids.iter().map(ToString::to_string).collect(),
         });
     }
@@ -3585,6 +3737,51 @@ pub fn pending_by_txid(txid: &Txid) -> Option<MempoolEntry> {
     get_tx_from_mempool(txid)
 }
 
+/// What the projection says about one pending transaction: which block it is
+/// expected to land in, and, for a DIESEL mint, how many other mints it is
+/// sharing that block's reward with.
+///
+/// This exists because a mint cannot be valued by simulating it on its own. Any
+/// single-transaction replay (`simulatetransaction` and friends) puts one mint in
+/// the block, so the contract hands it the entire reward. Only the projection
+/// knows about the competition.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MempoolTxProjection {
+    pub txid: String,
+    /// Index into the projected block sequence (0 = next block).
+    pub block: Option<usize>,
+    pub projected_height: Option<u64>,
+    pub is_diesel_mint: bool,
+    /// Mints competing for that block, this one included.
+    pub diesel_mint_count: Option<usize>,
+    /// This mint's projected share, in sats of DIESEL.
+    pub diesel_value_per_mint: Option<u128>,
+}
+
+pub fn projected_tx(txid: &Txid) -> Option<MempoolTxProjection> {
+    let state = mempool_state().read().ok()?;
+    let entry = state.txs.get(txid)?;
+    let block = entry.template_index.or_else(|| entry.position.as_ref().map(|pos| pos.block));
+    let template = block.and_then(|index| state.templates.iter().find(|t| t.index == index));
+    // A mint that has not been placed in a template yet has no share to report,
+    // so leave both counts None rather than implying a full reward.
+    let (diesel_mint_count, diesel_value_per_mint) = match (entry.is_diesel_mint, template) {
+        (true, Some(template)) => {
+            (Some(template.diesel_mint_count), Some(template.diesel_value_per_mint))
+        }
+        _ => (None, None),
+    };
+    Some(MempoolTxProjection {
+        txid: txid.to_string(),
+        block,
+        projected_height: block
+            .map(|index| crate::config::get_espo_next_height() as u64 + index as u64),
+        is_diesel_mint: entry.is_diesel_mint,
+        diesel_mint_count,
+        diesel_value_per_mint,
+    })
+}
+
 pub fn pending_action_entries() -> Vec<MempoolEntry> {
     let Ok(state) = mempool_state().read() else {
         return Vec::new();
@@ -3971,6 +4168,117 @@ mod tests {
         let traces = fast_traces_for_tx(&txid, &tx, &[protostone]).expect("fast traces");
 
         assert!(traces.is_empty());
+    }
+
+    fn diesel_return(
+        traces: &[EspoTrace],
+    ) -> &crate::alkanes::trace::EspoSandshrewLikeTraceReturnData {
+        let events = &traces[0].sandshrew_trace.events;
+        let EspoSandshrewLikeTraceEvent::Return(ret) = events.last().expect("mint return") else {
+            panic!("expected the mint to end in a return event");
+        };
+        ret
+    }
+
+    /// A mint is worth the block reward divided by every mint racing for the same
+    /// block. Valuing one on its own is the whole bug this guards: a single-tx
+    /// replay sees one mint and hands it all 3.125 DIESEL.
+    #[test]
+    fn projected_diesel_value_per_mint_splits_the_reward_across_competing_mints() {
+        let reward = 312_500_000u128;
+
+        assert_eq!(projected_diesel_value_per_mint(reward, 0, 1), reward);
+        assert_eq!(projected_diesel_value_per_mint(reward, 0, 250), reward / 250);
+        assert_eq!(projected_diesel_value_per_mint(reward, 0, 0), 0);
+    }
+
+    #[test]
+    fn projected_diesel_value_per_mint_takes_the_fee_cut_before_splitting() {
+        let reward = 312_500_000u128;
+
+        assert_eq!(
+            projected_diesel_value_per_mint(reward, 1_000_000, 100),
+            (reward - 1_000_000) / 100
+        );
+        // The cut is capped at half the reward however rich the block is.
+        assert_eq!(projected_diesel_value_per_mint(reward, reward * 4, 100), (reward / 2) / 100);
+    }
+
+    #[test]
+    fn diesel_trace_credits_only_the_projected_share() {
+        let tx = sample_tx();
+        let txid = tx.compute_txid();
+        let per_mint = 758_252u128;
+
+        let traces = diesel_trace_for_tx(&txid, &tx, 3, per_mint, 412, 313_417_824, &[])
+            .expect("diesel trace");
+
+        let EspoSandshrewLikeTraceEvent::Invoke(invoke) = &traces[0].sandshrew_trace.events[0]
+        else {
+            panic!("expected invoke event");
+        };
+        // A mint carries no DIESEL in; only what the tx actually spends.
+        assert!(invoke.context.incoming_alkanes.is_empty());
+        assert_eq!(invoke.context.vout, 3);
+
+        let ret = diesel_return(&traces);
+        assert_eq!(ret.response.alkanes.len(), 1);
+        assert_eq!(ret.response.alkanes[0].id.block, "0x2");
+        assert_eq!(ret.response.alkanes[0].id.tx, "0x0");
+        assert_eq!(ret.response.alkanes[0].value, hex_u128(per_mint));
+        // No storage deltas borrowed from the mint the template was captured from.
+        assert!(ret.response.storage.is_empty());
+    }
+
+    #[test]
+    fn diesel_trace_forwards_spent_balances_then_appends_the_mint() {
+        let tx = sample_tx();
+        let txid = tx.compute_txid();
+        let spent = [
+            BalanceEntry { alkane: SchemaAlkaneId { block: 2, tx: 0 }, amount: 3_046_375_266 },
+            BalanceEntry { alkane: SchemaAlkaneId { block: 32, tx: 0 }, amount: 12_000 },
+            BalanceEntry { alkane: SchemaAlkaneId { block: 2, tx: 77 }, amount: 0 },
+        ];
+
+        let traces =
+            diesel_trace_for_tx(&txid, &tx, 3, 758_252, 412, 313_417_824, &spent).expect("trace");
+
+        let EspoSandshrewLikeTraceEvent::Invoke(invoke) = &traces[0].sandshrew_trace.events[0]
+        else {
+            panic!("expected invoke event");
+        };
+        // Zero balances are not transfers.
+        assert_eq!(invoke.context.incoming_alkanes.len(), 2);
+
+        let ret = diesel_return(&traces);
+        let values: Vec<&str> =
+            ret.response.alkanes.iter().map(|transfer| transfer.value.as_str()).collect();
+        assert_eq!(values, vec![hex_u128(3_046_375_266), hex_u128(12_000), hex_u128(758_252)]);
+    }
+
+    #[test]
+    fn diesel_trace_echoes_the_block_it_was_valued_against() {
+        let tx = sample_tx();
+        let txid = tx.compute_txid();
+
+        let traces = diesel_trace_for_tx(&txid, &tx, 3, 758_252, 412, 313_417_824, &[])
+            .expect("diesel trace");
+
+        let events = &traces[0].sandshrew_trace.events;
+        let EspoSandshrewLikeTraceEvent::Return(mints) = &events[1] else {
+            panic!("expected the number_diesel_mints return");
+        };
+        let EspoSandshrewLikeTraceEvent::Return(fee) = &events[2] else {
+            panic!("expected the total_miner_fee return");
+        };
+        assert_eq!(mints.response.data, hex_u128_le(412));
+        assert_eq!(fee.response.data, hex_u128_le(313_417_824));
+    }
+
+    #[test]
+    fn hex_u128_le_encodes_sixteen_little_endian_bytes() {
+        assert_eq!(hex_u128_le(412), "0x9c010000000000000000000000000000");
+        assert_eq!(hex_u128_le(0), "0x00000000000000000000000000000000");
     }
 
     /// The address page asks for one window of pending transactions. Matches
