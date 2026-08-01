@@ -16,12 +16,12 @@ use crate::modules::defs::EspoModule;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use bitcoin::Transaction;
 use bitcoin::absolute::LockTime;
 use bitcoin::block::Header;
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::transaction::Version;
-use bitcoin::Transaction;
 use rocksdb::{DB, Options};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,7 +99,13 @@ fn open_module() -> (ExplorerExtensions, Arc<Mdb>, TempDir) {
     let mut opts = Options::default();
     opts.create_if_missing(true);
     let db = Arc::new(DB::open(&opts, tmp.path()).unwrap());
-    let mdb = Arc::new(Mdb::from_db(db, b"explorerextensions:"));
+    // Deliberately NOT the "explorerextensions:" prefix. That namespace is
+    // versioned, and a versioned Mdb resolves through the process-global tree db,
+    // which another test in this binary may already have installed over its own
+    // temp store. These tests would then read and write each other's rows instead
+    // of the store opened here, and pass or fail on test order. The index shapes
+    // under test are the same either way.
+    let mdb = Arc::new(Mdb::from_db(db, b"explorerextensions-test:"));
     let mut module = ExplorerExtensions::new();
     module.set_mdb(mdb.clone());
     (module, mdb, tmp)
@@ -122,8 +128,10 @@ fn top_level_and_internal_indexes_are_separated() {
     );
     // tx B: 4:70002 is itself the top-level target, and it reverts.
     let tx_b = make_tx(2);
-    let trace_b =
-        trace_for(&tx_b, vec![invoke("call", short("4", "70002"), short("0", "0"), vec![]), ret(false)]);
+    let trace_b = trace_for(
+        &tx_b,
+        vec![invoke("call", short("4", "70002"), short("0", "0"), vec![]), ret(false)],
+    );
 
     let txid_a = tx_a.compute_txid().to_string();
     let txid_b = tx_b.compute_txid().to_string();
@@ -133,6 +141,7 @@ fn top_level_and_internal_indexes_are_separated() {
         height: 880_001,
         block_header: header(),
         host_function_values: (vec![], vec![], vec![], vec![]),
+        fee_summary: None,
         tx_count: 2,
         transactions: vec![
             EspoAlkanesTransaction { traces: Some(vec![trace_a]), transaction: tx_a },
@@ -181,12 +190,14 @@ fn top_level_and_internal_indexes_are_separated() {
 fn reindexing_same_block_is_idempotent() {
     let (module, mdb, _tmp) = open_module();
     let tx = make_tx(7);
-    let trace = trace_for(&tx, vec![invoke("call", short("2", "0"), short("0", "0"), vec![]), ret(true)]);
+    let trace =
+        trace_for(&tx, vec![invoke("call", short("2", "0"), short("0", "0"), vec![]), ret(true)]);
     let mk_block = |tx: Transaction, trace: EspoTrace| EspoBlock {
         is_latest: true,
         height: 880_010,
         block_header: header(),
         host_function_values: (vec![], vec![], vec![], vec![]),
+        fee_summary: None,
         tx_count: 1,
         transactions: vec![EspoAlkanesTransaction { traces: Some(vec![trace]), transaction: tx }],
     };

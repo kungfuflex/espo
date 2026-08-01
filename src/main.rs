@@ -1251,16 +1251,20 @@ async fn main() -> Result<()> {
     }));
     eprintln!("[rpc] listening on {}", addr);
 
-    // Optional SSR explorer server.
+    // Explorer server: JSON API always, SSR pages on request.
     //
-    // The subfrost deployment consumes only espo's backend RPC/view API
-    // (explorer.subfrost.io is our own frontend); it never uses espo's built-in
-    // server-rendered explorer. That SSR frontend is also the OOM-prone path —
-    // its address page walked an address's entire outpoint history per request.
-    // So the SSR listener is gated behind ESPO_EXPLORER_ENABLED and defaults to
-    // OFF here, even when `explorer_host` is configured. run_rpc (above) and the
-    // OylAPI module are unaffected. Set ESPO_EXPLORER_ENABLED=true to restore it.
-    let explorer_enabled = std::env::var("ESPO_EXPLORER_ENABLED")
+    // The subfrost deployment renders its own frontend (explorer.subfrost.io)
+    // and never uses espo's server-rendered pages. Those pages are also the
+    // OOM-prone path: the address page walked an address's entire outpoint
+    // history per request. So they stay behind ESPO_EXPLORER_ENABLED.
+    //
+    // The LISTENER is no longer gated with them. The frontend proxies its live
+    // feeds from this same router (block carousel, mempool-block projection,
+    // per-tx projection, events websocket), so gating the whole server took
+    // those down too, silently: on mainnet the carousel rendered bare heights
+    // with no fee rate and "0 traces", and the mempool projection fell back to
+    // the esplora fee histogram. Serve the API; mount the pages only when asked.
+    let explorer_pages_enabled = std::env::var("ESPO_EXPLORER_ENABLED")
         .map(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -1269,19 +1273,16 @@ async fn main() -> Result<()> {
         })
         .unwrap_or(false);
     if let Some(explorer_addr) = cfg.explorer_host {
-        if explorer_enabled {
-            service_handles.push(tokio::spawn(async move {
-                if let Err(e) = run_explorer(explorer_addr).await {
-                    eprintln!("[explorer] server error: {e:?}");
-                }
-            }));
-            eprintln!("[explorer] listening on {}", explorer_addr);
-        } else {
-            eprintln!(
-                "[explorer] SSR frontend disabled (explorer_host={} configured but ESPO_EXPLORER_ENABLED is not set); RPC/view API + OylAPI remain up",
-                explorer_addr
-            );
-        }
+        service_handles.push(tokio::spawn(async move {
+            if let Err(e) = run_explorer(explorer_addr, explorer_pages_enabled).await {
+                eprintln!("[explorer] server error: {e:?}");
+            }
+        }));
+        eprintln!(
+            "[explorer] listening on {} (JSON API{})",
+            explorer_addr,
+            if explorer_pages_enabled { " + SSR pages" } else { ", SSR pages disabled" }
+        );
     }
 
     let height_cell = Arc::new(AtomicU32::new(start_height));

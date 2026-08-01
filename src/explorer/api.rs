@@ -1,6 +1,7 @@
 use crate::runtime::state_at::StateAt;
 use axum::Json;
 use axum::body::Body;
+use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::{StatusCode, header};
@@ -36,7 +37,8 @@ use crate::modules::runes::storage::{RuneEntry, RunesProvider, SchemaRuneId};
 use crate::modules::tokendata::storage::TokenDataProvider;
 use crate::runtime::mdb::Mdb;
 use crate::runtime::mempool::{
-    current_mempool_compact_snapshot, get_mempool_block_transaction_ids, pending_by_txid,
+    BlockTxCell, classify_block_tx, current_mempool_compact_snapshot,
+    get_mempool_block_transaction_ids, mempool_block_cells, pending_by_txid, projected_tx,
     subscribe_mempool_events,
 };
 use crate::schemas::SchemaAlkaneId;
@@ -50,6 +52,7 @@ use anyhow::Context;
 use bitcoin::blockdata::block::Header;
 use bitcoin::consensus::Encodable;
 use bitcoin::consensus::encode::deserialize;
+use bitcoin::hashes::Hash;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use bitcoin::transaction::Version;
@@ -167,6 +170,139 @@ pub async fn mempool_blocks() -> Response {
         return crate::explorer::relay::proxy_mempool_blocks(events_host).await;
     }
     Json(explorer_mempool_snapshot()).into_response()
+}
+
+/// The projection for a single pending transaction.
+///
+/// Exists for clients that value a DIESEL mint before it confirms. Replaying the
+/// transaction on its own (`simulatetransaction`) always reports the whole block
+/// reward, because the replay block holds exactly one mint. The true share only
+/// appears once you know how many mints are queued for the same block, which is
+/// what this returns. 404 when the transaction is not in the mempool.
+pub async fn mempool_tx_projection(Path(txid): Path<String>) -> Response {
+    if let Some(events_host) = crate::config::get_explorer_espo_events_host() {
+        return crate::explorer::relay::proxy_mempool_json(
+            events_host,
+            &format!("/api/mempool/tx/{txid}"),
+        )
+        .await;
+    }
+    let Ok(txid) = Txid::from_str(txid.trim()) else {
+        return (StatusCode::BAD_REQUEST, "invalid txid").into_response();
+    };
+    match projected_tx(&txid) {
+        Some(projection) => Json(projection).into_response(),
+        None => (StatusCode::NOT_FOUND, "not in mempool").into_response(),
+    }
+}
+
+/// Every transaction in a PROJECTED block, as visualisation cells.
+///
+/// Served from the in-memory template, so it is a read lock and a clone. The
+/// order is the template's own packing order (highest effective fee rate
+/// first), which is what a treemap wants to lay out.
+pub async fn mempool_block_txs(Path(index): Path<usize>) -> Response {
+    if let Some(events_host) = crate::config::get_explorer_espo_events_host() {
+        return crate::explorer::relay::proxy_mempool_json(
+            events_host,
+            &format!("/api/mempool/block/{index}/txs"),
+        )
+        .await;
+    }
+    let cells = mempool_block_cells(index);
+    Json(json!({ "index": index, "tx_count": cells.len(), "txs": cells })).into_response()
+}
+
+/// Every transaction in a MINED block, as visualisation cells.
+///
+/// bitcoind's `getblock` at verbosity 2 already returns each transaction with
+/// its weight and its fee, which is exactly the pair a treemap needs and which
+/// espo already fetches for its per-block fee-rate summary before discarding
+/// the rows. This keeps them, and classifies each transaction from its own hex
+/// so the alkanes calls can be marked without touching an index.
+///
+/// A block is immutable, so the answer is cached under its hash.
+pub async fn block_txs(Path(height): Path<u32>) -> Response {
+    let Some(summary) = get_cached_block_summary(height) else {
+        return (StatusCode::NOT_FOUND, "block not indexed").into_response();
+    };
+    let blockhash = bitcoin::BlockHash::from_byte_array(summary.blockhash);
+    if let Some(cached) = cached_block_tx_cells(&blockhash) {
+        return Json(json!({ "height": height, "tx_count": cached.len(), "txs": cached }))
+            .into_response();
+    }
+    let cells = match block_tx_cells(&blockhash) {
+        Ok(cells) => cells,
+        Err(e) => {
+            eprintln!("[explorer] block_txs({height}) failed: {e:?}");
+            return (StatusCode::BAD_GATEWAY, "block transactions unavailable").into_response();
+        }
+    };
+    store_block_tx_cells(blockhash, cells.clone());
+    Json(json!({ "height": height, "tx_count": cells.len(), "txs": cells })).into_response()
+}
+
+#[derive(Deserialize)]
+struct VerboseBlockTxs {
+    tx: Vec<VerboseBlockTx>,
+}
+
+#[derive(Deserialize)]
+struct VerboseBlockTx {
+    txid: String,
+    weight: u64,
+    fee: Option<f64>,
+    hex: String,
+}
+
+fn block_tx_cells(blockhash: &bitcoin::BlockHash) -> anyhow::Result<Vec<BlockTxCell>> {
+    let rpc = get_bitcoind_rpc_client();
+    let block: VerboseBlockTxs = rpc
+        .call("getblock", &[json!(blockhash.to_string()), json!(2)])
+        .map_err(|e| anyhow::anyhow!("getblock({blockhash}, 2) failed: {e}"))?;
+    Ok(block
+        .tx
+        .into_iter()
+        .map(|tx| {
+            let vsize = tx.weight.div_ceil(4);
+            // The coinbase has no fee; everything else does at verbosity 2.
+            let fee_rate = match tx.fee {
+                Some(fee_btc) if vsize > 0 => (fee_btc * 100_000_000.0) / vsize as f64,
+                _ => 0.0,
+            };
+            let (alkane, diesel_mint) = hex::decode(&tx.hex)
+                .ok()
+                .and_then(|raw| deserialize::<Transaction>(&raw).ok())
+                .map(|parsed| classify_block_tx(&parsed))
+                .unwrap_or((false, false));
+            BlockTxCell { txid: tx.txid, vsize, fee_rate, alkane, diesel_mint, rune: false }
+        })
+        .collect())
+}
+
+/// Mined blocks never change, so one entry per block is enough. Bounded to a
+/// handful because each is a few hundred KB and the view is opened one block at
+/// a time.
+const BLOCK_TX_CELL_CACHE_LIMIT: usize = 8;
+static BLOCK_TX_CELLS: OnceLock<Mutex<Vec<(bitcoin::BlockHash, Vec<BlockTxCell>)>>> =
+    OnceLock::new();
+
+fn cached_block_tx_cells(blockhash: &bitcoin::BlockHash) -> Option<Vec<BlockTxCell>> {
+    let cache = BLOCK_TX_CELLS.get_or_init(|| Mutex::new(Vec::new()));
+    let guard = cache.lock().ok()?;
+    guard.iter().find(|(hash, _)| hash == blockhash).map(|(_, cells)| cells.clone())
+}
+
+fn store_block_tx_cells(blockhash: bitcoin::BlockHash, cells: Vec<BlockTxCell>) {
+    let cache = BLOCK_TX_CELLS.get_or_init(|| Mutex::new(Vec::new()));
+    let Ok(mut guard) = cache.lock() else { return };
+    if guard.iter().any(|(hash, _)| *hash == blockhash) {
+        return;
+    }
+    if guard.len() >= BLOCK_TX_CELL_CACHE_LIMIT {
+        guard.remove(0);
+    }
+    guard.push((blockhash, cells));
 }
 
 pub async fn explorer_events_ws(ws: WebSocketUpgrade) -> Response {
