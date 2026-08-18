@@ -55,7 +55,28 @@ fn load_historical_backfill() -> Result<BTreeMap<u64, u128>> {
     Ok(prices)
 }
 
+/// Resolve the bootstrap price file.
+///
+/// `CARGO_MANIFEST_DIR` is a BUILD-time path, so on its own this never resolved
+/// in a container: the espo image builds in `/build` and copies only the binary
+/// into the runtime stage, leaving `/build/resources/` absent. Every lookup
+/// failed with "failed to read /build/resources/btc_usd_historical.json", which
+/// silently removed the last fallback in the ammdata btc/usd chain.
+///
+/// Prefer an explicit `ESPO_RESOURCES_DIR`, then the packaged image location,
+/// and only then the build-time path (which is what makes `cargo test` and
+/// local `cargo run` work from a source checkout).
 fn historical_backfill_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("ESPO_RESOURCES_DIR") {
+        let p = PathBuf::from(dir).join("btc_usd_historical.json");
+        if p.exists() {
+            return p;
+        }
+    }
+    let packaged = PathBuf::from("/usr/local/share/espo").join(BTC_USD_HISTORICAL_REL_PATH);
+    if packaged.exists() {
+        return packaged;
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(BTC_USD_HISTORICAL_REL_PATH)
 }
 

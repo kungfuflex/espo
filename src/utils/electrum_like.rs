@@ -248,10 +248,22 @@ impl ElectrumLike for ElectrumRpcClient {
     }
 }
 
+/// How long a pooled idle connection may sit before we drop it ourselves.
+///
+/// Shrinking this narrows (but cannot close) the race described on
+/// `get_idempotent` — it only reduces how often we hand out a socket the server
+/// has already closed. The retry is what makes it correct.
+const ESPLORA_POOL_IDLE_TIMEOUT_SECS: u64 = 15;
+
 /// Esplora-backed implementation that hits `/tx/:txid/raw`.
 pub struct EsploraElectrumLike {
     base_url: String,
     http: HttpClient,
+    /// Pool-free client used ONLY to retry a request that died on a reused
+    /// connection. `pool_max_idle_per_host(0)` means every request off this
+    /// client dials a brand-new socket, so a retry can never inherit the same
+    /// half-closed connection that just failed.
+    http_fresh: HttpClient,
 }
 
 impl EsploraElectrumLike {
@@ -260,7 +272,66 @@ impl EsploraElectrumLike {
         while url.ends_with('/') {
             url.pop();
         }
-        Ok(Self { base_url: url, http: HttpClient::new() })
+        let http = HttpClient::builder()
+            .pool_idle_timeout(std::time::Duration::from_secs(ESPLORA_POOL_IDLE_TIMEOUT_SECS))
+            .build()
+            .context("failed to build esplora HTTP client")?;
+        let http_fresh = HttpClient::builder()
+            .pool_max_idle_per_host(0)
+            .build()
+            .context("failed to build esplora no-pool HTTP client")?;
+        Ok(Self { base_url: url, http, http_fresh })
+    }
+
+    /// GET an esplora endpoint, retrying ONCE on a brand-new connection if the
+    /// transport fails.
+    ///
+    /// WHY THIS EXISTS. electrs closes idle keep-alive connections on its own
+    /// schedule. Between the moment we pull a pooled connection and the moment
+    /// we write the request, the server may already have sent its FIN — a
+    /// TOCTOU we cannot detect by inspecting the socket first. The request then
+    /// dies as `client error (SendRequest) / connection closed before message
+    /// completed`.
+    ///
+    /// This is not hypothetical and not rare: it silently wedged espo-a for
+    /// 16.5 hours on 2026-08-17, and again ~9 minutes after a restart. The
+    /// indexer simply stopped, while the pod stayed Running with 0 restarts.
+    /// It bites hardest when CATCHING UP, because that is when we issue the
+    /// most back-to-back requests — so an espo that falls behind cannot get
+    /// back, which is the worst possible failure shape. Blocks now carrying
+    /// 2,000-6,800 traces each (vs 135-250 earlier in 2026) turned a rare race
+    /// into a constant one. tlsd hit the identical race against the same
+    /// electrs and fixed it the same way (retry the idempotent GET on a fresh
+    /// connection).
+    ///
+    /// Retrying a *transport* failure is safe here precisely because every
+    /// caller is a GET: nothing was committed server-side, so re-issuing it
+    /// cannot double-apply anything. `broadcast_raw` is deliberately NOT routed
+    /// through this helper — it is a POST, it is not idempotent, and a blind
+    /// retry there could rebroadcast.
+    ///
+    /// We retry on ANY send() error rather than string-matching the message.
+    /// Matching on "connection closed before message completed" would be
+    /// brittle across hyper/reqwest versions, and for an idempotent GET a
+    /// single extra attempt costs one connect on a genuinely-down backend.
+    async fn get_idempotent(&self, url: &str) -> Result<reqwest::Response> {
+        match self.http.get(url).send().await {
+            Ok(resp) => Ok(resp),
+            Err(first) => {
+                eprintln!(
+                    "[esplora] GET {url} failed on a pooled connection ({first}); retrying on a fresh connection"
+                );
+                self.http_fresh
+                    .get(url)
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "esplora GET {url} failed on a fresh connection after a pooled-connection failure ({first})"
+                        )
+                    })
+            }
+        }
     }
 
     async fn fetch_one_indexed(&self, idx: usize, txid: &Txid) -> Result<(usize, Vec<u8>)> {
@@ -269,9 +340,7 @@ impl EsploraElectrumLike {
         }
         let url = format!("{}/tx/{}/raw", self.base_url, txid);
         let resp = self
-            .http
-            .get(&url)
-            .send()
+            .get_idempotent(&url)
             .await
             .with_context(|| format!("esplora GET {url} failed"))?
             .error_for_status()
@@ -290,9 +359,7 @@ impl EsploraElectrumLike {
     ) -> Result<Option<(serde_json::Value, String)>> {
         let url = format!("{}/tx/{}", self.base_url, txid);
         let resp = self
-            .http
-            .get(&url)
-            .send()
+            .get_idempotent(&url)
             .await
             .with_context(|| format!("esplora GET {url} failed"))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -307,9 +374,7 @@ impl EsploraElectrumLike {
 
         let hex_url = format!("{}/tx/{}/hex", self.base_url, txid);
         let hex_resp = self
-            .http
-            .get(&hex_url)
-            .send()
+            .get_idempotent(&hex_url)
             .await
             .with_context(|| format!("esplora GET {hex_url} failed"))?;
         if hex_resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -360,9 +425,7 @@ impl EsploraElectrumLike {
     async fn fetch_address_summary(&self, address: &str) -> Result<AddressSummary> {
         let url = format!("{}/address/{}", self.base_url, address);
         let resp = self
-            .http
-            .get(&url)
-            .send()
+            .get_idempotent(&url)
             .await
             .with_context(|| format!("esplora GET {url} failed"))?
             .error_for_status()
@@ -377,9 +440,7 @@ impl EsploraElectrumLike {
     async fn fetch_address_utxos(&self, address: &str) -> Result<Vec<EsploraUtxo>> {
         let url = format!("{}/address/{}/utxo", self.base_url, address);
         let resp = self
-            .http
-            .get(&url)
-            .send()
+            .get_idempotent(&url)
             .await
             .with_context(|| format!("esplora GET {url} failed"))?
             .error_for_status()
@@ -394,9 +455,7 @@ impl EsploraElectrumLike {
     async fn fetch_outspends_single(&self, txid: &Txid) -> Result<Vec<Option<Txid>>> {
         let url = format!("{}/tx/{}/outspends", self.base_url, txid);
         let resp = self
-            .http
-            .get(&url)
-            .send()
+            .get_idempotent(&url)
             .await
             .with_context(|| format!("esplora GET {url} failed"))?
             .error_for_status()
@@ -436,9 +495,7 @@ impl EsploraElectrumLike {
     }
     async fn fetch_address_txs(&self, url: &str) -> Result<Vec<EsploraAddressTx>> {
         let resp = self
-            .http
-            .get(url)
-            .send()
+            .get_idempotent(url)
             .await
             .with_context(|| format!("esplora GET {url} failed"))?
             .error_for_status()
@@ -512,9 +569,7 @@ impl ElectrumLike for EsploraElectrumLike {
         self.block_on_result(async {
             let url = format!("{}/blocks/tip/height", self.base_url);
             let resp = self
-                .http
-                .get(&url)
-                .send()
+                .get_idempotent(&url)
                 .await
                 .with_context(|| format!("esplora GET {url} failed"))?
                 .error_for_status()
@@ -544,9 +599,7 @@ impl ElectrumLike for EsploraElectrumLike {
         self.block_on_result(async {
             let url = format!("{}/tx/{}", self.base_url, txid);
             let resp = self
-                .http
-                .get(&url)
-                .send()
+                .get_idempotent(&url)
                 .await
                 .with_context(|| format!("esplora GET {url} failed"))?
                 .error_for_status()

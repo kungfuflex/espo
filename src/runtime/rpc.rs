@@ -5,6 +5,7 @@ use crate::{
     modules::defs::RpcRegistry,
     runtime::mempool::{
         MempoolBlockSummary, current_mempool_compact_snapshot, current_mempool_minimum_fee_rate,
+        mempool_availability,
     },
 };
 use axum::{
@@ -222,7 +223,41 @@ fn calculate_fee_estimates(
     }
 }
 
+/// `btc.fee_estimates`.
+///
+/// **This endpoint refuses rather than degrades, and that is load-bearing.**
+///
+/// `calculate_fee_estimates` collapses to the fee FLOOR for every bucket when
+/// handed an empty block list — see `precise_fee_estimates_have_stable_empty_view_floors`,
+/// which asserts exactly that. Empty projections arise whenever the mempool
+/// subsystem is not maintaining state: `mempool.enabled = false`, a first sync
+/// that has not landed, or an ingest path that has been failing for a while.
+///
+/// The caller that makes this dangerous is `qubitcoin-shim`, which maps this
+/// method onto Core's `estimatesmartfee` to price **FROST mint RBF**. A
+/// replacement priced at the floor does not error — it simply never confirms,
+/// and nothing anywhere reports a fault. That is the worst possible shape for a
+/// signing path.
+///
+/// So: if the mempool is not being maintained, this returns a JSON-RPC ERROR
+/// naming the subsystem. A genuinely empty mempool that we ARE maintaining
+/// still answers normally — the floor is the right answer for that, and
+/// `mempool_availability` is what tells the two cases apart.
 fn fee_estimates_response(id: Value) -> JsonRpcResponse {
+    if let Err(unavailable) = mempool_availability() {
+        return err_response(
+            id,
+            unavailable.code(),
+            &format!(
+                "btc.fee_estimates unavailable: {}. \
+                 Refusing to return floor fee estimates — a caller pricing a \
+                 replacement transaction from these would underpay silently.",
+                unavailable.message()
+            ),
+            Some(json!({ "reason": unavailable.reason() })),
+        );
+    }
+
     let snapshot = current_mempool_compact_snapshot();
     let minimum_fee = current_mempool_minimum_fee_rate().unwrap_or(PRECISE_FEE_INCREMENT);
     let max_block_vsize = (get_config().mempool.block_weight_units as f64 / 4.0).max(1.0);
@@ -1069,6 +1104,67 @@ mod tests {
                 minimum_fee: 0.1,
             }
         );
+    }
+
+    /// The hazard the availability gate exists to close, stated as a test.
+    ///
+    /// An empty block list produces a full set of floor estimates that look
+    /// completely ordinary — no zeroes, no NaN, no signal of any kind that the
+    /// mempool is not being maintained. `qubitcoin-shim` prices FROST mint RBF
+    /// off these. A replacement priced here does not bounce; it just never
+    /// confirms.
+    ///
+    /// This is why `fee_estimates_response` consults `mempool_availability()`
+    /// and returns a JSON-RPC ERROR rather than calling
+    /// `calculate_fee_estimates` at all when ingest is off, never synced, or
+    /// stale. If someone ever removes that check, the floors below are what
+    /// callers silently get back.
+    #[test]
+    fn empty_projection_floors_are_indistinguishable_from_a_real_quote() {
+        let dark = calculate_fee_estimates(&[], 1.0, 1_000_000.0);
+        // A genuinely cheap-but-live mempool produces the same shape.
+        let live = calculate_fee_estimates(&[fee_block(0, 100, 1.0)], 1.0, 1_000_000.0);
+
+        assert_eq!(
+            dark, live,
+            "a dark mempool and a live-but-cheap one quote identically — \
+             the ONLY thing that can tell them apart is mempool_availability()"
+        );
+        // And every field is a plausible fee, not an obvious sentinel.
+        assert!(dark.fastest_fee > 0.0 && dark.fastest_fee.is_finite());
+        assert!(dark.minimum_fee > 0.0 && dark.minimum_fee.is_finite());
+    }
+
+    #[test]
+    fn mempool_unavailable_messages_name_the_subsystem_and_the_replacement() {
+        use crate::runtime::mempool::{MEMPOOL_DISABLED_CODE, MempoolUnavailable};
+
+        let disabled = MempoolUnavailable::Disabled;
+        assert_eq!(disabled.code(), MEMPOOL_DISABLED_CODE);
+        assert_eq!(disabled.reason(), "mempool_disabled");
+        let msg = disabled.message();
+        // An operator hitting this in prod must learn three things from the
+        // message alone: what is off, why, and where to go instead.
+        assert!(msg.contains("mempool.enabled"), "must name the config key: {msg}");
+        assert!(msg.contains("DISABLED"), "must be unambiguous: {msg}");
+        assert!(msg.contains("subvh-mempool"), "must name the replacement: {msg}");
+
+        let stale = MempoolUnavailable::Stale { age_secs: 1200, limit_secs: 900 };
+        assert_eq!(stale.reason(), "mempool_stale");
+        assert!(stale.message().contains("1200"));
+        assert!(stale.message().contains("900"));
+
+        let never = MempoolUnavailable::NeverSynced;
+        assert_eq!(never.reason(), "mempool_never_synced");
+        assert!(never.message().contains("first successful sync"));
+
+        // The three reasons must be distinguishable by a machine, not just by a
+        // human reading prose.
+        let reasons = [disabled.reason(), stale.reason(), never.reason()];
+        let mut uniq = reasons.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3);
     }
 
     #[test]

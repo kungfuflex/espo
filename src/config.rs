@@ -1098,6 +1098,21 @@ pub fn init_config() -> Result<()> {
         cfg.trace_format = fmt;
     }
     if cli.mempool_p2p {
+        // `--mempool-p2p` selects the ingest SOURCE. It is NOT an on switch, and
+        // it cannot override `mempool.enabled = false`. The two are easy to
+        // confuse — and confusing them in the other direction is worse: DROPPING
+        // this flag does not disable the mempool, it reverts ingest to
+        // getrawmempool polling with `hydration_workers` in parallel, which is
+        // the MORE expensive mode. Say so here rather than let someone discover
+        // it from an RSS graph.
+        if !cfg.mempool.enabled {
+            eprintln!(
+                "[config] WARNING: --mempool-p2p was passed but `mempool.enabled = false`. \
+                 The flag only selects the ingest source; it does NOT re-enable ingest. \
+                 The mempool subsystem stays OFF. Remove `mempool.enabled = false` if you \
+                 meant to run the p2p driver."
+            );
+        }
         cfg.mempool.source = "p2p".to_string();
     }
     init_config_from(cfg)

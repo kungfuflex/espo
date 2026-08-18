@@ -15,7 +15,7 @@ use crate::modules::essentials::storage::{
     RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcPingParams, RpcSearchAlkaneParams,
     RpcSearchFactoryKeysParams,
 };
-use crate::runtime::mempool::current_mempool_memory_stats;
+use crate::runtime::mempool::{current_mempool_memory_stats, mempool_availability};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -50,6 +50,17 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_mempool_traces", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_mem);
                     async move {
+                        // Refuse rather than return an empty trace list: with
+                        // ingest off there is nothing pending to trace, and an
+                        // empty `traces` array is indistinguishable from "the
+                        // mempool is quiet right now".
+                        if let Err(unavailable) = mempool_availability() {
+                            return json!({
+                                "ok": false,
+                                "error": unavailable.reason(),
+                                "message": unavailable.message(),
+                            });
+                        }
                         let view = match resolve_view(mdb.as_ref(), &payload) {
                             Ok(v) => v,
                             Err(err) => return err,
@@ -64,9 +75,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .filter(|s| !s.is_empty()),
                             fee_paid: payload.get("fee_paid").and_then(|v| v.as_f64()),
                         };
-                        view.rpc_get_mempool_traces(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_mempool_traces(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -78,6 +92,16 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
         tokio::spawn(async move {
             reg_mem_stats
                 .register("get_mempool_memory_stats", move |_cx, _payload| async move {
+                    // Distinguish "switched off" from the pre-existing generic
+                    // unavailable, so an operator reading this can tell a
+                    // configured shutdown from a fault.
+                    if let Err(unavailable) = mempool_availability() {
+                        return json!({
+                            "ok": false,
+                            "error": unavailable.reason(),
+                            "message": unavailable.message(),
+                        });
+                    }
                     match current_mempool_memory_stats() {
                         Some(stats) => json!({"ok": true, "stats": stats}),
                         None => json!({"ok": false, "error": "mempool_unavailable"}),
@@ -116,9 +140,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             keys,
                         };
-                        view.rpc_get_keys(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_keys(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -141,9 +168,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_all_alkanes(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_all_alkanes(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -169,9 +199,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(str::to_string),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_search_alkane(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_search_alkane(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -196,9 +229,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_alkane_info(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_alkane_info(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -304,9 +340,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_factory_children(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_factory_children(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -344,9 +383,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_search_factory_keys(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_search_factory_keys(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -368,9 +410,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                         let params = RpcGetBlockSummaryParams {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_block_summary(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_block_summary(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -392,9 +437,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                         let params = RpcGetBlockTimeParams {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_block_time(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_block_time(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -419,9 +467,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             })
                         });
                         let params = RpcGetBlockTimesParams { heights };
-                        view.rpc_get_block_times(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_block_times(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -448,9 +499,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_holders(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_holders(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -479,9 +533,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_orbital_holders(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_orbital_holders(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -514,9 +571,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_orbital_send_volumes(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_get_orbital_send_volumes(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -541,9 +603,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_orbital_balances(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_orbital_balances(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -576,9 +641,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_orbital_receive_volumes(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_get_orbital_receive_volumes(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -611,9 +681,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_alkane_send_volumes(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_get_alkane_send_volumes(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -646,9 +721,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_alkane_receive_volumes(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_get_alkane_receive_volumes(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -675,9 +755,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_transfer_volume(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_transfer_volume(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -704,9 +787,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_total_received(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_total_received(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -733,9 +819,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                             height_present: payload.get("height").is_some(),
                         };
-                        view.rpc_get_circulating_supply(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_circulating_supply(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -760,9 +849,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_address_activity(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_address_activity(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -787,9 +879,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_address_cumulative_send_alkanes(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_address_cumulative_send_alkanes(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -814,9 +911,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_address_cumulative_receive_alkanes(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_address_cumulative_receive_alkanes(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -841,9 +943,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_address_cumulative_send_orbitals(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_address_cumulative_send_orbitals(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -868,9 +975,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_address_cumulative_receive_orbitals(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_address_cumulative_receive_orbitals(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -898,9 +1010,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .get("include_outpoints")
                                 .and_then(|v| v.as_bool()),
                         };
-                        view.rpc_get_address_balances(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_address_balances(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -927,9 +1042,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                             height_present: payload.get("height").is_some(),
                         };
-                        view.rpc_get_alkane_balances(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_alkane_balances(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -962,9 +1080,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                             height_present,
                         };
-                        view.rpc_get_alkane_balance_metashrew(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_get_alkane_balance_metashrew(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -995,9 +1118,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_alkane_balance_txs(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_alkane_balance_txs(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1032,9 +1158,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_alkane_balance_txs_by_token(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_get_alkane_balance_txs_by_token(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1059,9 +1190,35 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_outpoint_balances(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        // 🔴 spawn_blocking IS LOAD-BEARING — do not inline this
+                        // back into the async body.
+                        //
+                        // rpc_get_outpoint_balances is a SYNCHRONOUS RocksDB
+                        // read. Awaiting it directly on a Tokio worker parks
+                        // that worker for the whole read, so concurrent callers
+                        // do not overlap — they queue. Measured from the
+                        // explorer side: 380ms at N=1, 3,794ms with ten in
+                        // flight, and 349ms -> 6.2s at N=100. That is linear,
+                        // i.e. perfect serialization, and it is why concurrency
+                        // bought nothing and only issuing FEWER calls helped.
+                        //
+                        // This is the single hottest call the explorer makes —
+                        // one per non-OP_RETURN outpoint when assembling a
+                        // TxView. A 4-minute sample showed 6,034 of these, some
+                        // taking 10.6s, and it is what capped
+                        // ADDRESS_HISTORY_ENRICH at 10 in
+                        // apps/explorer/lib/queries.ts (see the latency-budget
+                        // note there). Raise that cap only after re-measuring
+                        // N=1/10/100 against THIS build.
+                        //
+                        // Matches the idiom already used by get_alkabi and
+                        // get_alkane_wasm in this file.
+                        tokio::task::spawn_blocking(move || view.rpc_get_outpoint_balances(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1083,11 +1240,16 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             Ok(v) => v,
                             Err(err) => return err,
                         };
-                        view.rpc_get_runtime_balances_metashrew(
-                            RpcGetRuntimeBalancesMetashrewParams {},
-                        )
-                        .map(|resp| resp.value)
-                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_get_runtime_balances_metashrew(
+                                RpcGetRuntimeBalancesMetashrewParams {},
+                            )
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1109,9 +1271,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                         let params = RpcGetBlockTracesParams {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_block_traces(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_block_traces(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1136,9 +1301,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_holders_count(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_holders_count(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1163,9 +1331,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_address_outpoints(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_address_outpoints(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1214,9 +1385,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        view.rpc_get_alkane_tx_summary(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_alkane_tx_summary(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1240,9 +1414,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_alkane_block_txs(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_alkane_block_txs(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1269,9 +1446,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        view.rpc_get_alkane_address_txs(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || view.rpc_get_alkane_address_txs(params))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1309,9 +1489,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty()),
                         };
-                        view.rpc_get_address_transactions(params)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_get_address_transactions(params)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1330,9 +1515,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             Ok(v) => v,
                             Err(err) => return err,
                         };
-                        view.rpc_get_alkane_latest_traces(RpcGetAlkaneLatestTracesParams)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                        tokio::task::spawn_blocking(move || {
+                            view.rpc_get_alkane_latest_traces(RpcGetAlkaneLatestTracesParams)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|response| response.value)
+                        .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;
@@ -1389,9 +1579,12 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             Ok(v) => v,
                             Err(err) => return err,
                         };
-                        view.rpc_ping(RpcPingParams)
-                            .map(|resp| resp.value)
-                            .unwrap_or_else(|_| Value::String("pong".to_string()))
+                        tokio::task::spawn_blocking(move || view.rpc_ping(RpcPingParams))
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|response| response.value)
+                            .unwrap_or_else(|| Value::String("pong".to_string()))
                     }
                 })
                 .await;

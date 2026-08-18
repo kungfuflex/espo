@@ -513,6 +513,142 @@ fn now_ts() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+// ---------------------------------------------------------------------------
+// Availability gate — refuse rather than degrade
+// ---------------------------------------------------------------------------
+//
+// `mempool.enabled = false` stops INGEST (see `run_mempool_service`, which
+// returns early). Every read path below it, left to itself, keeps answering
+// from a mempool that is now frozen and will silently drain to empty. For most
+// endpoints that is merely misleading. For `btc.fee_estimates` it is dangerous:
+// an empty projection collapses to the fee FLOOR for every bucket, with no
+// error anywhere, and qubitcoin-shim prices FROST mint RBF off exactly that.
+// An underpaying replacement does not bounce — it just does not confirm.
+//
+// So a disabled subsystem must make its consumers FAIL, not guess. Everything
+// here exists to turn "I have no data" into an explicit refusal that names the
+// subsystem and points at its replacement.
+//
+// Note the deliberate distinction between *empty* and *unavailable*. A
+// genuinely empty mempool that we are actively maintaining is a real
+// observation and the floor is the correct answer for it. A mempool we are not
+// maintaining looks identical from the inside and the floor is a lie. The only
+// thing that separates them is whether ingest is running and recently
+// succeeded — which is what this gate checks.
+
+/// JSON-RPC error code: the mempool subsystem is switched off on this instance.
+pub const MEMPOOL_DISABLED_CODE: i64 = -32011;
+/// JSON-RPC error code: the subsystem is on, but its state is not trustworthy
+/// enough to answer from.
+pub const MEMPOOL_UNAVAILABLE_CODE: i64 = -32012;
+
+/// Where a caller should go instead when this instance no longer serves the
+/// mempool. Named in every refusal so the error is actionable rather than just
+/// a denial.
+pub const MEMPOOL_REPLACEMENT_HINT: &str =
+    "query subvh-mempool instead (/v4/{apikey}/mempool, or /ws for the change stream)";
+
+/// Why the mempool cannot be answered from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MempoolUnavailable {
+    /// `mempool.enabled = false` — ingest is off by configuration.
+    Disabled,
+    /// Ingest is on but has never completed a successful refresh, so the store
+    /// is empty because we have not looked yet, not because the mempool is
+    /// empty.
+    NeverSynced,
+    /// Ingest is on but the last successful refresh is older than we are
+    /// willing to answer from.
+    Stale { age_secs: u64, limit_secs: u64 },
+}
+
+impl MempoolUnavailable {
+    pub fn code(&self) -> i64 {
+        match self {
+            MempoolUnavailable::Disabled => MEMPOOL_DISABLED_CODE,
+            _ => MEMPOOL_UNAVAILABLE_CODE,
+        }
+    }
+
+    /// A message that names the subsystem, the reason, and the replacement.
+    pub fn message(&self) -> String {
+        match self {
+            MempoolUnavailable::Disabled => format!(
+                "mempool subsystem is DISABLED on this espo instance \
+                 (config `mempool.enabled = false`); it maintains no mempool state — {}",
+                MEMPOOL_REPLACEMENT_HINT
+            ),
+            MempoolUnavailable::NeverSynced => format!(
+                "mempool subsystem has not completed its first successful sync; \
+                 refusing to answer from an unpopulated mempool — {}",
+                MEMPOOL_REPLACEMENT_HINT
+            ),
+            MempoolUnavailable::Stale { age_secs, limit_secs } => format!(
+                "mempool state is STALE: last successful refresh was {age_secs}s ago \
+                 (limit {limit_secs}s); refusing to answer from it — {}",
+                MEMPOOL_REPLACEMENT_HINT
+            ),
+        }
+    }
+
+    /// Short machine-readable tag for HTTP bodies and logs.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            MempoolUnavailable::Disabled => "mempool_disabled",
+            MempoolUnavailable::NeverSynced => "mempool_never_synced",
+            MempoolUnavailable::Stale { .. } => "mempool_stale",
+        }
+    }
+}
+
+/// How old a successful refresh may be before we stop answering from it.
+///
+/// Derived rather than configured, so it cannot drift out of step with the poll
+/// cadence it is measuring. In p2p mode `run_mempool_service` floors the
+/// reconcile at 300s, so this lands at 900s there; in rpc mode it tracks
+/// `raw_poll_secs` directly.
+pub fn mempool_staleness_limit_secs() -> u64 {
+    let cfg = &get_config().mempool;
+    let base = if cfg.source.eq_ignore_ascii_case("p2p") {
+        cfg.raw_poll_secs.max(300)
+    } else {
+        cfg.raw_poll_secs.max(1)
+    };
+    base.saturating_mul(3).max(300)
+}
+
+/// Whether this instance can answer mempool questions at all.
+///
+/// Call this at the top of every read path whose answer depends on mempool
+/// state. `Ok(())` means the state is being maintained and is fresh enough to
+/// serve — including the case where it is legitimately empty.
+pub fn mempool_availability() -> Result<(), MempoolUnavailable> {
+    if !get_config().mempool.enabled {
+        return Err(MempoolUnavailable::Disabled);
+    }
+    let last_ok = mempool_state()
+        .read()
+        .ok()
+        .and_then(|state| state.status.last_successful_raw_refresh_at);
+    let Some(last_ok) = last_ok else {
+        return Err(MempoolUnavailable::NeverSynced);
+    };
+    let limit_secs = mempool_staleness_limit_secs();
+    let age_secs = now_ts().saturating_sub(last_ok);
+    if age_secs > limit_secs {
+        return Err(MempoolUnavailable::Stale { age_secs, limit_secs });
+    }
+    Ok(())
+}
+
+/// True when ingest is switched off by config. Cheap; does not touch the store.
+///
+/// Prefer [`mempool_availability`] on read paths — this is for startup logging
+/// and for deciding whether to spawn work, not for gating answers.
+pub fn mempool_ingest_disabled() -> bool {
+    !get_config().mempool.enabled
+}
+
 fn protostones_for_tx(tx: &Transaction) -> Vec<Protostone> {
     match Runestone::decipher(tx) {
         Some(Artifact::Runestone(r)) => Protostone::from_runestone(&r).unwrap_or_default(),
@@ -3661,7 +3797,30 @@ pub async fn run_mempool_service(network: Network) -> Result<()> {
     let cfg = get_config().mempool.clone();
 
     if !cfg.enabled {
-        eprintln!("[mempool] disabled by config");
+        // Loud, and specific about the consequences — an operator reading logs
+        // after a downsize needs to see WHICH consumers just started failing,
+        // not a four-word line they can scroll past.
+        eprintln!(
+            "[mempool] ================= MEMPOOL SUBSYSTEM DISABLED =================\n\
+             [mempool] config `mempool.enabled = false`. This instance will NOT ingest:\n\
+             [mempool]   - no p2p driver, no ZMQ ingest, no getrawmempool polling\n\
+             [mempool]   - no hydration workers ({} configured), no trace workers ({} configured)\n\
+             [mempool] The following now REFUSE (they do not return empty results):\n\
+             [mempool]   - btc.fee_estimates                  -> JSON-RPC error {}\n\
+             [mempool]   - essentials.get_mempool_traces      -> ok:false\n\
+             [mempool]   - essentials.get_mempool_memory_stats-> ok:false\n\
+             [mempool]   - GET /api/mempool/blocks            -> 503\n\
+             [mempool]   - GET /api/mempool/tx/{{txid}}         -> 503\n\
+             [mempool]   - GET /api/mempool/block/{{i}}/txs     -> 503\n\
+             [mempool] {}\n\
+             [mempool] NOTE: --mempool-p2p on the command line is now INERT; it selects\n\
+             [mempool] the ingest SOURCE and cannot re-enable ingest that config turned off.\n\
+             [mempool] ==============================================================",
+            cfg.hydration_workers,
+            cfg.trace_workers,
+            MEMPOOL_DISABLED_CODE,
+            MEMPOOL_REPLACEMENT_HINT,
+        );
         return Ok(());
     }
 

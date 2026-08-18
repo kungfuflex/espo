@@ -38,8 +38,8 @@ use crate::modules::tokendata::storage::TokenDataProvider;
 use crate::runtime::mdb::Mdb;
 use crate::runtime::mempool::{
     BlockTxCell, classify_block_tx, current_mempool_compact_snapshot,
-    get_mempool_block_transaction_ids, mempool_block_cells, pending_by_txid, projected_tx,
-    subscribe_mempool_events,
+    get_mempool_block_transaction_ids, mempool_availability, mempool_block_cells, pending_by_txid,
+    projected_tx, subscribe_mempool_events,
 };
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
@@ -163,11 +163,37 @@ fn explorer_mempool_snapshot() -> crate::runtime::mempool::MempoolCompactSnapsho
     snapshot
 }
 
+/// 503 for a mempool-derived route when this instance is not maintaining
+/// mempool state.
+///
+/// Deliberately an error status rather than an empty-but-200 body. The explorer
+/// renders an empty projection as "the mempool is quiet"; a 503 naming the
+/// subsystem is the difference between a UI that looks calm and a UI that says
+/// the data source is gone. `Retry-After` is omitted on purpose — when the
+/// subsystem is switched off, retrying is not the fix.
+fn mempool_unavailable_response(
+    unavailable: crate::runtime::mempool::MempoolUnavailable,
+) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": unavailable.reason(),
+            "message": unavailable.message(),
+        })),
+    )
+        .into_response()
+}
+
 pub async fn mempool_blocks() -> Response {
     // Client mode: the local mempool service is disabled; serve the data
-    // instance's snapshot instead.
+    // instance's snapshot instead. This is a legitimate delegation, so it is
+    // checked BEFORE availability — a relaying instance is not expected to hold
+    // mempool state of its own.
     if let Some(events_host) = crate::config::get_explorer_espo_events_host() {
         return crate::explorer::relay::proxy_mempool_blocks(events_host).await;
+    }
+    if let Err(unavailable) = mempool_availability() {
+        return mempool_unavailable_response(unavailable);
     }
     Json(explorer_mempool_snapshot()).into_response()
 }
@@ -187,9 +213,15 @@ pub async fn mempool_tx_projection(Path(txid): Path<String>) -> Response {
         )
         .await;
     }
+    if let Err(unavailable) = mempool_availability() {
+        return mempool_unavailable_response(unavailable);
+    }
     let Ok(txid) = Txid::from_str(txid.trim()) else {
         return (StatusCode::BAD_REQUEST, "invalid txid").into_response();
     };
+    // NOTE: 404 below means "we hold the mempool and this transaction is not in
+    // it" — a real negative answer. It is only trustworthy because the
+    // availability check above has already ruled out "we hold no mempool".
     match projected_tx(&txid) {
         Some(projection) => Json(projection).into_response(),
         None => (StatusCode::NOT_FOUND, "not in mempool").into_response(),
@@ -208,6 +240,9 @@ pub async fn mempool_block_txs(Path(index): Path<usize>) -> Response {
             &format!("/api/mempool/block/{index}/txs"),
         )
         .await;
+    }
+    if let Err(unavailable) = mempool_availability() {
+        return mempool_unavailable_response(unavailable);
     }
     let cells = mempool_block_cells(index);
     Json(json!({ "index": index, "tx_count": cells.len(), "txs": cells })).into_response()
