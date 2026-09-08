@@ -3920,6 +3920,44 @@ impl AmmDataProvider {
             }
         };
 
+        // A derived family that this node was never configured to compute must
+        // say so, rather than answering `ok:true` with an empty array.
+        //
+        // `derived_liquidity` is optional config. When it is absent,
+        // `derived_quotes` is empty, no `token_derived_*_candle_writes` are ever
+        // produced, and every read below finds nothing. The response was
+        // therefore indistinguishable from a token that is configured and has
+        // genuinely never traded, which is a real and common case.
+        //
+        // That ambiguity is expensive in practice. A deployment running without
+        // `derived_liquidity` blanked the price and market-cap columns for 87 of
+        // 89 tokens, and because nothing errored it read as an empty market
+        // rather than a misconfiguration. It was diagnosed by diffing responses
+        // against another deployment by hand.
+        //
+        // Only the UNCONFIGURED case is rejected. A configured quote with no
+        // candles yet still returns `ok:true` with `[]`, because that genuinely
+        // is "no trades in this window".
+        if let Some(quote) = derived_quote {
+            let configured = AmmDataConfig::load_from_global_config()
+                .ok()
+                .and_then(|cfg| cfg.derived_liquidity)
+                .map(|dl| dl.derived_quotes.iter().any(|q| q.alkane == quote))
+                .unwrap_or(false);
+            if !configured {
+                return Ok(RpcGetCandlesResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "derived_liquidity_not_configured",
+                        "hint": format!(
+                            "this node computes no derived candles for quote {};                              set ammdata.derived_liquidity to enable it",
+                            quote
+                        ),
+                    }),
+                });
+            }
+        }
+
         let slice = if is_mcusd {
             if let Some(quote) = derived_quote {
                 read_token_derived_mcusd_candles_v1(self, pool, quote, tf, now)
