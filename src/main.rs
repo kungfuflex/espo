@@ -72,6 +72,7 @@ use crate::modules::essentials::storage::{
 use crate::modules::explorerextensions::main::ExplorerExtensions;
 use crate::modules::oylapi::main::OylApi;
 use crate::modules::pizzafun::main::Pizzafun;
+use crate::modules::reorg;
 use crate::modules::runes::main::{Runes, runes_enabled_from_global_config};
 use crate::modules::runes::storage::RunesProvider;
 use crate::modules::subfrost::main::Subfrost;
@@ -238,50 +239,12 @@ fn set_rewind_target(rewind_target: &AtomicU32, divergence_height: u32) -> bool 
     false
 }
 
-fn rewind_tree_to_before(next_height: u32) -> Result<()> {
-    let Some(tree) = get_global_tree_db() else {
-        return Ok(());
-    };
-
-    let target_height = match next_height.checked_sub(1) {
-        Some(parent_height) => match tree.indexed_height_bounds()? {
-            Some((first_height, _)) if parent_height >= first_height => Some(parent_height),
-            _ => None,
-        },
-        None => None,
-    };
-
-    tree.rewind_to_height(target_height)
-        .with_context(|| format!("failed to rewind versioned tree before height {next_height}"))?;
-    Ok(())
-}
-
+/// Roll every module back so indexing can resume at `next_height`.
+///
+/// Thin wrapper over `modules::reorg::handle_reorg_switch`, which lives in the
+/// library so its contract can be pinned by tests.
 fn handle_reorg_switch(mods: &ModuleRegistry, next_height: u32) -> Result<()> {
-    for m in mods.modules() {
-        m.preflight_reorg(next_height).with_context(|| {
-            format!("module {} cannot roll back to height {next_height}", m.get_name())
-        })?;
-    }
-    rewind_tree_to_before(next_height)?;
-    for m in mods.modules() {
-        m.handle_reorg(next_height).with_context(|| {
-            format!("module {} failed to handle reorg to height {next_height}", m.get_name())
-        })?;
-    }
-    for m in mods.modules() {
-        let Some(height) = m.get_index_height() else {
-            continue;
-        };
-        if height >= next_height {
-            anyhow::bail!(
-                "module {} still reports index height {} after reorg to next_height {}",
-                m.get_name(),
-                height,
-                next_height
-            );
-        }
-    }
-    Ok(())
+    reorg::handle_reorg_switch(mods.modules(), next_height)
 }
 
 fn module_resume_start_height(mods: &ModuleRegistry, network: bitcoin::Network) -> u32 {

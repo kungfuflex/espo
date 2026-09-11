@@ -105,13 +105,96 @@ pub trait EspoModule: Send + Sync {
     fn index_block(&self, block: EspoBlock) -> Result<()>;
     fn get_index_height(&self) -> Option<u32>;
 
+    /// Optional pre-reorg check, run on *every* module before anything is
+    /// mutated. A module that knows it cannot roll back to `next_height`
+    /// should fail here, while the index is still consistent.
+    ///
+    /// This one keeps a no-op default on purpose: it is a *veto*, and a module
+    /// with nothing to veto is correct to say nothing. Contrast
+    /// [`EspoModule::handle_reorg`] below, where silence is a bug.
     fn preflight_reorg(&self, _next_height: u32) -> Result<()> {
         Ok(())
     }
 
-    fn handle_reorg(&self, _next_height: u32) -> Result<()> {
-        Ok(())
-    }
+    /// Roll this module's in-memory state back so it agrees with storage as of
+    /// `next_height - 1`. Called by
+    /// [`crate::modules::reorg::handle_reorg_switch`] *after* the shared
+    /// versioned tree has already been rewound.
+    ///
+    /// For almost every module the whole body is three lines: re-read the
+    /// persisted index height and overwrite the cached copy. Modules do **not**
+    /// delete their own rows — `rewind_tree_to_before` already did that for the
+    /// entire versioned namespace.
+    ///
+    /// # Why this has no default implementation
+    ///
+    /// It used to. The default was `Ok(())`, and on 2026-09-11 that cost us a
+    /// 36-minute production outage: `explorerextensions` caches its index
+    /// height in an `RwLock` and never implemented `handle_reorg`, so on a
+    /// reorg at height 966500 every other module rolled back and
+    /// `explorerextensions` kept reporting the pre-reorg height. The strict
+    /// verification pass in `handle_reorg_switch` — correctly — refused to
+    /// keep indexing, the indexer stopped for good, and the pod stayed
+    /// `Running` but unready with a climbing heap until a human restarted it.
+    ///
+    /// A silent no-op default plus a fatal verification pass is a trap: the
+    /// module compiles, passes review, indexes happily for weeks, and then
+    /// takes production down the first time the chain reorgs. Nothing catches
+    /// it in between, because you cannot detect "this module forgot to refresh
+    /// its cache" at registration time — a no-op `handle_reorg` and a correct
+    /// one are indistinguishable until there is actually something to roll
+    /// back.
+    ///
+    /// So the check moved to the only place that *can* catch it before a
+    /// reorg does: the compiler. Every module must now say, explicitly, what
+    /// it does on a reorg. A module that genuinely has no rollback state still
+    /// works — it writes `Ok(())` with a comment saying why, which is a claim
+    /// a reviewer can check, rather than an omission nobody can see.
+    ///
+    /// ```
+    /// # use anyhow::Result;
+    /// # use bitcoin::Network;
+    /// # use espo::alkanes::trace::EspoBlock;
+    /// # use espo::modules::defs::{EspoModule, RpcNsRegistrar};
+    /// # use espo::runtime::mdb::Mdb;
+    /// # use std::sync::Arc;
+    /// struct Stateless;
+    ///
+    /// impl EspoModule for Stateless {
+    ///     fn get_name(&self) -> &'static str { "stateless" }
+    ///     fn set_mdb(&mut self, _mdb: Arc<Mdb>) {}
+    ///     fn get_genesis_block(&self, _n: Network) -> u32 { 0 }
+    ///     fn index_block(&self, _block: EspoBlock) -> Result<()> { Ok(()) }
+    ///     fn get_index_height(&self) -> Option<u32> { None }
+    ///     // Holds no persisted state and caches no height, so there is
+    ///     // nothing to roll back. Explicit, and therefore reviewable.
+    ///     fn handle_reorg(&self, _next_height: u32) -> Result<()> { Ok(()) }
+    ///     fn register_rpc(&self, _reg: &RpcNsRegistrar) {}
+    /// }
+    /// ```
+    ///
+    /// Leaving it out no longer compiles — this is the same impl with
+    /// `handle_reorg` deleted:
+    ///
+    /// ```compile_fail
+    /// # use anyhow::Result;
+    /// # use bitcoin::Network;
+    /// # use espo::alkanes::trace::EspoBlock;
+    /// # use espo::modules::defs::{EspoModule, RpcNsRegistrar};
+    /// # use espo::runtime::mdb::Mdb;
+    /// # use std::sync::Arc;
+    /// struct Forgetful;
+    ///
+    /// impl EspoModule for Forgetful {
+    ///     fn get_name(&self) -> &'static str { "forgetful" }
+    ///     fn set_mdb(&mut self, _mdb: Arc<Mdb>) {}
+    ///     fn get_genesis_block(&self, _n: Network) -> u32 { 0 }
+    ///     fn index_block(&self, _block: EspoBlock) -> Result<()> { Ok(()) }
+    ///     fn get_index_height(&self) -> Option<u32> { Some(0) }
+    ///     fn register_rpc(&self, _reg: &RpcNsRegistrar) {}
+    /// }
+    /// ```
+    fn handle_reorg(&self, next_height: u32) -> Result<()>;
 
     /// Modules can only register RPCs via a namespaced registrar.
     /// For a module named "ammdata", all methods will be "ammdata.<suffix>".
