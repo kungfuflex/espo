@@ -194,6 +194,26 @@ impl EspoModule for ExplorerExtensions {
         *self.index_height.read().unwrap()
     }
 
+    /// `explorerextensions:` is a versioned namespace, so by the time this
+    /// runs the shared tree has already been rewound and both our reverse-index
+    /// rows and the persisted `/index_height` are back at their pre-reorg
+    /// values. The only thing still stale is the height we cache in memory, so
+    /// re-read it from storage — the same load `set_mdb` does at startup.
+    ///
+    /// No `preflight_reorg` override: we never delete rows ourselves (the tree
+    /// does it), so there is no rollback we could fail to perform, and nothing
+    /// to veto. `runes` is the only module that needs a preflight, because it
+    /// is the only one that does its own row deletion.
+    fn handle_reorg(&self, next_height: u32) -> Result<()> {
+        let height = self.provider().get_index_height()?;
+        *self.index_height.write().unwrap() = height;
+        eprintln!(
+            "[EXPLOREREXT] reorg rollback complete; next_height={}, index height: {:?}",
+            next_height, height
+        );
+        Ok(())
+    }
+
     fn register_rpc(&self, reg: &RpcNsRegistrar) {
         rpc::register_rpc(
             reg.clone(),
