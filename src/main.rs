@@ -1166,6 +1166,10 @@ async fn main() -> Result<()> {
     }
     // mods.register_module(TracesData::new());
 
+    // Health surface. Unconditional on purpose: a liveness probe cannot depend
+    // on an optional, key-gated endpoint. See ModuleRegistry::register_health_rpc.
+    mods.register_health_rpc().await;
+
     if crate::config::internal_rpc_enabled() {
         let internal_ns =
             crate::modules::defs::RpcNsRegistrar::new(mods.router.clone(), "internal");

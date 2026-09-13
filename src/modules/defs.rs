@@ -299,6 +299,48 @@ impl ModuleRegistry {
         self.modules.push(m);
     }
 
+    /// Register `get_module_heights`: per-module indexing progress.
+    ///
+    /// WHY THIS EXISTS (2026-09-13). `get_espo_height` already reports the
+    /// GLOBAL indexed height, and comparing it against chain tip catches a
+    /// whole-indexer stall. It does not catch a SINGLE wedged module, which is
+    /// the shape of the 2026-09-11 `explorerextensions` outage: every other
+    /// module rolled back, one did not, and the pod stayed Running and 0/1
+    /// ready while serving well-formed stale data.
+    ///
+    /// Every module already implements `get_index_height` — the trait requires
+    /// it — so the information existed the whole time and simply had no way
+    /// out. A module whose height stops advancing while its peers continue is
+    /// visible here and nowhere else.
+    ///
+    /// Deliberately NOT behind `internal_rpc_enabled`: a health surface that
+    /// needs a key and is off by default is not a health surface. This reports
+    /// progress only — no chain data, nothing sensitive.
+    ///
+    /// `null` means the module does not track a height (legitimate — see the
+    /// `EspoModule` docs), not that it is stuck.
+    pub async fn register_health_rpc(&self) {
+        let modules = self.modules.clone();
+        self.router
+            .register("get_module_heights", move |_cx, _payload| {
+                let modules = modules.clone();
+                async move {
+                    let mut out = serde_json::Map::new();
+                    for m in modules.iter() {
+                        out.insert(
+                            m.get_name().to_string(),
+                            match m.get_index_height() {
+                                Some(h) => serde_json::json!(h),
+                                None => Value::Null,
+                            },
+                        );
+                    }
+                    serde_json::json!({ "ok": true, "modules": Value::Object(out) })
+                }
+            })
+            .await;
+    }
+
     pub fn modules(&self) -> &[Arc<dyn EspoModule>] {
         &self.modules
     }
