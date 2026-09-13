@@ -202,18 +202,34 @@ pub enum PriceSide {
 pub struct CandleSlice {
     pub candles_newest_first: Vec<SchemaCandleV1>,
     pub newest_ts: u64, // bucket start of the newest candle that actually exists
-    /// Bucket start of the newest candle backed by a REAL write, i.e. the last
-    /// bucket in which something actually traded.
+    /// Bucket start of the newest candle PRESENT IN STORAGE.
     ///
-    /// Everything after it in `candles_newest_first` is gap fill: this reader
-    /// carries `last_close` forward across empty buckets at zero volume, and up
-    /// to `newest_ts` past the end of the data. That fill is correct for a
-    /// chart and indistinguishable from real data for everyone else — a frozen
-    /// writer and a quiet market produce byte-identical responses.
+    /// Everything after it in `candles_newest_first` is read-time gap fill:
+    /// this reader carries `last_close` forward from the newest stored bucket
+    /// up to `newest_ts`. That fill is correct for a chart and
+    /// indistinguishable from real data for everyone else — a writer that has
+    /// stopped and a quiet market produce byte-identical responses. Surfacing
+    /// this lets a caller tell them apart; `newest_ts - newest_real_ts` is how
+    /// far the series has been carried forward.
     ///
-    /// Surfacing it lets a caller tell those apart. `newest_ts - newest_real_ts`
-    /// is how long the series has been carried forward. Zero when there is no
-    /// data at all.
+    /// TWO LIMITS, STATED BECAUSE THE NAME OVERPROMISES:
+    ///
+    /// 1. It describes the HEAD only. A hole in the MIDDLE of the series is
+    ///    filled by the same loop and is invisible here — a series with a
+    ///    week-long interior gap still reports a fresh `newest_real_ts`.
+    ///
+    /// 2. "Stored" is not the same as "traded". The derived writer persists a
+    ///    flat carry-forward candle of its own when it has no pool info for a
+    ///    pair (`index_tokens.rs`, the `info.is_none()` branch), so a stored
+    ///    bucket can itself be synthetic. This field cannot see that.
+    ///
+    /// Both are cases where a per-bucket `synthetic` flag on the candle would
+    /// be the honest fix, since it would travel with the data instead of being
+    /// summarised at the series level. This is the cheap approximation of that,
+    /// and it does catch the case that matters most in practice: a writer that
+    /// has stopped entirely, leaving nothing but fill at the head.
+    ///
+    /// Zero when there is no data at all.
     pub newest_real_ts: u64,
 }
 /// How many buckets at the head of a series are carried-forward fill.

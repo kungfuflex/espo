@@ -1058,6 +1058,12 @@ fn docs_modules() -> Vec<ModuleDoc> {
             intro: "Pool, candle, activity, price, swap routing, and AMM analytics methods.",
             methods: vec![
                 rpc_doc(
+                    "get_module_heights",
+                    "Returns the current index height of every registered module, for health checking. get_espo_height reports the GLOBAL indexed height and, compared against chain tip, detects a whole-indexer stall; this detects the narrower case of a SINGLE module whose height stops advancing while its peers continue, which is what happened to explorerextensions on 2026-09-11 — the pod stayed Running and served well-formed stale data throughout. A module reporting null does not track a height and is not stuck. Intended use: alert when any module falls more than a few blocks behind get_espo_height, or when get_espo_height falls behind chain tip. Do NOT health-check with ping, which answers pong from a fully stalled node.",
+                    json!({}),
+                    json!({ "ok": true, "modules": { "ammdata": 966833, "essentials": 966833, "explorerextensions": 966500 } }),
+                ),
+                rpc_doc(
                     "ammdata.get_candles",
                     "Returns OHLCV candles for a pool or token pair over a supported timeframe. Missing buckets are forward-filled from the last indexed close at zero volume, and so is the span between the newest real write and now, so a series is never sparse and a stalled writer is NOT visible in the candles themselves. Use newest_real_ts and stale_buckets to tell a stalled series from a quiet market: newest_real_ts is the bucket start of the newest candle backed by an actual write, and stale_buckets is how many buckets of forward fill sit in front of it ((newest_ts - newest_real_ts) / timeframe). stale_buckets is 0 on a healthy series and grows by one per interval once the writer stops; it is also 0 when the series has no data at all, because \"never had any\" is a different claim from \"stopped updating\". A health check should assert on stale_buckets — asserting the candles array is non-empty does not work, because a fully stalled series is still a complete, well-formed array.",
                     json!({ "pool": "2:53014", "timeframe": "1h", "limit": 10, "page": 1, "side": "base" }),
