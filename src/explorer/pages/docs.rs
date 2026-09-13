@@ -1059,9 +1059,9 @@ fn docs_modules() -> Vec<ModuleDoc> {
             methods: vec![
                 rpc_doc(
                     "ammdata.get_candles",
-                    "Returns OHLCV candles for a pool or token pair over a supported timeframe.",
+                    "Returns OHLCV candles for a pool or token pair over a supported timeframe. Missing buckets are forward-filled from the last indexed close at zero volume, and so is the span between the newest real write and now, so a series is never sparse and a stalled writer is NOT visible in the candles themselves. Use newest_real_ts and stale_buckets to tell a stalled series from a quiet market: newest_real_ts is the bucket start of the newest candle backed by an actual write, and stale_buckets is how many buckets of forward fill sit in front of it ((newest_ts - newest_real_ts) / timeframe). stale_buckets is 0 on a healthy series and grows by one per interval once the writer stops; it is also 0 when the series has no data at all, because \"never had any\" is a different claim from \"stopped updating\". A health check should assert on stale_buckets — asserting the candles array is non-empty does not work, because a fully stalled series is still a complete, well-formed array.",
                     json!({ "pool": "2:53014", "timeframe": "1h", "limit": 10, "page": 1, "side": "base" }),
-                    json!({ "ok": true, "candles": [{ "ts": 1710000000, "open": "1", "high": "2", "low": "1", "close": "2", "volume": "100" }] }),
+                    json!({ "ok": true, "newest_real_ts": 1710000000, "stale_buckets": 0, "candles": [{ "ts": 1710000000, "open": "1", "high": "2", "low": "1", "close": "2", "volume": "100" }] }),
                 ),
                 rpc_doc(
                     "ammdata.get_btc_usd_candles",
