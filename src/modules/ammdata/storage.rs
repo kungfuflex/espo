@@ -14,7 +14,9 @@ use crate::modules::ammdata::utils::activity::{
     ActivityFilter, ActivityPage, ActivityRow, ActivitySideFilter, ActivitySortKey, SortDir,
     decode_activity_v1, read_activity_for_pool, read_activity_for_pool_sorted,
 };
-use crate::modules::ammdata::utils::candles::{CandleSlice, PriceSide, read_candles_v1};
+use crate::modules::ammdata::utils::candles::{
+    CandleSlice, PriceSide, read_candles_v1, stale_bucket_count,
+};
 use crate::modules::ammdata::utils::live_reserves::fetch_all_pools;
 use crate::modules::ammdata::utils::pathfinder::{
     DEFAULT_FEE_BPS, plan_best_mev_swap, plan_exact_in_default_fee, plan_exact_out_default_fee,
@@ -4144,6 +4146,20 @@ impl AmmDataProvider {
                         "limit": limit,
                         "total": total,
                         "has_more": end < total,
+                        // Staleness of the series, so a caller can tell a frozen
+                        // writer from a quiet market. See CandleSlice::newest_real_ts:
+                        // every bucket after `newest_real_ts` is carried-forward fill
+                        // at zero volume, which is byte-identical to real data.
+                        //
+                        // `stale_buckets` is that gap in bucket counts — 0 on a healthy
+                        // series, and it grows by one per interval once the writer stops.
+                        // A health check wants `stale_buckets`; a chart can ignore both.
+                        "newest_real_ts": slice.newest_real_ts,
+                        "stale_buckets": stale_bucket_count(
+                            slice.newest_ts,
+                            slice.newest_real_ts,
+                            dur,
+                        ),
                         "candles": arr
                     }),
                 })
@@ -6377,7 +6393,7 @@ fn read_token_usd_candles_v1(
     apply_token_chart_start_cutoff(token, &mut per_bucket);
 
     if per_bucket.is_empty() {
-        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0, newest_real_ts: 0 });
     }
 
     let start_bucket = *per_bucket.keys().next().unwrap();
@@ -6441,7 +6457,10 @@ fn read_token_usd_candles_v1(
 
     let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
-    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+    Ok(CandleSlice { candles_newest_first: newest_first,
+        newest_ts: newest_bucket_now,
+        newest_real_ts: newest_bucket_with_data,
+    })
 }
 
 fn read_token_derived_usd_candles_v1(
@@ -6478,7 +6497,7 @@ fn read_token_derived_usd_candles_v1(
     apply_token_chart_start_cutoff(token, &mut per_bucket);
 
     if per_bucket.is_empty() {
-        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0, newest_real_ts: 0 });
     }
 
     let start_bucket = *per_bucket.keys().next().unwrap();
@@ -6542,7 +6561,10 @@ fn read_token_derived_usd_candles_v1(
 
     let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
-    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+    Ok(CandleSlice { candles_newest_first: newest_first,
+        newest_ts: newest_bucket_now,
+        newest_real_ts: newest_bucket_with_data,
+    })
 }
 
 fn read_token_derived_mcusd_candles_v1(
@@ -6579,7 +6601,7 @@ fn read_token_derived_mcusd_candles_v1(
     apply_token_chart_start_cutoff(token, &mut per_bucket);
 
     if per_bucket.is_empty() {
-        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0, newest_real_ts: 0 });
     }
 
     let start_bucket = *per_bucket.keys().next().unwrap();
@@ -6643,7 +6665,10 @@ fn read_token_derived_mcusd_candles_v1(
 
     let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
-    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+    Ok(CandleSlice { candles_newest_first: newest_first,
+        newest_ts: newest_bucket_now,
+        newest_real_ts: newest_bucket_with_data,
+    })
 }
 
 fn read_token_mcusd_candles_v1(
@@ -6679,7 +6704,7 @@ fn read_token_mcusd_candles_v1(
     apply_token_chart_start_cutoff(token, &mut per_bucket);
 
     if per_bucket.is_empty() {
-        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0, newest_real_ts: 0 });
     }
 
     let start_bucket = *per_bucket.keys().next().unwrap();
@@ -6743,7 +6768,10 @@ fn read_token_mcusd_candles_v1(
 
     let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
-    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+    Ok(CandleSlice { candles_newest_first: newest_first,
+        newest_ts: newest_bucket_now,
+        newest_real_ts: newest_bucket_with_data,
+    })
 }
 
 fn apply_token_chart_start_cutoff(
@@ -6785,7 +6813,7 @@ fn read_btc_usd_line_v1(
     }
 
     if per_bucket.is_empty() {
-        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0, newest_real_ts: 0 });
     }
 
     let start_bucket = *per_bucket.keys().next().unwrap();
@@ -6829,7 +6857,10 @@ fn read_btc_usd_line_v1(
 
     let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
-    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+    Ok(CandleSlice { candles_newest_first: newest_first,
+        newest_ts: newest_bucket_now,
+        newest_real_ts: newest_bucket_with_data,
+    })
 }
 
 fn btc_usd_candles_json(slice: &CandleSlice, tf: Timeframe, limit: usize, page: usize) -> Value {
@@ -7111,6 +7142,9 @@ mod tests {
     fn btc_usd_candle_response_uses_native_scale_and_pagination() {
         let slice = CandleSlice {
             newest_ts: 7_200,
+            // Both buckets are real writes, so the newest real bucket IS the
+            // newest bucket: this fixture is a healthy series, not a stale one.
+            newest_real_ts: 7_200,
             candles_newest_first: vec![
                 SchemaCandleV1 {
                     open: 65_000 * PRICE_SCALE,

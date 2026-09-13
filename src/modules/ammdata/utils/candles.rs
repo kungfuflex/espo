@@ -202,7 +202,33 @@ pub enum PriceSide {
 pub struct CandleSlice {
     pub candles_newest_first: Vec<SchemaCandleV1>,
     pub newest_ts: u64, // bucket start of the newest candle that actually exists
+    /// Bucket start of the newest candle backed by a REAL write, i.e. the last
+    /// bucket in which something actually traded.
+    ///
+    /// Everything after it in `candles_newest_first` is gap fill: this reader
+    /// carries `last_close` forward across empty buckets at zero volume, and up
+    /// to `newest_ts` past the end of the data. That fill is correct for a
+    /// chart and indistinguishable from real data for everyone else — a frozen
+    /// writer and a quiet market produce byte-identical responses.
+    ///
+    /// Surfacing it lets a caller tell those apart. `newest_ts - newest_real_ts`
+    /// is how long the series has been carried forward. Zero when there is no
+    /// data at all.
+    pub newest_real_ts: u64,
 }
+/// How many buckets at the head of a series are carried-forward fill.
+///
+/// `0` on a healthy series, and it grows by one per interval once the writer
+/// that produces real candles stops. Also `0` when there is no data at all
+/// (`newest_real_ts == 0`), because "never had any" is not the same claim as
+/// "stopped updating" and callers should not read it as staleness.
+pub fn stale_bucket_count(newest_ts: u64, newest_real_ts: u64, dur: u64) -> u64 {
+    if newest_real_ts == 0 || dur == 0 {
+        return 0;
+    }
+    newest_ts.saturating_sub(newest_real_ts) / dur
+}
+
 pub fn read_candles_v1(
     provider: &AmmDataProvider,
     pool: SchemaAlkaneId,
@@ -236,7 +262,7 @@ pub fn read_candles_v1(
     }
 
     if per_bucket.is_empty() {
-        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0, newest_real_ts: 0 });
     }
 
     let start_bucket = *per_bucket.keys().next().unwrap();
@@ -303,5 +329,56 @@ pub fn read_candles_v1(
 
     let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
-    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+    Ok(CandleSlice { candles_newest_first: newest_first,
+        newest_ts: newest_bucket_now,
+        newest_real_ts: newest_bucket_with_data,
+    })
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::stale_bucket_count;
+
+    const HOUR: u64 = 3600;
+
+    #[test]
+    fn healthy_series_is_not_stale() {
+        // Newest real bucket IS the newest bucket.
+        assert_eq!(stale_bucket_count(1_789_221_600, 1_789_221_600, HOUR), 0);
+    }
+
+    #[test]
+    fn counts_one_bucket_per_interval_of_carry_forward() {
+        let newest = 1_789_221_600;
+        assert_eq!(stale_bucket_count(newest, newest - HOUR, HOUR), 1);
+        assert_eq!(stale_bucket_count(newest, newest - 5 * HOUR, HOUR), 5);
+    }
+
+    #[test]
+    fn reproduces_the_2026_09_11_derived_leg_stall() {
+        // The derived USD leg stopped writing at 2026-09-11T08:00Z. Read at
+        // 2026-09-12T15:00Z that is 31 hourly buckets of fill — a series that
+        // looked completely healthy to every caller, because the fill is
+        // byte-identical to real candles.
+        let newest_real = 1_789_128_000; // 2026-09-11T08:00Z
+        let newest = newest_real + 31 * HOUR;
+        assert_eq!(stale_bucket_count(newest, newest_real, HOUR), 31);
+    }
+
+    #[test]
+    fn no_data_is_reported_as_not_stale_rather_than_infinitely_stale() {
+        // "never had any" is a different claim from "stopped updating".
+        assert_eq!(stale_bucket_count(1_789_221_600, 0, HOUR), 0);
+    }
+
+    #[test]
+    fn a_zero_duration_cannot_divide_and_must_not_panic() {
+        assert_eq!(stale_bucket_count(1_789_221_600, 1_789_128_000, 0), 0);
+    }
+
+    #[test]
+    fn a_real_bucket_newer_than_the_window_saturates_to_zero() {
+        // Defensive: never underflow if the two ever cross.
+        assert_eq!(stale_bucket_count(100, 500, HOUR), 0);
+    }
 }
