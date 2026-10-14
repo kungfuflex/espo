@@ -1,26 +1,33 @@
 use super::schemas::{
     ActivityKind, SchemaActivityV1, SchemaCandleV1, SchemaCanonicalPoolEntry, SchemaMarketDefs,
     SchemaPoolCreationInfoV1, SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2,
-    SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
+    SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, SchemaTvlPointV1, Timeframe,
 };
 use crate::config::{get_electrum_like, get_espo_indexed_height, get_network};
 use crate::modules::ammdata::config::{AmmDataConfig, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
-    CanonicalQuoteUnit, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID, MAINNET_FIRE_USD_CHART_START_TS,
-    PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block, canonical_quotes_at_height,
+    AMOUNT_SCALE, CanonicalQuoteUnit, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID,
+    MAINNET_FIRE_USD_CHART_START_TS, PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block,
+    canonical_quotes_at_height, non_circulating_holders, pricing_factories_at_height,
 };
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
     ActivityFilter, ActivityPage, ActivityRow, ActivitySideFilter, ActivitySortKey, SortDir,
     decode_activity_v1, read_activity_for_pool, read_activity_for_pool_sorted,
 };
-use crate::modules::ammdata::utils::candles::{CandleSlice, PriceSide, read_candles_v1};
+use crate::modules::ammdata::utils::candles::{
+    CandleSlice, PriceSide, bucket_start_for, read_candles_v1,
+};
+use crate::modules::ammdata::utils::cmcap::{
+    CirculatingStep, circulating_steps, scale_candle, step_for_bucket,
+};
 use crate::modules::ammdata::utils::live_reserves::fetch_all_pools;
 use crate::modules::ammdata::utils::pathfinder::{
     DEFAULT_FEE_BPS, plan_best_mev_swap, plan_exact_in_default_fee, plan_exact_out_default_fee,
     plan_implicit_default_fee, plan_swap_exact_tokens_for_tokens,
     plan_swap_exact_tokens_for_tokens_implicit, plan_swap_tokens_for_exact_tokens,
 };
+use crate::modules::ammdata::utils::route::{RouteLeg, build_route, route_json};
 use crate::modules::ammdata::utils::token_volume::read_token_volume_v1;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetCreationRecordsByIdParams,
@@ -35,7 +42,7 @@ use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use alloy_primitives::U256;
 use anyhow::{Result, anyhow};
-use bitcoin::{Address, BlockHash, Transaction, consensus::deserialize};
+use bitcoin::{Address, BlockHash, Network, Transaction, consensus::deserialize};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{Value, json, map::Map};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -43,6 +50,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// `-cmcap` candles. Held off until the non-circulating holder table in
+/// `consts::MAINNET_NON_CIRCULATING` is verified.
+const CMCAP_ENABLED: bool = false;
 const PRICE_COMPARISON_HOURS: usize = 24;
 const MAX_PRICE_ASSETS: usize = 1_000;
 const FRBTC_ASSET: SchemaAlkaneId = SchemaAlkaneId { block: 32, tx: 0 };
@@ -95,6 +105,8 @@ pub struct AmmDataTable<'a> {
     pub TOKEN_VOLUME_CANDLES: ListPointer<'a>,
     pub TOKEN_VOLUME_TOTAL: KvPointer<'a>,
     pub TOKEN_DERIVED_MCAP_USD_CANDLES: ListPointer<'a>,
+    // One marker per (token, forked quote): its history fork has been done.
+    pub TOKEN_DERIVED_FORK: KvPointer<'a>,
     pub CHART_CHANGE_EVENTS: KvPointer<'a>,
     pub CHART_CHANGE_LATEST: KvPointer<'a>,
     // Activity logs + secondary indexes for sort/paging.
@@ -125,6 +137,12 @@ pub struct AmmDataTable<'a> {
     pub POOL_LP_SUPPLY: KvPointer<'a>,
     pub POOL_DETAILS_SNAPSHOT: KvPointer<'a>,
     pub TVL_VERSIONED: KvPointer<'a>,
+    // Aggregated TVL lines (canonical sats) + the running totals that feed them.
+    pub AMM_TVL_LINE: ListPointer<'a>,
+    pub TOKEN_TVL_LINE: ListPointer<'a>,
+    pub AMM_TVL_TOTAL: KvPointer<'a>,
+    pub TOKEN_TVL_TOTAL: KvPointer<'a>,
+    pub POOL_TVL_ANCHOR: KvPointer<'a>,
     pub TOKEN_ACTIVITY: ListPointer<'a>,
     pub TOKEN_ACTIVITY_AMOUNT: ListPointer<'a>,
     pub TOKEN_SWAPS: ListPointer<'a>,
@@ -157,6 +175,7 @@ impl<'a> AmmDataTable<'a> {
             TOKEN_VOLUME_CANDLES: root.list_keyword("tv1:"),
             TOKEN_VOLUME_TOTAL: root.keyword("/token_volume_total/v1/"),
             TOKEN_DERIVED_MCAP_USD_CANDLES: root.list_keyword("tdmc1:"),
+            TOKEN_DERIVED_FORK: root.keyword("/token_derived_fork/v1/"),
             CHART_CHANGE_EVENTS: root.keyword("/chart_change_events/v1/"),
             CHART_CHANGE_LATEST: root.keyword("/chart_change_latest/v1/"),
             ACTIVITY: root.list_keyword("activity:v1:"),
@@ -185,6 +204,11 @@ impl<'a> AmmDataTable<'a> {
             POOL_LP_SUPPLY: root.keyword("/pool_lp_supply/latest/"),
             POOL_DETAILS_SNAPSHOT: root.keyword("/pool_details/v2/"),
             TVL_VERSIONED: root.keyword("/tvlVersioned/"),
+            AMM_TVL_LINE: root.list_keyword("atl2:"),
+            TOKEN_TVL_LINE: root.list_keyword("ttl2:"),
+            AMM_TVL_TOTAL: root.keyword("/amm_tvl_total/v2/"),
+            TOKEN_TVL_TOTAL: root.keyword("/token_tvl_total/v2/"),
+            POOL_TVL_ANCHOR: root.keyword("/pool_tvl_anchor/v2/"),
             TOKEN_ACTIVITY: root.list_keyword("/token_activity/v1/"),
             TOKEN_ACTIVITY_AMOUNT: root.list_keyword("/token_activity_amount/v1/"),
             TOKEN_SWAPS: root.list_keyword("/token_swaps/v1/"),
@@ -531,6 +555,20 @@ impl<'a> AmmDataTable<'a> {
     ) -> Vec<u8> {
         let mut k = self.token_mcusd_candle_ns_prefix(token, tf);
         k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
+    pub fn token_derived_fork_key(
+        &self,
+        token: &SchemaAlkaneId,
+        quote: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.TOKEN_DERIVED_FORK.key().to_vec();
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k.push(b'/');
+        k.extend_from_slice(&quote.block.to_be_bytes());
+        k.extend_from_slice(&quote.tx.to_be_bytes());
         k
     }
 
@@ -1216,6 +1254,94 @@ impl<'a> AmmDataTable<'a> {
     pub fn tvl_versioned_key(&self, pool: &SchemaAlkaneId, height: u32) -> Vec<u8> {
         let mut k = self.tvl_versioned_prefix(pool);
         k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    pub fn amm_tvl_line_ns_prefix(&self, tf: Timeframe) -> Vec<u8> {
+        let suffix = format!("{}:", tf.code());
+        self.AMM_TVL_LINE.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn amm_tvl_line_key(&self, tf: Timeframe, bucket_ts: u64) -> Vec<u8> {
+        let mut k = self.amm_tvl_line_ns_prefix(tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
+    pub fn token_tvl_line_ns_prefix(&self, token: &SchemaAlkaneId, tf: Timeframe) -> Vec<u8> {
+        let blk_hex = format!("{:x}", token.block);
+        let tx_hex = format!("{:x}", token.tx);
+        let suffix = format!("{}:{}:{}:", blk_hex, tx_hex, tf.code());
+        self.TOKEN_TVL_LINE.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn token_tvl_line_key(
+        &self,
+        token: &SchemaAlkaneId,
+        tf: Timeframe,
+        bucket_ts: u64,
+    ) -> Vec<u8> {
+        let mut k = self.token_tvl_line_ns_prefix(token, tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
+    pub fn amm_tvl_total_prefix(&self) -> Vec<u8> {
+        self.AMM_TVL_TOTAL.key().to_vec()
+    }
+
+    pub fn amm_tvl_total_key(&self, height: u64) -> Vec<u8> {
+        let mut k = self.amm_tvl_total_prefix();
+        k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    pub fn parse_amm_tvl_total_key(&self, key: &[u8]) -> Option<u64> {
+        let prefix = self.amm_tvl_total_prefix();
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 8 {
+            return None;
+        }
+        let mut height = [0u8; 8];
+        height.copy_from_slice(rest);
+        Some(u64::from_be_bytes(height))
+    }
+
+    pub fn token_tvl_total_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.TOKEN_TVL_TOTAL.key().to_vec();
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k.push(b'/');
+        k
+    }
+
+    pub fn token_tvl_total_key(&self, token: &SchemaAlkaneId, height: u64) -> Vec<u8> {
+        let mut k = self.token_tvl_total_prefix(token);
+        k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    pub fn parse_token_tvl_total_key(&self, token: &SchemaAlkaneId, key: &[u8]) -> Option<u64> {
+        let prefix = self.token_tvl_total_prefix(token);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 8 {
+            return None;
+        }
+        let mut height = [0u8; 8];
+        height.copy_from_slice(rest);
+        Some(u64::from_be_bytes(height))
+    }
+
+    pub fn pool_tvl_anchor_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.POOL_TVL_ANCHOR.key().to_vec();
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
         k
     }
 
@@ -1960,6 +2086,162 @@ impl AmmDataProvider {
         Ok(None)
     }
 
+    /// Newest global TVL total written at or before `height`.
+    ///
+    /// The running total is keyed by height and read back through the versioned
+    /// store, so a reorg that drops the block that wrote a point automatically
+    /// falls back to the last surviving one - the same shape `total_volume_amm`
+    /// already relies on.
+    pub fn get_amm_tvl_total_at_or_before_height(
+        &self,
+        height: u32,
+    ) -> Result<Option<(u64, SchemaTvlPointV1)>> {
+        let table = self.table();
+        let rel_prefix = table.amm_tvl_total_prefix();
+        let end_exclusive = table.amm_tvl_total_key(u64::from(height).saturating_add(1));
+        let entries = self.raw_scan_range_entries_page_at(
+            &rel_prefix,
+            Some(&end_exclusive),
+            self.view_blockhash,
+            0,
+            16,
+            true,
+        )?;
+        for (k, v) in entries {
+            let Some(point_height) = table.parse_amm_tvl_total_key(&k) else { continue };
+            if let Ok(value) = decode_tvl_point_v1(&v) {
+                return Ok(Some((point_height, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Newest per-token TVL total written at or before `height`.
+    pub fn get_token_tvl_total_at_or_before_height(
+        &self,
+        token: &SchemaAlkaneId,
+        height: u32,
+    ) -> Result<Option<(u64, SchemaTvlPointV1)>> {
+        let table = self.table();
+        let rel_prefix = table.token_tvl_total_prefix(token);
+        let end_exclusive = table.token_tvl_total_key(token, u64::from(height).saturating_add(1));
+        let entries = self.raw_scan_range_entries_page_at(
+            &rel_prefix,
+            Some(&end_exclusive),
+            self.view_blockhash,
+            0,
+            16,
+            true,
+        )?;
+        for (k, v) in entries {
+            let Some(point_height) = table.parse_token_tvl_total_key(token, &k) else { continue };
+            if let Ok(value) = decode_tvl_point_v1(&v) {
+                return Ok(Some((point_height, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn token_derived_fork_done(
+        &self,
+        token: &SchemaAlkaneId,
+        quote: &SchemaAlkaneId,
+    ) -> Result<bool> {
+        let key = self.table().token_derived_fork_key(token, quote);
+        Ok(self
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+            .value
+            .is_some())
+    }
+
+    /// Give `token`'s derived chart against `dest` the history it had against
+    /// `source`, so a quote that comes into force at a height continues the series
+    /// instead of starting empty. Copies the usd and mcusd candles on every
+    /// timeframe, then writes the pair's marker in the same batch.
+    ///
+    /// For the source token itself there is no `(source, source)` series, so its
+    /// direct usd/mcusd charts are what gets carried over.
+    ///
+    /// Only ever writes new keys: if the destination already holds candles it is
+    /// left exactly as it is and only the marker is written. Returns the number of
+    /// candles copied. Meant to be called from inside `index_block`; the write
+    /// lands in the in-progress block, so the rest of that block reads it back
+    /// and a reorg takes the copy and the marker out together.
+    pub fn fork_token_derived_history(
+        &self,
+        token: &SchemaAlkaneId,
+        source: &SchemaAlkaneId,
+        dest: &SchemaAlkaneId,
+        height: u32,
+    ) -> Result<usize> {
+        let table = self.table();
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        let dest_has_candles = !self
+            .get_list_entries_desc_cursor(GetListEntriesDescCursorParams {
+                blockhash: StateAt::Latest,
+                prefix: table.token_derived_usd_candle_ns_prefix(token, dest, Timeframe::M10),
+                cursor: None,
+                limit: 1,
+            })?
+            .entries
+            .is_empty();
+
+        if !dest_has_candles && source != dest {
+            let self_source = token == source;
+            for tf in crate::modules::ammdata::schemas::active_timeframes() {
+                let usd_prefix = if self_source {
+                    table.token_usd_candle_ns_prefix(token, tf)
+                } else {
+                    table.token_derived_usd_candle_ns_prefix(token, source, tf)
+                };
+                let mc_prefix = if self_source {
+                    table.token_mcusd_candle_ns_prefix(token, tf)
+                } else {
+                    table.token_derived_mcusd_candle_ns_prefix(token, source, tf)
+                };
+                for (prefix, is_mc) in [(usd_prefix, false), (mc_prefix, true)] {
+                    let entries = self
+                        .get_list_entries_desc(GetListEntriesDescParams {
+                            blockhash: StateAt::Latest,
+                            prefix,
+                        })?
+                        .entries;
+                    for (k, v) in entries {
+                        let Some(ts) = trailing_bucket_ts(&k) else { continue };
+                        let dest_key = if is_mc {
+                            table.token_derived_mcusd_candle_key(token, dest, tf, ts)
+                        } else {
+                            table.token_derived_usd_candle_key(token, dest, tf, ts)
+                        };
+                        puts.push((dest_key, v));
+                    }
+                }
+            }
+        }
+
+        let copied = puts.len();
+        puts.push((
+            table.token_derived_fork_key(token, dest),
+            encode_u128_value(u128::from(height))?,
+        ));
+        self.with_view_blockhash(None).set_batch(SetBatchParams {
+            blockhash: StateAt::Latest,
+            puts,
+            deletes: Vec::new(),
+        })?;
+        Ok(copied)
+    }
+
+    /// The contribution a pool last made to the running totals, so the next block
+    /// can apply a delta instead of re-summing every pool.
+    pub fn get_pool_tvl_anchor(&self, pool: &SchemaAlkaneId) -> Result<Option<SchemaTvlPointV1>> {
+        let table = self.table();
+        let key = table.pool_tvl_anchor_key(pool);
+        let raw = self.get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?.value;
+        Ok(raw.and_then(|bytes| decode_tvl_point_v1(&bytes).ok()))
+    }
+
     pub fn get_latest_total_volume_amm(
         &self,
         unit: TotalVolumeAmmUnit,
@@ -2409,6 +2691,18 @@ impl AmmDataProvider {
             };
             pools.push(SchemaCanonicalPoolEntry { pool_id, quote_id });
         }
+
+        // The stored pointer keeps one pool per (token, quote) and the newest pool
+        // to be discovered overwrote it - including dust duplicates opened through
+        // other factories before the allowlist existed. Once the allowlist is in
+        // force the pointer is only a hint: entries naming an untrusted pool are
+        // dropped, and the token's own pool list supplies the trusted pool the
+        // pointer may have lost. Nothing stored is rewritten.
+        if let Some(factories) = pricing_factories_at_height(get_network(), canonical_height) {
+            pools =
+                self.trusted_canonical_pools(&params.token, &canonical_quote_ids, pools, factories);
+        }
+
         pools.sort_by_key(|e| (e.quote_id.block, e.quote_id.tx, e.pool_id.block, e.pool_id.tx));
         Ok(GetCanonicalPoolsResult { pools })
     }
@@ -2798,6 +3092,149 @@ impl AmmDataProvider {
             }
         }
         Ok(GetAmmFactoriesResult { factories: ids })
+    }
+
+    /// A token's canonical pools, restricted to trusted factories.
+    ///
+    /// `pointer_pools` is what the stored one-per-pair pointer says. Entries naming
+    /// an untrusted pool are dropped, and the token's own pool list supplies any
+    /// trusted pool the pointer lost when a later pool overwrote it.
+    fn trusted_canonical_pools(
+        &self,
+        token: &SchemaAlkaneId,
+        canonical_quote_ids: &HashSet<SchemaAlkaneId>,
+        pointer_pools: Vec<SchemaCanonicalPoolEntry>,
+        factories: &[SchemaAlkaneId],
+    ) -> Vec<SchemaCanonicalPoolEntry> {
+        let mut pools: Vec<SchemaCanonicalPoolEntry> = pointer_pools
+            .into_iter()
+            .filter(|e| self.pool_in_factories(&e.pool_id, factories))
+            .collect();
+        let token_pools = self
+            .get_token_pools(GetTokenPoolsParams { blockhash: StateAt::Latest, token: *token })
+            .map(|res| res.pools)
+            .unwrap_or_default();
+        for pool_id in token_pools {
+            if pools.iter().any(|e| e.pool_id == pool_id) {
+                continue;
+            }
+            let Some(defs) = self
+                .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool: pool_id })
+                .ok()
+                .and_then(|res| res.defs)
+            else {
+                continue;
+            };
+            let quote_id = if defs.base_alkane_id == *token {
+                defs.quote_alkane_id
+            } else if defs.quote_alkane_id == *token {
+                defs.base_alkane_id
+            } else {
+                continue;
+            };
+            if canonical_quote_ids.contains(&quote_id)
+                && self.pool_in_factories(&pool_id, factories)
+            {
+                pools.push(SchemaCanonicalPoolEntry { pool_id, quote_id });
+            }
+        }
+        pools
+    }
+
+    /// The pools in `pools` that were not created by any of `factories`.
+    ///
+    /// A pool's factory is recorded twice when it is discovered - `pool_factory`
+    /// (pool -> factory) and `factory_pools` (factory -> pool) - and a pool counts
+    /// as belonging to a factory if either says so, so an index that only gained
+    /// one of the two later cannot make an old pool look foreign. The two `pending`
+    /// slices are this block's not-yet-written entries for the same indexes, so a
+    /// pool discovered in this block is judged in this block.
+    ///
+    /// Read errors are returned, never swallowed: treating "could not read" as
+    /// "no pool is trusted" would silently stop pricing every token.
+    pub fn pools_not_in_factories(
+        &self,
+        pools: &[SchemaAlkaneId],
+        factories: &[SchemaAlkaneId],
+        pending_pool_factory: &[(Vec<u8>, Vec<u8>)],
+        pending_factory_pools: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<HashSet<SchemaAlkaneId>> {
+        // No network before init_config() (unit tests): no network-specific
+        // exemptions apply, which is what Regtest's empty cryptoswap table gives.
+        self.pools_not_in_factories_on(
+            crate::config::try_get_network().unwrap_or(Network::Regtest),
+            pools,
+            factories,
+            pending_pool_factory,
+            pending_factory_pools,
+        )
+    }
+
+    /// `pools_not_in_factories` for an explicit network (tests use mainnet).
+    pub fn pools_not_in_factories_on(
+        &self,
+        network: Network,
+        pools: &[SchemaAlkaneId],
+        factories: &[SchemaAlkaneId],
+        pending_pool_factory: &[(Vec<u8>, Vec<u8>)],
+        pending_factory_pools: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<HashSet<SchemaAlkaneId>> {
+        let table = self.table();
+        let mut trusted: HashSet<SchemaAlkaneId> = HashSet::new();
+
+        // Statically seeded CryptoSwap pools (BTCUSD 4:1778) have no factory at
+        // all: they were deployed directly, not through any AMM factory, so
+        // neither factory record exists for them and the allowlist would
+        // exclude them. They are trusted by construction: the cryptoswap table
+        // names exactly which alkane is which pool, and a pool not in it is
+        // never registered.
+        for pool in pools {
+            if crate::modules::ammdata::utils::cryptoswap::is_cryptoswap_pool(network, pool) {
+                trusted.insert(*pool);
+            }
+        }
+
+        // factory -> pools
+        for factory in factories {
+            let prefix = table.factory_pools_prefix(factory);
+            let keys = self
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+                    blockhash: StateAt::Latest,
+                    prefix: prefix.clone(),
+                })?
+                .keys;
+            for key in keys.iter().chain(pending_factory_pools.iter().map(|(k, _)| k)) {
+                if let Some(pool) = parse_alkane_id_from_prefixed_key(prefix.as_slice(), key) {
+                    trusted.insert(pool);
+                }
+            }
+        }
+
+        // pool -> factory
+        let keys: Vec<Vec<u8>> = pools.iter().map(|p| table.pool_factory_key(p)).collect();
+        let pending: HashMap<&[u8], &[u8]> =
+            pending_pool_factory.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        let stored = self
+            .get_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: keys.clone(),
+            })?
+            .values;
+        for ((pool, key), value) in pools.iter().zip(keys.iter()).zip(stored) {
+            let raw: Option<&[u8]> = pending.get(key.as_slice()).copied().or(value.as_deref());
+            if raw.and_then(decode_alkane_id_be).is_some_and(|f| factories.contains(&f)) {
+                trusted.insert(*pool);
+            }
+        }
+
+        Ok(pools.iter().filter(|p| !trusted.contains(p)).copied().collect())
+    }
+
+    /// Whether one pool was created by any of `factories`, for request-time use.
+    pub fn pool_in_factories(&self, pool: &SchemaAlkaneId, factories: &[SchemaAlkaneId]) -> bool {
+        self.pools_not_in_factories(&[*pool], factories, &[], &[])
+            .map(|excluded| excluded.is_empty())
+            .unwrap_or(false)
     }
 
     pub fn get_factory_pools(
@@ -3307,6 +3744,78 @@ impl AmmDataProvider {
         read_amm_history(self, prefix, params.offset, params.limit, params.kind)
     }
 
+    /// Every swap leg recorded at one block timestamp, grouped by transaction.
+    ///
+    /// A swap's legs are separate per-pool activity rows that share a txid and a
+    /// timestamp. `amm_history_all` already lists every AMM event by timestamp, so
+    /// one short scan of that timestamp plus one batched read of the (small)
+    /// activity entries finds them all - no transaction blobs, no traces.
+    pub fn trade_legs_at_ts(
+        &self,
+        ts: u64,
+        defs_cache: &mut HashMap<SchemaAlkaneId, Option<SchemaMarketDefs>>,
+    ) -> Result<HashMap<[u8; 32], Vec<RouteLeg>>> {
+        let table = self.table();
+        let mut prefix = table.amm_history_all_prefix();
+        prefix.extend_from_slice(&ts.to_be_bytes());
+        let entries = self
+            .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })?
+            .entries;
+
+        // Key tail: ts(8) seq(4) kind(1) pool.block(4) pool.tx(8).
+        let mut lookups: Vec<ActivityEntryLookup> = Vec::new();
+        for (key, _value) in entries {
+            if key.len() < 25 {
+                continue;
+            }
+            let tail = &key[key.len() - 25..];
+            let key_ts = u64::from_be_bytes(tail[0..8].try_into().expect("8 bytes"));
+            if key_ts != ts {
+                continue;
+            }
+            let seq = u32::from_be_bytes(tail[8..12].try_into().expect("4 bytes"));
+            let is_trade = matches!(
+                activity_kind_from_code(tail[12]),
+                Some(ActivityKind::TradeBuy | ActivityKind::TradeSell)
+            );
+            let Some(pool) = decode_alkane_id_be(&tail[13..25]) else { continue };
+            if is_trade {
+                lookups.push(ActivityEntryLookup { pool, ts, seq });
+            }
+        }
+        if lookups.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let keys: Vec<(SchemaAlkaneId, u32)> = lookups.iter().map(|l| (l.pool, l.seq)).collect();
+        let stored = self
+            .get_activity_entries(GetActivityEntriesParams {
+                blockhash: StateAt::Latest,
+                entries: lookups,
+            })?
+            .entries;
+
+        let mut by_tx: HashMap<[u8; 32], Vec<RouteLeg>> = HashMap::new();
+        for ((pool, seq), entry) in keys.into_iter().zip(stored) {
+            let Some(entry) = entry else { continue };
+            let defs = *defs_cache.entry(pool).or_insert_with(|| {
+                self.get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool })
+                    .ok()
+                    .and_then(|res| res.defs)
+            });
+            let Some(defs) = defs else { continue };
+            by_tx.entry(entry.txid).or_default().push(RouteLeg {
+                pool,
+                base: defs.base_alkane_id,
+                quote: defs.quote_alkane_id,
+                base_delta: entry.base_delta,
+                quote_delta: entry.quote_delta,
+                seq,
+            });
+        }
+        Ok(by_tx)
+    }
+
     pub fn get_amm_history_all_page(
         &self,
         params: GetAmmHistoryAllPageParams,
@@ -3514,15 +4023,23 @@ impl AmmDataProvider {
         now: u64,
     ) -> Result<HashMap<PriceAsset, AssetPriceSnapshot>> {
         let config = AmmDataConfig::load_from_global_config()?;
-        let derived_quotes = config
-            .derived_liquidity
-            .as_ref()
-            .map(|config| config.derived_quotes.as_slice())
-            .unwrap_or_default();
+        // Only quotes in force at the tip, and for each alkane the quote its
+        // `-full` chart proxies to goes first, so a quote agrees with that chart.
+        let tip = get_espo_indexed_height().unwrap_or(0);
+        let active = config.active_derived_quotes(tip);
         let mut snapshots = HashMap::with_capacity(assets.len());
         for asset in assets {
-            snapshots
-                .insert(*asset, self.hourly_asset_price_snapshot(*asset, now, derived_quotes)?);
+            let ordered: Vec<DerivedQuoteConfig> = match asset {
+                PriceAsset::Alkane(token) => {
+                    let target = config.full_target(token, tip);
+                    let mut ordered: Vec<DerivedQuoteConfig> =
+                        active.iter().filter(|q| Some(q.alkane) == target).cloned().collect();
+                    ordered.extend(active.iter().filter(|q| Some(q.alkane) != target).cloned());
+                    ordered
+                }
+                _ => active.clone(),
+            };
+            snapshots.insert(*asset, self.hourly_asset_price_snapshot(*asset, now, &ordered)?);
         }
         Ok(snapshots)
     }
@@ -3787,6 +4304,48 @@ impl AmmDataProvider {
         })
     }
 
+    /// The derived quote `<token>-full` proxies to right now, or `None` for the
+    /// direct chart. One place decides this - the candle RPC, the explorer's token
+    /// page and its chart endpoint all ask here - so they cannot disagree.
+    ///
+    /// A client-mode explorer asks the data instance: the answer depends on that
+    /// instance's config, tip and fork markers.
+    pub fn full_chart_target(
+        &self,
+        params: FullChartTargetParams,
+    ) -> Result<FullChartTargetResult> {
+        if let Some(remote) = crate::config::explorer_remote() {
+            return crate::modules::ammdata::internal_rpc::remote_full_chart_target(
+                &remote, params,
+            );
+        }
+        let token = params.token;
+        let tip = get_espo_indexed_height().unwrap_or(0);
+        let config = AmmDataConfig::load_from_global_config().ok();
+        let mut target = config.as_ref().and_then(|c| c.full_target(&token, tip));
+
+        // A quote that came into force at a height only has candles for a token
+        // once that token's history has been forked across, which happens on its
+        // first trade after the height. Until then the pair is still on the
+        // default quote, so an illiquid token does not go blank at the fork height.
+        if let (Some(config), Some(t)) = (config.as_ref(), target) {
+            let plan = config.derived_index_plan(tip);
+            if plan.is_forked_quote(&t)
+                && t != token
+                && !self.token_derived_fork_done(&token, &t).unwrap_or(false)
+            {
+                target = plan.fork_source.filter(|d| {
+                    config.derived_quotes().iter().any(|q| q.alkane == *d && q.active_at(tip))
+                });
+            }
+        }
+        // The token is the quote it would proxy to: that chart does not exist.
+        if target == Some(token) {
+            target = None;
+        }
+        Ok(FullChartTargetResult { target })
+    }
+
     pub fn rpc_get_candles(&self, params: RpcGetCandlesParams) -> Result<RpcGetCandlesResult> {
         if let Some(remote) = crate::config::explorer_remote() {
             return crate::modules::ammdata::internal_rpc::remote_rpc_get_candles(&remote, params);
@@ -3814,6 +4373,12 @@ impl AmmDataProvider {
             }
         };
 
+        // `-full`: the consumer does not track which derived quote an alkane is on.
+        // Rewrite it to the chart it proxies to and parse that like any other id.
+        let requested_pool = pool_raw.to_string();
+        let full_resolved: Option<String> = resolve_full_chart_id(self, pool_raw);
+        let pool_raw: &str = full_resolved.as_deref().unwrap_or(pool_raw);
+
         let parse_token_or_derived =
             |raw: &str| -> Result<(SchemaAlkaneId, Option<SchemaAlkaneId>)> {
                 if let Some((token_part, quote_part)) = raw.split_once("-derived_") {
@@ -3834,8 +4399,40 @@ impl AmmDataProvider {
         let mut is_mcusd = false;
         let mut is_sats = false;
         let mut is_mcsats = false;
+        let mut is_cmcap = false;
 
-        let pool = if let Some(stripped) = pool_raw.strip_suffix("-mcsats") {
+        // -cmcap is held in this fork: its non-circulating holder table is an
+        // upstream claim about who holds DIESEL, TORTILLA and SLICE that has not
+        // been verified here, and the number it publishes is a market-cap claim.
+        // Off until CMCAP_ENABLED is flipped deliberately.
+        if !CMCAP_ENABLED && pool_raw.ends_with("-cmcap") {
+            return Ok(RpcGetCandlesResult {
+                value: json!({
+                    "ok": false,
+                    "error": "cmcap_disabled",
+                    "hint": "circulating market cap charts are not enabled on this espo"
+                }),
+            });
+        }
+        let pool = if let Some(stripped) = pool_raw.strip_suffix("-cmcap") {
+            match parse_token_or_derived(stripped) {
+                Ok((p, q)) => {
+                    derived_quote = q;
+                    is_mcusd = true;
+                    is_cmcap = true;
+                    p
+                }
+                Err(_) => {
+                    return Ok(RpcGetCandlesResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "missing_or_invalid_pool",
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
+                        }),
+                    });
+                }
+            }
+        } else if let Some(stripped) = pool_raw.strip_suffix("-mcsats") {
             match parse_token_or_derived(stripped) {
                 Ok((p, q)) => {
                     derived_quote = q;
@@ -3848,7 +4445,7 @@ impl AmmDataProvider {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -3866,7 +4463,7 @@ impl AmmDataProvider {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -3883,7 +4480,7 @@ impl AmmDataProvider {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -3900,7 +4497,7 @@ impl AmmDataProvider {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -3913,7 +4510,7 @@ impl AmmDataProvider {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", \"2:0-cmcap\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -3972,6 +4569,27 @@ impl AmmDataProvider {
             }
         } else {
             read_candles_v1(self, pool, tf, /*unused*/ limit, now, side)
+        };
+
+        // cmcap: the ratio's step function for this token, built from indexes
+        // essentials already keeps. None unless the -cmcap suffix was asked for.
+        let cmcap: Option<(Vec<CirculatingStep>, bool, usize)> = if is_cmcap {
+            match non_circulating_holders(get_network(), &pool) {
+                Some(entry) => {
+                    let holders = entry.addresses.len() + entry.alkanes.len();
+                    match circulating_steps(self.essentials(), pool, entry) {
+                        Ok(steps) => Some((steps, true, holders)),
+                        Err(e) => {
+                            return Ok(RpcGetCandlesResult {
+                                value: json!({ "ok": false, "error": format!("cmcap_failed: {e}") }),
+                            });
+                        }
+                    }
+                }
+                None => Some((Vec::new(), false, 0)),
+            }
+        } else {
+            None
         };
 
         match slice {
@@ -4091,20 +4709,35 @@ impl AmmDataProvider {
                                 candle.low = candle.open;
                             }
                         }
-                        json!({
+                        let circulating_ratio = cmcap.as_ref().map(|(steps, _, _)| {
+                            match step_for_bucket(steps, ts, dur) {
+                                Some(step) => {
+                                    candle = scale_candle(candle, step);
+                                    step.ratio_f64()
+                                }
+                                None => 1.0,
+                            }
+                        });
+                        let mut row = json!({
                             "ts":     ts,
                             "open":   candle.open.to_string(),
                             "high":   candle.high.to_string(),
                             "low":    candle.low.to_string(),
                             "close":  candle.close.to_string(),
                             "volume": candle.volume.to_string(),
-                        })
+                        });
+                        if let Some(ratio) = circulating_ratio {
+                            row["circulating_ratio"] = json!(ratio);
+                        }
+                        row
                     })
                     .collect();
 
                 let pool_label = if is_usd || is_mcusd {
                     if let Some(q) = derived_quote {
-                        let suffix = if is_mcsats {
+                        let suffix = if is_cmcap {
+                            "cmcap"
+                        } else if is_mcsats {
                             "mcsats"
                         } else if is_sats {
                             "sats"
@@ -4114,6 +4747,8 @@ impl AmmDataProvider {
                             "usd"
                         };
                         format!("{}-derived_{}-{}", id_str(&pool), id_str(&q), suffix)
+                    } else if is_cmcap {
+                        format!("{}-cmcap", id_str(&pool))
                     } else if is_mcsats {
                         format!("{}-mcsats", id_str(&pool))
                     } else if is_sats {
@@ -4127,8 +4762,7 @@ impl AmmDataProvider {
                     id_str(&pool)
                 };
 
-                Ok(RpcGetCandlesResult {
-                    value: json!({
+                let mut value = json!({
                         "ok": true,
                         "pool": pool_label,
                         "timeframe": tf.code(),
@@ -4145,8 +4779,19 @@ impl AmmDataProvider {
                         "total": total,
                         "has_more": end < total,
                         "candles": arr
-                    }),
-                })
+                });
+                if let Some((steps, configured, holders)) = cmcap.as_ref() {
+                    value["cmcap"] = json!({
+                        "configured": configured,
+                        "holders": holders,
+                        "steps": steps.len(),
+                    });
+                }
+                if full_resolved.is_some() {
+                    value["resolved_pool"] = value["pool"].clone();
+                    value["pool"] = json!(requested_pool);
+                }
+                Ok(RpcGetCandlesResult { value })
             }
             Err(e) => Ok(RpcGetCandlesResult {
                 value: json!({ "ok": false, "error": format!("read_failed: {e}") }),
@@ -4177,6 +4822,88 @@ impl AmmDataProvider {
             }),
         };
         Ok(RpcGetBtcUsdCandlesResult { value })
+    }
+
+    /// TVL line, protocol-wide or for one token, as `{ts, sats, usd}` points.
+    ///
+    /// The series is stored in sats; the usd column is produced here by pricing
+    /// each bucket against the btc/usd line of the same bucket.
+    pub fn rpc_get_tvl_candles(
+        &self,
+        params: RpcGetTvlCandlesParams,
+    ) -> Result<RpcGetTvlCandlesResult> {
+        let tf = params.timeframe.as_deref().and_then(parse_timeframe).unwrap_or(Timeframe::D1);
+        let legacy_size = params.size.map(|value| value as usize);
+        let limit = params
+            .limit
+            .map(|value| value as usize)
+            .or(legacy_size)
+            .unwrap_or(120)
+            .clamp(1, 1_000);
+        let page = params.page.map(|value| value as usize).unwrap_or(1).max(1);
+        let now = params.now.unwrap_or_else(now_ts);
+        let include_unanchored = params.include_unanchored.unwrap_or(false);
+
+        let table = self.table();
+        let (ns_prefix, scope) = match params.token.as_deref().map(str::trim) {
+            Some(raw) if !raw.is_empty() => {
+                let Some(token) = parse_id_from_str(raw) else {
+                    return Ok(RpcGetTvlCandlesResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "missing_or_invalid_token",
+                            "hint": "token should be an Alkane id like \"2:0\""
+                        }),
+                    });
+                };
+                (
+                    table.token_tvl_line_ns_prefix(&token, tf),
+                    format!("{}:{}", token.block, token.tx),
+                )
+            }
+            _ => (table.amm_tvl_line_ns_prefix(tf), "amm".to_string()),
+        };
+
+        let mut slice = match read_tvl_line_v1(self, ns_prefix, tf, now) {
+            Ok(slice) => slice,
+            Err(error) => {
+                return Ok(RpcGetTvlCandlesResult {
+                    value: json!({
+                        "ok": false,
+                        "error": format!("read_failed: {error}")
+                    }),
+                });
+            }
+        };
+        // A token's start_offset hides its TVL line before that height as well.
+        let scope_token = params
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .and_then(parse_id_from_str);
+        if let Some(offset_ts) = scope_token.and_then(|t| token_start_offset_ts(self, &t)) {
+            let dur = tf.duration_secs();
+            let newest_ts = slice.newest_ts;
+            let keep = slice
+                .points_newest_first
+                .iter()
+                .enumerate()
+                .take_while(|(i, _)| {
+                    newest_ts.saturating_sub((*i as u64).saturating_mul(dur)).saturating_add(dur)
+                        > offset_ts
+                })
+                .count();
+            slice.points_newest_first.truncate(keep);
+        }
+
+        let btc_line = read_btc_usd_line_v1(self, tf, now)
+            .map(|btc| btc_usd_by_bucket(&btc, tf))
+            .unwrap_or_default();
+
+        Ok(RpcGetTvlCandlesResult {
+            value: tvl_candles_json(&slice, &btc_line, tf, limit, page, &scope, include_unanchored),
+        })
     }
 
     pub fn rpc_get_chart_change_block(
@@ -4461,6 +5188,12 @@ impl AmmDataProvider {
             blockhash: StateAt::Latest,
             entries: lookups,
         })?;
+        // Routes are opt-in: finding a trade's other legs is one extra scan per
+        // block in the page, cached so trades in the same block share it.
+        let include_route = params.include_route.unwrap_or(false);
+        let mut legs_by_ts: HashMap<u64, HashMap<[u8; 32], Vec<RouteLeg>>> = HashMap::new();
+        let mut route_defs_cache: HashMap<SchemaAlkaneId, Option<SchemaMarketDefs>> =
+            HashMap::new();
         let mut activity = Vec::with_capacity(page_result.entries.len());
         for (entry, stored) in page_result.entries.iter().zip(stored_entries.entries.into_iter()) {
             let Some(stored) = stored else { continue };
@@ -4486,12 +5219,34 @@ impl AmmDataProvider {
                     obj.insert("quote".to_string(), json!(id_str(&defs.quote_alkane_id)));
                 }
             }
+            if include_route
+                && matches!(stored.kind, ActivityKind::TradeBuy | ActivityKind::TradeSell)
+            {
+                if !legs_by_ts.contains_key(&entry.ts) {
+                    let legs =
+                        self.trade_legs_at_ts(entry.ts, &mut route_defs_cache).unwrap_or_default();
+                    legs_by_ts.insert(entry.ts, legs);
+                }
+                // If this row's own leg is not among what the scan found, the block
+                // predates the all-AMM index and the route is unknown - say so with
+                // null rather than passing a lone leg off as a one-hop route.
+                let route = legs_by_ts
+                    .get(&entry.ts)
+                    .and_then(|by_tx| by_tx.get(&stored.txid))
+                    .filter(|legs| legs.iter().any(|l| l.pool == entry.pool && l.seq == entry.seq))
+                    .map(|legs| route_json(&build_route(legs.clone()), &token))
+                    .unwrap_or(Value::Null);
+                if let Value::Object(ref mut obj) = row {
+                    obj.insert("route".to_string(), route);
+                }
+            }
             activity.push(row);
         }
 
         Ok(RpcGetTokenActivityResult {
             value: json!({
                 "ok": true,
+                "include_route": include_route,
                 "token": id_str(&token),
                 "activity_type": match activity_type {
                     ActivityFilter::All => "all",
@@ -5807,6 +6562,35 @@ pub struct RpcGetBtcUsdCandlesResult {
     pub value: Value,
 }
 
+/// Which chart `<token>-full` resolves to.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FullChartTargetParams {
+    pub token: SchemaAlkaneId,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FullChartTargetResult {
+    /// `Some(quote)`: the token's derived chart against `quote`. `None`: its direct chart.
+    pub target: Option<SchemaAlkaneId>,
+}
+
+pub struct RpcGetTvlCandlesParams {
+    /// Omit for the protocol-wide line; set to an alkane id for that token's line.
+    pub token: Option<String>,
+    pub timeframe: Option<String>,
+    pub limit: Option<u64>,
+    pub size: Option<u64>,
+    pub page: Option<u64>,
+    pub now: Option<u64>,
+    /// Include the `unanchored` component (pools with no canonical-rooted price)
+    /// in the reported totals. Off by default.
+    pub include_unanchored: Option<bool>,
+}
+
+pub struct RpcGetTvlCandlesResult {
+    pub value: Value,
+}
+
 pub struct RpcGetAlkanesQuoteParams {
     pub assets: Option<Vec<String>>,
     pub now: Option<u64>,
@@ -5887,6 +6671,8 @@ pub struct RpcGetTokenActivityParams {
     pub kind: Option<String>,
     pub sort: Option<String>,
     pub dir: Option<String>,
+    /// Attach each trade's full route across pools. Off by default.
+    pub include_route: Option<bool>,
 }
 
 pub struct RpcGetTokenActivityResult {
@@ -6065,6 +6851,15 @@ pub fn decode_pool_creation_info(bytes: &[u8]) -> anyhow::Result<SchemaPoolCreat
 }
 
 pub fn encode_pool_creation_info(v: &SchemaPoolCreationInfoV1) -> anyhow::Result<Vec<u8>> {
+    Ok(borsh::to_vec(v)?)
+}
+
+pub fn decode_tvl_point_v1(bytes: &[u8]) -> anyhow::Result<SchemaTvlPointV1> {
+    use borsh::BorshDeserialize;
+    Ok(SchemaTvlPointV1::try_from_slice(bytes)?)
+}
+
+pub fn encode_tvl_point_v1(v: &SchemaTvlPointV1) -> anyhow::Result<Vec<u8>> {
     Ok(borsh::to_vec(v)?)
 }
 
@@ -6374,7 +7169,13 @@ fn read_token_usd_candles_v1(
         }
     }
 
-    apply_token_chart_start_cutoff(token, &mut per_bucket);
+    apply_token_chart_start_cutoff(
+        provider,
+        token,
+        tf,
+        table.token_usd_candle_ns_prefix(&token, Timeframe::M10),
+        &mut per_bucket,
+    );
 
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
@@ -6475,7 +7276,13 @@ fn read_token_derived_usd_candles_v1(
         }
     }
 
-    apply_token_chart_start_cutoff(token, &mut per_bucket);
+    apply_token_chart_start_cutoff(
+        provider,
+        token,
+        tf,
+        table.token_derived_usd_candle_ns_prefix(&token, &quote, Timeframe::M10),
+        &mut per_bucket,
+    );
 
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
@@ -6576,7 +7383,13 @@ fn read_token_derived_mcusd_candles_v1(
         }
     }
 
-    apply_token_chart_start_cutoff(token, &mut per_bucket);
+    apply_token_chart_start_cutoff(
+        provider,
+        token,
+        tf,
+        table.token_derived_mcusd_candle_ns_prefix(&token, &quote, Timeframe::M10),
+        &mut per_bucket,
+    );
 
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
@@ -6676,7 +7489,13 @@ fn read_token_mcusd_candles_v1(
         }
     }
 
-    apply_token_chart_start_cutoff(token, &mut per_bucket);
+    apply_token_chart_start_cutoff(
+        provider,
+        token,
+        tf,
+        table.token_mcusd_candle_ns_prefix(&token, Timeframe::M10),
+        &mut per_bucket,
+    );
 
     if per_bucket.is_empty() {
         return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
@@ -6746,12 +7565,148 @@ fn read_token_mcusd_candles_v1(
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }
 
+/// Block time of an alkane's configured `start_offset`, or `None` if it has none.
+/// A height the index has not reached yet hides everything: every candle so far
+/// happened before it.
+fn token_start_offset_ts(provider: &AmmDataProvider, token: &SchemaAlkaneId) -> Option<u64> {
+    let height = AmmDataConfig::load_from_global_config().ok()?.start_offset(token)?;
+    if height > get_espo_indexed_height().unwrap_or(0) {
+        return Some(u64::MAX);
+    }
+    provider
+        .essentials()
+        .get_block_summaries_by_heights(&[height])
+        .ok()?
+        .into_iter()
+        .next()
+        .flatten()
+        .and_then(|summary| summary.block_time())
+}
+
+/// Aggregate a series' 10m candles in `[from_ts, to_ts)` into one candle.
+fn aggregate_m10_range(
+    provider: &AmmDataProvider,
+    m10_ns_prefix: &[u8],
+    from_ts: u64,
+    to_ts: u64,
+) -> Option<SchemaCandleV1> {
+    // Keys end in the decimal bucket timestamp; see `newest candle at or before`
+    // for why lexicographic bounds are safe on them.
+    let mut start = m10_ns_prefix.to_vec();
+    start.extend_from_slice(from_ts.to_string().as_bytes());
+    let mut end = m10_ns_prefix.to_vec();
+    end.extend_from_slice(to_ts.to_string().as_bytes());
+    let entries = provider
+        .get_list_entries_desc_range(GetListEntriesDescRangeParams {
+            blockhash: StateAt::Latest,
+            start_inclusive: start,
+            end_exclusive: Some(end),
+            limit: 10_000,
+        })
+        .ok()?
+        .entries;
+    // Newest first: the first candle closes the bucket, the last one opens it.
+    let mut out: Option<SchemaCandleV1> = None;
+    for (_k, v) in entries {
+        let Ok(c) = decode_candle_v1(&v) else { continue };
+        out = Some(match out {
+            None => c,
+            Some(acc) => SchemaCandleV1 {
+                open: c.open,
+                high: acc.high.max(c.high),
+                low: acc.low.min(c.low),
+                close: acc.close,
+                volume: acc.volume.saturating_add(c.volume),
+            },
+        });
+    }
+    out
+}
+
+/// Drop the part of a token chart that falls before its start: the fixed mainnet
+/// FIRE cutoff, and any `derive_sources[].start_offset` from config.
+///
+/// The offset is applied at 10-minute precision. Buckets that end before it go.
+/// On a higher timeframe the one bucket that straddles it is rebuilt from the
+/// series' own 10m candles from the offset on, so trading before the offset does
+/// not survive inside that candle's open, high or low.
 fn apply_token_chart_start_cutoff(
+    provider: &AmmDataProvider,
     token: SchemaAlkaneId,
+    tf: Timeframe,
+    m10_ns_prefix: Vec<u8>,
     per_bucket: &mut BTreeMap<u64, SchemaCandleV1>,
 ) {
     if get_network() == bitcoin::Network::Bitcoin && token == MAINNET_FIRE_ALKANE_ID {
         per_bucket.retain(|ts, _| *ts >= MAINNET_FIRE_USD_CHART_START_TS);
+    }
+
+    let Some(offset_ts) = token_start_offset_ts(provider, &token) else { return };
+    apply_start_offset_ts(provider, tf, &m10_ns_prefix, offset_ts, per_bucket);
+}
+
+/// The offset rule itself, separated from where the offset comes from.
+fn apply_start_offset_ts(
+    provider: &AmmDataProvider,
+    tf: Timeframe,
+    m10_ns_prefix: &[u8],
+    offset_ts: u64,
+    per_bucket: &mut BTreeMap<u64, SchemaCandleV1>,
+) {
+    let cutoff = bucket_start_for(offset_ts, Timeframe::M10);
+    if tf == Timeframe::M10 {
+        per_bucket.retain(|ts, _| *ts >= cutoff);
+        return;
+    }
+    let dur = tf.duration_secs();
+    per_bucket.retain(|ts, _| ts.saturating_add(dur) > cutoff);
+    let straddling = (cutoff / dur) * dur;
+    if straddling < cutoff && per_bucket.contains_key(&straddling) {
+        match aggregate_m10_range(provider, m10_ns_prefix, cutoff, straddling.saturating_add(dur)) {
+            Some(rebuilt) => {
+                per_bucket.insert(straddling, rebuilt);
+            }
+            None => {
+                per_bucket.remove(&straddling);
+            }
+        }
+    }
+}
+
+/// Candle keys end in the bucket timestamp, written as decimal ASCII.
+fn trailing_bucket_ts(key: &[u8]) -> Option<u64> {
+    let ts_bytes = key.rsplit(|&b| b == b':').next()?;
+    std::str::from_utf8(ts_bytes).ok()?.parse::<u64>().ok()
+}
+
+/// Rewrite a `-full` chart id to the chart it proxies to: the alkane's derived
+/// chart against its `derive_sources` target (or the default derived quote), or
+/// its direct chart when the alkane is that quote or no derived quote is in
+/// force. `<alkane>-full` is the usd chart; `<alkane>-full-<kind>` picks another.
+/// Returns `None` when `raw` is not a `-full` id.
+fn resolve_full_chart_id(provider: &AmmDataProvider, raw: &str) -> Option<String> {
+    let (token_part, kind) = if let Some(t) = raw.strip_suffix("-full") {
+        (t, "usd")
+    } else {
+        raw.split_once("-full-")?
+    };
+    if !matches!(kind, "usd" | "sats" | "mcusd" | "mcsats" | "cmcap") {
+        return None;
+    }
+    let token = parse_id_from_str(token_part)?;
+    let target = provider.full_chart_target(FullChartTargetParams { token }).ok()?.target;
+    Some(full_chart_id(token_part, &token, target, kind))
+}
+
+fn full_chart_id(
+    token_part: &str,
+    token: &SchemaAlkaneId,
+    target: Option<SchemaAlkaneId>,
+    kind: &str,
+) -> String {
+    match target {
+        Some(q) if q != *token => format!("{token_part}-derived_{}:{}-{kind}", q.block, q.tx),
+        _ => format!("{token_part}-{kind}"),
     }
 }
 
@@ -6830,6 +7785,156 @@ fn read_btc_usd_line_v1(
     let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+}
+
+/// A forward-filled TVL line: newest bucket first, one entry per bucket.
+pub struct TvlSlice {
+    pub points_newest_first: Vec<SchemaTvlPointV1>,
+    pub newest_ts: u64,
+}
+
+/// Read a TVL line and fill the gaps.
+///
+/// TVL is a level, not a flow: a bucket with no write means nothing moved, so the
+/// previous value carries forward - both across interior gaps and from the last
+/// written bucket up to now. Buckets before the first ever write stay zero.
+fn read_tvl_line_v1(
+    provider: &AmmDataProvider,
+    ns_prefix: Vec<u8>,
+    tf: Timeframe,
+    now_ts: u64,
+) -> Result<TvlSlice> {
+    let dur = tf.duration_secs();
+    let mut per_bucket: BTreeMap<u64, SchemaTvlPointV1> = BTreeMap::new();
+    for (k, v) in provider
+        .get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest,
+            prefix: ns_prefix,
+        })?
+        .entries
+    {
+        let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() else { continue };
+        let Ok(ts_str) = std::str::from_utf8(ts_bytes) else { continue };
+        let Ok(ts) = ts_str.parse::<u64>() else { continue };
+        if per_bucket.contains_key(&ts) {
+            continue;
+        }
+        if let Ok(point) = decode_tvl_point_v1(&v) {
+            per_bucket.insert(ts, point);
+        }
+    }
+
+    if per_bucket.is_empty() {
+        return Ok(TvlSlice { points_newest_first: vec![], newest_ts: 0 });
+    }
+
+    let start_bucket = *per_bucket.keys().next().unwrap();
+    let newest_bucket_with_data = *per_bucket.keys().last().unwrap();
+    let newest_bucket_now = (now_ts / dur) * dur;
+
+    let mut forward: BTreeMap<u64, SchemaTvlPointV1> = BTreeMap::new();
+    let mut last = SchemaTvlPointV1::default();
+    let mut bts = start_bucket;
+    while bts <= newest_bucket_with_data {
+        if let Some(point) = per_bucket.get(&bts) {
+            last = *point;
+        }
+        forward.insert(bts, last);
+        bts = match bts.checked_add(dur) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+
+    if newest_bucket_now > newest_bucket_with_data {
+        let mut t = newest_bucket_with_data.saturating_add(dur);
+        while t <= newest_bucket_now {
+            forward.insert(t, last);
+            t = match t.checked_add(dur) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+    }
+
+    let newest_ts = *forward.keys().last().unwrap_or(&newest_bucket_with_data);
+    let points_newest_first: Vec<SchemaTvlPointV1> =
+        forward.into_iter().rev().map(|(_ts, point)| point).collect();
+
+    Ok(TvlSlice { points_newest_first, newest_ts })
+}
+
+/// Map bucket ts -> btc/usd close, so a sats line can be priced at read time.
+fn btc_usd_by_bucket(slice: &CandleSlice, tf: Timeframe) -> BTreeMap<u64, u128> {
+    let dur = tf.duration_secs();
+    let mut map = BTreeMap::new();
+    for (index, candle) in slice.candles_newest_first.iter().enumerate() {
+        let ts = slice.newest_ts.saturating_sub((index as u64).saturating_mul(dur));
+        map.insert(ts, candle.close);
+    }
+    map
+}
+
+fn tvl_candles_json(
+    slice: &TvlSlice,
+    btc_line: &BTreeMap<u64, u128>,
+    tf: Timeframe,
+    limit: usize,
+    page: usize,
+    scope: &str,
+    include_unanchored: bool,
+) -> Value {
+    let total = slice.points_newest_first.len();
+    let offset = limit.saturating_mul(page.saturating_sub(1));
+    let end = offset.saturating_add(limit).min(total);
+    let points = if offset >= total {
+        Vec::new()
+    } else {
+        slice.points_newest_first[offset..end]
+            .iter()
+            .enumerate()
+            .map(|(index, point)| {
+                let global_index = offset.saturating_add(index);
+                let ts = slice
+                    .newest_ts
+                    .saturating_sub((global_index as u64).saturating_mul(tf.duration_secs()));
+                let sats = if include_unanchored {
+                    point.total_sats()
+                } else {
+                    point.canonical_sats.saturating_add(point.derived_sats)
+                };
+                // Price the sats level with the btc/usd close of the same bucket; a
+                // bucket the btc line does not cover yet reports usd as null.
+                let btc_usd = btc_line.get(&ts).copied();
+                let usd =
+                    btc_usd.map(|price| sats.saturating_mul(price).saturating_div(AMOUNT_SCALE));
+                json!({
+                    "ts": ts,
+                    "sats": sats.to_string(),
+                    "canonical_sats": point.canonical_sats.to_string(),
+                    "derived_sats": point.derived_sats.to_string(),
+                    "unanchored_sats": point.unanchored_sats.to_string(),
+                    "usd": usd.map(|v| v.to_string()),
+                    "btc_usd": btc_usd.map(|v| v.to_string()),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    json!({
+        "ok": true,
+        "scope": scope,
+        "timeframe": tf.code(),
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "has_more": end < total,
+        "include_unanchored": include_unanchored,
+        "sats_scale": AMOUNT_SCALE.to_string(),
+        "price_scale": PRICE_SCALE.to_string(),
+        "price_decimals": 16,
+        "points": points,
+    })
 }
 
 fn btc_usd_candles_json(slice: &CandleSlice, tf: Timeframe, limit: usize, page: usize) -> Value {
@@ -7005,6 +8110,651 @@ fn id_str(id: &SchemaAlkaneId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tvl_test_provider() -> (tempfile::TempDir, AmmDataProvider) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let amm_mdb =
+            std::sync::Arc::new(Mdb::open(dir.path(), b"ammdata_tvl_test:").expect("open mdb"));
+        let essentials = std::sync::Arc::new(EssentialsProvider::new(std::sync::Arc::new(
+            amm_mdb.clone_with_prefix(b"essentials:"),
+        )));
+        (dir, AmmDataProvider::new(amm_mdb, essentials))
+    }
+
+    fn candle(v: u128, volume: u128) -> SchemaCandleV1 {
+        SchemaCandleV1 { open: v, high: v, low: v, close: v, volume }
+    }
+
+    fn put_candles(provider: &AmmDataProvider, rows: Vec<(Vec<u8>, SchemaCandleV1)>) {
+        let puts = rows.into_iter().map(|(k, c)| (k, borsh::to_vec(&c).unwrap())).collect();
+        provider
+            .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+            .expect("write candles");
+    }
+
+    fn series(provider: &AmmDataProvider, prefix: Vec<u8>) -> BTreeMap<u64, SchemaCandleV1> {
+        provider
+            .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter_map(|(k, v)| Some((trailing_bucket_ts(&k)?, decode_candle_v1(&v).ok()?)))
+            .collect()
+    }
+
+    #[test]
+    fn forking_copies_a_tokens_history_to_the_new_quote_once() {
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let token = SchemaAlkaneId { block: 2, tx: 77 };
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let (t1, t2) = (1_700_000_400u64, 1_700_001_000u64);
+        let day = 1_699_920_000u64;
+
+        put_candles(
+            &provider,
+            vec![
+                (
+                    table.token_derived_usd_candle_key(&token, &diesel, Timeframe::M10, t1),
+                    candle(10, 1),
+                ),
+                (
+                    table.token_derived_usd_candle_key(&token, &diesel, Timeframe::M10, t2),
+                    candle(12, 2),
+                ),
+                (
+                    table.token_derived_usd_candle_key(&token, &diesel, Timeframe::D1, day),
+                    candle(11, 3),
+                ),
+                (
+                    table.token_derived_mcusd_candle_key(&token, &diesel, Timeframe::M10, t1),
+                    candle(1_000, 1),
+                ),
+            ],
+        );
+
+        assert!(!provider.token_derived_fork_done(&token, &tort).unwrap());
+        let copied = provider.fork_token_derived_history(&token, &diesel, &tort, 969_925).unwrap();
+        assert_eq!(copied, 4);
+        assert!(provider.token_derived_fork_done(&token, &tort).unwrap());
+
+        // Every timeframe and both series arrive under the new quote, values intact...
+        let usd_m10 = series(
+            &provider,
+            table.token_derived_usd_candle_ns_prefix(&token, &tort, Timeframe::M10),
+        );
+        assert_eq!(usd_m10.get(&t1), Some(&candle(10, 1)));
+        assert_eq!(usd_m10.get(&t2), Some(&candle(12, 2)));
+        let usd_d1 = series(
+            &provider,
+            table.token_derived_usd_candle_ns_prefix(&token, &tort, Timeframe::D1),
+        );
+        assert_eq!(usd_d1.get(&day), Some(&candle(11, 3)));
+        let mc_m10 = series(
+            &provider,
+            table.token_derived_mcusd_candle_ns_prefix(&token, &tort, Timeframe::M10),
+        );
+        assert_eq!(mc_m10.get(&t1), Some(&candle(1_000, 1)));
+
+        // ...and the source is still there: this is a copy, nothing was moved or deleted.
+        let src = series(
+            &provider,
+            table.token_derived_usd_candle_ns_prefix(&token, &diesel, Timeframe::M10),
+        );
+        assert_eq!(src.len(), 2);
+    }
+
+    #[test]
+    fn forking_never_overwrites_a_quote_that_already_has_candles() {
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let token = SchemaAlkaneId { block: 2, tx: 77 };
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let ts = 1_700_000_400u64;
+
+        put_candles(
+            &provider,
+            vec![
+                (
+                    table.token_derived_usd_candle_key(&token, &diesel, Timeframe::M10, ts),
+                    candle(10, 1),
+                ),
+                // The destination already carries its own value for the same bucket.
+                (
+                    table.token_derived_usd_candle_key(&token, &tort, Timeframe::M10, ts),
+                    candle(99, 9),
+                ),
+            ],
+        );
+
+        let copied = provider.fork_token_derived_history(&token, &diesel, &tort, 5).unwrap();
+        assert_eq!(copied, 0);
+        // Marked done so it is not retried every block, and the existing candle stands.
+        assert!(provider.token_derived_fork_done(&token, &tort).unwrap());
+        let dest = series(
+            &provider,
+            table.token_derived_usd_candle_ns_prefix(&token, &tort, Timeframe::M10),
+        );
+        assert_eq!(dest.get(&ts), Some(&candle(99, 9)));
+    }
+
+    #[test]
+    fn forking_the_default_quote_itself_carries_its_direct_chart() {
+        // DIESEL has no DIESEL-derived_DIESEL series; against a new quote its history
+        // is its own direct usd/mcusd chart.
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let ts = 1_700_000_400u64;
+        put_candles(
+            &provider,
+            vec![
+                (table.token_usd_candle_key(&diesel, Timeframe::M10, ts), candle(7, 1)),
+                (table.token_mcusd_candle_key(&diesel, Timeframe::M10, ts), candle(700, 1)),
+            ],
+        );
+
+        let copied = provider.fork_token_derived_history(&diesel, &diesel, &tort, 5).unwrap();
+        assert_eq!(copied, 2);
+        let usd = series(
+            &provider,
+            table.token_derived_usd_candle_ns_prefix(&diesel, &tort, Timeframe::M10),
+        );
+        assert_eq!(usd.get(&ts), Some(&candle(7, 1)));
+        let mc = series(
+            &provider,
+            table.token_derived_mcusd_candle_ns_prefix(&diesel, &tort, Timeframe::M10),
+        );
+        assert_eq!(mc.get(&ts), Some(&candle(700, 1)));
+    }
+
+    #[test]
+    fn start_offset_drops_earlier_buckets_and_rebuilds_the_straddling_one() {
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let token = SchemaAlkaneId { block: 2, tx: 77 };
+        let hour = 3_600u64;
+        let h0 = (1_700_000_000u64 / hour) * hour; // an hour bucket
+        let m10 = table.token_usd_candle_ns_prefix(&token, Timeframe::M10);
+
+        // 10m candles through the hour: a wild wick early, sane prices after.
+        put_candles(
+            &provider,
+            vec![
+                (table.token_usd_candle_key(&token, Timeframe::M10, h0), candle(9_999, 1)),
+                (table.token_usd_candle_key(&token, Timeframe::M10, h0 + 1_200), candle(10, 2)),
+                (table.token_usd_candle_key(&token, Timeframe::M10, h0 + 2_400), candle(14, 3)),
+            ],
+        );
+        // The stored hourly candles: the one before, and this hour with the wick baked in.
+        let mut hourly: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+        hourly.insert(h0 - hour, candle(5, 1));
+        hourly
+            .insert(h0, SchemaCandleV1 { open: 9_999, high: 9_999, low: 10, close: 14, volume: 6 });
+        hourly.insert(h0 + hour, candle(15, 4));
+
+        // Offset lands 20 minutes into the hour.
+        apply_start_offset_ts(&provider, Timeframe::H1, &m10, h0 + 1_200 + 30, &mut hourly);
+
+        // The hour before is gone, the hour after is untouched...
+        assert!(!hourly.contains_key(&(h0 - hour)));
+        assert_eq!(hourly.get(&(h0 + hour)), Some(&candle(15, 4)));
+        // ...and the straddling hour is rebuilt from the 10m candles at or after the
+        // offset: the wick is not in its open or high any more.
+        assert_eq!(
+            hourly.get(&h0),
+            Some(&SchemaCandleV1 { open: 10, high: 14, low: 10, close: 14, volume: 5 })
+        );
+
+        // On the 10m chart it is a plain filter at 10-minute precision.
+        let mut tens: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+        tens.insert(h0, candle(9_999, 1));
+        tens.insert(h0 + 1_200, candle(10, 2));
+        apply_start_offset_ts(&provider, Timeframe::M10, &m10, h0 + 1_200 + 30, &mut tens);
+        assert_eq!(tens.keys().copied().collect::<Vec<_>>(), vec![h0 + 1_200]);
+    }
+
+    #[test]
+    fn start_offset_in_the_future_hides_everything() {
+        let (_dir, provider) = tvl_test_provider();
+        let m10 = provider
+            .table()
+            .token_usd_candle_ns_prefix(&SchemaAlkaneId { block: 2, tx: 77 }, Timeframe::M10);
+        let mut daily: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+        daily.insert(1_699_920_000, candle(1, 1));
+        apply_start_offset_ts(&provider, Timeframe::D1, &m10, u64::MAX, &mut daily);
+        assert!(daily.is_empty());
+    }
+
+    #[test]
+    fn full_chart_ids_resolve_to_the_derived_or_direct_chart() {
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        // A token on a derived quote proxies to that derived chart, for any kind.
+        assert_eq!(full_chart_id("2:68479", &tort, Some(diesel), "usd"), "2:68479-derived_2:0-usd");
+        assert_eq!(
+            full_chart_id("2:68479", &tort, Some(diesel), "cmcap"),
+            "2:68479-derived_2:0-cmcap"
+        );
+        // The quote itself has no chart against itself: its direct chart.
+        assert_eq!(full_chart_id("2:0", &diesel, Some(diesel), "usd"), "2:0-usd");
+        // No derived quote in force: direct.
+        assert_eq!(full_chart_id("2:68479", &tort, None, "mcusd"), "2:68479-mcusd");
+    }
+
+    #[test]
+    fn only_full_ids_are_rewritten() {
+        let (_dir, provider) = tvl_test_provider();
+        assert_eq!(resolve_full_chart_id(&provider, "2:0-usd"), None);
+        assert_eq!(resolve_full_chart_id(&provider, "2:68441"), None);
+        assert_eq!(resolve_full_chart_id(&provider, "2:0-full-nonsense"), None);
+        assert_eq!(resolve_full_chart_id(&provider, "garbage-full"), None);
+    }
+
+    #[test]
+    fn trade_legs_at_a_timestamp_are_found_and_grouped_by_transaction() {
+        // The shape of mainnet tx bb0a04df..: one transaction through three pools,
+        // sharing a block with an unrelated swap, a liquidity add, and (at another
+        // timestamp) a swap that must not be picked up.
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let frbtc = SchemaAlkaneId { block: 32, tx: 0 };
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let pool_tort_frbtc = SchemaAlkaneId { block: 2, tx: 77269 };
+        let pool_diesel_tort = SchemaAlkaneId { block: 2, tx: 70020 };
+        let pool_diesel_frbtc = SchemaAlkaneId { block: 2, tx: 77087 };
+        let ts = 1_791_170_078u64;
+        let (tx_a, tx_b, tx_c) = ([0xaa; 32], [0xbb; 32], [0xcc; 32]);
+
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (pool, base, quote) in [
+            (pool_tort_frbtc, tort, frbtc),
+            (pool_diesel_tort, diesel, tort),
+            (pool_diesel_frbtc, diesel, frbtc),
+        ] {
+            let defs = SchemaMarketDefs {
+                base_alkane_id: base,
+                quote_alkane_id: quote,
+                pool_alkane_id: pool,
+            };
+            puts.push((table.pools_key(&pool), borsh::to_vec(&defs).unwrap()));
+        }
+        let mut event = |pool: SchemaAlkaneId,
+                         at: u64,
+                         seq: u32,
+                         kind: ActivityKind,
+                         txid: [u8; 32],
+                         base_delta: i128,
+                         quote_delta: i128| {
+            let activity = SchemaActivityV1 {
+                timestamp: at,
+                txid,
+                kind,
+                direction: None,
+                base_delta,
+                quote_delta,
+                address_spk: Vec::new(),
+                success: true,
+            };
+            puts.push((table.activity_key(&pool, at, seq), borsh::to_vec(&activity).unwrap()));
+            puts.push((table.amm_history_all_key(at, seq, kind, &pool), Vec::new()));
+        };
+        // tx A: frBTC -> TORT -> DIESEL -> frBTC.
+        event(pool_tort_frbtc, ts, 0, ActivityKind::TradeBuy, tx_a, -168_075_379_605, 21_470);
+        event(pool_diesel_tort, ts, 0, ActivityKind::TradeBuy, tx_a, -49_772_500, 168_075_379_605);
+        event(pool_diesel_frbtc, ts, 0, ActivityKind::TradeSell, tx_a, 48_334_811, -21_470);
+        // tx B: an unrelated single swap in the same block.
+        event(pool_tort_frbtc, ts, 1, ActivityKind::TradeSell, tx_b, 500, -3);
+        // tx C: a liquidity add in the same block - not a swap leg.
+        event(pool_diesel_frbtc, ts, 1, ActivityKind::LiquidityAdd, tx_c, 10, 10);
+        // A swap one second later - a different block.
+        event(pool_tort_frbtc, ts + 1, 0, ActivityKind::TradeBuy, tx_a, -1, 1);
+        provider
+            .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+            .expect("write events");
+
+        let mut cache = HashMap::new();
+        let by_tx = provider.trade_legs_at_ts(ts, &mut cache).expect("scan");
+
+        assert_eq!(by_tx.len(), 2, "the liquidity add is not a swap leg");
+        assert_eq!(by_tx[&tx_a].len(), 3, "all three pools, and not the next block's swap");
+        assert_eq!(by_tx[&tx_b].len(), 1);
+        assert!(!by_tx.contains_key(&tx_c));
+
+        // End to end: what TORT's feed would get attached for tx A.
+        let route = route_json(&build_route(by_tx[&tx_a].clone()), &tort);
+        assert_eq!(route["hops"], json!(3));
+        assert_eq!(route["pass_through"], json!(true));
+        assert_eq!(route["token_out"], json!("2:0"));
+        assert_eq!(route["amount_out"], json!("1437689"));
+        // A cycle is ordered to start and end on the token that came out ahead.
+        let legs = route["legs"].as_array().unwrap();
+        assert_eq!(legs[0]["pool"], json!("2:77087"));
+        assert_eq!(legs[1]["pool"], json!("2:77269"));
+        assert_eq!(legs[2]["pool"], json!("2:70020"));
+    }
+
+    const OYL: SchemaAlkaneId = SchemaAlkaneId { block: 4, tx: 65522 };
+    const OTHER_FACTORY: SchemaAlkaneId = SchemaAlkaneId { block: 4, tx: 235884 };
+
+    fn factory_bytes(f: &SchemaAlkaneId) -> Vec<u8> {
+        let mut b = Vec::with_capacity(12);
+        b.extend_from_slice(&f.block.to_be_bytes());
+        b.extend_from_slice(&f.tx.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn a_pool_is_trusted_if_either_factory_record_says_so() {
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let pool = |tx: u64| SchemaAlkaneId { block: 2, tx };
+        let (both, only_pool_factory, only_factory_pools) = (pool(1), pool(2), pool(3));
+        let (foreign, unrecorded) = (pool(4), pool(5));
+        let (pending_oyl, pending_foreign) = (pool(6), pool(7));
+
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (table.pool_factory_key(&both), factory_bytes(&OYL)),
+                    (table.factory_pools_key(&OYL, &both), Vec::new()),
+                    // Indexes that gained one record but not the other must not make
+                    // a real pool look foreign.
+                    (table.pool_factory_key(&only_pool_factory), factory_bytes(&OYL)),
+                    (table.factory_pools_key(&OYL, &only_factory_pools), Vec::new()),
+                    (table.pool_factory_key(&foreign), factory_bytes(&OTHER_FACTORY)),
+                    (table.factory_pools_key(&OTHER_FACTORY, &foreign), Vec::new()),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write records");
+
+        // Pools discovered in the block being indexed: records still pending.
+        let pending_pool_factory = vec![
+            (table.pool_factory_key(&pending_oyl), factory_bytes(&OYL)),
+            (table.pool_factory_key(&pending_foreign), factory_bytes(&OTHER_FACTORY)),
+        ];
+        let pending_factory_pools = vec![
+            (table.factory_pools_key(&OYL, &pending_oyl), Vec::new()),
+            (table.factory_pools_key(&OTHER_FACTORY, &pending_foreign), Vec::new()),
+        ];
+
+        let all = [
+            both,
+            only_pool_factory,
+            only_factory_pools,
+            foreign,
+            unrecorded,
+            pending_oyl,
+            pending_foreign,
+        ];
+        let excluded = provider
+            .pools_not_in_factories(&all, &[OYL], &pending_pool_factory, &pending_factory_pools)
+            .expect("read");
+
+        let expected: HashSet<SchemaAlkaneId> =
+            [foreign, unrecorded, pending_foreign].into_iter().collect();
+        assert_eq!(excluded, expected);
+
+        assert!(provider.pool_in_factories(&both, &[OYL]));
+        assert!(provider.pool_in_factories(&only_factory_pools, &[OYL]));
+        assert!(!provider.pool_in_factories(&foreign, &[OYL]));
+        assert!(!provider.pool_in_factories(&unrecorded, &[OYL]));
+        // Trusting the other factory instead flips it.
+        assert!(provider.pool_in_factories(&foreign, &[OTHER_FACTORY]));
+    }
+
+    #[test]
+    fn btcusd_cryptoswap_pool_still_prices_frusd_after_the_pricing_factory_fork() {
+        // BTCUSD (4:1778, frBTC/frUSD) was deployed directly, not through the Oyl
+        // factory, so it has no pool_factory / factory_pools record. From mainnet
+        // 970000 only allowlisted factories may price tokens; without the
+        // CryptoSwap exemption the pool would land in pricing_excluded_pools and
+        // every gate that consults that set (process_balance_deltas' canonical
+        // trade buckets, derive_token_data's canonical/derived pools,
+        // derive_pool_metrics, get_canonical_pools) would stop it pricing frUSD.
+        use crate::modules::ammdata::consts::{
+            MAINNET_PRICING_FACTORY_FORK_HEIGHT, pricing_factories_at_height,
+        };
+        use crate::modules::ammdata::utils::cryptoswap::is_cryptoswap_pool;
+        let (_dir, provider) = tvl_test_provider();
+        let btcusd = SchemaAlkaneId { block: 4, tx: 1778 };
+        let foreign = SchemaAlkaneId { block: 2, tx: 96884 };
+        assert!(is_cryptoswap_pool(Network::Bitcoin, &btcusd));
+
+        for height in [MAINNET_PRICING_FACTORY_FORK_HEIGHT, MAINNET_PRICING_FACTORY_FORK_HEIGHT + 10_000] {
+            let factories =
+                pricing_factories_at_height(Network::Bitcoin, height).expect("allowlist in force");
+            let excluded = provider
+                .pools_not_in_factories_on(Network::Bitcoin, &[btcusd, foreign], factories, &[], &[])
+                .expect("read");
+            assert!(!excluded.contains(&btcusd), "BTCUSD must keep pricing frUSD at {height}");
+            assert!(excluded.contains(&foreign), "an unrecorded non-Oyl pool is still excluded");
+        }
+
+        // The exemption is mainnet-table-only: on another network 4:1778 is just an
+        // unrecorded pool and is treated like any other.
+        let excluded = provider
+            .pools_not_in_factories_on(Network::Regtest, &[btcusd], &[OYL], &[], &[])
+            .expect("read");
+        assert!(excluded.contains(&btcusd));
+    }
+
+    #[test]
+    fn cmcap_is_held() {
+        let (_dir, provider) = tvl_test_provider();
+        assert!(!CMCAP_ENABLED);
+        for pool in ["2:0-cmcap", "2:68479-derived_2:0-cmcap"] {
+            let res = provider
+                .rpc_get_candles(RpcGetCandlesParams {
+                    pool: Some(pool.to_string()),
+                    timeframe: None,
+                    limit: None,
+                    size: None,
+                    page: None,
+                    side: None,
+                    now: None,
+                })
+                .expect("rpc");
+            assert_eq!(res.value["error"], json!("cmcap_disabled"), "{pool}");
+        }
+    }
+
+    #[test]
+    fn a_duplicate_pool_that_took_the_pointer_does_not_price_the_token() {
+        // Mainnet SLICE: the real SLICE/frBTC pool 2:96947 was the canonical pool
+        // until a second factory opened 2:102392 for the same pair, which overwrote
+        // the one-per-pair pointer. Live prices must still come from the real pool.
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let slice = SchemaAlkaneId { block: 4, tx: 8888 };
+        let frbtc = SchemaAlkaneId { block: 32, tx: 0 };
+        let tort = SchemaAlkaneId { block: 2, tx: 68479 };
+        let real = SchemaAlkaneId { block: 2, tx: 96947 };
+        let duplicate = SchemaAlkaneId { block: 2, tx: 102392 };
+        let tort_pool = SchemaAlkaneId { block: 2, tx: 97475 };
+
+        let defs = |pool, base, quote| {
+            (
+                table.pools_key(&pool),
+                borsh::to_vec(&SchemaMarketDefs {
+                    base_alkane_id: base,
+                    quote_alkane_id: quote,
+                    pool_alkane_id: pool,
+                })
+                .unwrap(),
+            )
+        };
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    defs(real, slice, frbtc),
+                    defs(duplicate, slice, frbtc),
+                    defs(tort_pool, tort, slice),
+                    (table.token_pools_key(&slice, &real), Vec::new()),
+                    (table.token_pools_key(&slice, &duplicate), Vec::new()),
+                    (table.token_pools_key(&slice, &tort_pool), Vec::new()),
+                    (table.pool_factory_key(&real), factory_bytes(&OYL)),
+                    (table.pool_factory_key(&tort_pool), factory_bytes(&OYL)),
+                    (table.pool_factory_key(&duplicate), factory_bytes(&OTHER_FACTORY)),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write");
+
+        let canonical: HashSet<SchemaAlkaneId> = [frbtc].into_iter().collect();
+        // What the stored pointer says today: the duplicate.
+        let pointer = vec![SchemaCanonicalPoolEntry { pool_id: duplicate, quote_id: frbtc }];
+
+        let pools = provider.trusted_canonical_pools(&slice, &canonical, pointer, &[OYL]);
+
+        // The duplicate is gone, the real pool is back, and the TORT pool is not a
+        // canonical pool at all (TORT is not a canonical quote).
+        assert_eq!(pools, vec![SchemaCanonicalPoolEntry { pool_id: real, quote_id: frbtc }]);
+
+        // A pointer that already names the trusted pool is kept, not duplicated.
+        let good = vec![SchemaCanonicalPoolEntry { pool_id: real, quote_id: frbtc }];
+        assert_eq!(
+            provider.trusted_canonical_pools(&slice, &canonical, good.clone(), &[OYL]),
+            good
+        );
+    }
+
+    #[test]
+    fn tvl_totals_read_the_newest_point_at_or_before_a_height() {
+        // This is the join between the backfill and the live path: the live path at
+        // height H reads the total at-or-before H-1 and applies a delta to it. If
+        // this returned the wrong point the running total would silently restart.
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let token = SchemaAlkaneId { block: 2, tx: 68479 };
+
+        let at_100 = SchemaTvlPointV1 { canonical_sats: 100, ..Default::default() };
+        let at_200 = SchemaTvlPointV1 { canonical_sats: 200, ..Default::default() };
+        let tok_150 = SchemaTvlPointV1 { derived_sats: 150, ..Default::default() };
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (table.amm_tvl_total_key(100), encode_tvl_point_v1(&at_100).unwrap()),
+                    (table.amm_tvl_total_key(200), encode_tvl_point_v1(&at_200).unwrap()),
+                    (
+                        table.token_tvl_total_key(&token, 150),
+                        encode_tvl_point_v1(&tok_150).unwrap(),
+                    ),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write totals");
+
+        // Exactly at a written height, between heights, past the newest, before the first.
+        let at = |h: u32| provider.get_amm_tvl_total_at_or_before_height(h).unwrap();
+        assert_eq!(at(100).map(|(h, p)| (h, p.canonical_sats)), Some((100, 100)));
+        assert_eq!(at(199).map(|(h, p)| (h, p.canonical_sats)), Some((100, 100)));
+        assert_eq!(at(200).map(|(h, p)| (h, p.canonical_sats)), Some((200, 200)));
+        assert_eq!(at(5_000).map(|(h, p)| (h, p.canonical_sats)), Some((200, 200)));
+        assert_eq!(at(99), None);
+
+        let tok = |h: u32| provider.get_token_tvl_total_at_or_before_height(&token, h).unwrap();
+        assert_eq!(tok(149), None);
+        assert_eq!(tok(150).map(|(h, p)| (h, p.derived_sats)), Some((150, 150)));
+        assert_eq!(tok(999).map(|(h, p)| (h, p.derived_sats)), Some((150, 150)));
+        // A different token sees nothing.
+        let other = SchemaAlkaneId { block: 2, tx: 1 };
+        assert_eq!(provider.get_token_tvl_total_at_or_before_height(&other, 999).unwrap(), None);
+    }
+
+    #[test]
+    fn tvl_line_carries_the_last_level_across_empty_buckets() {
+        let (_dir, provider) = tvl_test_provider();
+        let table = provider.table();
+        let tf = Timeframe::H1;
+        let dur = tf.duration_secs();
+        let base = (1_700_000_000u64 / dur) * dur;
+
+        let first = SchemaTvlPointV1 { canonical_sats: 1_000, ..Default::default() };
+        let later =
+            SchemaTvlPointV1 { canonical_sats: 4_000, derived_sats: 500, unanchored_sats: 0 };
+        provider
+            .set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts: vec![
+                    (table.amm_tvl_line_key(tf, base), encode_tvl_point_v1(&first).unwrap()),
+                    (
+                        table.amm_tvl_line_key(tf, base + dur * 3),
+                        encode_tvl_point_v1(&later).unwrap(),
+                    ),
+                ],
+                deletes: Vec::new(),
+            })
+            .expect("write line");
+
+        // Read as of one bucket past the last write.
+        let now = base + dur * 4;
+        let slice =
+            read_tvl_line_v1(&provider, table.amm_tvl_line_ns_prefix(tf), tf, now).expect("read");
+
+        // base..base+4h inclusive is 5 buckets, newest first.
+        assert_eq!(slice.points_newest_first.len(), 5);
+        assert_eq!(slice.newest_ts, now);
+        // Newest two buckets hold the later level (one written, one filled forward).
+        assert_eq!(slice.points_newest_first[0], later);
+        assert_eq!(slice.points_newest_first[1], later);
+        // The two buckets between the writes keep the first level rather than dropping to zero.
+        assert_eq!(slice.points_newest_first[2], first);
+        assert_eq!(slice.points_newest_first[3], first);
+        assert_eq!(slice.points_newest_first[4], first);
+    }
+
+    #[test]
+    fn tvl_json_prices_sats_with_the_btc_line_and_excludes_unanchored_by_default() {
+        let tf = Timeframe::D1;
+        let newest_ts = 1_700_000_000u64;
+        let point = SchemaTvlPointV1 {
+            canonical_sats: AMOUNT_SCALE,
+            derived_sats: AMOUNT_SCALE,
+            unanchored_sats: AMOUNT_SCALE,
+        };
+        let slice = TvlSlice { points_newest_first: vec![point], newest_ts };
+        let btc_usd = 50_000u128.saturating_mul(PRICE_SCALE);
+        let btc_line = BTreeMap::from([(newest_ts, btc_usd)]);
+
+        let value = tvl_candles_json(&slice, &btc_line, tf, 10, 1, "amm", false);
+        let entry = &value["points"][0];
+        // Two BTC of anchored liquidity; the unanchored leg is reported but not counted.
+        assert_eq!(entry["sats"], json!((AMOUNT_SCALE * 2).to_string()));
+        assert_eq!(entry["unanchored_sats"], json!(AMOUNT_SCALE.to_string()));
+        assert_eq!(entry["usd"], json!((100_000u128 * PRICE_SCALE).to_string()));
+
+        let with_unanchored = tvl_candles_json(&slice, &btc_line, tf, 10, 1, "amm", true);
+        assert_eq!(with_unanchored["points"][0]["sats"], json!((AMOUNT_SCALE * 3).to_string()));
+        assert_eq!(
+            with_unanchored["points"][0]["usd"],
+            json!((150_000u128 * PRICE_SCALE).to_string())
+        );
+    }
+
+    #[test]
+    fn tvl_json_reports_null_usd_for_buckets_the_btc_line_misses() {
+        let tf = Timeframe::D1;
+        let slice = TvlSlice {
+            points_newest_first: vec![SchemaTvlPointV1 {
+                canonical_sats: AMOUNT_SCALE,
+                ..Default::default()
+            }],
+            newest_ts: 1_700_000_000,
+        };
+
+        let value = tvl_candles_json(&slice, &BTreeMap::new(), tf, 10, 1, "amm", false);
+        assert_eq!(value["points"][0]["usd"], json!(null));
+        assert_eq!(value["points"][0]["sats"], json!(AMOUNT_SCALE.to_string()));
+    }
 
     #[test]
     fn price_assets_accept_btc_alkanes_and_remove_duplicates() {

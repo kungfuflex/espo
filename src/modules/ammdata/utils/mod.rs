@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod candles;
+pub mod cmcap;
 pub mod cryptoswap;
 pub mod index_activity;
 pub mod index_factories;
@@ -10,8 +11,10 @@ pub mod index_snapshot;
 pub mod index_state;
 pub mod index_tokens;
 pub mod index_total_volume_amm;
+pub mod index_tvl;
 pub mod live_reserves;
 pub mod pathfinder;
 pub mod reserves;
+pub mod route;
 pub mod search;
 pub mod token_volume;

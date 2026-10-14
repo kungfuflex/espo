@@ -1,5 +1,7 @@
-use crate::modules::ammdata::config::{DerivedMergeStrategy, DerivedQuoteConfig};
-use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE};
+use crate::modules::ammdata::config::{DerivedIndexPlan, DerivedMergeStrategy, DerivedQuoteConfig};
+use crate::modules::ammdata::consts::{
+    AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, derived_quote_detached_at_height,
+};
 use crate::modules::ammdata::price_feeds::{
     EspoPricerPriceFeed, PriceFeed, get_historical_btc_usd_price,
 };
@@ -401,7 +403,7 @@ pub fn derive_token_data(
     provider: &AmmDataProvider,
     essentials: &EssentialsProvider,
     canonical_quote_units: &HashMap<SchemaAlkaneId, CanonicalQuoteUnit>,
-    derived_quotes: &[DerivedQuoteConfig],
+    plan: &DerivedIndexPlan,
     use_historical_backfill: bool,
     search_index_enabled: bool,
     search_prefix_min: usize,
@@ -409,6 +411,17 @@ pub fn derive_token_data(
     state: &mut IndexState,
 ) -> Result<()> {
     let table = provider.table();
+    // Only the derived quotes in force at this height; one that comes into force
+    // later is invisible to everything below until then.
+    let derived_quotes: &[DerivedQuoteConfig] = plan.active_quotes.as_slice();
+    // Tokens that drop every canonical quote in force: their canonical pricing is
+    // kept out of their derived charts, which then follow the derived pool alone.
+    // Their direct usd/mcusd charts are untouched - those *are* the canonical leg.
+    let canonical_quote_ids: Vec<SchemaAlkaneId> = canonical_quote_units.keys().copied().collect();
+    let canonical_dropped: HashSet<SchemaAlkaneId> = plan
+        .canonical_dropped_tokens(&canonical_quote_ids, height)
+        .into_iter()
+        .collect();
     let now_m10_bucket = bucket_start_for(block_ts, Timeframe::M10);
     // Essentials circulating supply is amount-scaled (1e8). Market-cap outputs are price-scaled
     // (1e16), so we multiply by supply and divide by AMOUNT_SCALE.
@@ -492,6 +505,11 @@ pub fn derive_token_data(
     let mut canonical_pools_by_token: HashMap<SchemaAlkaneId, Vec<SchemaCanonicalPoolEntry>> =
         HashMap::new();
     for (pool, defs) in state.pools_map.iter() {
+        // A pool from a factory off the pricing allowlist is charted but never
+        // contributes to a token's own price.
+        if state.pricing_excluded_pools.contains(pool) {
+            continue;
+        }
         if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
             canonical_pools_by_token
                 .entry(defs.base_alkane_id)
@@ -565,6 +583,11 @@ pub fn derive_token_data(
 
     for (token, new_entries) in state.canonical_pool_updates.iter() {
         for entry in new_entries {
+            // The pointer holds one pool per (token, quote) and the newest writer
+            // wins, so an untrusted duplicate must not be allowed to take it.
+            if state.pricing_excluded_pools.contains(&entry.pool_id) {
+                continue;
+            }
             state.canonical_pool_writes.push((
                 table.canonical_pool_quote_key(token, &entry.quote_id),
                 encode_alkane_id_be(&entry.pool_id).to_vec(),
@@ -785,11 +808,31 @@ pub fn derive_token_data(
                     }
                 };
 
+            // A pair past its detach height gets no derived pool: the quote's price
+            // moves stop triggering or feeding its candles, and the `info.is_none()`
+            // path below writes the token's direct USD candle instead.
+            // Two sources say a pair is detached: the mainnet table in consts, and
+            // `derive_sources[].drop_forks` in config. Same effect either way.
+            let network = crate::config::get_network();
+            let pair_detached = |token: &SchemaAlkaneId, quote: &SchemaAlkaneId| -> bool {
+                derived_quote_detached_at_height(network, token, quote, height)
+                    || plan.pair_dropped(token, quote, height)
+            };
             for (pool, defs) in state.pools_map.iter() {
-                if derived_quote_set.contains(&defs.quote_alkane_id) {
+                // Same rule for the derived leg: a duplicate pool against the
+                // derived quote, with the token on the preferred side, would
+                // otherwise be picked over the real one.
+                if state.pricing_excluded_pools.contains(pool) {
+                    continue;
+                }
+                if derived_quote_set.contains(&defs.quote_alkane_id)
+                    && !pair_detached(&defs.base_alkane_id, &defs.quote_alkane_id)
+                {
                     maybe_insert_pool(defs.base_alkane_id, defs.quote_alkane_id, *pool, true);
                 }
-                if derived_quote_set.contains(&defs.base_alkane_id) {
+                if derived_quote_set.contains(&defs.base_alkane_id)
+                    && !pair_detached(&defs.quote_alkane_id, &defs.base_alkane_id)
+                {
                     maybe_insert_pool(defs.quote_alkane_id, defs.base_alkane_id, *pool, false);
                 }
             }
@@ -1062,6 +1105,11 @@ pub fn derive_token_data(
                 if *tf != Timeframe::M10 {
                     continue;
                 }
+                // A token whose canonical leg is dropped is not moved by its own
+                // canonical trades any more.
+                if canonical_dropped.contains(token) {
+                    continue;
+                }
                 if let Some(quotes) = token_to_quotes.get(token) {
                     for quote in quotes {
                         derived_buckets.insert((*token, *quote, *tf, *bucket));
@@ -1072,10 +1120,39 @@ pub fn derive_token_data(
                 if *tf != Timeframe::M10 {
                     continue;
                 }
+                if canonical_dropped.contains(token) {
+                    continue;
+                }
                 for quote in derived_quote_set.iter() {
                     if token != quote {
                         derived_buckets.insert((*token, *quote, *tf, *bucket));
                     }
+                }
+            }
+
+            // A quote that came into force at a height continues each token's
+            // chart from the default quote's history rather than starting empty.
+            // The first time a pair is about to get a candle, that history is copied
+            // into the pair's namespace - once, behind a marker, and written in-block
+            // so every lookup below (previous close, anchors, higher-timeframe
+            // aggregation, metrics) already sees it.
+            if let Some(source) = plan.fork_source {
+                let mut fork_pairs: HashSet<(SchemaAlkaneId, SchemaAlkaneId)> = HashSet::new();
+                for (token, quote, _tf, _bucket) in derived_buckets.iter() {
+                    if plan.is_forked_quote(quote) {
+                        fork_pairs.insert((*token, *quote));
+                    }
+                }
+                for (token, quote) in fork_pairs {
+                    if provider.token_derived_fork_done(&token, &quote)? {
+                        continue;
+                    }
+                    let copied =
+                        provider.fork_token_derived_history(&token, &source, &quote, height)?;
+                    eprintln!(
+                        "[AMMDATA] forked {}:{} derived history {}:{} -> {}:{} at height {height} ({copied} candles)",
+                        token.block, token.tx, source.block, source.tx, quote.block, quote.tx
+                    );
                 }
             }
 
@@ -1167,8 +1244,12 @@ pub fn derive_token_data(
                 });
                 let quote_usd_active =
                     token_usd_candle_overrides.get(&(quote, tf, bucket_ts)).copied();
-                let token_usd_active =
-                    token_usd_candle_overrides.get(&(token, tf, bucket_ts)).copied();
+                let canonical_leg_dropped = canonical_dropped.contains(&token);
+                let token_usd_active = if canonical_leg_dropped {
+                    None
+                } else {
+                    token_usd_candle_overrides.get(&(token, tf, bucket_ts)).copied()
+                };
 
                 let pool_bucket_candle = if let Some(c) = pool_active {
                     Some(c)
@@ -1179,6 +1260,8 @@ pub fn derive_token_data(
                 };
                 let token_usd_bucket_candle = if let Some(c) = token_usd_active {
                     Some(c)
+                } else if canonical_leg_dropped {
+                    None
                 } else {
                     load_token_usd_candle(&token, tf, bucket_ts)?
                 };
@@ -1562,6 +1645,9 @@ pub fn derive_token_data(
         }
         for (token, quote) in pairs_with_derived_usd_m10 {
             if !direct_derived_pairs.contains(&(token, quote)) {
+                if canonical_dropped.contains(&token) {
+                    continue;
+                }
                 for tf in higher_timeframes() {
                     let bucket_ts = bucket_start_for(block_ts, tf);
                     if let Some(agg) =
@@ -1648,6 +1734,9 @@ pub fn derive_token_data(
         }
         for (token, quote) in pairs_with_derived_mcusd_m10 {
             if !direct_derived_pairs.contains(&(token, quote)) {
+                if canonical_dropped.contains(&token) {
+                    continue;
+                }
                 for tf in higher_timeframes() {
                     let bucket_ts = bucket_start_for(block_ts, tf);
                     if let Some(agg) =

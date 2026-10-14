@@ -10,10 +10,10 @@ use crate::modules::essentials::storage::{
     RpcGetAllAlkanesParams, RpcGetBlockSummaryParams, RpcGetBlockTimeParams,
     RpcGetBlockTimesParams, RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams,
     RpcGetFactoryChildrenParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
-    RpcGetMempoolTracesParams, RpcGetOrbitalBalancesParams, RpcGetOrbitalHoldersParams,
-    RpcGetOrbitalVolumesParams, RpcGetOutpointBalancesParams, RpcGetRuntimeBalancesMetashrewParams,
-    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcPingParams, RpcSearchAlkaneParams,
-    RpcSearchFactoryKeysParams,
+    RpcGetMempoolTracesParams, RpcGetMempoolTxParams, RpcGetOrbitalBalancesParams,
+    RpcGetOrbitalHoldersParams, RpcGetOrbitalVolumesParams, RpcGetOutpointBalancesParams,
+    RpcGetRuntimeBalancesMetashrewParams, RpcGetTotalReceivedParams, RpcGetTransferVolumeParams,
+    RpcPingParams, RpcSearchAlkaneParams, RpcSearchFactoryKeysParams,
 };
 use crate::runtime::mempool::{current_mempool_memory_stats, mempool_availability};
 use serde_json::{Value, json};
@@ -74,6 +74,18 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty()),
                             fee_paid: payload.get("fee_paid").and_then(|v| v.as_f64()),
+                            targets: payload
+                                .get("targets")
+                                .and_then(|v| v.as_array())
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(|v| v.as_str())
+                                        .map(|s| s.trim().to_string())
+                                        .filter(|s| !s.is_empty())
+                                        .collect::<Vec<_>>()
+                                })
+                                .filter(|v| !v.is_empty()),
                         };
                         tokio::task::spawn_blocking(move || view.rpc_get_mempool_traces(params))
                             .await
@@ -1226,6 +1238,33 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             .and_then(Result::ok)
                             .map(|response| response.value)
                             .unwrap_or_else(|| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_mempool_tx = reg.clone();
+        let mdb_mempool_tx = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_mempool_tx
+                .register("get_mempool_tx", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_mempool_tx);
+                    async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        let params = RpcGetMempoolTxParams {
+                            txid: payload
+                                .get("txid")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        };
+                        view.rpc_get_mempool_tx(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
                 })
                 .await;

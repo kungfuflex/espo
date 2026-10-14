@@ -17,6 +17,7 @@ const MAINNET_ICON_OVERRIDES: &[(&str, &str)] = &[
     ("2:77269", "https://i.ibb.co/RTZw3zyh/tortilla-Lp-2.png"),
     ("2:77623", "https://i.ibb.co/nN1LKyZb/fire.png"),
     ("32:0", FRBTC_ICON_URL),
+    ("4:8888", "https://i.ibb.co/DD229cX0/slice-logo.png"),
 ];
 // Protocol infrastructure, named. These contracts are not tokens, so the token
 // metadata index has nothing to say about them and the explorer would otherwise
@@ -33,6 +34,7 @@ const MAINNET_ICON_OVERRIDES: &[(&str, &str)] = &[
 // Mirrored in apps/explorer/lib/alkanes/contracts.ts; change both together.
 const MAINNET_CONTRACT_NAME_OVERRIDES: &[(&str, &str)] = &[
     ("4:65522", "Oyl AMM Factory"),          // [app] ALKANE_FACTORY_ID
+    ("4:8888", "SLICE"),                     // upstream 877d74a
     ("4:65517", "Auth Token Factory"),       // [alk]
     ("2:77087", "DIESEL/frBTC LP"),          // [app] FIRE_LP_TOKEN_ID
     ("2:77623", "FIRE"),                     // [app] FIRE_TOKEN_ID

@@ -26,7 +26,10 @@ use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider, load
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, project_tx_output_balances_from_traces,
 };
-use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
+use crate::modules::essentials::utils::inspections::{
+    KV_KEY_BEACON, KV_KEY_IMPLEMENTATION, StoredInspectionResult, decode_kv_implementation,
+    is_upgradeable_proxy, load_inspection,
+};
 use crate::modules::essentials::utils::names::display_alkane_name_and_symbol;
 use crate::modules::runes::storage::{RuneBalance, RunesProvider, TxRuneIo};
 use crate::runtime::mdb::Mdb;
@@ -165,9 +168,6 @@ pub(crate) struct AlkaneMetaDisplay {
     pub symbol: String,
     pub icon_url: String,
 }
-const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
-const KV_KEY_BEACON: &[u8] = b"/beacon";
-const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward", 36863)];
 const TOKEN_METHOD_OPCODES: [u128; 6] = [99, 100, 101, 102, 103, 104];
 const TOKEN_METHOD_NAMES: [&str; 6] =
     ["get_name", "get_symbol", "get_total_supply", "get_cap", "get_minted", "get_value_per_mint"];
@@ -380,20 +380,6 @@ fn decode_trace_response(data_hex: &str) -> Option<String> {
     if trimmed.is_empty() { None } else { Some(trimmed) }
 }
 
-fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
-    if raw.len() < 32 {
-        return None;
-    }
-    let block_bytes: [u8; 16] = raw[0..16].try_into().ok()?;
-    let tx_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
-    let block = u128::from_le_bytes(block_bytes);
-    let tx = u128::from_le_bytes(tx_bytes);
-    if block > u32::MAX as u128 || tx > u64::MAX as u128 {
-        return None;
-    }
-    Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
-}
-
 fn kv_implementation_value(
     alk: &SchemaAlkaneId,
     cache: &mut AlkaneImplCache,
@@ -425,15 +411,6 @@ fn lookup_inspection<'a>(
         cache.insert(*id, loaded);
     }
     cache.get(id).and_then(|o| o.as_ref())
-}
-
-fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
-    let Some(meta) = inspection.metadata.as_ref() else { return false };
-    UPGRADEABLE_METHODS.iter().all(|(name, opcode)| {
-        meta.methods
-            .iter()
-            .any(|m| m.name.eq_ignore_ascii_case(name) && m.opcode == *opcode)
-    })
 }
 
 fn is_token_contract(inspection: Option<&StoredInspectionResult>) -> bool {
@@ -1473,9 +1450,30 @@ pub(crate) fn alkane_meta(
     meta
 }
 
+/// Above this much JSON, the viewer emits plain text instead of highlighting.
+///
+/// Highlighting wraps every token in its own span, which costs roughly four
+/// bytes of markup per byte of JSON. One AMM transaction with an 819 KB trace
+/// turned into 3.2 MB of markup — a third of an 11 MB address page, and ~290 ms
+/// of rendering — for a block that starts collapsed and is usually never
+/// opened. Past this size the content is served as-is: complete and readable,
+/// just not coloured.
+const JSON_VIEWER_HIGHLIGHT_MAX_BYTES: usize = 128 * 1024;
+
 pub fn json_viewer(value: Option<&Value>, raw: &str) -> Markup {
     match value {
         Some(v) => {
+            // Sizing the compact form first avoids building the per-token
+            // markup only to discover it is too big to be worth it. Callers
+            // pass all sorts of things as `raw` — for protostones it is the
+            // OP_RETURN text, not this JSON — so the plain rendering comes
+            // from the value itself.
+            let compact = serde_json::to_string(v).unwrap_or_default();
+            if compact.len() > JSON_VIEWER_HIGHLIGHT_MAX_BYTES {
+                let plain = serde_json::to_string_pretty(v).unwrap_or(compact);
+                return html! { pre class="json-raw" { (plain) } };
+            }
+
             let mut buf = String::new();
             render_json_value(v, 0, &mut buf);
             html! {

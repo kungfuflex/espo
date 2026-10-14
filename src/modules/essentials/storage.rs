@@ -37,8 +37,9 @@ use rocksdb::{Direction, IteratorMode, ReadOptions};
 use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    MempoolBlockTx, MempoolEntry, get_mempool_index_transactions_ordered_by_block_and_fee,
-    get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
+    MempoolBlockTx, MempoolEntry, fetch_mempool_tx_on_demand,
+    get_mempool_index_transactions_ordered_by_block_and_fee, get_seen_txids_page,
+    get_tx_from_mempool, pending_by_txid, pending_for_address,
 };
 use crate::utils::electrum_like::{AddressHistoryEntry, AddressUtxo, ElectrumLikeBackend};
 pub use crate::utils::fee_rates::{BlockFeeRateSummary, compute_block_fee_rate_summary};
@@ -3404,6 +3405,64 @@ impl EssentialsProvider {
         Ok(GetMempoolEntryResult { entry: get_tx_from_mempool(&params.txid) })
     }
 
+    /// One pending transaction's projected traces, by txid.
+    ///
+    /// A remote explorer keeps no mempool of its own, so without this it can
+    /// render an unconfirmed transaction's inputs and outputs — those come from
+    /// the address index — but none of its estimated trace or the call summary
+    /// built from it. The shape matches `get_block_traces`, so the same
+    /// reconstruction serves confirmed and pending transactions alike.
+    pub fn rpc_get_mempool_tx(
+        &self,
+        params: RpcGetMempoolTxParams,
+    ) -> Result<RpcGetMempoolTxResult> {
+        let Some(raw) = params.txid.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(RpcGetMempoolTxResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_txid",
+                    "hint": "expected {\"txid\": \"<txid>\"}"
+                }),
+            });
+        };
+        let Ok(txid) = Txid::from_str(raw) else {
+            return Ok(RpcGetMempoolTxResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_txid"}),
+            });
+        };
+
+        // not in the store yet (or metadata only): fetched from the node on the spot
+        let Some(entry) = fetch_mempool_tx_on_demand(&txid) else {
+            return Ok(RpcGetMempoolTxResult { value: json!({"ok": true, "found": false}) });
+        };
+
+        let traces = entry
+            .traces
+            .as_ref()
+            .map(|traces| {
+                traces
+                    .iter()
+                    .map(|trace| mempool_trace_to_json(&txid, trace))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        Ok(RpcGetMempoolTxResult {
+            value: json!({
+                "ok": true,
+                "found": true,
+                "txid": txid.to_string(),
+                "first_seen": entry.first_seen,
+                "mempool_block": entry.position.as_ref().map(|position| position.block),
+                "mempool_position_vsize": entry.position.as_ref().map(|position| position.vsize),
+                "defer_alkane_trace_status": entry.defer_alkane_trace_status,
+                "has_alkane_action": entry.has_alkane_action,
+                "has_rune_action": entry.has_rune_action,
+                "traces": traces,
+            }),
+        })
+    }
+
     pub fn get_mempool_pending_for_address(
         &self,
         params: GetMempoolPendingForAddressParams,
@@ -3420,6 +3479,11 @@ impl EssentialsProvider {
         let limit = params.limit.unwrap_or(100).max(1) as usize;
         let address = params.address.as_deref().and_then(normalize_address);
         let min_fee_paid = params.fee_paid.filter(|value| value.is_finite() && *value >= 0.0);
+        let targets = params
+            .targets
+            .as_ref()
+            .map(|list| list.iter().filter_map(|s| parse_alkane_from_str(s)).collect::<HashSet<SchemaAlkaneId>>())
+            .filter(|set| !set.is_empty());
 
         let filtered = get_mempool_index_transactions_ordered_by_block_and_fee()
             .into_iter()
@@ -3430,6 +3494,7 @@ impl EssentialsProvider {
                     .map_or(true, |addr| entry.addresses.iter().any(|candidate| candidate == addr))
             })
             .filter(|entry| min_fee_paid.map_or(true, |fee_paid| entry.fee_rate >= fee_paid))
+            .filter(|entry| targets.as_ref().map_or(true, |set| mempool_entry_invokes(entry, set)))
             .collect::<Vec<_>>();
         let total_traces = filtered
             .iter()
@@ -7125,6 +7190,12 @@ pub struct RpcGetMempoolTracesParams {
     pub limit: Option<u64>,
     pub address: Option<String>,
     pub fee_paid: Option<f64>,
+    /// Alkane ids ("2:68479", "0x2:0x10b59"): keep only the transactions whose
+    /// projected traces INVOKE one of them (a pool, the AMM factory, a token).
+    /// A client after the pending swaps of a token reads them in one small page
+    /// instead of paging through a mint storm (74,000 transactions, 4,000 of
+    /// them traced, the swaps sitting behind 3,700 mints).
+    pub targets: Option<Vec<String>>,
 }
 
 pub struct RpcGetMempoolTracesResult {
@@ -7404,6 +7475,14 @@ pub struct RpcGetOutpointBalancesParams {
 pub const MAX_OUTPOINT_BATCH: usize = 1000;
 
 pub struct RpcGetOutpointBalancesResult {
+    pub value: Value,
+}
+
+pub struct RpcGetMempoolTxParams {
+    pub txid: Option<String>,
+}
+
+pub struct RpcGetMempoolTxResult {
     pub value: Value,
 }
 
@@ -9172,6 +9251,38 @@ fn tx_summary_from_parts(
     AlkaneTxSummary { txid, traces, outflows, height }
 }
 
+/// Whether any projected trace of the entry runs a frame AS one of `targets`
+/// (the `myself` of an invoke: the pool a swap calls, the factory a path swap
+/// goes through, a token being minted) — the `targets` filter of
+/// `get_mempool_traces`.
+fn mempool_entry_invokes(entry: &MempoolBlockTx, targets: &HashSet<SchemaAlkaneId>) -> bool {
+    let parse = |s: &str| -> Option<u128> {
+        let t = s.trim();
+        if let Some(x) = t.strip_prefix("0x") {
+            u128::from_str_radix(x, 16).ok()
+        } else {
+            t.parse::<u128>().ok()
+        }
+    };
+    entry.traces.as_ref().is_some_and(|traces| {
+        traces.iter().any(|trace| {
+            trace.sandshrew_trace.events.iter().any(|event| match event {
+                EspoSandshrewLikeTraceEvent::Invoke(data) => {
+                    let myself = &data.context.myself;
+                    match (parse(&myself.block), parse(&myself.tx)) {
+                        (Some(block), Some(tx)) => match (u32::try_from(block), u64::try_from(tx)) {
+                            (Ok(block), Ok(tx)) => targets.contains(&SchemaAlkaneId { block, tx }),
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+                }
+                _ => false,
+            })
+        })
+    })
+}
+
 fn mem_block_tx_to_json(entry: &MempoolBlockTx) -> Value {
     let traces_json = entry
         .traces
@@ -9207,10 +9318,19 @@ fn mem_block_tx_to_json(entry: &MempoolBlockTx) -> Value {
 }
 
 fn mempool_trace_to_json(txid: &Txid, trace: &EspoTrace) -> Value {
-    let events_val = prettyify_protobuf_trace_json(&trace.protobuf_trace)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or(Value::Null);
+    // A mempool trace is projected rather than read back from metashrew, so it
+    // carries its events in the sandshrew-like form and leaves the protobuf one
+    // empty. Reading only the protobuf form returned `"events": []` for every
+    // pending transaction — the estimated trace, and the call summary built
+    // from it, simply were not in the response.
+    let events_val = if trace.sandshrew_trace.events.is_empty() {
+        prettyify_protobuf_trace_json(&trace.protobuf_trace)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .unwrap_or(Value::Null)
+    } else {
+        serde_json::to_value(&trace.sandshrew_trace.events).unwrap_or(Value::Null)
+    };
     json!({
         "outpoint": format!("{}:{}", txid, trace.outpoint.vout),
         "events": events_val,
@@ -10058,7 +10178,7 @@ mod tests {
             internal_rpc_key: None,
             explorer_base_path: "/".to_string(),
             explorer_pizza_tv_endpoint: "https://tv.pizza.fun".to_string(),
-            explorer_amm_prefix: "https://www.oyl.io/swap".to_string(),
+            explorer_amm_prefix: Some("https://www.oyl.io/swap".to_string()),
             sync_banner: None,
             network: Network::Regtest,
             metashrew_db_label: None,

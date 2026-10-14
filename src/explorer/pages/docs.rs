@@ -586,8 +586,28 @@ fn docs_modules() -> Vec<ModuleDoc> {
             intro: "Core Alkane, address, outpoint, trace, holder, and mempool reads.",
             methods: vec![
                 rpc_doc(
+                    "essentials.get_mempool_tx",
+                    "Returns one pending transaction's projected traces by txid, along with its projected mempool block and trace-status flags. Answers found false when the transaction is not in the mempool. The traces carry the same outpoint/events shape as get_block_traces, so one reconstruction covers pending and confirmed transactions alike; a remote explorer uses this to render an unconfirmed transaction's estimated trace and call summary, which it cannot project itself.",
+                    json!({ "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90" }),
+                    json!({
+                        "ok": true,
+                        "found": true,
+                        "txid": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90",
+                        "first_seen": 1785100016u64,
+                        "mempool_block": 0,
+                        "mempool_position_vsize": 141,
+                        "defer_alkane_trace_status": false,
+                        "has_alkane_action": true,
+                        "has_rune_action": false,
+                        "traces": [{
+                            "outpoint": "f390179d0a4586016c834a972abde346f1f0f095e3876513a5c96b8a93194f90:3",
+                            "events": [{ "event": "invoke", "data": { "type": "call", "context": { "myself": { "block": "0x2", "tx": "0x0" }, "inputs": ["0x4d", "0x0"] } } }]
+                        }]
+                    }),
+                ),
+                rpc_doc(
                     "essentials.get_mempool_traces",
-                    "Returns paged Alkane traces from the in-memory projected mempool index, optionally filtered by address and minimum sats/vbyte paid via fee_paid. Results are ordered by projected mempool block with the next block first, then by fee paid within that block.",
+                    "Returns paged Alkane traces from the in-memory projected mempool index, optionally filtered by address, by minimum sats/vbyte paid via fee_paid, and by targets: a list of alkane ids (\"2:68479\") that keeps only the transactions whose projected traces invoke one of them (a pool, the AMM factory) — the pending swaps of a token in one small page, whatever else fills the mempool. Results are ordered by projected mempool block with the next block first, then by fee paid within that block.",
                     json!({ "page": 1, "limit": 10, "address": "bc1phqvgwn7wn5e4s8g0999rtgafd07jpuuy59rkdrk4s5thw9jafkasg8umr8", "fee_paid": 2.16 }),
                     json!({
                         "ok": true,
@@ -1059,9 +1079,27 @@ fn docs_modules() -> Vec<ModuleDoc> {
             methods: vec![
                 rpc_doc(
                     "ammdata.get_candles",
-                    "Returns OHLCV candles for a pool or token pair over a supported timeframe.",
-                    json!({ "pool": "2:53014", "timeframe": "1h", "limit": 10, "page": 1, "side": "base" }),
-                    json!({ "ok": true, "candles": [{ "ts": 1710000000, "open": "1", "high": "2", "low": "1", "close": "2", "volume": "100" }] }),
+                    "Returns OHLCV candles for a pool or an alkane over a timeframe (10m, 1h, 4h, 1d, 1w, 1M), newest first, with missing buckets forward-filled. pool is a pool id, or an alkane id with a chart suffix. Price: -usd and -sats. Market cap: -mcusd and -mcsats, which are price times the supply essentials tracks; that supply counts every minted token, so these are closer to FDV. Circulating market cap (-cmcap) is not enabled on this espo and answers error cmcap_disabled. Derived: <alkane>-derived_<quote>-<kind> merges the alkane's direct frBTC pricing with its price through its pool against a derived quote. Full: <alkane>-full, or <alkane>-full-<kind> for usd, sats, mcusd and mcsats, is the id to use when you do not want to track which derived quote an alkane is on. It resolves to the alkane's derived chart against the target configured for it, otherwise against the default derived quote, otherwise to its direct chart; the response then keeps pool exactly as requested and adds resolved_pool, the id of the chart that was served. An operator can change how an alkane is priced from a chosen block onward without any id changing: a derived quote can come into force at a height, in which case each token's chart against it continues from its earlier history and -full moves a token over only once it has traded since; a pool can be dropped from an alkane's derived charts from a height; and an alkane can be given a start height before which none of its charts return candles. Volume is trade volume and is never scaled. USD values are fixed-point integers scaled by 10^16.",
+                    json!({ "pool": "4:8888-full-mcusd", "timeframe": "1d", "limit": 1, "page": 1 }),
+                    json!({
+                        "ok": true,
+                        "pool": "4:8888-full-mcusd",
+                        "resolved_pool": "4:8888-derived_2:68479-mcusd",
+                        "timeframe": "1d",
+                        "side": "base",
+                        "page": 1,
+                        "limit": 1,
+                        "total": 12,
+                        "has_more": true,
+                        "candles": [{
+                            "ts": 1790812800,
+                            "open": "1410000000000000000000",
+                            "high": "1460000000000000000000",
+                            "low": "1390000000000000000000",
+                            "close": "1440000000000000000000",
+                            "volume": "5200000000"
+                        }]
+                    }),
                 ),
                 rpc_doc(
                     "ammdata.get_btc_usd_candles",
@@ -1088,8 +1126,35 @@ fn docs_modules() -> Vec<ModuleDoc> {
                     }),
                 ),
                 rpc_doc(
+                    "ammdata.get_tvl_candles",
+                    "Returns the TVL line for the whole AMM, or for one token when token is set. Each pool contributes the side of it that can be priced without guessing, doubled, because a constant-product pool holds equal value on both sides: a pool with a canonical quote (frBTC, or BUSD before height 946500) lands in canonical_sats, one whose other side has a canonical-rooted price lands in derived_sats, and anything left is priced off both USD token feeds into unanchored_sats. sats is the reported level and excludes unanchored_sats unless include_unanchored is true. The series is stored in sats and priced into usd at read time against the BTC/USD line of the same bucket, so usd moves with both liquidity and the BTC price while sats isolates liquidity alone; usd and btc_usd are null for buckets the BTC/USD line does not cover. Supported timeframes are 10m, 1h, 4h, 1d, 1w, and 1M, default 1d. Points are newest first and buckets with no change are forward-filled, because TVL is a level rather than a flow. A per-token line counts each of its pools' full anchored value, so token lines do not sum to the AMM line. A token line also honours that token's start height when an operator has set one: points before it are not returned.",
+                    json!({ "token": "2:68479", "timeframe": "1d", "limit": 2, "page": 1 }),
+                    json!({
+                        "ok": true,
+                        "scope": "2:68479",
+                        "timeframe": "1d",
+                        "page": 1,
+                        "limit": 2,
+                        "total": 180,
+                        "has_more": true,
+                        "include_unanchored": false,
+                        "sats_scale": "100000000",
+                        "price_scale": "10000000000000000",
+                        "price_decimals": 16,
+                        "points": [{
+                            "ts": 1779235200,
+                            "sats": "240000000",
+                            "canonical_sats": "200000000",
+                            "derived_sats": "40000000",
+                            "unanchored_sats": "0",
+                            "usd": "1560000000000000000000000",
+                            "btc_usd": "650000000000000000000"
+                        }]
+                    }),
+                ),
+                rpc_doc(
                     "ammdata.get_alkanes_quote",
-                    "Returns current and 24-hour USD quotes for BTC and requested Alkanes. frBTC (32:0) is pegged directly to Espo's indexed BTC/USD history, so its prices and changes match BTC exactly. Other Alkane quotes prefer the configured merged <token>-derived_<quote>-usd chart, fall back to the direct <token>-usd chart, and return zero prices when neither chart exists. Current prices use the latest 10-minute close and comparison prices use hourly candle index 24. change_24h is the percentage change and change_24h_usd is the absolute price change.",
+                    "Returns current and 24-hour USD quotes for BTC and requested Alkanes. frBTC (32:0) is pegged directly to Espo's indexed BTC/USD history, so its prices and changes match BTC exactly. Other Alkane quotes are read from the same chart <token>-full serves, so a quote and that chart always agree: the token's derived chart against the target configured for it, otherwise against the other derived quotes in force in config order, otherwise the direct <token>-usd chart; prices are zero when no chart exists. A derived quote that has not come into force yet is never used. Current prices use the latest 10-minute close and comparison prices use hourly candle index 24. change_24h is the percentage change and change_24h_usd is the absolute price change.",
                     json!({ "assets": ["btc", "2:0", "2:68479"] }),
                     json!({
                         "ok": true,
@@ -1257,30 +1322,60 @@ fn docs_modules() -> Vec<ModuleDoc> {
                 ),
                 rpc_doc(
                     "ammdata.get_token_activity",
-                    "Returns AMM and token-market activity for a token.",
-                    json!({ "token": "2:0", "page": 1, "limit": 10, "kind": "trade", "sort_by": "timestamp" }),
-                    json!({
-                        "ok": true,
-                        "page": 1,
-                        "limit": 10,
-                        "has_more": true,
-                        "activity_type": "all",
-                        "kind": null,
-                        "activity": [{
-                            "kind": "swap",
-                            "index_kind": "swap",
-                            "pool": "DIESEL / CH4",
-                            "pool_id": "2:53014",
-                            "txid": "02146673f5ba09a67042626a21727466a3ac4c68bdce49e12fd9f734133489d3",
-                            "timestamp": 1779888869,
-                            "direction": "sell",
-                            "amount": "11486258",
-                            "base": "2:0",
-                            "quote": "2:16",
-                            "base_delta": "-11486258",
-                            "quote_delta": "1061552883247"
-                        }]
-                    }),
+                    "Returns AMM activity for a token: one row per pool event whose pool contains that token, newest first by default. activity_type is all, trades or events; kind narrows to one event kind; sort is timestamp or amount and dir is asc or desc. base_delta and quote_delta are the pool's own changes (positive is what the pool took in), side and amount describe the event from the queried token's point of view, and base and quote name the pool's two assets, which differ row to row. A swap routed through several pools is recorded as one row per pool, sharing only a txid, and a token's feed holds just the rows for pools that contain it. So on its own this endpoint shows a multi-hop buy as its last leg alone, priced in the intermediate asset rather than in what the buyer actually paid, and shows an arbitrage cycle that merely passes through the token as an unrelated buy and sell of the same amount. Pass include_route true to have every trade row carry route, the whole swap reassembled across pools: legs in the order the swap flowed through them (a cycle has no real start, so it is shown beginning and ending on the token the trader came out ahead in), each with pool, base, quote, token_in, amount_in, token_out and amount_out; hops, the number of legs; via, the tokens that were only passed through; net, what the trader ended up with per token over the whole transaction (negative is paid, positive is received, tokens that net to zero omitted); token_in and amount_in when exactly one token was net paid, and token_out and amount_out when exactly one was net received, each null otherwise; and pass_through, true when the queried token was only a hop and nobody ended up holding it. To count real trades of a token, skip rows whose route has pass_through true, and take the size of a trade from the route's amount_in and amount_out rather than from the row. A single-hop trade has a route of one leg, so the shape is the same for every trade. route is null where it cannot be determined, and rows that are not trades do not carry it. It is off by default because it costs one extra lookup per block in the page.",
+                    json!({ "token": "2:68479", "activity_type": "all", "limit": 1, "page": 1, "sort": "timestamp", "dir": "desc", "include_route": true }),
+                    {
+                        // Built in pieces: one json! this deep exceeds the macro
+                        // recursion limit.
+                        let legs = json!([
+                            { "pool": "2:77087", "base": "2:0", "quote": "32:0", "token_in": "2:0", "amount_in": "48334811", "token_out": "32:0", "amount_out": "21470" },
+                            { "pool": "2:77269", "base": "2:68479", "quote": "32:0", "token_in": "32:0", "amount_in": "21470", "token_out": "2:68479", "amount_out": "168075379605" },
+                            { "pool": "2:70020", "base": "2:0", "quote": "2:68479", "token_in": "2:68479", "amount_in": "168075379605", "token_out": "2:0", "amount_out": "49772500" }
+                        ]);
+                        let route = json!({
+                            "hops": 3,
+                            "legs": legs,
+                            "via": ["2:68479", "32:0"],
+                            "net": { "2:0": "1437689" },
+                            "token_in": null,
+                            "amount_in": null,
+                            "token_out": "2:0",
+                            "amount_out": "1437689",
+                            "pass_through": true
+                        });
+                        let row = json!({
+                            "timestamp": 1791170078,
+                            "txid": "bb0a04dffe30788c0fa6ed59fb86a8ec0fbcb5b4e70ee64f2279babf2ac704f1",
+                            "kind": "trade_buy",
+                            "index_kind": "trade_buy",
+                            "direction": "quote_in",
+                            "side": "buy",
+                            "amount": 1680.75379605,
+                            "base_delta": "-168075379605",
+                            "quote_delta": "21470",
+                            "pool": "2:77269",
+                            "pool_id": "2:77269",
+                            "base": "2:68479",
+                            "quote": "32:0",
+                            "token": "2:68479",
+                            "seq": 0,
+                            "route": route
+                        });
+                        json!({
+                            "ok": true,
+                            "include_route": true,
+                            "token": "2:68479",
+                            "activity_type": "all",
+                            "kind": null,
+                            "sort": "timestamp",
+                            "dir": "desc",
+                            "page": 1,
+                            "limit": 1,
+                            "total": 8269,
+                            "has_more": true,
+                            "activity": [row]
+                        })
+                    },
                 ),
                 rpc_doc(
                     "ammdata.get_pools",

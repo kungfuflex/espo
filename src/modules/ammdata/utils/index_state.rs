@@ -1,6 +1,6 @@
 use crate::modules::ammdata::schemas::{
     SchemaCanonicalPoolEntry, SchemaFullCandleV1, SchemaMarketDefs, SchemaPoolCreationInfoV1,
-    SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe,
+    SchemaPoolSnapshot, SchemaTokenMetricsV1, SchemaTvlPointV1, Timeframe,
 };
 use crate::modules::ammdata::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
 use crate::modules::ammdata::utils::candles::CandleCache;
@@ -32,6 +32,9 @@ pub struct IndexState {
     pub canonical_trade_buckets: HashMap<SchemaAlkaneId, HashSet<(Timeframe, u64)>>,
     pub in_block_trade_volumes: HashMap<SchemaAlkaneId, (u128, u128)>,
     pub pools_touched: HashSet<SchemaAlkaneId>,
+    /// Pools that may not set a token's price in this block: not created by a
+    /// factory on the pricing allowlist. Empty when the allowlist is not in force.
+    pub pricing_excluded_pools: HashSet<SchemaAlkaneId>,
     pub has_trades: bool,
 
     pub pool_name_index_writes: Vec<(Vec<u8>, Vec<u8>)>,
@@ -46,6 +49,12 @@ pub struct IndexState {
     pub pool_lp_supply_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub pool_details_snapshot_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub tvl_versioned_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    /// This block's anchored TVL contribution per touched pool, consumed by
+    /// `index_tvl` to move the running totals by a delta.
+    pub pool_tvl_anchor_current: HashMap<SchemaAlkaneId, SchemaTvlPointV1>,
+    pub tvl_line_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub tvl_total_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub pool_tvl_anchor_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_activity_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_activity_amount_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_swaps_writes: Vec<(Vec<u8>, Vec<u8>)>,
@@ -112,6 +121,7 @@ impl IndexState {
             canonical_trade_buckets: HashMap::new(),
             in_block_trade_volumes: HashMap::new(),
             pools_touched: HashSet::new(),
+            pricing_excluded_pools: HashSet::new(),
             has_trades: false,
             pool_name_index_writes: Vec::new(),
             factory_pools_writes: Vec::new(),
@@ -125,6 +135,10 @@ impl IndexState {
             pool_lp_supply_writes: Vec::new(),
             pool_details_snapshot_writes: Vec::new(),
             tvl_versioned_writes: Vec::new(),
+            pool_tvl_anchor_current: HashMap::new(),
+            tvl_line_writes: Vec::new(),
+            tvl_total_writes: Vec::new(),
+            pool_tvl_anchor_writes: Vec::new(),
             token_activity_writes: Vec::new(),
             token_activity_amount_writes: Vec::new(),
             token_swaps_writes: Vec::new(),

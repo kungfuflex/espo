@@ -20,7 +20,8 @@ use crate::explorer::pages::common::{ALKANE_SCALE, fmt_alkane_amount, fmt_scaled
 use crate::explorer::paths::explorer_path;
 use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
+    AmmDataProvider, FullChartTargetParams, GetTokenSearchIndexPageParams, RpcGetCandlesParams,
+    SearchIndexField,
 };
 use crate::modules::essentials::storage::{
     BlockSummaryPool, EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
@@ -503,6 +504,8 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
     }
 
     let mut events = subscribe_mempool_events();
+    // a lag resyncs the client ONCE per burst, and at most every few seconds
+    let mut last_resync: Option<TokioInstant> = None;
     let heartbeat_period = Duration::from_secs(25);
     let mut heartbeat = interval_at(TokioInstant::now() + heartbeat_period, heartbeat_period);
     loop {
@@ -510,6 +513,14 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
             event = events.recv() => {
                 match event {
                     Ok(payload) => {
+                        // nothing of this socket's could match: skip the parse (a mempool
+                        // refresh publishes one event per address of every transaction;
+                        // parsing each one on every socket is what let sockets lag)
+                        if (subscriptions.addresses.is_empty() && payload.contains("\"type\":\"address-tx\""))
+                            || (subscriptions.txids.is_empty() && payload.contains("\"type\":\"tx\""))
+                        {
+                            continue;
+                        }
                         let parsed_payload = serde_json::from_str::<Value>(&payload).ok();
                         if let Some(filtered) = parsed_payload
                             .as_ref()
@@ -563,6 +574,17 @@ async fn handle_explorer_events_socket(mut socket: WebSocket) {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Drain what is already queued, then resync ONCE — and not again
+                        // for a few seconds. A burst (a mempool refresh publishing an event
+                        // per address of thousands of transactions) lagged a socket once per
+                        // message, and a resync per lag — the snapshot plus every address's
+                        // status — was the storm: 250 messages a second, all the same
+                        // sequence, to a client that had asked for one address.
+                        while let Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) = events.try_recv() {}
+                        if last_resync.is_some_and(|at| at.elapsed() < Duration::from_secs(5)) {
+                            continue;
+                        }
+                        last_resync = Some(TokioInstant::now());
                         let mut disconnected = false;
                         if subscriptions.blocks {
                             let payload = json!({
@@ -1649,6 +1671,34 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty());
     let mut quote = q.quote.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    // First choice: what `<alkane>-full` resolves to, so the chart matches the
+    // price shown above it. The older search below stays as the fallback.
+    if source.is_none() {
+        match provider.full_chart_target(FullChartTargetParams { token: alkane }) {
+            Ok(res) => {
+                let (pool, kind, q) = match res.target {
+                    Some(quote_id) => (
+                        format!(
+                            "{}-derived_{}-usd",
+                            alkane_id_str(&alkane),
+                            alkane_id_str(&quote_id)
+                        ),
+                        "derived",
+                        Some(alkane_id_str(&quote_id)),
+                    ),
+                    None => (format!("{}-usd", alkane_id_str(&alkane)), "usd", None),
+                };
+                if candles_available(&provider, &pool, timeframe) {
+                    source = Some(kind.to_string());
+                    quote = q;
+                }
+            }
+            Err(e) => {
+                eprintln!("[explorer] full_chart_target failed for {}: {e}", alkane_id_str(&alkane))
+            }
+        }
+    }
 
     if source.is_none() {
         let pool = format!("{}-usd", alkane_id_str(&alkane));
