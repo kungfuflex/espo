@@ -5404,6 +5404,30 @@ impl EssentialsProvider {
         &self,
         params: RpcGetOutpointBalancesParams,
     ) -> Result<RpcGetOutpointBalancesResult> {
+        // BATCH form (2026-10-14): `outpoints: ["<txid>:<vout>", ...]` returns one
+        // item per requested outpoint, in request order, in ONE call. The explorer
+        // assembled a tx view with one call per input/output (hundreds for a big
+        // tx), and each call is a full HTTP round trip plus its own JS promise
+        // chain on the explorer side; batching is what lets a page cost one call.
+        // Additive: the single `outpoint` form below is unchanged, and an item
+        // that fails carries `ok:false` + `error` instead of failing the batch.
+        if let Some(list) = params.outpoints.as_ref() {
+            if list.len() > MAX_OUTPOINT_BATCH {
+                return Ok(RpcGetOutpointBalancesResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "too_many_outpoints",
+                        "max": MAX_OUTPOINT_BATCH
+                    }),
+                });
+            }
+            let items: Vec<Value> =
+                list.iter().map(|op| self.outpoint_balances_item(op.trim())).collect();
+            return Ok(RpcGetOutpointBalancesResult {
+                value: json!({ "ok": true, "items": items }),
+            });
+        }
+
         let Some(outpoint) = params.outpoint.as_deref().map(str::trim).filter(|s| !s.is_empty())
         else {
             return Ok(RpcGetOutpointBalancesResult {
@@ -5414,14 +5438,45 @@ impl EssentialsProvider {
                 }),
             });
         };
+        let item = self.outpoint_balances_item(outpoint);
+        if item.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            // Same error object the single form always returned.
+            let mut err = item;
+            if let Some(o) = err.as_object_mut() {
+                o.remove("outpoint");
+            }
+            return Ok(RpcGetOutpointBalancesResult { value: err });
+        }
+        Ok(RpcGetOutpointBalancesResult {
+            value: json!({
+                "ok": true,
+                "outpoint": item["outpoint"],
+                "items": [item]
+            }),
+        })
+    }
 
+    /// One outpoint's item for `get_outpoint_balances` (single and batch forms).
+    /// Success: `{outpoint, entries, address?}`. Failure: `{ok:false, error,
+    /// outpoint, ...}` with the same error values the single form returns.
+    fn outpoint_balances_item(&self, outpoint: &str) -> Value {
+        if outpoint.is_empty() {
+            return json!({
+                "ok": false,
+                "error": "missing_or_invalid_outpoint",
+                "hint": "expected \"<txid>:<vout>\"",
+                "outpoint": outpoint
+            });
+        }
         let (txid, vout_u32) = match parse_outpoint_str(outpoint) {
             Ok(tup) => tup,
-            Err(err_val) => {
-                return Ok(RpcGetOutpointBalancesResult { value: err_val });
+            Err(mut err_val) => {
+                if let Some(o) = err_val.as_object_mut() {
+                    o.insert("outpoint".to_string(), Value::String(outpoint.to_string()));
+                }
+                return err_val;
             }
         };
-
         let lookup =
             match crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent(
                 StateAt::Latest,
@@ -5431,13 +5486,10 @@ impl EssentialsProvider {
             ) {
                 Ok(v) => v,
                 Err(_) => {
-                    return Ok(RpcGetOutpointBalancesResult {
-                        value: json!({"ok": false, "error": "internal_error"}),
-                    });
+                    return json!({"ok": false, "error": "internal_error", "outpoint": outpoint});
                 }
             };
         let addr = get_outpoint_address(StateAt::Latest, self, &txid, vout_u32).ok().flatten();
-
         let entry_list: Vec<Value> = lookup
             .balances
             .into_iter()
@@ -5448,7 +5500,6 @@ impl EssentialsProvider {
                 })
             })
             .collect();
-
         let mut item = json!({
             "outpoint": outpoint,
             "entries": entry_list
@@ -5456,14 +5507,7 @@ impl EssentialsProvider {
         if let Some(a) = addr {
             item.as_object_mut().unwrap().insert("address".to_string(), Value::String(a));
         }
-
-        Ok(RpcGetOutpointBalancesResult {
-            value: json!({
-                "ok": true,
-                "outpoint": item["outpoint"],
-                "items": [item]
-            }),
-        })
+        item
     }
 
     /// The protocol's runtime balance sheet, read straight from metashrew.
@@ -7345,7 +7389,12 @@ pub struct RpcGetAlkaneBalanceTxsByTokenResult {
 
 pub struct RpcGetOutpointBalancesParams {
     pub outpoint: Option<String>,
+    /// Batch form: many outpoints in one call (see rpc_get_outpoint_balances).
+    pub outpoints: Option<Vec<String>>,
 }
+
+/// Upper bound on one batch `get_outpoint_balances` call.
+pub const MAX_OUTPOINT_BATCH: usize = 1000;
 
 pub struct RpcGetOutpointBalancesResult {
     pub value: Value,
@@ -9916,6 +9965,49 @@ mod tests {
         provider
             .set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
             .expect("write creation rows");
+    }
+
+    #[test]
+    fn outpoint_balances_batch_matches_single_form() {
+        let _ = init_test_config_for_addresses();
+        let p = new_provider_with_tempdb();
+        let call = |outpoint: Option<&str>, outpoints: Option<Vec<String>>| {
+            p.rpc_get_outpoint_balances(RpcGetOutpointBalancesParams {
+                outpoint: outpoint.map(str::to_string),
+                outpoints,
+            })
+            .expect("rpc")
+            .value
+        };
+        let unknown = format!("{}:0", "11".repeat(32));
+        let batch = call(None, Some(vec![unknown.clone(), "nope".to_string(), String::new()]));
+        assert_eq!(batch["ok"], true);
+        let items = batch["items"].as_array().expect("items");
+        assert_eq!(items.len(), 3, "one item per requested outpoint, in order");
+
+        // A valid outpoint: the batch item is exactly the single form's item.
+        let single = call(Some(&unknown), None);
+        assert_eq!(single["ok"], true);
+        assert_eq!(items[0], single["items"][0]);
+        assert_eq!(items[0]["entries"], json!([]));
+
+        // A bad outpoint fails ITS item only, with the single form's error.
+        let single_bad = call(Some("nope"), None);
+        assert_eq!(single_bad["ok"], false);
+        assert!(single_bad.get("outpoint").is_none(), "single form error shape unchanged");
+        assert_eq!(items[1]["ok"], false);
+        assert_eq!(items[1]["error"], single_bad["error"]);
+        assert_eq!(items[1]["outpoint"], "nope");
+        assert_eq!(items[2]["error"], "missing_or_invalid_outpoint");
+
+        // The single form with no outpoint is unchanged.
+        let missing = call(None, None);
+        assert_eq!(missing["error"], "missing_or_invalid_outpoint");
+
+        // Bounded.
+        let too_many = call(None, Some(vec![unknown; MAX_OUTPOINT_BATCH + 1]));
+        assert_eq!(too_many["ok"], false);
+        assert_eq!(too_many["error"], "too_many_outpoints");
     }
 
     fn new_provider_with_tempdb() -> EssentialsProvider {
