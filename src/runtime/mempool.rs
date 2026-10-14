@@ -2639,83 +2639,240 @@ fn remove_memory_txid(txid: &Txid) -> bool {
     removed
 }
 
-fn set_relatives(txid: Txid, pool: &mut HashMap<Txid, MinerTx>, visiting: &mut HashSet<Txid>) {
-    if !visiting.insert(txid) {
-        return;
-    }
-    let inputs = pool.get(&txid).map(|tx| tx.inputs.clone()).unwrap_or_default();
-    let mut ancestors = HashSet::new();
-    for parent in inputs {
-        if !pool.contains_key(&parent) {
+/// Fill `ancestors`, `children`, `ancestor_fee`, `ancestor_vsize` and `score`
+/// for every tx in `pool`.
+///
+/// Each tx is finalised exactly once, in post-order (all in-pool parents
+/// before the child), so a parent's ancestor set is reused rather than
+/// recomputed per descendant. The previous version recursed into every parent
+/// from every child with no memoisation; `inputs` carries one entry per vin
+/// (a tx spending three outputs of its parent lists that parent three times),
+/// so down an unconfirmed chain the work grew exponentially with depth. A
+/// cold-started espo bulk-loading ~80k mempool txs never got out of it, the
+/// reconcile loop stalled behind it, and the mempool went `mempool_stale`.
+///
+/// Iterative (explicit stack) so chain depth cannot overflow the thread
+/// stack. A parent that is still in progress (a cycle, which a consistent
+/// mempool never has) is linked but contributes no ancestors, matching the old
+/// `visiting` guard.
+fn compute_relatives(pool: &mut HashMap<Txid, MinerTx>) {
+    let keys: Vec<Txid> = pool.keys().copied().collect();
+    let mut done: HashSet<Txid> = HashSet::with_capacity(pool.len());
+    let mut in_progress: HashSet<Txid> = HashSet::new();
+    let mut stack: Vec<(Txid, bool)> = Vec::new();
+    for root in keys {
+        if done.contains(&root) {
             continue;
         }
-        set_relatives(parent, pool, visiting);
-        ancestors.insert(parent);
-        if let Some(parent_tx) = pool.get(&parent) {
-            for ancestor in &parent_tx.ancestors {
-                ancestors.insert(*ancestor);
+        stack.push((root, false));
+        while let Some((txid, expanded)) = stack.pop() {
+            if done.contains(&txid) {
+                continue;
             }
-        }
-        if let Some(parent_tx) = pool.get_mut(&parent) {
-            parent_tx.children.insert(txid);
+            if !expanded {
+                if !in_progress.insert(txid) {
+                    continue;
+                }
+                stack.push((txid, true));
+                if let Some(tx) = pool.get(&txid) {
+                    for parent in &tx.inputs {
+                        if !done.contains(parent) && !in_progress.contains(parent) {
+                            stack.push((*parent, false));
+                        }
+                    }
+                }
+                continue;
+            }
+            let inputs = pool.get(&txid).map(|tx| tx.inputs.clone()).unwrap_or_default();
+            let mut ancestors = HashSet::new();
+            for parent in &inputs {
+                let Some(parent_tx) = pool.get_mut(parent) else { continue };
+                parent_tx.children.insert(txid);
+                ancestors.insert(*parent);
+                ancestors.extend(parent_tx.ancestors.iter().copied());
+            }
+            let mut ancestor_fee = pool.get(&txid).map(|tx| tx.fee).unwrap_or_default();
+            let mut ancestor_vsize = pool.get(&txid).map(|tx| tx.adjusted_vsize).unwrap_or(1);
+            for ancestor in &ancestors {
+                if let Some(parent) = pool.get(ancestor) {
+                    ancestor_fee = ancestor_fee.saturating_add(parent.fee);
+                    ancestor_vsize = ancestor_vsize.saturating_add(parent.adjusted_vsize);
+                }
+            }
+            if let Some(tx) = pool.get_mut(&txid) {
+                tx.ancestors = ancestors;
+                tx.ancestor_fee = ancestor_fee;
+                tx.ancestor_vsize = ancestor_vsize.max(1);
+                tx.score = tx.ancestor_fee as f64 / tx.ancestor_vsize as f64;
+            }
+            in_progress.remove(&txid);
+            done.insert(txid);
         }
     }
-    let mut ancestor_fee = pool.get(&txid).map(|tx| tx.fee).unwrap_or_default();
-    let mut ancestor_vsize = pool.get(&txid).map(|tx| tx.adjusted_vsize).unwrap_or(1);
-    for ancestor in &ancestors {
-        if let Some(parent) = pool.get(ancestor) {
-            ancestor_fee = ancestor_fee.saturating_add(parent.fee);
-            ancestor_vsize = ancestor_vsize.saturating_add(parent.adjusted_vsize);
+}
+
+/// Max-heap entry for the "modified" queue: highest score first, ties broken
+/// by the SMALLER txid first — the same order the old per-iteration
+/// `modified.sort_by(score desc, txid asc)` produced.
+#[derive(Clone, Copy)]
+struct ModifiedEntry {
+    score: f64,
+    txid: Txid,
+}
+
+impl PartialEq for ModifiedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for ModifiedEntry {}
+
+impl PartialOrd for ModifiedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ModifiedEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score.total_cmp(&other.score).then_with(|| other.txid.cmp(&self.txid))
+    }
+}
+
+/// The "modified" queue. Replaces a Vec that was fully re-sorted on every
+/// iteration and drained with `remove(0)` (O(n^2 log n) on a large mempool).
+///
+/// It models the old Vec exactly, as a multiset: `count[txid]` is how many
+/// times the tx is queued (`enqueue` = the old `push`, `pop` = the old
+/// `remove(0)` of the best entry). Because the Vec was re-sorted by CURRENT
+/// score, a queued tx whose score changes is re-keyed: a fresh heap entry is
+/// pushed and the old one goes stale. Entries are valid while the tx is queued
+/// and at the entry's score; stale ones are dropped lazily.
+///
+/// A queued tx that has meanwhile been USED (placed as an ancestor of another
+/// package) deliberately stays a valid candidate: the old loop popped it and
+/// hit `if used { continue }`, which also skips that iteration's block-close
+/// check, and when it was the last queued item the loop then ended with txs
+/// still in `overflow` (they were left out of the projection). Reproducing
+/// that keeps the output byte-identical to the previous implementation; the
+/// equivalence test pins it.
+struct ModifiedQueue {
+    heap: std::collections::BinaryHeap<ModifiedEntry>,
+    count: HashMap<Txid, usize>,
+}
+
+impl ModifiedQueue {
+    fn new() -> Self {
+        Self { heap: std::collections::BinaryHeap::new(), count: HashMap::new() }
+    }
+
+    fn push_entry(&mut self, txid: Txid, pool: &HashMap<Txid, MinerTx>) {
+        if let Some(tx) = pool.get(&txid) {
+            self.heap.push(ModifiedEntry { score: tx.score, txid });
         }
     }
-    if let Some(tx) = pool.get_mut(&txid) {
-        tx.ancestors = ancestors;
-        tx.ancestor_fee = ancestor_fee;
-        tx.ancestor_vsize = ancestor_vsize.max(1);
-        tx.score = tx.ancestor_fee as f64 / tx.ancestor_vsize as f64;
+
+    fn enqueue(&mut self, txid: Txid, pool: &HashMap<Txid, MinerTx>) {
+        *self.count.entry(txid).or_default() += 1;
+        self.push_entry(txid, pool);
     }
-    visiting.remove(&txid);
+
+    /// The tx's score changed; if it is queued, queue it at the new score.
+    fn rekey(&mut self, txid: Txid, pool: &HashMap<Txid, MinerTx>) {
+        if self.count.get(&txid).copied().unwrap_or(0) > 0 {
+            self.push_entry(txid, pool);
+        }
+    }
+
+    fn is_valid(&self, entry: &ModifiedEntry, pool: &HashMap<Txid, MinerTx>) -> bool {
+        self.count.get(&entry.txid).copied().unwrap_or(0) > 0
+            && pool
+                .get(&entry.txid)
+                .map(|tx| tx.score.to_bits() == entry.score.to_bits())
+                .unwrap_or(false)
+    }
+
+    fn clean(&mut self, pool: &HashMap<Txid, MinerTx>) {
+        while let Some(top) = self.heap.peek().copied() {
+            if self.is_valid(&top, pool) {
+                break;
+            }
+            self.heap.pop();
+        }
+    }
+
+    fn peek(&mut self, pool: &HashMap<Txid, MinerTx>) -> Option<Txid> {
+        self.clean(pool);
+        self.heap.peek().map(|entry| entry.txid)
+    }
+
+    fn pop(&mut self, pool: &HashMap<Txid, MinerTx>) -> Option<Txid> {
+        self.clean(pool);
+        let entry = self.heap.pop()?;
+        // Drop identical entries (same txid and score) so the remaining
+        // multiplicity is represented by exactly one fresh entry.
+        while self.heap.peek().map(|top| *top == entry).unwrap_or(false) {
+            self.heap.pop();
+        }
+        let remaining = {
+            let c = self.count.entry(entry.txid).or_default();
+            *c = c.saturating_sub(1);
+            *c
+        };
+        if remaining > 0 {
+            self.push_entry(entry.txid, pool);
+        }
+        Some(entry.txid)
+    }
+
+    fn is_empty(&mut self, pool: &HashMap<Txid, MinerTx>) -> bool {
+        self.clean(pool);
+        self.heap.is_empty()
+    }
 }
 
 fn update_descendants(
     root: Txid,
     pool: &mut HashMap<Txid, MinerTx>,
-    modified: &mut Vec<Txid>,
+    modified: &mut ModifiedQueue,
     cluster_rate: f64,
 ) {
     let mut stack: Vec<Txid> = pool
         .get(&root)
         .map(|tx| tx.children.iter().copied().collect())
         .unwrap_or_default();
+    let (root_fee, root_vsize) = match pool.get(&root) {
+        Some(tx) => (tx.fee, tx.adjusted_vsize),
+        None => return,
+    };
     let mut seen = HashSet::new();
     while let Some(child) = stack.pop() {
         if !seen.insert(child) {
             continue;
         }
-        let children: Vec<Txid> = pool
-            .get(&child)
-            .map(|tx| tx.children.iter().copied().collect())
-            .unwrap_or_default();
         let mut changed = false;
-        if let (Some(root_tx), Some(child_tx)) = (pool.get(&root).cloned(), pool.get_mut(&child)) {
+        let mut newly_modified = false;
+        if let Some(child_tx) = pool.get_mut(&child) {
+            stack.extend(child_tx.children.iter().copied());
             if child_tx.ancestors.remove(&root) {
-                child_tx.ancestor_fee = child_tx.ancestor_fee.saturating_sub(root_tx.fee);
+                child_tx.ancestor_fee = child_tx.ancestor_fee.saturating_sub(root_fee);
                 child_tx.ancestor_vsize =
-                    child_tx.ancestor_vsize.saturating_sub(root_tx.adjusted_vsize).max(1);
+                    child_tx.ancestor_vsize.saturating_sub(root_vsize).max(1);
                 child_tx.score = child_tx.ancestor_fee as f64 / child_tx.ancestor_vsize as f64;
                 child_tx.dependency_rate = child_tx.dependency_rate.min(cluster_rate);
                 changed = true;
-            }
-        }
-        if changed {
-            if let Some(child_tx) = pool.get_mut(&child) {
                 if !child_tx.modified {
                     child_tx.modified = true;
-                    modified.push(child);
+                    newly_modified = true;
                 }
             }
         }
-        stack.extend(children);
+        if newly_modified {
+            modified.enqueue(child, pool);
+        } else if changed {
+            modified.rekey(child, pool);
+        }
     }
 }
 
@@ -2728,6 +2885,14 @@ fn calculate_block_templates(
         .iter()
         .map(|(txid, tx)| {
             let adjusted_vsize = tx.vsize.max(1);
+            // In-pool parents, DEDUPLICATED: `inputs` has one entry per vin.
+            let mut seen_parents = HashSet::new();
+            let inputs: Vec<Txid> = tx
+                .inputs
+                .iter()
+                .copied()
+                .filter(|parent| txs.contains_key(parent) && seen_parents.insert(*parent))
+                .collect();
             (
                 *txid,
                 MinerTx {
@@ -2736,12 +2901,7 @@ fn calculate_block_templates(
                     adjusted_vsize,
                     fee_rate: tx.fee_rate,
                     dependency_rate: tx.fee_rate,
-                    inputs: tx
-                        .inputs
-                        .iter()
-                        .copied()
-                        .filter(|parent| txs.contains_key(parent))
-                        .collect(),
+                    inputs,
                     spent_outpoints: tx.spent_outpoints.clone(),
                     ancestors: HashSet::new(),
                     children: HashSet::new(),
@@ -2755,10 +2915,7 @@ fn calculate_block_templates(
         })
         .collect();
 
-    let keys: Vec<Txid> = pool.keys().copied().collect();
-    for txid in keys {
-        set_relatives(txid, &mut pool, &mut HashSet::new());
-    }
+    compute_relatives(&mut pool);
 
     let mut mempool_array: Vec<Txid> = pool.keys().copied().collect();
     mempool_array.sort_by(|a, b| {
@@ -2770,27 +2927,22 @@ fn calculate_block_templates(
     let mut blocks = Vec::new();
     let mut block = Vec::new();
     let mut block_weight = 4_000u64;
-    let mut modified: Vec<Txid> = Vec::new();
+    let mut modified = ModifiedQueue::new();
     let mut overflow: Vec<Txid> = Vec::new();
     let mut failures = 0usize;
     let mut top = 0usize;
     let mut spent_outpoints: HashSet<OutPoint> = HashSet::new();
     let mut effective_rates: HashMap<Txid, f64> = HashMap::new();
 
-    while top < mempool_array.len() || !modified.is_empty() {
+    while top < mempool_array.len() || !modified.is_empty(&pool) {
         while top < mempool_array.len()
             && pool.get(&mempool_array[top]).map(|tx| tx.used || tx.modified).unwrap_or(true)
         {
             top += 1;
         }
-        modified.sort_by(|a, b| {
-            let aa = pool.get(a).map(|tx| tx.score).unwrap_or_default();
-            let bb = pool.get(b).map(|tx| tx.score).unwrap_or_default();
-            bb.partial_cmp(&aa).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.cmp(b))
-        });
 
         let next_pool = mempool_array.get(top).copied();
-        let next_modified = modified.first().copied();
+        let next_modified = modified.peek(&pool);
         let next = match (next_pool, next_modified) {
             (Some(pool_tx), Some(mod_tx)) => {
                 let pool_score = pool.get(&pool_tx).map(|tx| tx.score).unwrap_or_default();
@@ -2799,7 +2951,7 @@ fn calculate_block_templates(
                     top += 1;
                     Some(pool_tx)
                 } else {
-                    modified.remove(0);
+                    modified.pop(&pool);
                     Some(mod_tx)
                 }
             }
@@ -2808,7 +2960,7 @@ fn calculate_block_templates(
                 Some(pool_tx)
             }
             (None, Some(mod_tx)) => {
-                modified.remove(0);
+                modified.pop(&pool);
                 Some(mod_tx)
             }
             (None, None) => None,
@@ -2818,13 +2970,15 @@ fn calculate_block_templates(
             if pool.get(&next_txid).map(|tx| tx.used).unwrap_or(true) {
                 continue;
             }
-            let next_tx = pool.get(&next_txid).cloned();
-            let Some(next_tx) = next_tx else { continue };
+            let Some(next_tx) = pool.get(&next_txid) else { continue };
             let package_fits = blocks.len() >= max_blocks.saturating_sub(1)
                 || block_weight.saturating_add(next_tx.ancestor_vsize.saturating_mul(4))
                     < weight_limit;
             if package_fits {
                 let mut package: Vec<Txid> = next_tx.ancestors.iter().copied().collect();
+                let dependency_rate = next_tx.dependency_rate;
+                let ancestor_fee = next_tx.ancestor_fee;
+                let ancestor_vsize = next_tx.ancestor_vsize;
                 package.sort_by_key(|txid| {
                     pool.get(txid).map(|tx| tx.ancestors.len()).unwrap_or_default()
                 });
@@ -2845,9 +2999,8 @@ fn calculate_block_templates(
                     failures += 1;
                     continue;
                 }
-                let effective_rate = next_tx
-                    .dependency_rate
-                    .min(next_tx.ancestor_fee as f64 / next_tx.ancestor_vsize.max(1) as f64);
+                let effective_rate =
+                    dependency_rate.min(ancestor_fee as f64 / ancestor_vsize.max(1) as f64);
                 let mut used = Vec::new();
                 for txid in package {
                     if let Some(tx) = pool.get_mut(&txid) {
@@ -2876,7 +3029,7 @@ fn calculate_block_templates(
         }
 
         let exceeded_tries = failures > 1000 && block_weight > weight_limit.saturating_sub(4_000);
-        let queue_empty = top >= mempool_array.len() && modified.is_empty();
+        let queue_empty = top >= mempool_array.len() && modified.is_empty(&pool);
         if (exceeded_tries || queue_empty) && blocks.len() < max_blocks.saturating_sub(1) {
             if block.is_empty() {
                 break;
@@ -2886,7 +3039,7 @@ fn calculate_block_templates(
             block_weight = 4_000;
             for txid in overflow.drain(..).rev() {
                 if pool.get(&txid).map(|tx| tx.modified).unwrap_or(false) {
-                    modified.push(txid);
+                    modified.enqueue(txid, &pool);
                 } else {
                     top = top.saturating_sub(1);
                     if top < mempool_array.len() {
@@ -3037,8 +3190,70 @@ fn calculate_template_deltas(
     deltas
 }
 
+static TEMPLATE_RECALC_PENDING: AtomicBool = AtomicBool::new(false);
+static TEMPLATE_RECALC_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Request a block-template recalculation. NON-BLOCKING.
+///
+/// Every caller (the reconcile loop, `refresh_memory_mempool`, hydration,
+/// ZMQ/p2p ingest, block purges) used to run the full recalculation inline.
+/// When one run was slow, the reconcile loop sat inside it, stopped
+/// refreshing, and the 900 s staleness guard turned the whole mempool surface
+/// into `mempool_stale`. Now the work runs on one dedicated background thread:
+/// requests made while it is busy coalesce into a single follow-up run, so the
+/// templates always converge on the latest state and no caller waits.
 fn recalculate_memory_templates() {
-    let Ok(_recalculate_guard) = recalculate_templates_lock().try_lock() else {
+    TEMPLATE_RECALC_PENDING.store(true, Ordering::SeqCst);
+    if TEMPLATE_RECALC_RUNNING.swap(true, Ordering::SeqCst) {
+        return; // the running worker will pick the request up
+    }
+    let spawned = std::thread::Builder::new().name("mempool-templates".into()).spawn(|| {
+        loop {
+            while TEMPLATE_RECALC_PENDING.swap(false, Ordering::SeqCst) {
+                let started = std::time::Instant::now();
+                let result = std::panic::catch_unwind(recalculate_memory_templates_blocking);
+                let elapsed = started.elapsed();
+                if result.is_err() {
+                    eprintln!("[mempool] template recalculation panicked");
+                } else if elapsed > Duration::from_secs(5) {
+                    eprintln!("[mempool] template recalculation took {:.1}s", elapsed.as_secs_f64());
+                }
+            }
+            TEMPLATE_RECALC_RUNNING.store(false, Ordering::SeqCst);
+            // A request may have landed between the last swap and the store
+            // above; if so, and nobody else has claimed the worker, keep going.
+            if TEMPLATE_RECALC_PENDING.load(Ordering::SeqCst)
+                && !TEMPLATE_RECALC_RUNNING.swap(true, Ordering::SeqCst)
+            {
+                continue;
+            }
+            break;
+        }
+    });
+    if spawned.is_err() {
+        TEMPLATE_RECALC_RUNNING.store(false, Ordering::SeqCst);
+        TEMPLATE_RECALC_PENDING.store(false, Ordering::SeqCst);
+        recalculate_memory_templates_blocking();
+    }
+}
+
+/// Take the template lock without blocking. A panic in an earlier run (now
+/// caught by the worker) poisons it; the old `let Ok(..) = try_lock() else {
+/// return }` would then have skipped EVERY later recalculation, freezing the
+/// projection for the life of the process. Recover the guard instead.
+fn try_acquire_template_lock() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match recalculate_templates_lock().try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            recalculate_templates_lock().clear_poison();
+            Some(poisoned.into_inner())
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+fn recalculate_memory_templates_blocking() {
+    let Some(_recalculate_guard) = try_acquire_template_lock() else {
         return;
     };
     let cfg = get_config().mempool.clone();
@@ -4581,5 +4796,459 @@ mod tests {
         );
         assert!(actions.is_empty());
         assert_eq!(actions_total, 0);
+    }
+
+    // ---- block-template algorithm: reference + scale tests -------------------
+    //
+    // The pre-2026-10-13 implementation, kept VERBATIM (renamed) as the
+    // reference the optimised one must match exactly.
+    fn old_set_relatives(txid: Txid, pool: &mut HashMap<Txid, MinerTx>, visiting: &mut HashSet<Txid>) {
+        if !visiting.insert(txid) {
+            return;
+        }
+        let inputs = pool.get(&txid).map(|tx| tx.inputs.clone()).unwrap_or_default();
+        let mut ancestors = HashSet::new();
+        for parent in inputs {
+            if !pool.contains_key(&parent) {
+                continue;
+            }
+            old_set_relatives(parent, pool, visiting);
+            ancestors.insert(parent);
+            if let Some(parent_tx) = pool.get(&parent) {
+                for ancestor in &parent_tx.ancestors {
+                    ancestors.insert(*ancestor);
+                }
+            }
+            if let Some(parent_tx) = pool.get_mut(&parent) {
+                parent_tx.children.insert(txid);
+            }
+        }
+        let mut ancestor_fee = pool.get(&txid).map(|tx| tx.fee).unwrap_or_default();
+        let mut ancestor_vsize = pool.get(&txid).map(|tx| tx.adjusted_vsize).unwrap_or(1);
+        for ancestor in &ancestors {
+            if let Some(parent) = pool.get(ancestor) {
+                ancestor_fee = ancestor_fee.saturating_add(parent.fee);
+                ancestor_vsize = ancestor_vsize.saturating_add(parent.adjusted_vsize);
+            }
+        }
+        if let Some(tx) = pool.get_mut(&txid) {
+            tx.ancestors = ancestors;
+            tx.ancestor_fee = ancestor_fee;
+            tx.ancestor_vsize = ancestor_vsize.max(1);
+            tx.score = tx.ancestor_fee as f64 / tx.ancestor_vsize as f64;
+        }
+        visiting.remove(&txid);
+    }
+
+    fn old_update_descendants(
+        root: Txid,
+        pool: &mut HashMap<Txid, MinerTx>,
+        modified: &mut Vec<Txid>,
+        cluster_rate: f64,
+    ) {
+        let mut stack: Vec<Txid> = pool
+            .get(&root)
+            .map(|tx| tx.children.iter().copied().collect())
+            .unwrap_or_default();
+        let mut seen = HashSet::new();
+        while let Some(child) = stack.pop() {
+            if !seen.insert(child) {
+                continue;
+            }
+            let children: Vec<Txid> = pool
+                .get(&child)
+                .map(|tx| tx.children.iter().copied().collect())
+                .unwrap_or_default();
+            let mut changed = false;
+            if let (Some(root_tx), Some(child_tx)) = (pool.get(&root).cloned(), pool.get_mut(&child)) {
+                if child_tx.ancestors.remove(&root) {
+                    child_tx.ancestor_fee = child_tx.ancestor_fee.saturating_sub(root_tx.fee);
+                    child_tx.ancestor_vsize =
+                        child_tx.ancestor_vsize.saturating_sub(root_tx.adjusted_vsize).max(1);
+                    child_tx.score = child_tx.ancestor_fee as f64 / child_tx.ancestor_vsize as f64;
+                    child_tx.dependency_rate = child_tx.dependency_rate.min(cluster_rate);
+                    changed = true;
+                }
+            }
+            if changed {
+                if let Some(child_tx) = pool.get_mut(&child) {
+                    if !child_tx.modified {
+                        child_tx.modified = true;
+                        modified.push(child);
+                    }
+                }
+            }
+            stack.extend(children);
+        }
+    }
+
+    fn old_calculate_block_templates(
+        txs: &HashMap<Txid, MempoolTransactionStruct>,
+        max_blocks: usize,
+        weight_limit: u64,
+    ) -> (Vec<Vec<Txid>>, HashMap<Txid, f64>) {
+        let mut pool: HashMap<Txid, MinerTx> = txs
+            .iter()
+            .map(|(txid, tx)| {
+                let adjusted_vsize = tx.vsize.max(1);
+                (
+                    *txid,
+                    MinerTx {
+                        fee: tx.fee_sat,
+                        weight: tx.weight.max(adjusted_vsize * 4),
+                        adjusted_vsize,
+                        fee_rate: tx.fee_rate,
+                        dependency_rate: tx.fee_rate,
+                        inputs: tx
+                            .inputs
+                            .iter()
+                            .copied()
+                            .filter(|parent| txs.contains_key(parent))
+                            .collect(),
+                        spent_outpoints: tx.spent_outpoints.clone(),
+                        ancestors: HashSet::new(),
+                        children: HashSet::new(),
+                        ancestor_fee: tx.fee_sat,
+                        ancestor_vsize: adjusted_vsize,
+                        score: tx.fee_rate,
+                        used: false,
+                        modified: false,
+                    },
+                )
+            })
+            .collect();
+
+        let keys: Vec<Txid> = pool.keys().copied().collect();
+        for txid in keys {
+            old_set_relatives(txid, &mut pool, &mut HashSet::new());
+        }
+
+        let mut mempool_array: Vec<Txid> = pool.keys().copied().collect();
+        mempool_array.sort_by(|a, b| {
+            let aa = pool.get(a).map(|tx| tx.score).unwrap_or_default();
+            let bb = pool.get(b).map(|tx| tx.score).unwrap_or_default();
+            bb.partial_cmp(&aa).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.cmp(b))
+        });
+
+        let mut blocks = Vec::new();
+        let mut block = Vec::new();
+        let mut block_weight = 4_000u64;
+        let mut modified: Vec<Txid> = Vec::new();
+        let mut overflow: Vec<Txid> = Vec::new();
+        let mut failures = 0usize;
+        let mut top = 0usize;
+        let mut spent_outpoints: HashSet<OutPoint> = HashSet::new();
+        let mut effective_rates: HashMap<Txid, f64> = HashMap::new();
+
+        while top < mempool_array.len() || !modified.is_empty() {
+            while top < mempool_array.len()
+                && pool.get(&mempool_array[top]).map(|tx| tx.used || tx.modified).unwrap_or(true)
+            {
+                top += 1;
+            }
+            modified.sort_by(|a, b| {
+                let aa = pool.get(a).map(|tx| tx.score).unwrap_or_default();
+                let bb = pool.get(b).map(|tx| tx.score).unwrap_or_default();
+                bb.partial_cmp(&aa).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.cmp(b))
+            });
+
+            let next_pool = mempool_array.get(top).copied();
+            let next_modified = modified.first().copied();
+            let next = match (next_pool, next_modified) {
+                (Some(pool_tx), Some(mod_tx)) => {
+                    let pool_score = pool.get(&pool_tx).map(|tx| tx.score).unwrap_or_default();
+                    let mod_score = pool.get(&mod_tx).map(|tx| tx.score).unwrap_or_default();
+                    if pool_score > mod_score {
+                        top += 1;
+                        Some(pool_tx)
+                    } else {
+                        modified.remove(0);
+                        Some(mod_tx)
+                    }
+                }
+                (Some(pool_tx), None) => {
+                    top += 1;
+                    Some(pool_tx)
+                }
+                (None, Some(mod_tx)) => {
+                    modified.remove(0);
+                    Some(mod_tx)
+                }
+                (None, None) => None,
+            };
+
+            if let Some(next_txid) = next {
+                if pool.get(&next_txid).map(|tx| tx.used).unwrap_or(true) {
+                    continue;
+                }
+                let next_tx = pool.get(&next_txid).cloned();
+                let Some(next_tx) = next_tx else { continue };
+                let package_fits = blocks.len() >= max_blocks.saturating_sub(1)
+                    || block_weight.saturating_add(next_tx.ancestor_vsize.saturating_mul(4))
+                        < weight_limit;
+                if package_fits {
+                    let mut package: Vec<Txid> = next_tx.ancestors.iter().copied().collect();
+                    package.sort_by_key(|txid| {
+                        pool.get(txid).map(|tx| tx.ancestors.len()).unwrap_or_default()
+                    });
+                    package.push(next_txid);
+                    let package_conflicts = package.iter().any(|txid| {
+                        pool.get(txid)
+                            .map(|tx| {
+                                tx.spent_outpoints
+                                    .iter()
+                                    .any(|outpoint| spent_outpoints.contains(outpoint))
+                            })
+                            .unwrap_or(false)
+                    });
+                    if package_conflicts {
+                        if let Some(tx) = pool.get_mut(&next_txid) {
+                            tx.used = true;
+                        }
+                        failures += 1;
+                        continue;
+                    }
+                    let effective_rate = next_tx
+                        .dependency_rate
+                        .min(next_tx.ancestor_fee as f64 / next_tx.ancestor_vsize.max(1) as f64);
+                    let mut used = Vec::new();
+                    for txid in package {
+                        if let Some(tx) = pool.get_mut(&txid) {
+                            if tx.used {
+                                continue;
+                            }
+                            tx.used = true;
+                            tx.fee_rate = effective_rate;
+                            for outpoint in &tx.spent_outpoints {
+                                spent_outpoints.insert(*outpoint);
+                            }
+                            effective_rates.insert(txid, effective_rate);
+                            block_weight = block_weight.saturating_add(tx.weight);
+                            block.push(txid);
+                            used.push(txid);
+                        }
+                    }
+                    for txid in used {
+                        old_update_descendants(txid, &mut pool, &mut modified, effective_rate);
+                    }
+                    failures = 0;
+                } else {
+                    overflow.push(next_txid);
+                    failures += 1;
+                }
+            }
+
+            let exceeded_tries = failures > 1000 && block_weight > weight_limit.saturating_sub(4_000);
+            let queue_empty = top >= mempool_array.len() && modified.is_empty();
+            if (exceeded_tries || queue_empty) && blocks.len() < max_blocks.saturating_sub(1) {
+                if block.is_empty() {
+                    break;
+                }
+                blocks.push(block);
+                block = Vec::new();
+                block_weight = 4_000;
+                for txid in overflow.drain(..).rev() {
+                    if pool.get(&txid).map(|tx| tx.modified).unwrap_or(false) {
+                        modified.push(txid);
+                    } else {
+                        top = top.saturating_sub(1);
+                        if top < mempool_array.len() {
+                            mempool_array[top] = txid;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !block.is_empty() {
+            blocks.push(block);
+        }
+        (blocks, effective_rates)
+    }
+
+
+    /// Tiny deterministic PRNG (no rand dependency in this crate's tests).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    fn txid_from_index(i: u64) -> Txid {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&i.to_le_bytes());
+        bytes[8] = 0xA5;
+        Txid::from_byte_array(bytes)
+    }
+
+    /// A synthetic mempool of `chains` unconfirmed chains, each `depth` deep.
+    /// Every child spends `dup` outputs of its parent (so its `inputs` list the
+    /// parent `dup` times, exactly like `tx_inputs` on a real tx) and, every
+    /// third tx, also an output of its grandparent (a diamond).
+    /// `conflicts` makes some txs double-spend an outpoint shared with another chain.
+    fn synthetic_mempool(
+        rng: &mut Lcg,
+        chains: u64,
+        depth: u64,
+        dup: usize,
+        conflicts: bool,
+    ) -> HashMap<Txid, MempoolTransactionStruct> {
+        let mut txs = HashMap::new();
+        let mut next_id = 0u64;
+        for chain in 0..chains {
+            let mut prev: Option<Txid> = None;
+            let mut prev2: Option<Txid> = None;
+            for level in 0..depth {
+                let txid = txid_from_index(next_id);
+                next_id += 1;
+                let vsize = 100 + rng.below(900);
+                let fee = 1 + rng.below(vsize * 50);
+                let mut inputs = Vec::new();
+                let mut spent = Vec::new();
+                if let Some(p) = prev {
+                    for vout in 0..dup {
+                        inputs.push(p);
+                        spent.push(OutPoint { txid: p, vout: vout as u32 });
+                    }
+                }
+                if level % 3 == 2 {
+                    if let Some(gp) = prev2 {
+                        inputs.push(gp);
+                        spent.push(OutPoint { txid: gp, vout: 7 });
+                    }
+                }
+                if conflicts && rng.below(10) == 0 {
+                    // double-spend a confirmed outpoint shared with another chain
+                    let shared = txid_from_index(1_000_000_000 + rng.below(chains.max(2)));
+                    spent.push(OutPoint { txid: shared, vout: 0 });
+                } else {
+                    spent.push(OutPoint { txid: txid_from_index(2_000_000_000 + chain * 1000 + level), vout: 0 });
+                }
+                let (_, mut entry) = mempool_transaction(0, vsize, fee);
+                entry.txid = txid;
+                entry.inputs = inputs;
+                entry.spent_outpoints = spent;
+                txs.insert(txid, entry);
+                prev2 = prev;
+                prev = Some(txid);
+            }
+        }
+        txs
+    }
+
+    /// Every in-pool parent is placed before its child (earlier block, or
+    /// earlier in the same block), and no tx is placed twice.
+    fn assert_topologically_valid(
+        txs: &HashMap<Txid, MempoolTransactionStruct>,
+        blocks: &[Vec<Txid>],
+    ) {
+        let mut position: HashMap<Txid, (usize, usize)> = HashMap::new();
+        for (b, block) in blocks.iter().enumerate() {
+            for (i, txid) in block.iter().enumerate() {
+                assert!(position.insert(*txid, (b, i)).is_none(), "tx placed twice");
+            }
+        }
+        for (txid, tx) in txs {
+            let Some(child_pos) = position.get(txid) else { continue };
+            for parent in &tx.inputs {
+                if !txs.contains_key(parent) {
+                    continue;
+                }
+                let parent_pos = position.get(parent).expect("child placed without its parent");
+                assert!(parent_pos < child_pos, "parent placed after child");
+            }
+        }
+    }
+
+    #[test]
+    fn calculate_block_templates_matches_reference_on_random_mempools() {
+        let mut rng = Lcg(0x5eed_e5b0);
+        for case in 0..400u64 {
+            let chains = 1 + rng.below(40);
+            let depth = 1 + rng.below(7);
+            let dup = 1 + rng.below(3) as usize;
+            let txs = synthetic_mempool(&mut rng, chains, depth, dup, case % 2 == 0);
+            // Small blocks so packages overflow, blocks close early, and the
+            // modified queue and overflow re-insertion paths are exercised.
+            let weight_limit = 4_000 + rng.below(40_000);
+            let max_blocks = 1 + rng.below(8) as usize;
+            let (new_blocks, new_rates) = calculate_block_templates(&txs, max_blocks, weight_limit);
+            let (old_blocks, old_rates) =
+                old_calculate_block_templates(&txs, max_blocks, weight_limit);
+            assert_eq!(new_blocks, old_blocks, "blocks differ in case {case}");
+            assert_eq!(new_rates.len(), old_rates.len(), "rates differ in case {case}");
+            for (txid, rate) in &old_rates {
+                assert_eq!(
+                    new_rates.get(txid).map(|r| r.to_bits()),
+                    Some(rate.to_bits()),
+                    "rate differs in case {case}"
+                );
+            }
+            assert_topologically_valid(&txs, &new_blocks);
+        }
+    }
+
+    /// The production failure: a cold start bulk-loads ~80k mempool txs with
+    /// deep chains whose children spend several outputs of their parent. The
+    /// old algorithm is exponential in chain depth there and never returned
+    /// (observed: >40 min on espo-z at 80k txs). Bound is generous for debug
+    /// builds; release runs in well under a second.
+    #[test]
+    fn calculate_block_templates_bulk_80k_deep_chains_is_bounded() {
+        let mut rng = Lcg(0x80_000);
+        // 1250 chains x 64 deep = 80,000 txs (v31 cluster limit is 64), each
+        // child spending 3 outputs of its parent plus diamonds every 3rd level.
+        let txs = synthetic_mempool(&mut rng, 1250, 64, 3, true);
+        assert_eq!(txs.len(), 80_000);
+        let started = std::time::Instant::now();
+        let (blocks, rates) = calculate_block_templates(&txs, 8, 4_000_000);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "80k-tx template took {elapsed:?}"
+        );
+        assert!(!blocks.is_empty());
+        assert!(blocks.len() <= 8);
+        let placed: usize = blocks.iter().map(Vec::len).sum();
+        assert_eq!(placed, rates.len());
+        assert_topologically_valid(&txs, &blocks);
+        eprintln!("80k deep-chain template: {} blocks, {} txs placed in {:?}", blocks.len(), placed, elapsed);
+    }
+
+    #[test]
+    fn recalculate_requests_do_not_block_the_caller_and_survive_a_panic() {
+        // The request must return immediately and the worker must wind down.
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            recalculate_memory_templates();
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while TEMPLATE_RECALC_RUNNING.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "template worker never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!TEMPLATE_RECALC_PENDING.load(Ordering::SeqCst));
+
+        // Same test (not a separate one) because both touch the global
+        // template lock and tests run in parallel. Under test every run panics
+        // (config is not initialised), which is exactly the case to cover: the
+        // worker catches the panic, and the lock it poisoned must not block
+        // later recalculations. Poison it the same way, explicitly:
+        let _ = std::thread::spawn(|| {
+            let _guard = recalculate_templates_lock().lock().unwrap_or_else(|e| e.into_inner());
+            panic!("simulated panic inside a template recalculation");
+        })
+        .join();
+        assert!(recalculate_templates_lock().is_poisoned());
+        let guard = try_acquire_template_lock();
+        assert!(guard.is_some(), "a poisoned lock must not block later recalculations");
+        drop(guard);
+        assert!(!recalculate_templates_lock().is_poisoned());
     }
 }
