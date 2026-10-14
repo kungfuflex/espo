@@ -809,6 +809,23 @@ impl EspoModule for AmmData {
         )?;
         debug::log_elapsed(module, "discover_new_pools", timer);
 
+        // Curve CryptoSwap pools have no factory to discover them from, so they
+        // are seeded from a static table and priced off their own storage. This
+        // has to run before the delta pass, which consumes both.
+        let timer = debug::start_if(debug);
+        let cryptoswap_cnt = crate::modules::ammdata::utils::cryptoswap::register_cryptoswap_pools(
+            blockhash_state.clone(),
+            network,
+            provider,
+            essentials,
+            &canonical_quote_units,
+            &mut state,
+        )?;
+        if cryptoswap_cnt > 0 {
+            eprintln!("[AMMDATA] registered {cryptoswap_cnt} cryptoswap pools");
+        }
+        debug::log_elapsed(module, "register_cryptoswap_pools", timer);
+
         let timer = debug::start_if(debug);
         crate::modules::ammdata::utils::index_activity::process_balance_deltas(
             block_ts,

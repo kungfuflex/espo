@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::config::get_metashrew;
+use crate::config::{get_metashrew, get_network};
 use crate::modules::ammdata::schemas::{SchemaMarketDefs, SchemaPoolSnapshot};
 use crate::modules::ammdata::storage::{
     AmmDataProvider, GetAmmFactoriesParams, GetFactoryPoolsParams, GetIndexHeightParams,
@@ -98,6 +98,26 @@ pub fn fetch_all_pools(
                     pools.insert(pool, defs);
                 }
             }
+        }
+    }
+
+    // CryptoSwap pools are registered from a static table rather than by a
+    // factory, so walking `factory_pools` above cannot reach them. They are
+    // added here from their persisted defs, which is also why they are not
+    // written into the AMM factory set: that set means "this alkane is an AMM
+    // factory", and none of these is.
+    for def in crate::modules::ammdata::utils::cryptoswap::cryptoswap_pools(get_network()) {
+        if pools.contains_key(&def.pool) {
+            continue;
+        }
+        let registered = provider
+            .get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool: def.pool })
+            .ok()
+            .and_then(|v| v.defs);
+        // Only surface a pool the indexer has actually registered. Seeding from
+        // the static table alone would advertise a pool before it is deployed.
+        if let Some(defs) = registered {
+            pools.insert(def.pool, defs);
         }
     }
 

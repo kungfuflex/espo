@@ -18,6 +18,16 @@ pub struct IndexState {
     pub activity_acc: ActivityWriteAcc,
     pub index_acc: ActivityIndexAcc,
 
+    /// Pools whose price does not come from the reserve ratio, as
+    /// `(quote_per_base, base_per_quote)` at `PRICE_SCALE`.
+    ///
+    /// Populated per block from the pool's own on-chain price oracle. Only
+    /// Curve CryptoSwap pools appear here: on a constant-product pool the ratio
+    /// *is* the price, but on a v2 curve the balances sit wherever the
+    /// invariant puts them and the ratio only coincides with the price at
+    /// equilibrium. See [`super::cryptoswap`].
+    pub pool_price_overrides: HashMap<SchemaAlkaneId, (u128, u128)>,
+
     pub canonical_pool_updates: HashMap<SchemaAlkaneId, Vec<SchemaCanonicalPoolEntry>>,
     pub canonical_trade_buckets: HashMap<SchemaAlkaneId, HashSet<(Timeframe, u64)>>,
     pub in_block_trade_volumes: HashMap<SchemaAlkaneId, (u128, u128)>,
@@ -97,6 +107,7 @@ impl IndexState {
             candle_cache: CandleCache::new(),
             activity_acc: ActivityWriteAcc::new(),
             index_acc: ActivityIndexAcc::new(),
+            pool_price_overrides: HashMap::new(),
             canonical_pool_updates: HashMap::new(),
             canonical_trade_buckets: HashMap::new(),
             in_block_trade_volumes: HashMap::new(),

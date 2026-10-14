@@ -194,8 +194,24 @@ pub fn process_balance_deltas(
                 let entry = state.in_block_trade_volumes.entry(owner).or_insert((0, 0));
                 entry.0 = entry.0.saturating_add(base_abs);
                 entry.1 = entry.1.saturating_add(quote_abs);
-                let p_q_per_b = price_quote_per_base(new_base, new_quote);
-                let p_b_per_q = price_base_per_quote(new_base, new_quote);
+                // The reserve ratio is the spot price only on a constant-product
+                // pool. A Curve v2 pool carries its price in `price_oracle`, and
+                // its balances sit wherever the invariant puts them, so for those
+                // the ratio is overridden with the price read off the contract.
+                //
+                // The override is one price per block, so several trades in the
+                // same block share it and cannot carve out intra-block wicks. A
+                // block is already shorter than the 10m base frame, and the
+                // alternative — the realised rate implied by the deltas — is
+                // fee-inclusive, which on a 0.2-0.8% dynamic fee would print a
+                // visible sawtooth across alternating buys and sells.
+                let (p_q_per_b, p_b_per_q) = match state.pool_price_overrides.get(&owner) {
+                    Some((quote_per_base, base_per_quote)) => (*quote_per_base, *base_per_quote),
+                    None => (
+                        price_quote_per_base(new_base, new_quote),
+                        price_base_per_quote(new_base, new_quote),
+                    ),
+                };
                 let base_volume = base_abs;
                 let quote_volume = quote_abs;
 
