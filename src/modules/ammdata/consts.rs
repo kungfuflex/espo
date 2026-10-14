@@ -104,14 +104,16 @@ pub struct DerivedQuoteFork {
     pub height: u32,
 }
 
-/// TORTILLA stops taking DIESEL price movements into its derived chart here.
+/// The height upstream compiled in for TORTILLA's detach from DIESEL. Kept as a
+/// reference value only: this fork does NOT apply it from a constant. The detach
+/// is an operator decision and is expressed in config as
+/// `derive_sources: [{ "alkane": "2:68479", "drop_forks": [{ "alkane": "2:0",
+/// "height": 969393 }] }]`, which `DerivedIndexPlan::pair_dropped` applies with
+/// exactly the same effect.
 pub const MAINNET_TORTILLA_DIESEL_DETACH_HEIGHT: u32 = 969_393;
 
-const MAINNET_DERIVED_QUOTE_FORKS: &[DerivedQuoteFork] = &[DerivedQuoteFork {
-    token: SchemaAlkaneId { block: 2, tx: 68479 },
-    quote: SchemaAlkaneId { block: 2, tx: 0 },
-    height: MAINNET_TORTILLA_DIESEL_DETACH_HEIGHT,
-}];
+/// Compiled-in derived-quote forks. Deliberately empty: every fork is config.
+const MAINNET_DERIVED_QUOTE_FORKS: &[DerivedQuoteFork] = &[];
 
 /// True when `token`'s derived chart against `quote` must ignore the quote's pool
 /// at `height`.
@@ -206,18 +208,16 @@ mod tests {
     }
 
     #[test]
-    fn tortilla_detaches_from_diesel_at_the_fork_height() {
+    fn no_derived_quote_fork_is_compiled_in() {
+        // The TORTILLA/DIESEL detach is config (derive_sources.drop_forks), never
+        // a constant: nothing detaches on any network unless configured.
         let tort = SchemaAlkaneId { block: 2, tx: 68479 };
         let diesel = SchemaAlkaneId { block: 2, tx: 0 };
         let h = MAINNET_TORTILLA_DIESEL_DETACH_HEIGHT;
-        assert!(!derived_quote_detached_at_height(Network::Bitcoin, &tort, &diesel, h - 1));
-        assert!(derived_quote_detached_at_height(Network::Bitcoin, &tort, &diesel, h));
-        assert!(derived_quote_detached_at_height(Network::Bitcoin, &tort, &diesel, h + 100_000));
-        // Mainnet only, and only that pair.
-        assert!(!derived_quote_detached_at_height(Network::Regtest, &tort, &diesel, h));
-        let other = SchemaAlkaneId { block: 2, tx: 1 };
-        assert!(!derived_quote_detached_at_height(Network::Bitcoin, &other, &diesel, h));
-        assert!(!derived_quote_detached_at_height(Network::Bitcoin, &tort, &other, h));
+        for height in [h - 1, h, h + 100_000] {
+            assert!(!derived_quote_detached_at_height(Network::Bitcoin, &tort, &diesel, height));
+        }
+        assert!(MAINNET_DERIVED_QUOTE_FORKS.is_empty());
     }
 
     #[test]

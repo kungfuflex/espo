@@ -197,6 +197,13 @@ reads - or to divide out supply per bucket from the stored price candle.
 
 ### Derived-chart forks
 
+**In this fork `MAINNET_DERIVED_QUOTE_FORKS` is empty: every derived-chart fork is
+config.** Upstream compiled in TORTILLA (`2:68479`) detaching from DIESEL (`2:0`) at
+969393; here that is the operator's `derive_sources` entry
+`{ "alkane": "2:68479", "drop_forks": [{ "alkane": "2:0", "height": 969393 }] }`,
+which has the same effect. `-cmcap` is likewise held (`CMCAP_ENABLED = false` in
+`storage.rs`; requests answer `cmcap_disabled`).
+
 `MAINNET_DERIVED_QUOTE_FORKS` (`consts.rs`) lists (token, derived quote, height)
 triples. From the height on, the token's `-derived_<quote>-usd` chart no longer
 registers the quote's pool as its derived pool, so the quote's price moves stop

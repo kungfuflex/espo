@@ -1079,27 +1079,25 @@ fn docs_modules() -> Vec<ModuleDoc> {
             methods: vec![
                 rpc_doc(
                     "ammdata.get_candles",
-                    "Returns OHLCV candles for a pool or an alkane over a timeframe (10m, 1h, 4h, 1d, 1w, 1M), newest first, with missing buckets forward-filled. pool is a pool id, or an alkane id with a chart suffix. Price: -usd and -sats. Market cap: -mcusd and -mcsats, which are price times the supply essentials tracks; that supply counts every minted token, so these are closer to FDV. Circulating market cap: -cmcap, the mcusd candles multiplied by (supply - non_circulating) / supply, where non_circulating is what the token's listed mainnet lockers, treasuries and burn addresses hold. The candle values are the scaled market cap; each candle also carries circulating_ratio, the multiplier that was applied, and the response carries cmcap with configured, holders and steps (how many times the ratio has changed). A token with no holder list comes back identical to -mcusd with configured false and a ratio of 1. Derived: <alkane>-derived_<quote>-<kind> merges the alkane's direct frBTC pricing with its price through its pool against a derived quote. Full: <alkane>-full, or <alkane>-full-<kind> for usd, sats, mcusd, mcsats and cmcap, is the id to use when you do not want to track which derived quote an alkane is on. It resolves to the alkane's derived chart against the target configured for it, otherwise against the default derived quote, otherwise to its direct chart; the response then keeps pool exactly as requested and adds resolved_pool, the id of the chart that was served. An operator can change how an alkane is priced from a chosen block onward without any id changing: a derived quote can come into force at a height, in which case each token's chart against it continues from its earlier history and -full moves a token over only once it has traded since; a pool can be dropped from an alkane's derived charts from a height; and an alkane can be given a start height before which none of its charts return candles. Volume is trade volume and is never scaled. USD values are fixed-point integers scaled by 10^16.",
-                    json!({ "pool": "4:8888-full-cmcap", "timeframe": "1d", "limit": 1, "page": 1 }),
+                    "Returns OHLCV candles for a pool or an alkane over a timeframe (10m, 1h, 4h, 1d, 1w, 1M), newest first, with missing buckets forward-filled. pool is a pool id, or an alkane id with a chart suffix. Price: -usd and -sats. Market cap: -mcusd and -mcsats, which are price times the supply essentials tracks; that supply counts every minted token, so these are closer to FDV. Circulating market cap (-cmcap) is not enabled on this espo and answers error cmcap_disabled. Derived: <alkane>-derived_<quote>-<kind> merges the alkane's direct frBTC pricing with its price through its pool against a derived quote. Full: <alkane>-full, or <alkane>-full-<kind> for usd, sats, mcusd and mcsats, is the id to use when you do not want to track which derived quote an alkane is on. It resolves to the alkane's derived chart against the target configured for it, otherwise against the default derived quote, otherwise to its direct chart; the response then keeps pool exactly as requested and adds resolved_pool, the id of the chart that was served. An operator can change how an alkane is priced from a chosen block onward without any id changing: a derived quote can come into force at a height, in which case each token's chart against it continues from its earlier history and -full moves a token over only once it has traded since; a pool can be dropped from an alkane's derived charts from a height; and an alkane can be given a start height before which none of its charts return candles. Volume is trade volume and is never scaled. USD values are fixed-point integers scaled by 10^16.",
+                    json!({ "pool": "4:8888-full-mcusd", "timeframe": "1d", "limit": 1, "page": 1 }),
                     json!({
                         "ok": true,
-                        "pool": "4:8888-full-cmcap",
-                        "resolved_pool": "4:8888-derived_2:68479-cmcap",
+                        "pool": "4:8888-full-mcusd",
+                        "resolved_pool": "4:8888-derived_2:68479-mcusd",
                         "timeframe": "1d",
                         "side": "base",
                         "page": 1,
                         "limit": 1,
                         "total": 12,
                         "has_more": true,
-                        "cmcap": { "configured": true, "holders": 5, "steps": 38 },
                         "candles": [{
                             "ts": 1790812800,
                             "open": "1410000000000000000000",
                             "high": "1460000000000000000000",
                             "low": "1390000000000000000000",
                             "close": "1440000000000000000000",
-                            "volume": "5200000000",
-                            "circulating_ratio": 0.0112
+                            "volume": "5200000000"
                         }]
                     }),
                 ),

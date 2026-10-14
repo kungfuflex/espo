@@ -42,7 +42,7 @@ use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use alloy_primitives::U256;
 use anyhow::{Result, anyhow};
-use bitcoin::{Address, BlockHash, Transaction, consensus::deserialize};
+use bitcoin::{Address, BlockHash, Network, Transaction, consensus::deserialize};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{Value, json, map::Map};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -50,6 +50,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// `-cmcap` candles. Held off until the non-circulating holder table in
+/// `consts::MAINNET_NON_CIRCULATING` is verified.
+const CMCAP_ENABLED: bool = false;
 const PRICE_COMPARISON_HOURS: usize = 24;
 const MAX_PRICE_ASSETS: usize = 1_000;
 const FRBTC_ASSET: SchemaAlkaneId = SchemaAlkaneId { block: 32, tx: 0 };
@@ -3156,15 +3159,33 @@ impl AmmDataProvider {
         pending_pool_factory: &[(Vec<u8>, Vec<u8>)],
         pending_factory_pools: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<HashSet<SchemaAlkaneId>> {
+        self.pools_not_in_factories_on(
+            get_network(),
+            pools,
+            factories,
+            pending_pool_factory,
+            pending_factory_pools,
+        )
+    }
+
+    /// `pools_not_in_factories` for an explicit network (tests use mainnet).
+    pub fn pools_not_in_factories_on(
+        &self,
+        network: Network,
+        pools: &[SchemaAlkaneId],
+        factories: &[SchemaAlkaneId],
+        pending_pool_factory: &[(Vec<u8>, Vec<u8>)],
+        pending_factory_pools: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<HashSet<SchemaAlkaneId>> {
         let table = self.table();
         let mut trusted: HashSet<SchemaAlkaneId> = HashSet::new();
 
-        // Statically seeded CryptoSwap pools (BTCUSD) have no factory at all:
-        // they were deployed directly, not through any AMM factory, so neither
-        // factory record exists for them. They are trusted by construction:
-        // the table names exactly which alkane is which pool, and a pool not
-        // in it is never registered.
-        let network = get_network();
+        // Statically seeded CryptoSwap pools (BTCUSD 4:1778) have no factory at
+        // all: they were deployed directly, not through any AMM factory, so
+        // neither factory record exists for them and the allowlist would
+        // exclude them. They are trusted by construction: the cryptoswap table
+        // names exactly which alkane is which pool, and a pool not in it is
+        // never registered.
         for pool in pools {
             if crate::modules::ammdata::utils::cryptoswap::is_cryptoswap_pool(network, pool) {
                 trusted.insert(*pool);
@@ -4378,6 +4399,19 @@ impl AmmDataProvider {
         let mut is_mcsats = false;
         let mut is_cmcap = false;
 
+        // -cmcap is held in this fork: its non-circulating holder table is an
+        // upstream claim about who holds DIESEL, TORTILLA and SLICE that has not
+        // been verified here, and the number it publishes is a market-cap claim.
+        // Off until CMCAP_ENABLED is flipped deliberately.
+        if !CMCAP_ENABLED && pool_raw.ends_with("-cmcap") {
+            return Ok(RpcGetCandlesResult {
+                value: json!({
+                    "ok": false,
+                    "error": "cmcap_disabled",
+                    "hint": "circulating market cap charts are not enabled on this espo"
+                }),
+            });
+        }
         let pool = if let Some(stripped) = pool_raw.strip_suffix("-cmcap") {
             match parse_token_or_derived(stripped) {
                 Ok((p, q)) => {
@@ -8471,6 +8505,62 @@ mod tests {
         assert!(!provider.pool_in_factories(&unrecorded, &[OYL]));
         // Trusting the other factory instead flips it.
         assert!(provider.pool_in_factories(&foreign, &[OTHER_FACTORY]));
+    }
+
+    #[test]
+    fn btcusd_cryptoswap_pool_still_prices_frusd_after_the_pricing_factory_fork() {
+        // BTCUSD (4:1778, frBTC/frUSD) was deployed directly, not through the Oyl
+        // factory, so it has no pool_factory / factory_pools record. From mainnet
+        // 970000 only allowlisted factories may price tokens; without the
+        // CryptoSwap exemption the pool would land in pricing_excluded_pools and
+        // every gate that consults that set (process_balance_deltas' canonical
+        // trade buckets, derive_token_data's canonical/derived pools,
+        // derive_pool_metrics, get_canonical_pools) would stop it pricing frUSD.
+        use crate::modules::ammdata::consts::{
+            MAINNET_PRICING_FACTORY_FORK_HEIGHT, pricing_factories_at_height,
+        };
+        use crate::modules::ammdata::utils::cryptoswap::is_cryptoswap_pool;
+        let (_dir, provider) = tvl_test_provider();
+        let btcusd = SchemaAlkaneId { block: 4, tx: 1778 };
+        let foreign = SchemaAlkaneId { block: 2, tx: 96884 };
+        assert!(is_cryptoswap_pool(Network::Bitcoin, &btcusd));
+
+        for height in [MAINNET_PRICING_FACTORY_FORK_HEIGHT, MAINNET_PRICING_FACTORY_FORK_HEIGHT + 10_000] {
+            let factories =
+                pricing_factories_at_height(Network::Bitcoin, height).expect("allowlist in force");
+            let excluded = provider
+                .pools_not_in_factories_on(Network::Bitcoin, &[btcusd, foreign], factories, &[], &[])
+                .expect("read");
+            assert!(!excluded.contains(&btcusd), "BTCUSD must keep pricing frUSD at {height}");
+            assert!(excluded.contains(&foreign), "an unrecorded non-Oyl pool is still excluded");
+        }
+
+        // The exemption is mainnet-table-only: on another network 4:1778 is just an
+        // unrecorded pool and is treated like any other.
+        let excluded = provider
+            .pools_not_in_factories_on(Network::Regtest, &[btcusd], &[OYL], &[], &[])
+            .expect("read");
+        assert!(excluded.contains(&btcusd));
+    }
+
+    #[test]
+    fn cmcap_is_held() {
+        let (_dir, provider) = tvl_test_provider();
+        assert!(!CMCAP_ENABLED);
+        for pool in ["2:0-cmcap", "2:68479-derived_2:0-cmcap"] {
+            let res = provider
+                .rpc_get_candles(RpcGetCandlesParams {
+                    pool: Some(pool.to_string()),
+                    timeframe: None,
+                    limit: None,
+                    size: None,
+                    page: None,
+                    side: None,
+                    now: None,
+                })
+                .expect("rpc");
+            assert_eq!(res.value["error"], json!("cmcap_disabled"), "{pool}");
+        }
     }
 
     #[test]
