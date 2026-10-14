@@ -9,8 +9,8 @@ use crate::modules::essentials::utils::balances::{
     SignedU128, get_address_activity_for_address, get_alkane_balances,
     get_alkane_balances_at_or_before, get_alkane_volume_for_source, get_balance_for_address,
     get_holders_for_alkane, get_orbital_holders_for_factory, get_orbital_volume_for_factory,
-    get_outpoint_address, get_outpoint_balances_with_spent_batch, get_total_received_for_alkane,
-    get_transfer_volume_for_alkane,
+    get_outpoint_address, get_outpoint_balances_with_spent_batch, get_self_held_balance,
+    get_total_received_for_alkane, get_transfer_volume_for_alkane,
 };
 use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
 use crate::modules::essentials::utils::names::{
@@ -4350,6 +4350,12 @@ impl EssentialsProvider {
             })
             .collect();
 
+        // The alkane's balance of ITSELF (e.g. LP returned to an OYL pool on
+        // burn) is kept out of `items`/`total`: it is not in circulation, see
+        // `drop_self_holding`. It is reported here so nothing is hidden. `null`
+        // means the metashrew lookup failed, not zero.
+        let self_held = get_self_held_balance(&alk).map(|v| v.to_string());
+
         Ok(RpcGetHoldersResult {
             value: json!({
                 "ok": true,
@@ -4358,6 +4364,7 @@ impl EssentialsProvider {
                 "limit": limit,
                 "total": total,
                 "has_more": has_more,
+                "self_held": self_held,
                 "items": items
             }),
         })
