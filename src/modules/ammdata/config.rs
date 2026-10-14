@@ -680,4 +680,24 @@ mod tests {
         assert!(c.derived_quotes()[0].active_at(0));
         assert!(c.derive_sources.is_empty());
     }
+
+    #[test]
+    fn tortilla_diesel_detach_is_a_drop_forks_entry() {
+        // The deployed config's form of upstream's compiled-in 969393 detach.
+        let c = cfg(json!({
+            "derived_liquidity": [ { "alkane": "2:0", "strategy": "neutral-vwap" } ],
+            "derive_sources": [
+                { "alkane": "2:68479", "drop_forks": [{ "alkane": "2:0", "height": 969393 }] }
+            ]
+        }))
+        .expect("parses");
+        let before = c.derived_index_plan(969_392);
+        assert!(!before.pair_dropped(&TORT, &DIESEL, 969_392));
+        let at = c.derived_index_plan(969_393);
+        assert!(at.pair_dropped(&TORT, &DIESEL, 969_393));
+        assert!(at.pair_dropped(&TORT, &DIESEL, 1_000_000));
+        // only that pair, and DIESEL is not canonical so TORT keeps its canonical leg
+        assert!(!at.pair_dropped(&OTHER, &DIESEL, 969_393));
+        assert!(at.forked_quotes.is_empty());
+    }
 }
