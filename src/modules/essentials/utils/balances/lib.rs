@@ -7022,6 +7022,30 @@ pub fn get_outpoint_balances_with_spent_batch(
     Ok(out)
 }
 
+/// 🔴 A contract's balance of its OWN token is not a holding, and it is not in
+/// the circulating supply.
+///
+/// The OYL pool burn (`alkanes-runtime-pool` burn) takes the LP it is handed,
+/// pays out the reserves, and only lowers its `total_supply` counter: the LP
+/// alkanes stay on the pool's own balance sheet forever. The indexer never adds
+/// those to `/circulating_supply`, but this list used to inject them from
+/// metashrew (`lookup_self_balance`) as an ordinary holder. Measured on DIESEL /
+/// FIRE LP 2:78528 @ 2026-10-03: self row 2,622.09 LP against a circulating
+/// supply of 3,234.04, so the explorer showed the pool "holding 81%" and the
+/// column summed to ~177%; the other 74 rows summed to the supply exactly.
+///
+/// The amount is still reported, but as `self_held` on `essentials.get_holders`
+/// (see `get_self_held_balance`), never as a row, a holder count, or a share.
+pub(crate) fn drop_self_holding(all: &mut Vec<HolderEntry>, alk: &SchemaAlkaneId) {
+    all.retain(|h| h.holder != HolderId::Alkane(*alk));
+}
+
+/// The alkane's balance of itself (burned / returned units), read from
+/// metashrew. `None` when the lookup failed — unknown, not zero.
+pub fn get_self_held_balance(alk: &SchemaAlkaneId) -> Option<u128> {
+    lookup_self_balance(alk)
+}
+
 pub fn get_holders_for_alkane(
     blockhash: StateAt,
     provider: &EssentialsProvider,
@@ -7101,17 +7125,7 @@ pub fn get_holders_for_alkane(
             all.push(HolderEntry { holder, amount });
         }
     }
-    if let Some(self_balance) = lookup_self_balance(&alk) {
-        if self_balance > 0 {
-            if let Some(existing) = all.iter_mut().find(|h| h.holder == HolderId::Alkane(alk)) {
-                existing.amount = self_balance;
-            } else {
-                all.push(HolderEntry { holder: HolderId::Alkane(alk), amount: self_balance });
-            }
-        } else {
-            all.retain(|h| h.holder != HolderId::Alkane(alk));
-        }
-    }
+    drop_self_holding(&mut all, &alk);
 
     all.sort_by(|a, b| match b.amount.cmp(&a.amount) {
         std::cmp::Ordering::Equal => holder_order_key(&a.holder).cmp(&holder_order_key(&b.holder)),
@@ -7494,4 +7508,39 @@ pub fn get_scriptpubkey_for_address(
     let key = table.addr_spk_key(addr);
     let v = provider.get_raw_value(GetRawValueParams { blockhash, key })?.value;
     Ok(v.map(ScriptBuf::from))
+}
+
+#[cfg(test)]
+mod self_holding_tests {
+    use super::*;
+
+    // Shape of DIESEL / FIRE LP 2:78528 on 2026-10-03: the pool holds burned LP
+    // of itself, and that amount is NOT in the circulating supply.
+    #[test]
+    fn self_row_is_dropped_and_rows_sum_to_circulating_supply() {
+        let pool = SchemaAlkaneId { block: 2, tx: 78528 };
+        let other_contract = SchemaAlkaneId { block: 4, tx: 1 };
+        let mut all = vec![
+            HolderEntry { holder: HolderId::Alkane(pool), amount: 262_209_039_891 },
+            HolderEntry { holder: HolderId::Address("bc1pa".into()), amount: 300_000_000_000 },
+            HolderEntry { holder: HolderId::Alkane(other_contract), amount: 23_403_911_297 },
+        ];
+        let circulating: u128 = 323_403_911_297;
+
+        drop_self_holding(&mut all, &pool);
+
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|h| h.holder != HolderId::Alkane(pool)));
+        // A DIFFERENT contract holding the token is a real holder and stays.
+        assert!(all.iter().any(|h| h.holder == HolderId::Alkane(other_contract)));
+        assert_eq!(all.iter().map(|h| h.amount).sum::<u128>(), circulating);
+    }
+
+    #[test]
+    fn no_self_row_is_a_no_op() {
+        let pool = SchemaAlkaneId { block: 2, tx: 78528 };
+        let mut all = vec![HolderEntry { holder: HolderId::Address("bc1pa".into()), amount: 5 }];
+        drop_self_holding(&mut all, &pool);
+        assert_eq!(all.len(), 1);
+    }
 }
