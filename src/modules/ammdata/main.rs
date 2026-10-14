@@ -871,6 +871,12 @@ impl EspoModule for AmmData {
         debug::log_elapsed(module, "pool_metrics_tvl", timer);
 
         let timer = debug::start_if(debug);
+        crate::modules::ammdata::utils::index_tvl::prepare_tvl_lines(
+            block_ts, height, provider, &mut state,
+        )?;
+        debug::log_elapsed(module, "tvl_lines", timer);
+
+        let timer = debug::start_if(debug);
         crate::modules::ammdata::utils::index_total_volume_amm::prepare_total_volume_amm(
             height,
             provider,
@@ -889,7 +895,7 @@ impl EspoModule for AmmData {
         let finalize =
             crate::modules::ammdata::utils::index_finalize::prepare_batch(provider, &mut state)?;
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_derived_mcusd_candles={tdmc_cnt}, chart_changes={cc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, btc_usd_price={btc_cnt}, btc_usd_line={btcl_cnt}, total_volume_amm={tva_cnt}, token_volume_candles={tvc_cnt}, token_volume_total={tvt_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_metrics_index={pmi_cnt}, pool_lp_supply={pls_cnt}, pool_details_snapshot={pds_cnt}, tvl_versioned={tvl_cnt}, token_activity={ta_cnt}, token_activity_amount={taa_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_derived_mcusd_candles={tdmc_cnt}, chart_changes={cc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, btc_usd_price={btc_cnt}, btc_usd_line={btcl_cnt}, total_volume_amm={tva_cnt}, token_volume_candles={tvc_cnt}, token_volume_total={tvt_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_metrics_index={pmi_cnt}, pool_lp_supply={pls_cnt}, pool_details_snapshot={pds_cnt}, tvl_versioned={tvl_cnt}, tvl_line={tvll_cnt}, tvl_total={tvlt_cnt}, pool_tvl_anchor={pta_cnt}, token_activity={ta_cnt}, token_activity_amount={taa_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = finalize.stats.candle_writes,
             tc_cnt = finalize.stats.token_usd_candles,
@@ -920,6 +926,9 @@ impl EspoModule for AmmData {
             pmi_cnt = finalize.stats.pool_metrics_index,
             pls_cnt = finalize.stats.pool_lp_supply,
             tvl_cnt = finalize.stats.tvl_versioned,
+            tvll_cnt = finalize.stats.tvl_line,
+            tvlt_cnt = finalize.stats.tvl_total,
+            pta_cnt = finalize.stats.pool_tvl_anchor,
             ta_cnt = finalize.stats.token_activity,
             taa_cnt = finalize.stats.token_activity_amount,
             ts_cnt = finalize.stats.token_swaps,
