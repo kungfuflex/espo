@@ -1189,6 +1189,13 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .get("outpoint")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
+                            outpoints: payload.get("outpoints").and_then(|v| v.as_array()).map(
+                                |a| {
+                                    a.iter()
+                                        .map(|x| x.as_str().unwrap_or_default().to_string())
+                                        .collect()
+                                },
+                            ),
                         };
                         // 🔴 spawn_blocking IS LOAD-BEARING — do not inline this
                         // back into the async body.
