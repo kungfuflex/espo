@@ -3159,8 +3159,10 @@ impl AmmDataProvider {
         pending_pool_factory: &[(Vec<u8>, Vec<u8>)],
         pending_factory_pools: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<HashSet<SchemaAlkaneId>> {
+        // No network before init_config() (unit tests): no network-specific
+        // exemptions apply, which is what Regtest's empty cryptoswap table gives.
         self.pools_not_in_factories_on(
-            get_network(),
+            crate::config::try_get_network().unwrap_or(Network::Regtest),
             pools,
             factories,
             pending_pool_factory,

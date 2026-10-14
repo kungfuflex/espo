@@ -1321,6 +1321,11 @@ pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
 }
 
+/// `get_network`, but `None` before `init_config()` (unit tests, tools).
+pub fn try_get_network() -> Option<Network> {
+    NETWORK.get().copied()
+}
+
 pub fn compact_tx_trace_rows_enabled() -> bool {
     get_config().compact_tx_trace_rows
 }
