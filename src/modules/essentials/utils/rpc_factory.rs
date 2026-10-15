@@ -178,8 +178,19 @@ fn template_of(
     in_block: &HashMap<SchemaAlkaneId, SchemaAlkaneId>,
     alias: &SchemaAlkaneId,
 ) -> Result<SchemaAlkaneId> {
+    Ok(recorded_template(provider, in_block, alias)?.unwrap_or(*alias))
+}
+
+/// The template espo recorded for `alias` (this block's resolutions first),
+/// or `None` when espo has no creation record for it (e.g. it predates the
+/// index's genesis, or is precompiled).
+fn recorded_template(
+    provider: &EssentialsProvider,
+    in_block: &HashMap<SchemaAlkaneId, SchemaAlkaneId>,
+    alias: &SchemaAlkaneId,
+) -> Result<Option<SchemaAlkaneId>> {
     if let Some(t) = in_block.get(alias) {
-        return Ok(*t);
+        return Ok(Some(*t));
     }
     let rec = provider
         .get_creation_record(GetCreationRecordParams {
@@ -187,7 +198,22 @@ fn template_of(
             alkane: *alias,
         })?
         .record;
-    Ok(rec.and_then(|r| r.inspection.and_then(|i| i.factory_alkane)).unwrap_or(*alias))
+    Ok(rec.and_then(|r| r.inspection.and_then(|i| i.factory_alkane)))
+}
+
+/// TiKV source: a template from espo's records, else the cache's alias
+/// record, else the id itself (the local walk's answer for a binary holder
+/// espo has no record of).
+fn template_of_tikv(
+    rpc: &MetashrewRpc,
+    provider: &EssentialsProvider,
+    in_block: &HashMap<SchemaAlkaneId, SchemaAlkaneId>,
+    id: &SchemaAlkaneId,
+) -> Result<SchemaAlkaneId> {
+    if let Some(t) = recorded_template(provider, in_block, id)? {
+        return Ok(t);
+    }
+    Ok(rpc.tikv_alias(id)?.unwrap_or(*id))
 }
 
 /// Which binary holder's code `code` is, for an internally created clone.
@@ -261,11 +287,23 @@ pub fn creation_wasm_rpc(
     if let Some(hint) = factory_hint {
         // local: prefer the hint's code; on None/Err fall back to the alkane
         if let Ok(Some(bytes)) = rpc.bytecode(hint, Some(height)) {
-            return Ok(Some((bytes, template_of(provider, in_block, hint)?)));
+            let template = if rpc.traces_from_tikv() {
+                template_of_tikv(rpc, provider, in_block, hint)?
+            } else {
+                template_of(provider, in_block, hint)?
+            };
+            return Ok(Some((bytes, template)));
         }
     }
     let Some(bytes) = rpc.bytecode(&rec.alkane, Some(height))? else { return Ok(None) };
-    let kind = creation_kind(block, rec);
+    // The genesis alkanes are seeded into the genesis block without a create
+    // event (essentials main.rs); they hold their own binaries.
+    let genesis_seeded = block.height
+        == crate::modules::essentials::consts::essentials_genesis_block(crate::config::get_network())
+        && crate::modules::essentials::consts::ESSENTIALS_GENESIS_INSPECTIONS
+            .iter()
+            .any(|(b, t, _)| *b == rec.alkane.block && *t == rec.alkane.tx);
+    let kind = if genesis_seeded { CreationKind::OwnBinary } else { creation_kind(block, rec) };
     let template = if rpc.traces_from_tikv() {
         // TiKV source: the alias records written beside the block entries are
         // authoritative. A clone made inside a contract has no other exact
@@ -273,9 +311,12 @@ pub fn creation_wasm_rpc(
         // nothing is guessed. Where a record exists for a creation we can also
         // derive, the two must agree.
         let recorded = rpc.tikv_alias(&rec.alkane)?;
+        // Only a derivation espo can back with its own records is compared
+        // against the alias record; an alias target espo never recorded (it
+        // predates the index's genesis) is left to the record.
         let derived = match kind {
             CreationKind::OwnBinary => Some(rec.alkane),
-            CreationKind::Clone(alias) => Some(template_of(provider, in_block, &alias)?),
+            CreationKind::Clone(alias) => recorded_template(provider, in_block, &alias)?,
             CreationKind::Internal => None,
         };
         match (recorded, derived) {
