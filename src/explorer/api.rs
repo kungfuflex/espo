@@ -3072,6 +3072,7 @@ fn rpc_get_candles_value(
             page: Some(1),
             side: None,
             now: None,
+            price_per: None,
         })
         .ok()
         .map(|resp| resp.value)

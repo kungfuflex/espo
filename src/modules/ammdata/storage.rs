@@ -6,7 +6,7 @@ use super::schemas::{
 use crate::config::{get_electrum_like, get_espo_indexed_height, get_network};
 use crate::modules::ammdata::config::{AmmDataConfig, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
-    AMOUNT_SCALE, CanonicalQuoteUnit, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID,
+    AMOUNT_SCALE, CanonicalQuoteUnit, price_per_whole_token, token_decimals, KEY_INDEX_HEIGHT, MAINNET_FIRE_ALKANE_ID,
     MAINNET_FIRE_USD_CHART_START_TS, PRICE_SCALE, SATS_PER_BTC, ammdata_genesis_block,
     canonical_quotes_at_height, non_circulating_holders, pricing_factories_at_height,
 };
@@ -4787,6 +4787,16 @@ impl AmmDataProvider {
                         "steps": steps.len(),
                     });
                 }
+                // Opt-in per-whole-token pricing (RpcGetCandlesParams::price_per).
+                if let Some(d) = per_token_decimals(
+                    is_usd,
+                    is_mcusd,
+                    params.price_per.as_deref(),
+                    get_network(),
+                    &pool,
+                ) {
+                    apply_price_per_token(&mut value, d);
+                }
                 if full_resolved.is_some() {
                     value["resolved_pool"] = value["pool"].clone();
                     value["pool"] = json!(requested_pool);
@@ -6534,6 +6544,42 @@ pub struct SetReservesSnapshotParams {
     pub snapshot: HashMap<SchemaAlkaneId, SchemaPoolSnapshot>,
 }
 
+/// The decimals to price a `get_candles` answer per whole token at, or None
+/// to leave it per 1e8 raw units. Only a token PRICE series (`-usd`, `-sats`,
+/// either derived) when the caller opted in with `price_per: "token"`; a
+/// market-cap series is decimals-neutral and a pool series is a raw ratio.
+fn per_token_decimals(
+    is_usd: bool,
+    is_mcusd: bool,
+    price_per: Option<&str>,
+    network: bitcoin::Network,
+    token: &SchemaAlkaneId,
+) -> Option<u32> {
+    (is_usd && !is_mcusd && price_per == Some("token")).then(|| token_decimals(network, token))
+}
+
+/// Rescale a built `get_candles` answer's open/high/low/close to a price per
+/// whole token and say so (`price_per`, `token_decimals`). Volume is USD (or
+/// sats) and stays as it is.
+fn apply_price_per_token(value: &mut Value, decimals: u32) {
+    if let Some(candles) = value.get_mut("candles").and_then(|c| c.as_array_mut()) {
+        for c in candles.iter_mut() {
+            for k in ["open", "high", "low", "close"] {
+                let scaled = c
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u128>().ok())
+                    .map(|p| price_per_whole_token(p, decimals));
+                if let Some(p) = scaled {
+                    c[k] = json!(p.to_string());
+                }
+            }
+        }
+    }
+    value["price_per"] = json!("token");
+    value["token_decimals"] = json!(decimals);
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RpcGetCandlesParams {
     pub pool: Option<String>,
@@ -6543,6 +6589,13 @@ pub struct RpcGetCandlesParams {
     pub page: Option<u64>,
     pub side: Option<String>,
     pub now: Option<u64>,
+    /// Opt-in `"token"`: a token price series (`-usd`, `-sats`, derived) comes
+    /// back per WHOLE token (`consts::token_decimals`) and the answer says so
+    /// with `price_per: "token"`. Absent, prices stay per 1e8 raw units as
+    /// every existing consumer expects. Market-cap series are never touched
+    /// (they are decimals-neutral already).
+    #[serde(default)]
+    pub price_per: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -8559,10 +8612,53 @@ mod tests {
                     page: None,
                     side: None,
                     now: None,
+                    price_per: None,
                 })
                 .expect("rpc");
             assert_eq!(res.value["error"], json!("cmcap_disabled"), "{pool}");
         }
+    }
+
+    /// frSOL (4:50050, 9 decimals) and frXRP (4:50051, 6): espo prices per 1e8
+    /// raw units, so the live closes were $10.32 for a ~$103 SOL and $136.79
+    /// for a ~$1.37 XRP (2026-10-14). `price_per: "token"` serves them per
+    /// whole token and says so; without it nothing changes.
+    #[test]
+    fn price_per_token_rescales_nonstandard_decimals_token_series_only() {
+        use bitcoin::Network::{Bitcoin, Regtest};
+        let frsol = SchemaAlkaneId { block: 4, tx: 50050 };
+        let frxrp = SchemaAlkaneId { block: 4, tx: 50051 };
+        let diesel = SchemaAlkaneId { block: 2, tx: 0 };
+        // Gate: token price series (usd / sats) only, opt-in only.
+        assert_eq!(per_token_decimals(true, false, Some("token"), Bitcoin, &frsol), Some(9));
+        assert_eq!(per_token_decimals(true, false, Some("token"), Bitcoin, &frxrp), Some(6));
+        assert_eq!(per_token_decimals(true, false, Some("token"), Bitcoin, &diesel), Some(8));
+        assert_eq!(per_token_decimals(true, false, None, Bitcoin, &frsol), None);
+        assert_eq!(per_token_decimals(true, false, Some("raw"), Bitcoin, &frsol), None);
+        assert_eq!(per_token_decimals(false, true, Some("token"), Bitcoin, &frsol), None); // mcusd
+        assert_eq!(per_token_decimals(false, false, Some("token"), Bitcoin, &frsol), None); // pool
+        assert_eq!(per_token_decimals(true, false, Some("token"), Regtest, &frsol), Some(8));
+
+        let sol_raw: u128 = 103_192_000_000_000_000; // $10.3192 @1e16
+        let xrp_raw: u128 = 1_367_858_240_000_000_000; // $136.785824 @1e16
+        let usd_vol = "93687978946011010";
+        let answer = |p: u128| {
+            json!({ "ok": true, "candles": [{ "ts": 1_792_022_400u64, "open": p.to_string(),
+                "high": p.to_string(), "low": p.to_string(), "close": p.to_string(), "volume": usd_vol }] })
+        };
+        let mut sol = answer(sol_raw);
+        apply_price_per_token(&mut sol, 9);
+        assert_eq!(sol["candles"][0]["close"], json!((sol_raw * 10).to_string())); // $103.192
+        assert_eq!(sol["candles"][0]["open"], json!((sol_raw * 10).to_string()));
+        assert_eq!(sol["candles"][0]["volume"], json!(usd_vol)); // USD: untouched
+        assert_eq!(sol["price_per"], json!("token"));
+        assert_eq!(sol["token_decimals"], json!(9));
+        let mut xrp = answer(xrp_raw);
+        apply_price_per_token(&mut xrp, 6);
+        assert_eq!(xrp["candles"][0]["low"], json!((xrp_raw / 100).to_string())); // $1.36785824
+        let mut d = answer(37 * PRICE_SCALE);
+        apply_price_per_token(&mut d, 8);
+        assert_eq!(d["candles"][0]["close"], json!((37 * PRICE_SCALE).to_string()));
     }
 
     #[test]
