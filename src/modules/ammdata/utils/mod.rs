@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod candles;
+pub mod canonical_depth;
 pub mod cmcap;
 pub mod cryptoswap;
 pub mod index_activity;
