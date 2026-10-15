@@ -51,6 +51,7 @@ fn init_test_config_from_run_sh() {
         safe_tip_hook_script: None,
         block_source_mode: BlockFetchMode::RpcOnly,
         metashrew_source: crate::config::MetashrewSource::Local,
+        espo_rocksdb: Default::default(),
         metashrew_rpc: Default::default(),
         compact_tx_trace_rows: true,
         address_index_chunk_size: 512,
