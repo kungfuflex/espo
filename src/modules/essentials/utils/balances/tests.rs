@@ -50,6 +50,8 @@ fn init_test_config_from_run_sh() {
         debug_ignore_ms: 0,
         safe_tip_hook_script: None,
         block_source_mode: BlockFetchMode::RpcOnly,
+        metashrew_source: crate::config::MetashrewSource::Local,
+        metashrew_rpc: Default::default(),
         compact_tx_trace_rows: true,
         address_index_chunk_size: 512,
         trace_read_workers: 8,

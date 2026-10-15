@@ -459,8 +459,28 @@ impl EspoModule for Essentials {
         let timer = debug::start_if(debug);
         let inspect_timer = debug::start_if(debug);
         let metashrew = get_metashrew();
+        // metashrew_source=rpc: wasm + template come from getbytecode and the
+        // creation's own cellpack (see utils::rpc_factory). Templates resolved in
+        // this block are visible to later creations in the same block.
+        let rpc_source = crate::alkanes::metashrew_rpc::get();
+        let mut rpc_templates_in_block: HashMap<SchemaAlkaneId, SchemaAlkaneId> = HashMap::new();
         for rec in created_records.iter_mut() {
-            let wasm_result = if let Some(factory_hint) = factory_hint_updates.get(&rec.alkane) {
+            let wasm_result = if let Some(rpc) = rpc_source.as_ref() {
+                let res = crate::modules::essentials::utils::rpc_factory::creation_wasm_rpc(
+                    rpc,
+                    provider,
+                    &block,
+                    rec,
+                    factory_hint_updates.get(&rec.alkane),
+                    &rpc_templates_in_block,
+                );
+                if let Ok(Some((_, template))) = res.as_ref() {
+                    rpc_templates_in_block.insert(rec.alkane, *template);
+                }
+                // A source fault must not become "no wasm" in the index: fail the
+                // block so the indexer retries it.
+                Ok(res?)
+            } else if let Some(factory_hint) = factory_hint_updates.get(&rec.alkane) {
                 match metashrew.get_alkane_wasm_bytes_prefer_first_version(factory_hint) {
                     Ok(Some(value)) => Ok(Some(value)),
                     Ok(None) => metashrew.get_alkane_wasm_bytes_prefer_first_version(&rec.alkane),
