@@ -326,6 +326,9 @@ mod trace_clean_tests {
                             .collect(),
                         data,
                     }),
+                    // Added by the pinned alkanes-rs (prost message, so
+                    // Default is the wire default); this test helper predates it.
+                    ..Default::default()
                 },
             )),
         }
