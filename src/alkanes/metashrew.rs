@@ -2,7 +2,7 @@ use crate::alkanes::defs::AlkaneMessageContext;
 use crate::alkanes::trace::PartialEspoTrace;
 use crate::config::{
     TraceFormat, get_bitcoind_rpc_client, get_metashrew_sdb, get_trace_read_workers,
-    strict_check_trace_mismatches, trace_format,
+    metashrew_source_is_rpc, strict_check_trace_mismatches, trace_format,
 };
 use crate::runtime::sdb::SDB;
 use crate::schemas::SchemaAlkaneId;
@@ -28,6 +28,50 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 const CANONICAL_TIP_SCAN_BUFFER: u32 = 288;
+
+/// Wasm over RPC. The factory reported is the alkane itself: `getbytecode`
+/// follows the alias chain but does not say where it ended. Index-time
+/// inspection resolves the template separately (essentials
+/// `resolve_factory_rpc`); this path serves request-time reads only.
+fn wasm_bytes_rpc(
+    alkane: &SchemaAlkaneId,
+    height: Option<u32>,
+) -> Result<Option<(Vec<u8>, SchemaAlkaneId)>> {
+    Ok(crate::alkanes::metashrew_rpc::require()?.bytecode(alkane, height)?.map(|b| (b, *alkane)))
+}
+
+/// `get_canonical_tip_height` over RPC: metashrew's tip, walked back to the
+/// highest height whose stored hash bitcoind agrees with (same scan window as
+/// the local reader).
+fn get_canonical_tip_height_rpc() -> Result<u32> {
+    let rpc = crate::alkanes::metashrew_rpc::require()?;
+    if rpc.traces_from_tikv() {
+        // No rockshrew in the trace path: the tip is bitcoind's minus the cache's
+        // settle depth; each block is then pinned by hash at read time.
+        return rpc.trace_tip_height();
+    }
+    let indexed_tip = rpc.tip_height()?;
+    if indexed_tip == 0 {
+        return Ok(0);
+    }
+    let core = get_bitcoind_rpc_client();
+    let floor = indexed_tip.saturating_sub(CANONICAL_TIP_SCAN_BUFFER);
+    for height in (floor..=indexed_tip).rev() {
+        let Some(raw) = rpc.indexed_block_hash_hex(height)? else { continue };
+        let chain_hash = core
+            .get_block_hash(height as u64)
+            .map_err(|e| anyhow!("bitcoind get_block_hash({height}): {e}"))?;
+        if crate::alkanes::metashrew_rpc::hash_matches(&raw, &chain_hash)? {
+            LAST_CANONICAL_METASHREW_TIP.store(height, Ordering::Relaxed);
+            return Ok(height);
+        }
+    }
+    anyhow::bail!(
+        "unable to find canonical metashrew tip within {} blocks of indexed tip {}",
+        CANONICAL_TIP_SCAN_BUFFER,
+        indexed_tip
+    );
+}
 
 static LAST_CANONICAL_METASHREW_TIP: AtomicU32 = AtomicU32::new(0);
 
@@ -569,6 +613,9 @@ impl MetashrewAdapter {
         &self,
         alkane: &SchemaAlkaneId,
     ) -> Result<Option<(Vec<u8>, SchemaAlkaneId)>> {
+        if metashrew_source_is_rpc() {
+            return wasm_bytes_rpc(alkane, None);
+        }
         let db = get_metashrew_sdb();
         db.catch_up_now().context("metashrew catch_up before wasm fetch")?;
         self.get_alkane_wasm_bytes_with_db(db.as_ref(), alkane)
@@ -578,6 +625,9 @@ impl MetashrewAdapter {
         &self,
         alkane: &SchemaAlkaneId,
     ) -> Result<Option<(Vec<u8>, SchemaAlkaneId)>> {
+        if metashrew_source_is_rpc() {
+            return wasm_bytes_rpc(alkane, None);
+        }
         let db = get_metashrew_sdb();
         db.catch_up_now().context("metashrew catch_up before wasm fetch")?;
         self.get_alkane_wasm_bytes_with_db_prefer_first_version(db.as_ref(), alkane)
@@ -591,8 +641,12 @@ impl MetashrewAdapter {
 
     pub fn get_alkanes_tip_height(&self) -> Result<u32> {
         static LAST_LOGGED_HEIGHT: AtomicU32 = AtomicU32::new(u32::MAX);
-        let db = get_metashrew_sdb();
-        let height = self.get_alkanes_tip_height_with_db(db.as_ref())?;
+        let height = if metashrew_source_is_rpc() {
+            crate::alkanes::metashrew_rpc::require()?.trace_tip_height()?
+        } else {
+            let db = get_metashrew_sdb();
+            self.get_alkanes_tip_height_with_db(db.as_ref())?
+        };
         let prev = LAST_LOGGED_HEIGHT.load(Ordering::Relaxed);
         if prev != height {
             eprintln!("[metashrew] indexed height: {}", height);
@@ -720,6 +774,9 @@ impl MetashrewAdapter {
     }
 
     pub fn get_canonical_tip_height(&self) -> Result<u32> {
+        if metashrew_source_is_rpc() {
+            return get_canonical_tip_height_rpc();
+        }
         let db = get_metashrew_sdb();
         db.catch_up_now().context("metashrew catch_up before computing canonical tip")?;
         self.get_canonical_tip_height_with_db(db.as_ref())
@@ -727,6 +784,11 @@ impl MetashrewAdapter {
 
     /// Fetch all traces for a txid directly from the secondary DB, without needing block height.
     pub fn traces_for_tx(&self, txid: &Txid) -> Result<Vec<PartialEspoTrace>> {
+        if metashrew_source_is_rpc() {
+            return Err(anyhow!(
+                "traces_for_tx({txid}) is not available with metashrew_source=rpc (no txid trace index over RPC)"
+            ));
+        }
         let db = get_metashrew_sdb();
         self.traces_for_tx_with_db(db.as_ref(), txid)
     }
@@ -902,6 +964,13 @@ impl MetashrewAdapter {
         what_alkane: &SchemaAlkaneId,
         height: Option<u64>,
     ) -> Result<Option<u128>> {
+        if metashrew_source_is_rpc() {
+            let height = height
+                .map(|h| u32::try_from(h).map_err(|_| anyhow!("height {h} does not fit in u32")))
+                .transpose()?;
+            return crate::alkanes::metashrew_rpc::require()?
+                .alkane_balance(who_alkane, what_alkane, height);
+        }
         let db = get_metashrew_sdb();
         self.get_reserves_for_alkane_with_db(db.as_ref(), who_alkane, what_alkane, height)
     }
@@ -1006,6 +1075,9 @@ impl MetashrewAdapter {
         txid: &Txid,
         vout: u32,
     ) -> Result<Vec<(SupportAlkaneId, u128)>> {
+        if metashrew_source_is_rpc() {
+            return Err(anyhow!("outpoint balance sheets are not read with metashrew_source=rpc"));
+        }
         let db = get_metashrew_sdb();
         db.catch_up_now().context("metashrew catch_up before outpoint balances")?;
         self.get_outpoint_alkane_balances_with_db(db.as_ref(), txid, vout)
@@ -1027,6 +1099,13 @@ impl MetashrewAdapter {
     }
 
     pub fn traces_for_block_as_prost(&self, block: u64) -> Result<Vec<PartialEspoTrace>> {
+        if metashrew_source_is_rpc() {
+            let h: u32 = block.try_into().context("block height does not fit into u32")?;
+            let chain_hash = get_bitcoind_rpc_client()
+                .get_block_hash(block)
+                .with_context(|| format!("bitcoind get_block_hash({block})"))?;
+            return crate::alkanes::metashrew_rpc::require()?.traces_for_block(h, &chain_hash);
+        }
         let db = get_metashrew_sdb();
         self.traces_for_block_as_prost_with_db(db.as_ref(), block)
     }

@@ -23,9 +23,12 @@ required-features = ["binary"]
 # of GB of freed-but-retained heap until it OOMs. `unprefixed_malloc_on_
 # supported_platforms` routes RocksDB's C++ allocations through jemalloc too.
 binary = [
+    "tikv-traces",
     "dep:tikv-jemallocator",
     "tikv-jemallocator/unprefixed_malloc_on_supported_platforms",
 ]
+# Read block traces from the TiKV trace cache (metashrew_source=rpc + traces_tikv_pd).
+tikv-traces = ["dep:tikv-client"]
 jemalloc-prof = ["binary", "dep:tikv-jemalloc-ctl", "tikv-jemallocator/profiling"]
 test-utils = ["alkanes", "metashrew-runtime", "rockshrew-runtime", "wasmtime", "protorune/test-utils"]
 
@@ -76,6 +79,7 @@ zmq = "0.10"
 # (net + primitives + crypto) so it builds with no git creds for the private repo.
 qubitcoin-net = { path = "vendor/qubitcoin/crates/qubitcoin-net" }
 tikv-jemallocator = { version = "0.6", optional = true }
+tikv-client = { version = "0.4", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
 
 # Required dependencies for alkanes support (from alkanes-rs)

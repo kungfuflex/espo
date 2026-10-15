@@ -6462,6 +6462,21 @@ fn lookup_self_balance(alk: &SchemaAlkaneId) -> Option<u128> {
             }
         };
     }
+    if let Some(rpc) = crate::alkanes::metashrew_rpc::get() {
+        // metashrew_source=rpc: same latest-state read, memoised per indexed
+        // block, and retried rather than degraded to `None` on a backend fault.
+        if crate::alkanes::metashrew_rpc::on_indexer_thread() {
+            return rpc.self_balance_blocking(alk);
+        }
+        // request path: one attempt, never stall a handler
+        return match rpc.self_balance_for_block(crate::alkanes::metashrew_rpc::current_block(), alk) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[balances] WARN: rpc self-balance lookup failed for {}:{} ({e:#})", alk.block, alk.tx);
+                None
+            }
+        };
+    }
     match get_metashrew().get_reserves_for_alkane(alk, alk, None) {
         Ok(val) => val,
         Err(e) => {

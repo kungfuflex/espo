@@ -177,6 +177,9 @@ fn classify_metashrew_canonicality_wait(
 ) -> Option<MetashrewCanonicalityWaitKind> {
     for cause in err.chain() {
         let message = cause.to_string();
+        if message.contains(crate::alkanes::trace_cache::MISS_MESSAGE) {
+            return Some(MetashrewCanonicalityWaitKind::TipBehind);
+        }
         if message.contains("metashrew tip ") && message.contains(" is behind required height ") {
             return Some(MetashrewCanonicalityWaitKind::TipBehind);
         }
@@ -511,6 +514,31 @@ fn run_safe_tip_hook(script: &str, next_height: u32, tip: u32) {
     });
 }
 
+/// metashrew_source=rpc: start fetching the traces of the blocks after
+/// `next_height` (up to the configured window, never past `target_tip`) while
+/// `next_height` is indexed. Each prefetched answer is tied to the block hash
+/// bitcoind reports for that height and is discarded if it does not match when
+/// the indexer reaches it.
+fn kick_metashrew_rpc_prefetch(next_height: u32, target_tip: u32) {
+    let Some(rpc) = crate::alkanes::metashrew_rpc::get() else { return };
+    crate::alkanes::metashrew_rpc::set_current_block(next_height);
+    let window = rpc.prefetch_window();
+    rpc.prefetch_drop_below(next_height);
+    if window == 0 || next_height < alkanes_genesis_block(get_network()) {
+        return;
+    }
+    let last = next_height.saturating_add(window).min(target_tip);
+    // next_height itself is fetched by the indexer right now; prefetch after it.
+    let heights: Vec<u32> = (next_height.saturating_add(1)..=last).collect();
+    if heights.is_empty() {
+        return;
+    }
+    rpc.prefetch(
+        heights,
+        std::sync::Arc::new(|h: u32| get_bitcoind_rpc_client().get_block_hash(h as u64).ok()),
+    );
+}
+
 fn get_indexer_block(height: u32, tip: u32, network: bitcoin::Network) -> Result<EspoBlock> {
     let alkane_genesis = alkanes_genesis_block(network);
     if height >= alkane_genesis {
@@ -653,7 +681,7 @@ async fn run_indexer_loop(
     start_height: u32,
     mut next_height: u32,
     network: bitcoin::Network,
-    metashrew_sdb: std::sync::Arc<crate::runtime::sdb::SDB>,
+    metashrew_sdb: Option<std::sync::Arc<crate::runtime::sdb::SDB>>,
     cfg: crate::config::AppConfig,
     shutdown_requested: Arc<AtomicBool>,
     db_write_active: Arc<AtomicBool>,
@@ -722,7 +750,7 @@ async fn run_indexer_loop(
             eprintln!("[reorg] switching indexer to height {}", next_height);
         }
 
-        if let Err(e) = metashrew_sdb.catch_up_now() {
+        if let Some(Err(e)) = metashrew_sdb.as_ref().map(|sdb| sdb.catch_up_now()) {
             eprintln!("[indexer] metashrew catch_up before tip fetch: {e:?}");
         }
 
@@ -791,7 +819,7 @@ async fn run_indexer_loop(
         }
         if let Some(prev_tip) = last_tip {
             if tip > prev_tip {
-                if let Err(e) = metashrew_sdb.catch_up_now() {
+                if let Some(Err(e)) = metashrew_sdb.as_ref().map(|sdb| sdb.catch_up_now()) {
                     eprintln!(
                         "[indexer] metashrew catch_up after new tip {} (prev {}) detected: {e:?}",
                         tip, prev_tip
@@ -827,13 +855,14 @@ async fn run_indexer_loop(
 
             eta.start_block();
 
-            if let Err(e) = metashrew_sdb.catch_up_now() {
+            if let Some(Err(e)) = metashrew_sdb.as_ref().map(|sdb| sdb.catch_up_now()) {
                 eprintln!(
                     "[indexer] metashrew catch_up before indexing block {}: {e:?}",
                     next_height
                 );
             }
 
+            kick_metashrew_rpc_prefetch(next_height, target_tip);
             match get_indexer_block(next_height, target_tip, network)
                 .with_context(|| format!("failed to load espo block {next_height}"))
             {
@@ -1294,13 +1323,19 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let metashrew_sdb = metashrew_sdb_opt
-        .expect("indexing requires a local metashrew database (readonly_metashrew_db_dir)");
+    let metashrew_sdb = if crate::config::metashrew_source_is_rpc() {
+        None
+    } else {
+        Some(metashrew_sdb_opt.expect(
+            "indexing requires a local metashrew database (readonly_metashrew_db_dir) unless metashrew_source=rpc",
+        ))
+    };
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let shutdown_for_indexer = shutdown_requested.clone();
     let db_write_active = Arc::new(AtomicBool::new(false));
     let db_write_active_for_indexer = db_write_active.clone();
     let indexer_handle = std::thread::spawn(move || {
+        crate::alkanes::metashrew_rpc::mark_indexer_thread();
         let rt = TokioBuilder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

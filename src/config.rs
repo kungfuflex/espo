@@ -83,6 +83,46 @@ fn parse_block_fetch_mode(s: &str) -> std::result::Result<BlockFetchMode, String
     }
 }
 
+/// Where the indexer reads metashrew state (traces, block hashes, wasm,
+/// alkane balances) from.
+///   - `Local` (default): a local rockshrew RocksDB opened as a secondary
+///     (`readonly_metashrew_db_dir`). Unchanged behaviour.
+///   - `Rpc`: metashrew JSON-RPC (`metashrew_traces_rpc_url`, falling back to
+///     `metashrew_rpc_url`); no local database. See `alkanes::metashrew_rpc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetashrewSource {
+    #[default]
+    Local,
+    Rpc,
+}
+
+fn parse_metashrew_source(s: &str) -> std::result::Result<MetashrewSource, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "local" | "rocksdb" | "sdb" => Ok(MetashrewSource::Local),
+        "rpc" | "rpc_traces" | "rpc-traces" => Ok(MetashrewSource::Rpc),
+        other => Err(format!("invalid value for metashrew_source: {other} (use local | rpc)")),
+    }
+}
+
+/// `block_source_mode: "rpc_traces"` = blocks from bitcoind RPC AND metashrew
+/// state over RPC (the `metashrew_source = rpc` shorthand).
+fn is_rpc_traces_mode(s: &str) -> bool {
+    matches!(s.trim().to_ascii_lowercase().as_str(), "rpc_traces" | "rpc-traces")
+}
+
+fn default_metashrew_rpc_concurrency() -> usize {
+    4
+}
+fn default_metashrew_rpc_prefetch() -> u32 {
+    8
+}
+fn default_metashrew_rpc_timeout_secs() -> u64 {
+    180
+}
+fn default_metashrew_rpc_max_retries() -> u32 {
+    6
+}
+
 /// Which on-disk / RPC alkanes trace layout espo expects from the metashrew it
 /// reads. The by-alkane fork can index against two incompatible metashrew trace
 /// encodings:
@@ -634,6 +674,31 @@ pub struct ConfigFile {
     pub safe_tip_hook_script: Option<String>,
     #[serde(default = "default_block_source_mode")]
     pub block_source_mode: String,
+    /// "local" (default) | "rpc". See `MetashrewSource`.
+    #[serde(default)]
+    pub metashrew_source: Option<String>,
+    /// JSON-RPC endpoint for `metashrew_source = rpc` (defaults to
+    /// `metashrew_rpc_url`). Point it at a rockshrew that does not serve the
+    /// public edges.
+    #[serde(default)]
+    pub metashrew_traces_rpc_url: Option<String>,
+    #[serde(default = "default_metashrew_rpc_concurrency")]
+    pub metashrew_rpc_concurrency: usize,
+    #[serde(default = "default_metashrew_rpc_prefetch")]
+    pub metashrew_rpc_prefetch: u32,
+    #[serde(default = "default_metashrew_rpc_timeout_secs")]
+    pub metashrew_rpc_timeout_secs: u64,
+    #[serde(default = "default_metashrew_rpc_max_retries")]
+    pub metashrew_rpc_max_retries: u32,
+    /// Minimum spacing between request starts, in ms (rate limit). 0 = off.
+    #[serde(default)]
+    pub metashrew_rpc_min_interval_ms: u64,
+    /// PD endpoints of the TiKV block-trace cache (alspo-traces `asp1:blk:`).
+    /// With metashrew_source=rpc, traces then come from TiKV only.
+    #[serde(default)]
+    pub traces_tikv_pd: Vec<String>,
+    #[serde(default)]
+    pub traces_tikv_key_prefix: Option<String>,
     /// Alkanes trace layout to read: "v2" (standard/release metashrew) or "v3"
     /// (develop metashrew). Overridden by the `--format` CLI flag. Defaults v2.
     #[serde(default)]
@@ -701,6 +766,8 @@ pub struct AppConfig {
     pub debug_backup: Option<DebugBackupConfig>,
     pub safe_tip_hook_script: Option<String>,
     pub block_source_mode: BlockFetchMode,
+    pub metashrew_source: MetashrewSource,
+    pub metashrew_rpc: crate::alkanes::metashrew_rpc::MetashrewRpcConfig,
     pub trace_format: TraceFormat,
     pub compact_tx_trace_rows: bool,
     pub address_index_chunk_size: u32,
@@ -752,8 +819,41 @@ fn load_config_file(path: &str) -> Result<ConfigFile> {
 impl AppConfig {
     fn from_file(file: ConfigFile, view_only: bool) -> Result<Self> {
         let network = parse_network(&file.network)?;
-        let block_source_mode =
-            parse_block_fetch_mode(&file.block_source_mode).map_err(|e| anyhow::anyhow!(e))?;
+        let rpc_traces_mode = is_rpc_traces_mode(&file.block_source_mode);
+        let block_source_mode = if rpc_traces_mode {
+            BlockFetchMode::RpcOnly
+        } else {
+            parse_block_fetch_mode(&file.block_source_mode).map_err(|e| anyhow::anyhow!(e))?
+        };
+        let metashrew_source = match file.metashrew_source.as_deref() {
+            Some(raw) => parse_metashrew_source(raw).map_err(|e| anyhow::anyhow!(e))?,
+            None if rpc_traces_mode => MetashrewSource::Rpc,
+            None => MetashrewSource::Local,
+        };
+        if rpc_traces_mode && metashrew_source != MetashrewSource::Rpc {
+            anyhow::bail!("block_source_mode=rpc_traces contradicts metashrew_source=local");
+        }
+        let metashrew_rpc = crate::alkanes::metashrew_rpc::MetashrewRpcConfig {
+            url: normalize_optional_string(file.metashrew_traces_rpc_url.clone())
+                .unwrap_or_else(|| file.metashrew_rpc_url.clone()),
+            concurrency: file.metashrew_rpc_concurrency.max(1),
+            prefetch: file.metashrew_rpc_prefetch,
+            timeout: std::time::Duration::from_secs(file.metashrew_rpc_timeout_secs.max(1)),
+            max_retries: file.metashrew_rpc_max_retries,
+            min_interval: std::time::Duration::from_millis(file.metashrew_rpc_min_interval_ms),
+            tikv_pd: file
+                .traces_tikv_pd
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            tikv_prefix: normalize_optional_string(file.traces_tikv_key_prefix.clone())
+                .unwrap_or_else(|| crate::alkanes::trace_cache::DEFAULT_KEY_PREFIX.to_string()),
+            tikv_settle_depth: 6,
+        };
+        if !metashrew_rpc.tikv_pd.is_empty() && metashrew_source != MetashrewSource::Rpc {
+            anyhow::bail!("traces_tikv_pd needs metashrew_source=rpc (or block_source_mode=rpc_traces)");
+        }
         let explorer_base_path = normalize_explorer_base_path(&file.explorer_base_path)?;
         let explorer_pizza_tv_endpoint =
             normalize_optional_string(Some(file.explorer_pizza_tv_endpoint))
@@ -805,6 +905,8 @@ impl AppConfig {
             debug_backup,
             safe_tip_hook_script: normalize_optional_string(file.safe_tip_hook_script),
             block_source_mode,
+            metashrew_source,
+            metashrew_rpc,
             trace_format: file
                 .trace_format
                 .as_deref()
@@ -839,8 +941,34 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
     // --- validations ---
     let db = Path::new(&cfg.readonly_metashrew_db_dir);
-    let metashrew_dir_ok = db.exists() && db.is_dir();
-    if !metashrew_dir_ok {
+    let rpc_source = cfg.metashrew_source == MetashrewSource::Rpc;
+    let metashrew_dir_ok = !rpc_source && db.exists() && db.is_dir();
+    if rpc_source {
+        // No local metashrew database in RPC mode, by design. The strict-mode
+        // cross-checks read metashrew's balance tables directly and have no RPC
+        // form, so they are refused rather than silently skipped.
+        let strict = cfg.strict_mode.as_ref();
+        if strict.is_some_and(|s| s.check_alkane_balances || s.check_utxos) {
+            anyhow::bail!(
+                "metashrew_source=rpc does not support strict_mode.check_alkane_balances / check_utxos (they read the local metashrew db)"
+            );
+        }
+        if cfg.recover_missing_traces_by_txid {
+            anyhow::bail!(
+                "metashrew_source=rpc does not support recover_missing_traces_by_txid (a block's traces come whole from traceblock)"
+            );
+        }
+        if cfg.metashrew_rpc.url.trim().is_empty() {
+            anyhow::bail!("metashrew_source=rpc needs metashrew_traces_rpc_url or metashrew_rpc_url");
+        }
+        eprintln!(
+            "[config] metashrew_source=rpc: reading metashrew over {} (concurrency={}, prefetch={}, min_interval={:?}); no local metashrew db",
+            cfg.metashrew_rpc.url,
+            cfg.metashrew_rpc.concurrency,
+            cfg.metashrew_rpc.prefetch,
+            cfg.metashrew_rpc.min_interval
+        );
+    } else if !metashrew_dir_ok {
         // A remote-explorer deployment (explorer_espo_rpc_host) may not have a
         // local metashrew database; SSR data comes from the remote espo's
         // getter RPCs, so a missing metashrew dir is survivable there and
@@ -1017,6 +1145,14 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
         BITCOIND_CLIENT
             .set(core)
             .map_err(|_| anyhow::anyhow!("bitcoind rpc client already initialized"))?;
+    }
+
+    // --- init the metashrew RPC source (metashrew_source = rpc) ---
+    if cfg.metashrew_source == MetashrewSource::Rpc
+        && std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err()
+        && crate::alkanes::metashrew_rpc::get().is_none()
+    {
+        crate::alkanes::metashrew_rpc::init(cfg.metashrew_rpc.clone())?;
     }
 
     // --- init Secondary RocksDB (SDB) once ---
@@ -1376,6 +1512,12 @@ pub fn strict_check_trace_mismatches() -> bool {
 
 /// The alkanes trace layout espo should read (v2 = standard/release metashrew,
 /// v3 = develop metashrew). Set via `--format` or config-file `trace_format`.
+/// True when metashrew state comes over RPC (`metashrew_source = rpc`).
+/// Tolerates uninitialised config (tests): no config means the local default.
+pub fn metashrew_source_is_rpc() -> bool {
+    CONFIG.get().is_some_and(|c| c.metashrew_source == MetashrewSource::Rpc)
+}
+
 pub fn trace_format() -> TraceFormat {
     get_config().trace_format
 }

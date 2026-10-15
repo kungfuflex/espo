@@ -368,6 +368,11 @@ fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
     format!("{}:{}", hex::encode(txid_be), vout)
 }
 
+/// The alkanes cellpack a protostone carries, if any (protocol tag 1).
+pub(crate) fn alkanes_cellpack_of(protostone: &Protostone) -> Option<Cellpack> {
+    alkane_cellpack_from_protostone(protostone)
+}
+
 fn alkane_cellpack_from_protostone(protostone: &Protostone) -> Option<Cellpack> {
     if protostone.protocol_tag != 1 || protostone.message.is_empty() {
         return None;
@@ -507,19 +512,52 @@ fn select_canonical_traces(
         return Ok(CanonicalTraceSelection::default());
     }
 
+    let block_u32: u32 = block
+        .try_into()
+        .context("block height does not fit into u32 for canonical trace selection")?;
+    let allow_txids = trace_txid_allow_set(selected);
+
+    if crate::config::metashrew_source_is_rpc() {
+        // Whole block from `traceblock`, pinned to this height and to the
+        // canonical hash; same allow-list filter as the local reader. There is no
+        // per-txid fallback over RPC (config refuses recover_missing_traces_by_txid),
+        // so a protocol tx without a trace is reported as missing exactly as the
+        // local path reports it with the fallback off.
+        use bitcoincore_rpc::RpcApi as _;
+        let chain_hash = crate::config::get_bitcoind_rpc_client()
+            .get_block_hash(block)
+            .with_context(|| format!("bitcoind get_block_hash({block})"))?;
+        let all = crate::alkanes::metashrew_rpc::require()?
+            .traces_for_block(block_u32, &chain_hash)
+            .with_context(|| format!("metashrew not canonical at block {block}"))?;
+        let height_partials: Vec<PartialEspoTrace> = all
+            .into_iter()
+            .filter(|p| {
+                p.outpoint.len() >= 32 && {
+                    let mut t = [0u8; 32];
+                    t.copy_from_slice(&p.outpoint[..32]);
+                    allow_txids.contains(&t)
+                }
+            })
+            .collect();
+        return finish_canonical_trace_selection(
+            height_partials,
+            canonical_txids,
+            selected,
+            alkane_protocol_txids,
+            None,
+        );
+    }
+
     let metashrew = get_metashrew();
     let metashrew_sdb = get_metashrew_sdb();
     metashrew_sdb
         .catch_up_now()
         .with_context(|| format!("metashrew catch_up before validating block {block}"))?;
-    let block_u32: u32 = block
-        .try_into()
-        .context("block height does not fit into u32 for canonical trace selection")?;
     metashrew
         .ensure_canonical_height_with_db(metashrew_sdb.as_ref(), block_u32)
         .with_context(|| format!("metashrew not canonical at block {block}"))?;
 
-    let allow_txids = trace_txid_allow_set(selected);
     let height_partials = metashrew
         .traces_for_block_as_prost_with_db_uncaught_filtered(
             metashrew_sdb.as_ref(),
@@ -527,7 +565,26 @@ fn select_canonical_traces(
             Some(&allow_txids),
         )
         .with_context(|| format!("failed traces_for_block_as_prost_with_db_uncaught({block})"))?;
+    finish_canonical_trace_selection(
+        height_partials,
+        canonical_txids,
+        selected,
+        alkane_protocol_txids,
+        Some((&metashrew, metashrew_sdb.as_ref())),
+    )
+}
 
+/// The part of canonical trace selection shared by both metashrew sources:
+/// index the block's traces by txid, stitch them to the selected txs, and
+/// account for missing / unexpected ones. `local` carries the secondary DB for
+/// the optional per-txid recovery, which only the local source has.
+fn finish_canonical_trace_selection(
+    height_partials: Vec<PartialEspoTrace>,
+    canonical_txids: &HashSet<Txid>,
+    selected: &[(Txid, Transaction)],
+    alkane_protocol_txids: &HashSet<Txid>,
+    local: Option<(&crate::alkanes::metashrew::MetashrewAdapter, &crate::runtime::sdb::SDB)>,
+) -> Result<CanonicalTraceSelection> {
     let mut traces_by_txid: HashMap<Txid, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
     let mut recovered_txids: Vec<String> = Vec::new();
     let mut missing_candidate_txids: Vec<String> = Vec::new();
@@ -544,13 +601,14 @@ fn select_canonical_traces(
         if !alkane_protocol_txids.contains(txid) {
             continue;
         }
-        if !recover_missing_traces_by_txid() {
+        let Some((metashrew, metashrew_sdb)) = local.filter(|_| recover_missing_traces_by_txid())
+        else {
             missing_candidate_txids.push(txid.to_string());
             continue;
-        }
+        };
 
         let fallback_partials = metashrew
-            .traces_for_tx_with_db_uncaught(metashrew_sdb.as_ref(), txid)
+            .traces_for_tx_with_db_uncaught(metashrew_sdb, txid)
             .with_context(|| format!("failed traces_for_tx_with_db_uncaught({txid})"))?;
         let allow = HashSet::from([*txid]);
         let mut fallback_index = partial_traces_indexed(fallback_partials, Some(&allow))?;
