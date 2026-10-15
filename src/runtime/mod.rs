@@ -1,3 +1,4 @@
+pub mod bitcoind_pool;
 pub mod dbpaths;
 pub mod internal_rpc;
 pub mod jemalloc_prof;
