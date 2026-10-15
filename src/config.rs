@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use electrum_client::Client;
 use rocksdb::{BlockBasedOptions, Cache, DB, Options};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -42,13 +42,59 @@ const ESPO_ROCKS_MAX_OPEN_FILES: i32 = 1024;
 const CACHE_ROCKS_BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const CACHE_ROCKS_MAX_OPEN_FILES: i32 = 128;
 
-fn configure_espo_rocksdb_options(opts: &mut Options) {
-    let cache = Cache::new_lru_cache(ESPO_ROCKS_BLOCK_CACHE_BYTES);
+/// Performance knobs for espo's own RocksDB. None of them changes what is
+/// stored: they size the block cache, keep index/filter blocks resident, set
+/// the background flush/compaction parallelism and the size of new SST data
+/// blocks. Every default reproduces the previous fixed configuration, so an
+/// instance that sets nothing behaves exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct EspoRocksTuning {
+    /// LRU block cache size in MiB (default 512).
+    #[serde(default = "default_rocks_block_cache_mb")]
+    pub block_cache_mb: usize,
+    /// Pin L0's index/filter blocks in the cache (rust-rocksdb 0.21 has no
+    /// high-priority pool knob).
+    #[serde(default)]
+    pub pin_index_and_filter: bool,
+    /// RocksDB max_background_jobs; 0 = RocksDB's default (2).
+    #[serde(default)]
+    pub background_jobs: i32,
+    /// Data block size in KiB for newly written SSTs; 0 = RocksDB's default (4).
+    #[serde(default)]
+    pub block_size_kb: usize,
+}
+
+fn default_rocks_block_cache_mb() -> usize {
+    ESPO_ROCKS_BLOCK_CACHE_BYTES / (1024 * 1024)
+}
+
+impl Default for EspoRocksTuning {
+    fn default() -> Self {
+        Self {
+            block_cache_mb: default_rocks_block_cache_mb(),
+            pin_index_and_filter: false,
+            background_jobs: 0,
+            block_size_kb: 0,
+        }
+    }
+}
+
+fn configure_espo_rocksdb_options(opts: &mut Options, tuning: &EspoRocksTuning) {
+    let cache = Cache::new_lru_cache(tuning.block_cache_mb.max(8) * 1024 * 1024);
     let mut table = BlockBasedOptions::default();
     table.set_block_cache(&cache);
     table.set_cache_index_and_filter_blocks(true);
+    if tuning.pin_index_and_filter {
+        table.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    }
+    if tuning.block_size_kb > 0 {
+        table.set_block_size(tuning.block_size_kb * 1024);
+    }
     opts.set_block_based_table_factory(&table);
     opts.set_max_open_files(ESPO_ROCKS_MAX_OPEN_FILES);
+    if tuning.background_jobs > 0 {
+        opts.set_max_background_jobs(tuning.background_jobs);
+    }
 }
 
 fn configure_cache_rocksdb_options(opts: &mut Options) {
@@ -674,6 +720,9 @@ pub struct ConfigFile {
     pub safe_tip_hook_script: Option<String>,
     #[serde(default = "default_block_source_mode")]
     pub block_source_mode: String,
+    /// espo's own RocksDB performance knobs (see EspoRocksTuning).
+    #[serde(default)]
+    pub espo_rocksdb: EspoRocksTuning,
     /// "local" (default) | "rpc". See `MetashrewSource`.
     #[serde(default)]
     pub metashrew_source: Option<String>,
@@ -766,6 +815,7 @@ pub struct AppConfig {
     pub debug_backup: Option<DebugBackupConfig>,
     pub safe_tip_hook_script: Option<String>,
     pub block_source_mode: BlockFetchMode,
+    pub espo_rocksdb: EspoRocksTuning,
     pub metashrew_source: MetashrewSource,
     pub metashrew_rpc: crate::alkanes::metashrew_rpc::MetashrewRpcConfig,
     pub trace_format: TraceFormat,
@@ -905,6 +955,7 @@ impl AppConfig {
             debug_backup,
             safe_tip_hook_script: normalize_optional_string(file.safe_tip_hook_script),
             block_source_mode,
+            espo_rocksdb: file.espo_rocksdb,
             metashrew_source,
             metashrew_rpc,
             trace_format: file
@@ -1180,7 +1231,7 @@ fn init_config_from_inner(cfg: AppConfig, espo_read_only: bool) -> Result<()> {
 
     // --- init ESPO RocksDB once ---
     let mut espo_opts = Options::default();
-    configure_espo_rocksdb_options(&mut espo_opts);
+    configure_espo_rocksdb_options(&mut espo_opts, &cfg.espo_rocksdb);
     if !espo_read_only {
         espo_opts.create_if_missing(true);
     }

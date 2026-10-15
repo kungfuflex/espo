@@ -10189,6 +10189,7 @@ mod tests {
             safe_tip_hook_script: None,
             block_source_mode: BlockFetchMode::RpcOnly,
             metashrew_source: crate::config::MetashrewSource::Local,
+            espo_rocksdb: Default::default(),
             metashrew_rpc: Default::default(),
             trace_format: Default::default(),
             compact_tx_trace_rows: true,

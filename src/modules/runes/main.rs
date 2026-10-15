@@ -20,7 +20,7 @@ use super::storage::{
 };
 use super::transfer::{OutputRuneSheets, RuneSheet, RunestoneTransfer, TransferRules};
 use crate::alkanes::trace::EspoBlock;
-use crate::config::{debug_enabled, get_bitcoind_rpc_client, get_electrum_like, get_network};
+use crate::config::{debug_enabled, get_electrum_like, get_network};
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{PRICE_SCALE, SATS_PER_BTC};
 use crate::modules::ammdata::storage::AmmDataProvider;
@@ -38,7 +38,6 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 use bitcoin::hashes::Hash;
 use bitcoin::{Network, OutPoint, Transaction, Txid, opcodes};
-use bitcoincore_rpc::RpcApi;
 use ordinals::{Artifact, Edict, Etching, Height, Rune, RuneId, Runestone};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1217,8 +1216,9 @@ impl<'a> BlockRunesIndexer<'a> {
         }
 
         let delegate = delegate_inscription_from_tx(tx)?;
-        let delegate_tx =
-            get_bitcoind_rpc_client().get_raw_transaction(&delegate.txid, None).ok()?;
+        // pooled keep-alive client (runtime::bitcoind_pool); same answer as the
+        // per-call client, without a connect + DNS round trip per lookup
+        let delegate_tx = crate::runtime::bitcoind_pool::get().raw_transaction(&delegate.txid)?;
         image_inscription_from_tx_at(&delegate_tx, delegate.index)
     }
 
@@ -1304,14 +1304,16 @@ impl<'a> BlockRunesIndexer<'a> {
     }
 
     fn commitment_input_is_mature(&self, outpoint: OutPoint) -> bool {
-        let Ok(info) = get_bitcoind_rpc_client().get_raw_transaction_info(&outpoint.txid, None)
-        else {
+        // Pooled keep-alive client + header-height cache by block hash
+        // (runtime::bitcoind_pool). Same decisions as before: an RPC error,
+        // a missing output, a non-taproot or undecodable script, or an
+        // unconfirmed commitment are all "not mature". Transport failures are
+        // retried instead of being read as "not mature".
+        let pool = crate::runtime::bitcoind_pool::get();
+        let Some(info) = pool.tx_outputs_and_block(&outpoint.txid) else {
             return false;
         };
-        let Some(prev_out) = info.vout.get(outpoint.vout as usize) else {
-            return false;
-        };
-        let Ok(script) = prev_out.script_pub_key.script() else {
+        let Some(Some(script)) = info.scripts.get(outpoint.vout as usize) else {
             return false;
         };
         if !script.is_p2tr() {
@@ -1320,12 +1322,22 @@ impl<'a> BlockRunesIndexer<'a> {
         let Some(blockhash) = info.blockhash else {
             return false;
         };
-        let Ok(header) = get_bitcoind_rpc_client().get_block_header_info(&blockhash) else {
+        let Some(header_height) = pool.header_height(&blockhash) else {
             return false;
         };
-        let Ok(commit_height) = u32::try_from(header.height) else {
+        let Ok(commit_height) = u32::try_from(header_height) else {
             return false;
         };
+        if std::env::var_os("ESPO_LOG_RUNE_COMMITMENTS").is_some() {
+            eprintln!(
+                "[runes] commitment {}:{} at height {} -> confirmed at {} ({} confs)",
+                outpoint.txid,
+                outpoint.vout,
+                self.height,
+                commit_height,
+                self.height.saturating_sub(commit_height).saturating_add(1)
+            );
+        }
         self.height.saturating_sub(commit_height).saturating_add(1)
             >= Runestone::COMMIT_CONFIRMATIONS as u32
     }
