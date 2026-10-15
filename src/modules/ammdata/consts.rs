@@ -23,6 +23,48 @@ pub const PRICE_SCALE_DECIMALS: u32 = 16;
 pub const PRICE_SCALE: u128 = 10_000_000_000_000_000; // 1e16
 pub const AMOUNT_SCALE: u128 = 100_000_000; // on-chain token amount precision (1e8)
 pub const SATS_PER_BTC: u128 = AMOUNT_SCALE;
+
+/// Decimals every token is priced against: ammdata stores and serves a token's
+/// price as quote per `AMOUNT_SCALE` (1e8) RAW units, whatever the token's own
+/// decimals. Its USD aggregates (TVL, volume, market cap) are right for any
+/// token, because they multiply that price by `raw / AMOUNT_SCALE`; only the
+/// per-token PRICE is off for a token that is not 8 decimals, by 10^(d - 8).
+pub const AMOUNT_SCALE_DECIMALS: u32 = 8;
+
+/// Mainnet tokens whose decimals are not 8. The one table: the SUBZERO L0 peg
+/// tokens carry their native chain's base unit and cannot declare it on chain
+/// (their `__meta` has no decimals method; opcode 102 reverts, probed
+/// 2026-10-14 at 971500). Evidence: the get_limits mint caps are 4,000 SOL /
+/// 500,000 XRP / 100,000 ADA only at these scales, and the SUBFROST AMM pools
+/// 2:103202..2:103204 were seeded at market only at these scales.
+/// Same table as subvh apps/explorer lib/alkanes/decimals-known.ts.
+pub const MAINNET_NONSTANDARD_DECIMALS: &[(SchemaAlkaneId, u32)] = &[
+    (SchemaAlkaneId { block: 4, tx: 50050 }, 9), // frSOL (lamports)
+    (SchemaAlkaneId { block: 4, tx: 50051 }, 6), // frXRP (drops)
+    (SchemaAlkaneId { block: 4, tx: 50052 }, 6), // frADA (lovelace)
+];
+
+/// A token's own decimals, `AMOUNT_SCALE_DECIMALS` unless the table says otherwise.
+pub fn token_decimals(network: Network, id: &SchemaAlkaneId) -> u32 {
+    if network != Network::Bitcoin {
+        return AMOUNT_SCALE_DECIMALS;
+    }
+    MAINNET_NONSTANDARD_DECIMALS
+        .iter()
+        .find(|(t, _)| t == id)
+        .map(|(_, d)| *d)
+        .unwrap_or(AMOUNT_SCALE_DECIMALS)
+}
+
+/// A price per `AMOUNT_SCALE` raw units → the price per WHOLE token of
+/// `decimals`. Render-time only: nothing stored changes.
+pub fn price_per_whole_token(price: u128, decimals: u32) -> u128 {
+    if decimals >= AMOUNT_SCALE_DECIMALS {
+        price.saturating_mul(10u128.pow(decimals - AMOUNT_SCALE_DECIMALS))
+    } else {
+        price / 10u128.pow(AMOUNT_SCALE_DECIMALS - decimals)
+    }
+}
 pub const K_TOLERANCE_BPS: u128 = 10; // 0.1%
 pub const FRBTC_ALKANE_ID: SchemaAlkaneId = SchemaAlkaneId { block: 32, tx: 0 };
 pub const BUSD_ALKANE_ID: SchemaAlkaneId = SchemaAlkaneId { block: 2, tx: 56801 };
@@ -182,6 +224,23 @@ pub fn non_circulating_holders(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn nonstandard_decimals_table_and_per_token_price() {
+        let frsol = SchemaAlkaneId { block: 4, tx: 50050 };
+        let frxrp = SchemaAlkaneId { block: 4, tx: 50051 };
+        let frada = SchemaAlkaneId { block: 4, tx: 50052 };
+        assert_eq!(token_decimals(Network::Bitcoin, &frsol), 9);
+        assert_eq!(token_decimals(Network::Bitcoin, &frxrp), 6);
+        assert_eq!(token_decimals(Network::Bitcoin, &frada), 6);
+        assert_eq!(token_decimals(Network::Bitcoin, &FRBTC_ALKANE_ID), 8);
+        // Mainnet ids only: 4:50050 is something else on another network.
+        assert_eq!(token_decimals(Network::Regtest, &frsol), 8);
+        // Live espo closes (2026-10-14) -> per whole token.
+        assert_eq!(price_per_whole_token(103_192_000_000_000_000, 9), 1_031_920_000_000_000_000);
+        assert_eq!(price_per_whole_token(226_765_320_000_000_000, 6), 2_267_653_200_000_000);
+        assert_eq!(price_per_whole_token(37 * PRICE_SCALE, 8), 37 * PRICE_SCALE);
+    }
     use super::*;
 
     #[test]

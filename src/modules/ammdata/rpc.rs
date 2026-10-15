@@ -35,6 +35,10 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         page: payload.get("page").and_then(|v| v.as_u64()),
                         side: payload.get("side").and_then(|v| v.as_str()).map(|s| s.to_string()),
                         now: payload.get("now").and_then(|v| v.as_u64()),
+                        price_per: payload
+                            .get("price_per")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                     };
                     let view = match mdb.with_height(
                         payload.get("height").and_then(|v| v.as_u64()),
