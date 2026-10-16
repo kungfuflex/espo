@@ -17,6 +17,9 @@ use crate::modules::ammdata::storage::{
     encode_token_metrics, encode_u128_value, parse_change_basis_points,
 };
 use crate::modules::ammdata::utils::candles::bucket_start_for;
+use crate::modules::ammdata::utils::canonical_depth::{
+    CanonicalPoolCandidate, canonical_side_depth, combine_canonical_unit_candles, min_abs_depth,
+};
 use crate::modules::ammdata::utils::index_state::IndexState;
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
@@ -616,15 +619,14 @@ pub fn derive_token_data(
         for (token, buckets) in state.canonical_trade_buckets.iter() {
             let Some(pools) = canonical_pools_by_token.get(token) else { continue };
             for (tf, bucket_ts) in buckets {
-                let mut btc_candle: Option<SchemaCandleV1> = None;
-                let mut usd_candle: Option<SchemaCandleV1> = None;
+                // Every canonical pool of the token, per unit, with its depth and (if it
+                // traded in the bucket) its USD-converted candle. They are combined below
+                // by depth, so a dust pool can no longer set the token's price.
+                let mut btc_cands: Vec<CanonicalPoolCandidate> = Vec::new();
+                let mut usd_cands: Vec<CanonicalPoolCandidate> = Vec::new();
 
                 for entry in pools.iter() {
                     let Some(unit) = canonical_quote_units.get(&entry.quote_id) else {
-                        continue;
-                    };
-                    let Some(pool_candle) = load_pool_candle(&entry.pool_id, *tf, *bucket_ts)?
-                    else {
                         continue;
                     };
                     let Some(defs) = state.pools_map.get(&entry.pool_id) else {
@@ -636,20 +638,37 @@ pub fn derive_token_data(
                     if !token_is_base && !token_is_quote {
                         continue;
                     }
+                    if token_is_base && defs.quote_alkane_id != entry.quote_id {
+                        continue;
+                    }
+                    if !token_is_base && defs.base_alkane_id != entry.quote_id {
+                        continue;
+                    }
+
+                    let depth = canonical_side_depth(
+                        state.reserves_snapshot.get(&entry.pool_id),
+                        &entry.quote_id,
+                    );
+                    let cands = match unit {
+                        CanonicalQuoteUnit::Usd => &mut usd_cands,
+                        CanonicalQuoteUnit::Btc => &mut btc_cands,
+                    };
+                    let mut candidate =
+                        CanonicalPoolCandidate { pool_id: entry.pool_id, depth, candle: None };
+
+                    let Some(pool_candle) = load_pool_candle(&entry.pool_id, *tf, *bucket_ts)?
+                    else {
+                        cands.push(candidate);
+                        continue;
+                    };
 
                     let (price_candle, inverse_candle, canonical_volume) = if token_is_base {
-                        if defs.quote_alkane_id != entry.quote_id {
-                            continue;
-                        }
                         (
                             pool_candle.base_candle,
                             pool_candle.quote_candle,
                             pool_candle.quote_candle.volume,
                         )
                     } else {
-                        if defs.base_alkane_id != entry.quote_id {
-                            continue;
-                        }
                         (
                             pool_candle.quote_candle,
                             pool_candle.base_candle,
@@ -680,24 +699,26 @@ pub fn derive_token_data(
                         }
                     };
 
-                    let Some(open) = conv(price_candle.open, inverse_candle.open) else { continue };
-                    let Some(high) = conv(price_candle.high, inverse_candle.high) else { continue };
-                    let Some(low) = conv(price_candle.low, inverse_candle.low) else { continue };
-                    let Some(close) = conv(price_candle.close, inverse_candle.close) else {
-                        continue;
-                    };
-                    let Some(volume) = conv_vol(canonical_volume) else { continue };
-
-                    let converted = SchemaCandleV1 { open, high, low, close, volume };
-                    match unit {
-                        CanonicalQuoteUnit::Usd => {
-                            usd_candle = Some(converted);
-                        }
-                        CanonicalQuoteUnit::Btc => {
-                            btc_candle = Some(converted);
-                        }
-                    }
+                    candidate.candle = (|| {
+                        Some(SchemaCandleV1 {
+                            open: conv(price_candle.open, inverse_candle.open)?,
+                            high: conv(price_candle.high, inverse_candle.high)?,
+                            low: conv(price_candle.low, inverse_candle.low)?,
+                            close: conv(price_candle.close, inverse_candle.close)?,
+                            volume: conv_vol(canonical_volume)?,
+                        })
+                    })();
+                    cands.push(candidate);
                 }
+
+                let btc_candle = combine_canonical_unit_candles(
+                    &btc_cands,
+                    min_abs_depth(CanonicalQuoteUnit::Btc),
+                );
+                let usd_candle = combine_canonical_unit_candles(
+                    &usd_cands,
+                    min_abs_depth(CanonicalQuoteUnit::Usd),
+                );
 
                 let mut derived = match (btc_candle, usd_candle) {
                     (Some(btc), Some(usd)) => SchemaCandleV1 {
