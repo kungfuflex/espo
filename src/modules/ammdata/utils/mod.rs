@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod candles;
+pub mod canonical_depth;
 pub mod index_activity;
 pub mod index_factories;
 pub mod index_finalize;
